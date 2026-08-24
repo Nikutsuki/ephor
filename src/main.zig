@@ -10034,6 +10034,71 @@ fn blockOnEveryContinuingPath(
     return true;
 }
 
+/// The chain predecessor of the header block at `bid`: the block whose
+/// branch_false edge enters it, when that block also wires a branch_true
+/// edge (an if/loop/else-if header — the shapes whose false exit opens a
+/// chain link). Null when no branch_false in-edge exists (the chain root)
+/// or the source wires no branch_true (a merge). Block ids increase with
+/// creation order and branch_false edges always point forward, so the
+/// walk this feeds is strictly descending and terminates (EPH-I1142).
+fn chainPredecessorHeader(cfg: *const ControlFlowGraph, bid: usize) ?usize {
+    for (cfg.edges.items) |edge| {
+        if (edge.to != bid or edge.kind != .branch_false) continue;
+        for (cfg.edges.items) |e2| {
+            if (e2.from == edge.from and e2.kind == .branch_true) return edge.from;
+        }
+        return null;
+    }
+    return null;
+}
+
+/// True when the branch_true arm of the chain predecessor at `pred` frees
+/// the tracked var anywhere in its span: the path that skips the chain
+/// link (the path that took pred's true edge) then runs a second free of
+/// its own, so the pair stays definite (EPH-I1142). Var-aware — a free of
+/// a different variable cannot cover the skip path (stricter than the
+/// forward gate's own sibling scan, matching the reverse gate's
+/// spanFreesTrackedVar discipline).
+fn predArmFreesTrackedVar(ctx: *const FreeScanCtx, pred: usize) bool {
+    var arm: ?usize = null;
+    for (ctx.cfg.edges.items) |edge| {
+        if (edge.from == pred and edge.kind == .branch_true) arm = edge.to;
+    }
+    const arm_bid = arm orelse return false;
+    const block = ctx.cfg.blocks.items[arm_bid];
+    if (block.start_line < ctx.scan.func_line or block.end_line < block.start_line)
+        return false;
+    const first_idx = block.start_line - ctx.scan.func_line;
+    if (first_idx >= ctx.scan.lines.len) return false;
+    const last_idx = @min(block.end_line - ctx.scan.func_line, ctx.scan.lines.len - 1);
+    return spanFreesTrackedVar(ctx, first_idx, last_idx);
+}
+
+/// The chain-aware reachability for the forward both-arms gate
+/// (EPH-I1142): true when the construct header sits on every continuing
+/// path, OR the header is an else-if chain link whose every skip path
+/// runs a second free — each chain-prefix arm frees the tracked var —
+/// AND the chain root sits on every continuing path. The walk follows
+/// branch_false in-edges: the skip path of one link is the predecessor
+/// header's branch_true arm, so every predecessor's arm must free. A
+/// non-freeing prefix arm (the prefix path runs no second free), a
+/// nested chain root (an enclosing arm's other paths skip the whole
+/// chain), and a loop-false exit all keep the conditional grade — the
+/// safe direction.
+fn headerOnEveryPathOrChainArmsFree(ctx: *const FreeScanCtx, header: usize) !bool {
+    if (try blockOnEveryContinuingPath(ctx.allocator, ctx.cfg, header)) return true;
+    var cur = header;
+    while (chainPredecessorHeader(ctx.cfg, cur)) |pred| {
+        if (!predArmFreesTrackedVar(ctx, pred)) return false;
+        cur = pred;
+    }
+    // The walk moved cur to the chain root. No move means the header is
+    // not a chain link — its skip path then runs no provable second free
+    // (the conditional grade), so the root reachability walk is skipped.
+    if (cur == header) return false;
+    return blockOnEveryContinuingPath(ctx.allocator, ctx.cfg, cur);
+}
+
 /// The branch_true in-edge pair of the block at bid: the sibling arm the
 /// construct header's branch_false edge leaves via, and the header block
 /// that sources the branch_true edge. Null when bid is not a branch_true
@@ -10106,13 +10171,16 @@ const SiblingArm = struct {
 /// dominating pre-free reads definite through the own-line escape
 /// (isSameLineBothArmsFree, EPH-I1030) instead. The forward direction
 /// requires the construct header to sit on every continuing path,
-/// mirroring the reverse gate (EPH-I1141): an else-if chain grades
-/// arm-by-arm, an intermediate arm's sibling is the marked final-else
-/// body for a single-link chain — never the chain prefix arm's pair
-/// partner (the else-if continuation), and the reachability check on the
-/// chain
-/// header — which the prefix arm's path skips — keeps the intermediate
-/// arm's free at the conditional grade, the safe direction. An own-line
+/// mirroring the reverse gate (EPH-I1141), refined chain-aware
+/// (EPH-I1142): an else-if chain grades arm-by-arm, an intermediate arm's
+/// sibling is the marked final-else body for a single-link chain — never
+/// the chain prefix arm's pair partner (the else-if continuation) — and
+/// the reachability check on the chain header (which the prefix arm's
+/// path skips) keeps the intermediate arm's free at the conditional
+/// grade, the safe direction, UNLESS every chain-prefix arm also frees
+/// the tracked var and the chain root sits on every continuing path —
+/// the prefix path then runs a second free of its own, and the err grade
+/// is correct (the all-arms chain). An own-line
 /// `else {` header (the line-start else body) counts as a genuine arm
 /// start like the `}`-prefixed form: its else-claim mark proves the body
 /// (EPH-I1063). The mid-line `} else {` marker still suppresses the
@@ -10188,12 +10256,15 @@ fn elseBodyArmFrees(ctx: *const FreeScanCtx, arm: SiblingArm) !bool {
     // (EPH-I1032).
     if (!block.is_else_body) return false;
     // The upgrade reads definite only when every path that continues past
-    // the construct runs it: the construct header must sit on every
-    // continuing path, mirroring the reverse gate (EPH-I1141). A nested
-    // construct skips on the enclosing arm's other paths, and an
-    // else-if chain's intermediate arm skips on the prefix arm's path —
-    // both stay conditional.
-    if (!try blockOnEveryContinuingPath(ctx.allocator, ctx.cfg, arm.header)) return false;
+    // the construct runs it, mirroring the reverse gate (EPH-I1141), with
+    // the chain-aware refinement (EPH-I1142): an else-if chain's
+    // intermediate arm skips on the prefix arm's path, but the pair stays
+    // definite when every chain-prefix arm also frees the tracked var
+    // (the prefix path then runs a second free of its own) and the chain
+    // root sits on every continuing path. A nested construct skips on the
+    // enclosing arm's other paths, and a chain whose prefix arm does not
+    // free leaves the prefix path uncovered — both stay conditional.
+    if (!try headerOnEveryPathOrChainArmsFree(ctx, arm.header)) return false;
     const last_idx = @min(block.end_line - ctx.scan.func_line, lines.len - 1);
     var idx = first_idx;
     while (idx <= last_idx) : (idx += 1) {
@@ -16126,7 +16197,10 @@ fn extractAllocatorName(t: []const u8) ?[]const u8 {
 /// matchAllocArgPattern (the extractor for allocator names). findAllocCall
 /// does NOT read this list — it reads compat.getAllocMethodPatterns() and
 /// compat.getQualifiedAllocFnPatterns(), so a pattern must first exist in
-/// those tables before any entry here matters. The 0.15-only path ops stay
+/// those tables before any entry here matters. The same mandate binds
+/// third_arg_alloc_patterns (EPH-I1113): the .realPathFileAlloc entry
+/// there matters only because the 0.16 table carries it. The 0.15-only
+/// path ops stay
 /// (fs.zig:521/656/683), and the 0.15.1+/0.16 reader allocs
 /// (.readAlloc/.allocRemaining — allocator is the first arg after the
 /// receiver in both: Io/Reader.zig:682/288 and :739/292) joined.
@@ -16167,6 +16241,21 @@ const type_first_arg_alloc_patterns = [_][]const u8{
     ".replaceOwned(",
 };
 
+/// Patterns whose allocator is the THIRD call argument (the trailing-
+/// allocator shape, EPH-I1113). Verified against the 0.16.0 stdlib
+/// signature (the 0.15 stdlib has no such form — its realpathAlloc takes
+/// the allocator first):
+///   Io.Dir.realPathFileAlloc(dir, io, sub_path, allocator) — Io/Dir.zig:944
+/// The sibling standalone Io.Dir.realPathFileAbsoluteAlloc (Io/Dir.zig:974)
+/// shares the shape but stays out: its only call form is namespace-
+/// qualified through the uppercase `Dir` segment, which findAllocCall's
+/// type-factory suppression rejects, so the entry would never reach this
+/// extractor (ruled-out with the reason recorded at the compat table,
+/// EPH-I1113).
+const third_arg_alloc_patterns = [_][]const u8{
+    ".realPathFileAlloc(",
+};
+
 /// Return the position just after the first comma at bracket depth zero
 /// following `start`, or null when the call closes first. Nested parens,
 /// brackets, and braces inside the skipped argument (array dims, tuple
@@ -16201,15 +16290,26 @@ fn typeFirstAllocArgStart(t: []const u8, start: usize) ?usize {
     return skipPastTopLevelComma(t, start);
 }
 
+/// Argument start for third-arg allocating calls (the trailing-allocator
+/// shape, EPH-I1113): skip the two leading arguments and return the third
+/// argument's start. Null when the call closes before two top-level commas
+/// (a too-short call — the caller then leaves the line unmodeled, the
+/// FN-only direction).
+fn thirdArgAllocArgStart(t: []const u8, start: usize) ?usize {
+    const after_first = skipPastTopLevelComma(t, start) orelse return null;
+    return skipPastTopLevelComma(t, after_first);
+}
+
 /// Whether the matched allocating call takes the allocator as its first
-/// argument or as the argument after a leading comptime type parameter.
-const AllocArgKind = enum { first_arg, type_first };
+/// argument, as the argument after a leading comptime type parameter, or
+/// as its third call argument (the trailing-allocator shape).
+const AllocArgKind = enum { first_arg, type_first, third_arg };
 
 const AllocArgMatch = struct { start: usize, kind: AllocArgKind };
 
 /// Match the first allocating-call pattern present in the line, checking
-/// qualified, first-arg, then type-param-first patterns in order. Null when
-/// the line has no allocating pattern.
+/// qualified, first-arg, type-param-first, then third-arg patterns in
+/// order. Null when the line has no allocating pattern.
 fn matchAllocArgPattern(t: []const u8) ?AllocArgMatch {
     for (compat.getQualifiedAllocFnPatterns()) |pat| {
         if (mem.indexOf(u8, t, pat)) |pos| return .{ .start = pos + pat.len, .kind = .first_arg };
@@ -16219,6 +16319,9 @@ fn matchAllocArgPattern(t: []const u8) ?AllocArgMatch {
     }
     for (type_first_arg_alloc_patterns) |pat| {
         if (mem.indexOf(u8, t, pat)) |pos| return .{ .start = pos + pat.len, .kind = .type_first };
+    }
+    for (third_arg_alloc_patterns) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| return .{ .start = pos + pat.len, .kind = .third_arg };
     }
     return null;
 }
@@ -16234,8 +16337,11 @@ fn matchAllocArgPattern(t: []const u8) ?AllocArgMatch {
 ///   std.mem.replaceOwned(u8, builder.arena, ...)
 fn extractStandaloneAllocator(t: []const u8) ?[]const u8 {
     const m = matchAllocArgPattern(t) orelse return null;
-    if (m.kind == .first_arg) return extractFirstArgIdent(t, m.start);
-    const arg_start = typeFirstAllocArgStart(t, m.start) orelse return null;
+    const arg_start = switch (m.kind) {
+        .first_arg => m.start,
+        .type_first => typeFirstAllocArgStart(t, m.start) orelse return null,
+        .third_arg => thirdArgAllocArgStart(t, m.start) orelse return null,
+    };
     return extractFirstArgIdent(t, arg_start);
 }
 
@@ -16283,12 +16389,16 @@ fn isFirstArgArena(t: []const u8) bool {
 }
 
 /// Find the position after an allocating-call pattern (standalone or qualified).
-/// For type-param-first patterns the position is the SECOND argument's start.
+/// For type-param-first patterns the position is the SECOND argument's start;
+/// for third-arg patterns it is the THIRD argument's start (EPH-I1113).
 /// Null when the line has no allocating pattern.
 fn findAllocArgStart(t: []const u8) ?usize {
     const m = matchAllocArgPattern(t) orelse return null;
-    if (m.kind == .first_arg) return m.start;
-    return typeFirstAllocArgStart(t, m.start);
+    return switch (m.kind) {
+        .first_arg => m.start,
+        .type_first => typeFirstAllocArgStart(t, m.start),
+        .third_arg => thirdArgAllocArgStart(t, m.start),
+    };
 }
 
 /// Extract the first argument of a multiline allocating call.
@@ -16309,7 +16419,14 @@ fn extractMultilineFirstArg(t: []const u8, lines: []const []const u8, idx: usize
     // Look at the next line for the first argument
     if (idx + 1 >= lines.len) return null;
     const next_line = mem.trim(u8, lines[idx + 1], " \t\r");
-    if (m.kind == .first_arg) return extractFirstArgIdent(next_line, 0);
+    switch (m.kind) {
+        .first_arg => return extractFirstArgIdent(next_line, 0),
+        // The third-arg allocator sits at least two argument lines past
+        // the opener; the one-line lookahead cannot reach it. Unmodeled
+        // (the FN-only direction) (EPH-I1113).
+        .third_arg => return null,
+        .type_first => {},
+    }
     const arg_start = typeFirstAllocArgStart(next_line, 0) orelse return null;
     return extractFirstArgIdent(next_line, arg_start);
 }
@@ -22767,9 +22884,11 @@ const ComplexityState = struct {
     params: usize = 0,
     is_type_factory: bool = false,
     is_data_dispatch: bool = false,
-    // EPH-I1059: extern / callconv(.c) fns. The C ABI pins the parameter
-    // list (skytale proc_pidinfo carries 5 params the macOS libproc C API
-    // fixes), so ZA303 never fires on them.
+    // EPH-I1059/EPH-I1093/EPH-I1096: extern / export / callconv(.c) /
+    // callconv(.Stdcall) fns. The pinned ABI fixes the parameter list
+    // (skytale proc_pidinfo carries 5 params the macOS libproc C API
+    // fixes; export pins the C ABI; .Stdcall is the WinAPI class), so
+    // ZA303 never fires on them.
     is_c_abi: bool = false,
     cyclomatic: usize = 1,
     cognitive: usize = 0,
@@ -22813,9 +22932,11 @@ const PendingFnStart = struct {
     col: usize,
     abs_start: usize,
     is_data_dispatch: bool,
-    // EPH-I1059: C-ABI prefix (`extern `, `pub extern `, `callconv(.c)`)
-    // seen before the `fn` keyword on the keyword line. Carried to the
-    // state open so a wrapped signature keeps the exemption.
+    // EPH-I1059/EPH-I1093/EPH-I1096: ABI-pinned prefix (`extern `,
+    // `pub extern `, `export `, `pub export `, `callconv(.c)` /
+    // `callconv(.Stdcall)`) seen before the `fn` keyword on the keyword
+    // line. Carried to the state open so a wrapped signature keeps the
+    // exemption.
     is_c_abi_prefix: bool = false,
     sig_parens: usize,
     // EPH-I0788: count of processed signature lines before the body opens.
@@ -23391,7 +23512,7 @@ fn isTypeFactory(sig: []const u8) bool {
 fn sigSuffixIsCAbi(sig: []const u8) bool {
     const close = paramListEnd(sig) orelse return false;
     const body_open = bodyBraceAfter(sig, close + 1) orelse sig.len;
-    return hasCCallconv(sig[close + 1 .. body_open]);
+    return hasAbiPinnedCallconv(sig[close + 1 .. body_open]);
 }
 
 /// Index of the first code-position `{` at or after `from` in `sig`
@@ -23429,12 +23550,14 @@ fn paramListEnd(sig: []const u8) ?usize {
     return null;
 }
 
-/// True when a code-position callconv(.c) or callconv(.C) token appears in
-/// `t`. Both spell the C calling convention. The closing `)` in the needle
-/// keeps `callconv(.cc)` and `callconv(.Cdecl)` out; the ident-boundary
-/// filter guards the left edge of the needle (EPH-I1059).
-fn hasCCallconv(t: []const u8) bool {
-    inline for (.{ "callconv(.c)", "callconv(.C)" }) |mark| {
+/// True when a code-position callconv token in `t` names an ABI the
+/// caller pins: `callconv(.c)` or `callconv(.C)` (the C calling convention,
+/// EPH-I1059) or `callconv(.Stdcall)` (the Windows WinAPI convention — the
+/// same ABI-pinned class, EPH-I1093). The closing `)` in each needle keeps
+/// `callconv(.cc)` and `callconv(.Cdecl)` out; the ident-boundary filter
+/// guards the left edge of the needle.
+fn hasAbiPinnedCallconv(t: []const u8) bool {
+    inline for (.{ "callconv(.c)", "callconv(.C)", "callconv(.Stdcall)" }) |mark| {
         if (realTokenPos(t, mark) != null) return true;
     }
     return false;
@@ -23512,12 +23635,16 @@ fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void 
     // fn the same way call sites do.
     const fn_name = pubFnNameAt(t, pos + 3) orelse return;
     const name = fn_name.name;
-    // EPH-I1059: the text before the `fn` keyword carries the C-ABI prefix
-    // (`extern `, `pub extern `, `callconv(.c)`) when one is present.
+    // EPH-I1059/EPH-I1093/EPH-I1096: the text before the `fn` keyword
+    // carries the ABI-pinned prefix (`extern `, `pub extern `,
+    // `callconv(.c)`, `export `, `pub export `) when one is present.
+    // export pins the C ABI the same way extern does.
     const pre = mem.trimStart(u8, t[0..pos], " \t");
     const is_c_abi_prefix = mem.startsWith(u8, pre, "extern ") or
         mem.startsWith(u8, pre, "pub extern ") or
-        hasCCallconv(pre);
+        mem.startsWith(u8, pre, "export ") or
+        mem.startsWith(u8, pre, "pub export ") or
+        hasAbiPinnedCallconv(pre);
     var pending: PendingFnStart = .{
         .name = name,
         .start_line = line_num,
@@ -25908,14 +26035,18 @@ fn hasRealDeferKeyword(t: []const u8) bool {
     return nextRealDeferPos(t, &cls, 0) != null;
 }
 
-/// Append one `.deinit(` receiver path (ident chain) to `paths`. Same
-/// leading/trailing-dot and `..` guards as v1; duplicate paths are skipped
-/// so a repeated deinit cannot starve the cap.
-fn collectDeinitPath(
+/// Append one `.deinit(`/`.close(` receiver path (ident chain) to the
+/// scan's `paths`, tagged with the armed method (EPH-I1117: close is the
+/// resource release for Io.File/Io.Dir, the deinit-free managed
+/// containers). Same leading/trailing-dot and `..` guards as v1;
+/// duplicate paths are skipped so a repeated release cannot starve the
+/// cap. The scan struct carries the path set so the signature stays
+/// within the parameter threshold.
+fn collectManagedPath(
     t: []const u8,
     call: usize,
-    paths: *[max_defer_paths][]const u8,
-    count: *usize,
+    kind: DeferArmKind,
+    s: *DeferRegionScan,
 ) void {
     var start = call;
     while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) start -= 1;
@@ -25923,12 +26054,12 @@ fn collectDeinitPath(
     const path = t[start..call];
     if (path[0] == '.' or path[path.len - 1] == '.') return;
     if (mem.indexOf(u8, path, "..") != null) return;
-    for (paths[0..count.*]) |p| {
-        if (mem.eql(u8, p, path)) return;
+    for (s.paths[0..s.count.*]) |p| {
+        if (mem.eql(u8, p.path, path)) return;
     }
-    if (count.* >= max_defer_paths) return;
-    paths[count.*] = path;
-    count.* += 1;
+    if (s.count.* >= max_defer_paths) return;
+    s.paths[s.count.*] = .{ .path = path, .kind = kind };
+    s.count.* += 1;
 }
 
 /// Position right after a word-boundary `else` at or after `from` (skipping
@@ -25958,6 +26089,36 @@ fn isDeferCloser(c: u8) bool {
 fn isDeinitCallAt(t: []const u8, i: usize) bool {
     return i + 8 <= t.len and mem.eql(u8, t[i..][0..8], ".deinit(");
 }
+
+/// True when a `.close(` call starts at `i` (code position). close is the
+/// resource release for the deinit-free managed containers Io.File and
+/// Io.Dir (EPH-I1117), so a defer-armed close dangles a by-value return
+/// the same way a deinit does.
+fn isCloseCallAt(t: []const u8, i: usize) bool {
+    return i + 7 <= t.len and mem.eql(u8, t[i..][0..7], ".close(");
+}
+
+/// The armed release method of one defer path (EPH-I1117).
+const DeferArmKind = enum { deinit, close };
+
+/// The release call starting at the `.` at `i`, or null when neither a
+/// `.deinit(` nor a `.close(` starts there. The single dispatch point for
+/// the defer-region scanner: deferRegionStep calls it on every `.`, so
+/// its own branch count stays under the complexity threshold
+/// (EPH-I1117).
+fn releaseKindAt(t: []const u8, i: usize) ?DeferArmKind {
+    if (isDeinitCallAt(t, i)) return .deinit;
+    if (isCloseCallAt(t, i)) return .close;
+    return null;
+}
+
+/// One armed defer-release path: the receiver ident chain and the method
+/// that releases it. The kind picks the ZA110 message at emit time, so a
+/// close-armed path never reports as "deinited" (EPH-I1117).
+const DeferPath = struct {
+    path: []const u8,
+    kind: DeferArmKind,
+};
 
 /// Apply a `}` byte to the defer-region state: returns the next scan
 /// position (past the close brace, or past a continuing `else` branch),
@@ -25992,11 +26153,11 @@ fn deferRegionStep(
         return i + 1;
     }
     if (c == ';' and depth.* == 0) return null;
-    if (c == '.' and isDeinitCallAt(t, i)) {
+    if (c == '.') {
         // The call's own `(` and `)` are scanned as ordinary bytes, so
         // they balance each other: skipping the opener would drop the
         // block depth at the close and end the region prematurely.
-        collectDeinitPath(t, i, s.paths, s.count);
+        if (releaseKindAt(t, i)) |kind| collectManagedPath(t, i, kind, s);
     }
     return i + 1;
 }
@@ -26004,7 +26165,7 @@ fn deferRegionStep(
 /// Line-scan state shared by the defer-region scanner.
 const DeferRegionScan = struct {
     cls: LineClassifier,
-    paths: *[max_defer_paths][]const u8,
+    paths: *[max_defer_paths]DeferPath,
     count: *usize,
 };
 
@@ -26029,17 +26190,19 @@ fn scanDeferRegion(
     return null;
 }
 
-/// Collect every defer-deinit receiver path on `t` into `paths`. Each
-/// `.deinit(` is collected only inside the defer statement that contains
-/// it: the scan starts at the defer keyword (never before it, so
+/// Collect every defer-release receiver path on `t` into `paths`. Each
+/// `.deinit(`/`.close(` is collected only inside the defer statement that
+/// contains it: the scan starts at the defer keyword (never before it, so
 /// `a.deinit(); defer mu.unlock();` arms nothing) and iterates every
 /// occurrence on the line (`defer a.deinit(); defer b.deinit();` arms
 /// both — EPH-I0476). Statements that run past the line end stay armed
-/// through `state` (EPH-I0477).
+/// through `state` (EPH-I0477). The `.close(` arm tags its paths close
+/// (EPH-I1117): close is the release for Io.File/Io.Dir, whose deinit-free
+/// shape the deinit-only collector never armed.
 fn collectDeferDeinitPaths(
     t: []const u8,
     state: *DeferScanState,
-    paths: *[max_defer_paths][]const u8,
+    paths: *[max_defer_paths]DeferPath,
     count: *usize,
 ) void {
     if (!state.active and !hasRealDeferKeyword(t)) return;
@@ -26173,7 +26336,7 @@ fn resolveAliasHead(head: []const u8, aliases: []const LocalAlias) []const u8 {
     return cur;
 }
 
-/// True when some armed defer-deinit path matches the returned path: an
+/// True when some armed defer-release path matches the returned path: an
 /// exact path match, or a whole-owner return (`return w;`) while one of
 /// its fields (`w.list`) is armed — both copies alias the freed backing.
 /// Copy-alias heads resolve on both sides before the comparison, so
@@ -26181,44 +26344,62 @@ fn resolveAliasHead(head: []const u8, aliases: []const LocalAlias) []const u8 {
 /// list.deinit();` (EPH-I0480). The reverse — an armed whole owner with a
 /// field return (`defer w.deinit(); return w.list;`) — stays silent:
 /// whether the whole-owner deinit frees the field's backing is
-/// owner-dependent (EPH-I1046).
+/// owner-dependent (EPH-I1046). The matched arm's kind returns for the
+/// emit message, so a close-armed path reports closed, never deinited
+/// (EPH-I1117).
 fn deferPathArmsReturn(
-    paths: []const []const u8,
+    paths: []const DeferPath,
     ret_path: []const u8,
     head: []const u8,
     aliases: []const LocalAlias,
-) bool {
+) ?DeferArmKind {
     const ret_tail = ret_path[head.len..];
     const ret_root = resolveAliasHead(head, aliases);
     for (paths) |p| {
-        const p_head = mem.sliceTo(p, '.');
+        const p_head = mem.sliceTo(p.path, '.');
         const p_root = resolveAliasHead(p_head, aliases);
-        const p_tail = p[p_head.len..];
-        if (mem.eql(u8, ret_root, p_root) and mem.eql(u8, ret_tail, p_tail)) return true;
+        const p_tail = p.path[p_head.len..];
+        if (mem.eql(u8, ret_root, p_root) and mem.eql(u8, ret_tail, p_tail))
+            return p.kind;
         if (ret_tail.len == 0 and p_tail.len > 0 and p_tail[0] == '.' and
-            mem.eql(u8, ret_root, p_root)) return true;
+            mem.eql(u8, ret_root, p_root)) return p.kind;
     }
-    return false;
+    return null;
 }
 
-/// Emit the ZA110 warning for one defer-armed by-value return.
-fn emitMustReturnRef(
-    ctx: MustReturnRefCtx,
+/// One ZA110 emit site: the returned path's line, index, and name plus
+/// the armed release kind. Bundled so the emitter stays within the
+/// parameter threshold after the close arm joined (EPH-I1117).
+const MustReturnRefSite = struct {
     line: []const u8,
     idx: usize,
     ident: []const u8,
-) !void {
-    const msg = try std.fmt.allocPrint(
-        ctx.a,
-        "returned local '{s}' is deinited by an armed defer — " ++
-            "the returned copy's backing is freed at scope exit",
-        .{ident},
-    );
+    kind: DeferArmKind,
+};
+
+/// Emit the ZA110 warning for one defer-armed by-value return. The message
+/// names the armed release: deinit frees the returned copy's backing,
+/// close closes the returned copy's handle (EPH-I1117).
+fn emitMustReturnRef(ctx: MustReturnRefCtx, site: MustReturnRefSite) !void {
+    const msg = switch (site.kind) {
+        .deinit => try std.fmt.allocPrint(
+            ctx.a,
+            "returned local '{s}' is deinited by an armed defer — " ++
+                "the returned copy's backing is freed at scope exit",
+            .{site.ident},
+        ),
+        .close => try std.fmt.allocPrint(
+            ctx.a,
+            "returned local '{s}' is closed by an armed defer — " ++
+                "the returned copy's handle is closed at scope exit",
+            .{site.ident},
+        ),
+    };
     errdefer ctx.a.free(msg);
     try ctx.out.append(ctx.a, .{
         .file = ctx.fp,
-        .line = ctx.fstart + idx,
-        .col = skipLeadingWhitespace(line) + 1,
+        .line = ctx.fstart + site.idx,
+        .col = skipLeadingWhitespace(site.line) + 1,
         .severity = .warning,
         .rule = RULE_MUST_RETURN_REF,
         .message = msg,
@@ -26232,7 +26413,7 @@ fn emitMustReturnRef(
 const MustReturnRefScan = struct {
     locals: [max_tracked_locals][]const u8 = undefined,
     local_count: usize = 0,
-    defer_paths: [max_defer_paths][]const u8 = undefined,
+    defer_paths: [max_defer_paths]DeferPath = undefined,
     defer_count: usize = 0,
     aliases: [max_alias_copies]LocalAlias = undefined,
     alias_count: usize = 0,
@@ -26293,13 +26474,18 @@ fn checkMustReturnRef(ctx: MustReturnRefCtx) !void {
         // scopes the F7 direction applies there.
         const head_is_local = containsName(scan.locals[0..scan.local_count], head);
         if (!head_is_local and path.len == head.len) continue;
-        if (!deferPathArmsReturn(
+        const arm_kind = deferPathArmsReturn(
             scan.defer_paths[0..scan.defer_count],
             path,
             head,
             scan.aliases[0..scan.alias_count],
-        )) continue;
-        try emitMustReturnRef(ctx, line, i, path);
+        ) orelse continue;
+        try emitMustReturnRef(ctx, .{
+            .line = line,
+            .idx = i,
+            .ident = path,
+            .kind = arm_kind,
+        });
     }
 }
 
@@ -48041,6 +48227,44 @@ test "ZA101/ZA103: multi-line .alloc( with wrapped args is detected" {
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_ERRDEFER) == 1);
 }
 
+test "ZA101: third-arg allocator tracks realPathFileAlloc with arena suppression (EPH-I1113)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The 0.16 Io.Dir.realPathFileAlloc takes the allocator as the THIRD
+    // call argument. Pre-fix neither findAllocCall nor the extractor
+    // modeled the shape, so the unprotected gpa fn fired nothing (the
+    // FN). The arena fn is the suppression discriminator: the same call
+    // with an arena-named third arg must stay silent.
+    const content =
+        \\fn realpath_gpa(io: std.Io, sub: []const u8, gpa: std.mem.Allocator) !void {
+        \\    const p = try std.Io.Dir.cwd().realPathFileAlloc(io, sub, gpa);
+        \\    _ = p;
+        \\}
+        \\fn realpath_arena(io: std.Io, sub: []const u8, arena: std.mem.Allocator) !void {
+        \\    const p = try std.Io.Dir.cwd().realPathFileAlloc(io, sub, arena);
+        \\    _ = p;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_third_arg_alloc.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_third_arg_alloc.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_DEFER) == 1);
+    var gpa_line = false;
+    var arena_line = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.file, file)) continue;
+        if (!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) continue;
+        if (issue.line == 2) gpa_line = true;
+        if (issue.line == 6) arena_line = true;
+    }
+    try std.testing.expect(gpa_line);
+    try std.testing.expect(!arena_line);
+}
+
 test "ZA101: .prepend( transfers ownership (ghostty list_keybinds shape)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -49846,6 +50070,119 @@ test "ZA106: nested both-arms pair under an outer if grades conditional, top-lev
     try std.testing.expect(nested_then_warning);
     try std.testing.expect(nested_else_warning);
     try std.testing.expect(both_err);
+}
+
+test "ZA106: all-arms chain intermediate grades err, skip paths stay conditional (EPH-I1142)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The chain-aware refinement of the I1141 guard: an all-arms chain's
+    // intermediate free grades err (every path through the chain runs a
+    // second free — the prefix arm covers the skip path), while the three
+    // skip-path shapes stay conditional: a nested chain (the enclosing
+    // arm's other path skips the whole chain), a chain whose prefix arm
+    // does not free (the prefix path runs no second free), and a chain
+    // inside a loop (the zero-trip false exit skips it). Pre-fix the
+    // guard capped every intermediate at warning; the err assertion
+    // fails on the pre-fix binary.
+    const content =
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+        \\fn chain_own(allocator: std.mem.Allocator, a: bool, b: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (a) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    else if (b) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    else {
+        \\        allocator.free(buf);
+        \\    }
+        \\    use(buf);
+        \\}
+        \\fn chain_nested(allocator: std.mem.Allocator, outer: bool, a: bool, b: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (outer) {
+        \\        if (a) {
+        \\            allocator.free(buf);
+        \\        }
+        \\        else if (b) {
+        \\            allocator.free(buf);
+        \\        }
+        \\        else {
+        \\            allocator.free(buf);
+        \\        }
+        \\    }
+        \\    use(buf);
+        \\}
+        \\fn chain_prefix_no_free(allocator: std.mem.Allocator, a: bool, b: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (a) {
+        \\        _ = buf;
+        \\    }
+        \\    else if (b) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    else {
+        \\        allocator.free(buf);
+        \\    }
+        \\    use(buf);
+        \\}
+        \\fn chain_in_loop(allocator: std.mem.Allocator, a: bool, b: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    while (a) {
+        \\        if (a) {
+        \\            allocator.free(buf);
+        \\        }
+        \\        else if (b) {
+        \\            allocator.free(buf);
+        \\        }
+        \\        else {
+        \\            allocator.free(buf);
+        \\        }
+        \\    }
+        \\    use(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_chain_all_arms.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_chain_all_arms.zig";
+    // chain_own: then/intermediate/final. chain_nested: the same three.
+    // chain_prefix_no_free: intermediate/final (the prefix arm never
+    // frees). chain_in_loop: the same three as chain_own. The post-use
+    // lines fire ZA105, not ZA106.
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 11);
+    var own_intermediate_err = false;
+    var own_then_warning = false;
+    var own_final_warning = false;
+    var nested_intermediate_warning = false;
+    var prefix_intermediate_warning = false;
+    var loop_intermediate_warning = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.file, file)) continue;
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        if (issue.line == 8) own_then_warning = issue.severity == .warning;
+        if (issue.line == 11) own_intermediate_err = issue.severity == .err;
+        if (issue.line == 14) own_final_warning = issue.severity == .warning;
+        if (issue.line == 26) nested_intermediate_warning = issue.severity == .warning;
+        if (issue.line == 41) prefix_intermediate_warning = issue.severity == .warning;
+        if (issue.line == 56) loop_intermediate_warning = issue.severity == .warning;
+    }
+    try std.testing.expect(own_intermediate_err);
+    try std.testing.expect(own_then_warning);
+    try std.testing.expect(own_final_warning);
+    try std.testing.expect(nested_intermediate_warning);
+    try std.testing.expect(prefix_intermediate_warning);
+    try std.testing.expect(loop_intermediate_warning);
 }
 
 test "ZA106: loop-else both-arms free grades err, plain loop twin stays conditional (EPH-I1017 F1)" {
@@ -77646,11 +77983,46 @@ test "findAllocCall detects .allocRemaining(" {
 
 test "findAllocCall no longer detects .realpathAlloc( (removed with B71)" {
     // realpathAlloc left the vocabulary: 0.15.1 keeps it (fs.zig:683) but the
-    // running 0.16 tables dropped it, and its 0.16 successor
-    // (Io.Dir.realPathFileAlloc) takes the allocator as the third argument,
-    // which the first-arg extractor cannot model.
+    // running 0.16 tables dropped it. Its 0.16 successor
+    // (Io.Dir.realPathFileAlloc) takes the allocator as the third argument
+    // and joins the 0.16 table with the third-arg extractor arm
+    // (EPH-I1113).
     const result = findAllocCall("    const path = try std.fs.cwd().realpathAlloc(allocator, \".\");", null);
     try std.testing.expect(result == null);
+}
+
+test "findAllocCall detects .realPathFileAlloc( (EPH-I1113)" {
+    const result = findAllocCall(
+        "    const p = try dir.realPathFileAlloc(io, sub_path, allocator);",
+        null,
+    );
+    try std.testing.expect(result != null);
+    try std.testing.expect(!result.?.is_create);
+}
+
+test "extractStandaloneAllocator models the third-arg allocator (EPH-I1113)" {
+    try std.testing.expectEqualStrings(
+        "gpa",
+        extractStandaloneAllocator(
+            "    const p = try dir.realPathFileAlloc(io, sub_path, gpa);",
+        ).?,
+    );
+    // The first-arg and type-first shapes keep their arms: a nested comma
+    // inside an argument (the tuple type) never counts toward the third.
+    try std.testing.expectEqualStrings(
+        "a",
+        extractStandaloneAllocator("    const p = try std.fmt.allocPrint(a, \"{d}\", .{42});").?,
+    );
+    try std.testing.expectEqualStrings(
+        "allocator",
+        extractStandaloneAllocator(
+            "    const out = try std.mem.replaceOwned(u8, allocator, input, \"a\", \"b\");",
+        ).?,
+    );
+    // A too-short third-arg call (one argument) leaves the line unmodeled.
+    try std.testing.expect(extractStandaloneAllocator(
+        "    const p = try dir.realPathFileAlloc(io);",
+    ) == null);
 }
 
 test "findAllocCall no longer detects .stringifyAlloc( (removed with B71)" {
@@ -82508,6 +82880,57 @@ test "ZA303 exempts extern and callconv(.c) declarations (EPH-I1059)" {
     }
     // The three C-ABI shapes are exempt; plainFive and decoy still fire
     // (the EntryPoint callconv on a later declaration exempts neither).
+    try std.testing.expectEqual(@as(usize, 2), za303_count);
+}
+
+test "ZA303 exempts callconv(.Stdcall) and export declarations (EPH-I1093, EPH-I1096)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The ABI-pinned shapes carry 5 params the ABI fixes: a suffix and a
+    // prefix callconv(.Stdcall) (the WinAPI class), a bodied export fn,
+    // and a pub export fn. The sysv fn is the discriminating neighbor —
+    // callconv(.x86_64_sysv) is NOT a pinned ABI, so it still fires like
+    // the plain control.
+    const code =
+        \\fn winapiSuffix(a: u8, b: u8, c: u8, d: u8, e: u8) callconv(.Stdcall) void {
+        \\    _ = .{ a, b, c, d, e };
+        \\}
+        \\callconv(.Stdcall) fn winapiPrefix(a: u8, b: u8, c: u8, d: u8, e: u8) void {
+        \\    _ = .{ a, b, c, d, e };
+        \\}
+        \\export fn exportedFive(a: u8, b: u8, c: u8, d: u8, e: u8) void {
+        \\    _ = .{ a, b, c, d, e };
+        \\}
+        \\pub export fn pubExportedFive(a: u8, b: u8, c: u8, d: u8, e: u8) void {
+        \\    _ = .{ a, b, c, d, e };
+        \\}
+        \\fn sysvFive(a: u8, b: u8, c: u8, d: u8, e: u8) callconv(.x86_64_sysv) void {
+        \\    _ = .{ a, b, c, d, e };
+        \\}
+        \\fn plainFive(a: u8, b: u8, c: u8, d: u8, e: u8) void {
+        \\    _ = .{ a, b, c, d, e };
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_abi_pinned.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_abi_pinned.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    var za303_count: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_TOO_MANY_PARAMS) and
+            mem.eql(u8, issue.file, "test_abi_pinned.zig")) za303_count += 1;
+    }
+    // The four pinned shapes are exempt; sysvFive and plainFive still fire.
     try std.testing.expectEqual(@as(usize, 2), za303_count);
 }
 
@@ -100218,6 +100641,50 @@ test "ZA110: multi-line signature with armed defer fires" {
     );
 }
 
+test "ZA110: close-armed defer fires with a close-accurate message (EPH-I1117)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Io.File/Io.Dir are deinit-free: close is their resource release. The
+    // deinit-only collector never armed `defer f.close();`, so the opener
+    // fired nothing (the FN). The deiniter is the message discriminator:
+    // its issue must still say "deinited", the opener's must say "closed".
+    const content =
+        \\const std = @import("std");
+        \\fn opener() !std.Io.File {
+        \\    const f = try std.Io.File.open("x.txt");
+        \\    defer f.close();
+        \\    return f;
+        \\}
+        \\fn deiniter(a: std.mem.Allocator) !std.ArrayList(u8) {
+        \\    var list = std.ArrayList(u8).init(a);
+        \\    defer list.deinit();
+        \\    return list;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_close.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countRuleIssues(run.issues.items, "za110_close.zig", RULE_MUST_RETURN_REF),
+    );
+    var opened_closed_msg = false;
+    var deinit_msg = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.file, "za110_close.zig")) continue;
+        if (!mem.eql(u8, issue.rule, RULE_MUST_RETURN_REF)) continue;
+        if (issue.line == 5 and mem.indexOf(u8, issue.message, "closed by an armed defer") != null)
+            opened_closed_msg = true;
+        if (issue.line == 10 and mem.indexOf(u8, issue.message, "deinited by an armed defer") != null)
+            deinit_msg = true;
+    }
+    try std.testing.expect(opened_closed_msg);
+    try std.testing.expect(deinit_msg);
+}
+
 test "ZA110: hasRealDeferKeyword masks defer inside strings (EPH-I0475)" {
     // A string literal containing `defer ` is text, never an armed defer —
     // the F1 phantom-defer FP class (a string + a real `.deinit(` on the
@@ -100231,17 +100698,34 @@ test "ZA110: hasRealDeferKeyword masks defer inside strings (EPH-I0475)" {
 }
 
 test "ZA110: defer scan takes every deinit after the keyword (EPH-I0476)" {
-    var paths: [max_defer_paths][]const u8 = undefined;
+    var paths: [max_defer_paths]DeferPath = undefined;
     var count: usize = 0;
     var state = DeferScanState{};
     collectDeferDeinitPaths("defer a.deinit(); defer b.deinit();", &state, &paths, &count);
     try std.testing.expectEqual(@as(usize, 2), count);
-    try std.testing.expectEqualStrings("a", paths[0]);
-    try std.testing.expectEqualStrings("b", paths[1]);
+    try std.testing.expectEqualStrings("a", paths[0].path);
+    try std.testing.expectEqualStrings("b", paths[1].path);
+}
+
+test "ZA110: defer scan tags close arms and keeps deinit arms (EPH-I1117)" {
+    var paths: [max_defer_paths]DeferPath = undefined;
+    var count: usize = 0;
+    var state = DeferScanState{};
+    collectDeferDeinitPaths("defer f.close(); defer list.deinit();", &state, &paths, &count);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqualStrings("f", paths[0].path);
+    try std.testing.expect(paths[0].kind == .close);
+    try std.testing.expectEqualStrings("list", paths[1].path);
+    try std.testing.expect(paths[1].kind == .deinit);
+    // A close before the defer keyword never arms (the deinit discipline).
+    count = 0;
+    state = DeferScanState{};
+    collectDeferDeinitPaths("f.close(); defer mu.unlock();", &state, &paths, &count);
+    try std.testing.expectEqual(@as(usize, 0), count);
 }
 
 test "ZA110: deinit before the defer keyword never arms (EPH-I0476)" {
-    var paths: [max_defer_paths][]const u8 = undefined;
+    var paths: [max_defer_paths]DeferPath = undefined;
     var count: usize = 0;
     var state = DeferScanState{};
     collectDeferDeinitPaths("a.deinit(); defer mu.unlock();", &state, &paths, &count);
@@ -100251,16 +100735,16 @@ test "ZA110: deinit before the defer keyword never arms (EPH-I0476)" {
 }
 
 test "ZA110: deinit after the defer statement is inline, not armed (EPH-I0476)" {
-    var paths: [max_defer_paths][]const u8 = undefined;
+    var paths: [max_defer_paths]DeferPath = undefined;
     var count: usize = 0;
     var state = DeferScanState{};
     collectDeferDeinitPaths("defer a.deinit(); b.deinit();", &state, &paths, &count);
     try std.testing.expectEqual(@as(usize, 1), count);
-    try std.testing.expectEqualStrings("a", paths[0]);
+    try std.testing.expectEqualStrings("a", paths[0].path);
 }
 
 test "ZA110: multi-line defer blocks arm their body deinits (EPH-I0477)" {
-    var paths: [max_defer_paths][]const u8 = undefined;
+    var paths: [max_defer_paths]DeferPath = undefined;
     var count: usize = 0;
     var state = DeferScanState{};
     collectDeferDeinitPaths("defer {", &state, &paths, &count);
@@ -100268,14 +100752,14 @@ test "ZA110: multi-line defer blocks arm their body deinits (EPH-I0477)" {
     try std.testing.expectEqual(@as(usize, 0), count);
     collectDeferDeinitPaths("    list.deinit();", &state, &paths, &count);
     try std.testing.expectEqual(@as(usize, 1), count);
-    try std.testing.expectEqualStrings("list", paths[0]);
+    try std.testing.expectEqualStrings("list", paths[0].path);
     collectDeferDeinitPaths("}", &state, &paths, &count);
     try std.testing.expect(!state.active);
     try std.testing.expectEqual(@as(usize, 1), count);
 }
 
 test "ZA110: defer if-block else branch is still the defer statement (EPH-I0477)" {
-    var paths: [max_defer_paths][]const u8 = undefined;
+    var paths: [max_defer_paths]DeferPath = undefined;
     var count: usize = 0;
     var state = DeferScanState{};
     collectDeferDeinitPaths(
@@ -100322,11 +100806,24 @@ test "ZA110: deferPathArmsReturn resolves copy aliases (EPH-I0480)" {
         .{ .name = "out", .rhs = "list" },
         .{ .name = "b", .rhs = "out" },
     };
-    try std.testing.expect(deferPathArmsReturn(&.{"list"}, "out", "out", &aliases));
-    try std.testing.expect(deferPathArmsReturn(&.{"out"}, "b", "b", &aliases));
-    try std.testing.expect(deferPathArmsReturn(&.{"out"}, "list", "list", &aliases));
-    try std.testing.expect(deferPathArmsReturn(&.{"out.list"}, "out", "out", &aliases));
-    try std.testing.expect(!deferPathArmsReturn(&.{"other"}, "out", "out", &aliases));
+    const deinit_arms = [_]DeferPath{
+        .{ .path = "list", .kind = .deinit },
+        .{ .path = "out", .kind = .deinit },
+    };
+    try std.testing.expect(deferPathArmsReturn(deinit_arms[0..1], "out", "out", &aliases) != null);
+    try std.testing.expect(deferPathArmsReturn(deinit_arms[1..2], "b", "b", &aliases) != null);
+    try std.testing.expect(deferPathArmsReturn(deinit_arms[1..2], "list", "list", &aliases) != null);
+    const field_arm = [_]DeferPath{.{ .path = "out.list", .kind = .deinit }};
+    try std.testing.expect(deferPathArmsReturn(&field_arm, "out", "out", &aliases) != null);
+    const other_arm = [_]DeferPath{.{ .path = "other", .kind = .deinit }};
+    try std.testing.expect(deferPathArmsReturn(&other_arm, "out", "out", &aliases) == null);
+    // The matched arm's kind returns for the emit message (EPH-I1117).
+    const close_arms = [_]DeferPath{
+        .{ .path = "f", .kind = .close },
+        .{ .path = "g", .kind = .deinit },
+    };
+    try std.testing.expect(deferPathArmsReturn(close_arms[0..2], "f", "f", &aliases).? == .close);
+    try std.testing.expect(deferPathArmsReturn(close_arms[0..2], "g", "g", &aliases).? == .deinit);
 }
 
 test "ZA110: string-literal defer text never arms a phantom defer (EPH-I0475)" {

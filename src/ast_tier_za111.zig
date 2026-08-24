@@ -996,8 +996,33 @@ fn bindForRoot(name: []const u8, scan: *const FnScan) ?Bind {
 }
 
 fn chainIsUnsafe(sctx: ScanCtx, info: ChainInfo, bind: Bind) bool {
-    if (bind.is_pointer) return false;
+    if (bind.is_pointer) return finalHopIsOwnSlot(sctx, info, bind);
     return resolveChainSafety(sctx, info, bind.type_node) == .unsafe;
+}
+
+/// The slot-address discrimination for pointer/slice roots (EPH-I1122):
+/// a lone `.len`/`.ptr` field hop on a slice root (or on a many
+/// pointer — `[*]T` carries the same fat-pointer slot) addresses the
+/// pointer value stored in the root's own stack slot, so the chain is
+/// unsafe. Every other hop shape stays caller-owned memory and silent:
+/// an index into the backing array (`&v[i]`), a pointee field through a
+/// single-item pointer (`&p.len` on a `*S` addresses `(*S).len`), and any
+/// deeper chain (`&v[i].len` addresses the element's field). A root whose
+/// type is unprovable from the AST (an inferred local) stays silent too —
+/// the FN-only direction.
+fn finalHopIsOwnSlot(sctx: ScanCtx, info: ChainInfo, bind: Bind) bool {
+    if (info.hop_count != 1) return false;
+    const field = switch (info.hops[0]) {
+        .field => |f| f,
+        else => return false,
+    };
+    if (!mem.eql(u8, field, "len") and !mem.eql(u8, field, "ptr")) return false;
+    const tn = bind.type_node.unwrap() orelse return false;
+    const pt = sctx.tree.fullPtrType(tn) orelse return false;
+    return switch (pt.size) {
+        .slice, .many => true,
+        else => false,
+    };
 }
 
 // ============================================================================

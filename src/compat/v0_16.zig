@@ -780,9 +780,20 @@ pub const alloc_method_patterns: []const []const u8 = &.{
     // (Io/Reader.zig:299 — allocator is the first arg after the receiver,
     // the same shape as .readAlloc/.allocRemaining)
     ".allocRemainingAlignedSentinel(",
-    // Path operations (0.15's realpathAlloc moved and renamed to
-    // Io.Dir.realPathFileAlloc, where the allocator is the third argument —
-    // the first-arg extractor cannot model it, so it is deliberately absent)
+    // Path operations: 0.15's realpathAlloc moved and renamed. The 0.16
+    // method form takes the allocator as the THIRD call argument (the
+    // trailing-allocator shape, EPH-I1113):
+    //   Io.Dir.realPathFileAlloc(dir, io, sub_path, allocator) —
+    //   Io/Dir.zig:944
+    // The sibling standalone form Io.Dir.realPathFileAbsoluteAlloc
+    // (Io/Dir.zig:974) shares the shape but is deliberately absent: its
+    // only call form is namespace-qualified through the uppercase `Dir`
+    // segment, which the type-factory suppression guard (isTypeAllocFactory)
+    // rejects — covering it needs a findAllocCall carve-out
+    // disproportionate to the form's prevalence (recorded ruled-out,
+    // EPH-I1113). The v0_15 table deliberately omits the method form too —
+    // 0.15 carries neither (its realpathAlloc takes the allocator first).
+    ".realPathFileAlloc(",
     // String operations
     ".replaceOwned(",
     ".concatWithSentinel(",

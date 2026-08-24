@@ -275,7 +275,7 @@ Example config:
 | `version` | Pinned ephor version (set by `install`/`upgrade`) |
 | `path_dir` | Directory to analyze (also accepts `code`, `src`, or `root` as aliases). Must resolve inside the config's own directory |
 | `entries` | Entry points for orphan detection |
-| `exclude` | Paths to exclude from all checks (substring match). Empty is a hard error. Ephor ignores `/` and `.zig` with a warning |
+| `exclude` | Paths to exclude from all checks (substring match). Empty is a hard error. Ephor ignores the over-broad patterns `/`, `.zig`, `.`, `zig`, and the scan root's first path component with a warning |
 | `orphan_exclude` | Patterns to exclude from orphan detection only |
 | `disable` | Rule IDs to disable (prefix matching: `ZA3` disables all) |
 | `enable` | Rule IDs to enable (overrides disable) |
@@ -296,10 +296,28 @@ Ephor honors only `entries` from an untrusted config. It ignores the suppression
 note: ignoring suppression/gate keys from untrusted <path> (use --trust-target-config to honor)
 ```
 
+The trust decision is visible. A trusted config whose directory covers the scan target prints one note:
+
+```
+note: trusting config at <path>
+```
+
 Ephor containment-checks honored `entries` at load. Each entry must resolve inside the scan root (realpath compare). Ephor drops an entry that resolves outside, escapes through `..`, or does not resolve, and prints one note per file:
 
 ```
 note: ignoring <N> outside-root entries from untrusted <path> (use --trust-target-config to honor)
+```
+
+The entries that survive are honored as reachability hints, and ephor names them:
+
+```
+note: honoring 2 entries from untrusted <path> as reachability hints
+```
+
+A non-default `error_naming` convention that comes from a config at or inside the scanned tree prints its own note:
+
+```
+note: error naming convention snake_case comes from config <path>
 ```
 
 Entries extracted from build.zig files in the scanned tree pass the same check, with one note per scan:
@@ -310,7 +328,7 @@ note: ignoring <N> outside-root entries extracted from target tree <path>
 
 Operator channels stay exempt: `--entry`, a trusted config's `entries`, and the working directory's own build.zig may point outside the scan root. Orphan detection then stays complete for files the scan root does not cover.
 
-The containment gates realpath a path to decide, then open the original textual path. A tree mutated during the scan could swap a symlink between the check and the open. The scanner assumes no active adversary during the scan.
+The containment gates realpath a path to decide, then open the original textual path. The final path component opens no-follow, so a symlink swapped in there fails the open instead of redirecting the read, and a symlinked scan root fails closed. An intermediate path component swapped between the gate and the open could still redirect the read. That residual is the accepted posture for a batch scanner.
 
 The `check` scan covers the CLI path and every honored entry point. An entry outside the CLI path joins the scan as an extra root. A targeted run such as `ephor check src/foo.zig` also scans those entry files. The summary's Files count reflects the union. Ephor prints one note when the entries widen the scan:
 
@@ -335,7 +353,7 @@ Residual: running ephor inside a tree trusts that tree's config. To audit an unt
 Validation rules:
 
 - Every config `path_dir` resolves relative to the config's directory and must stay inside it. Ephor ignores an escaping value (for example `..` or `/`) with a warning.
-- An honored `exclude` list rejects an empty pattern with a hard usage error. Ephor ignores the over-broad patterns `/` and `.zig` with a warning. Untrusted configs skip `exclude` before validation.
+- An honored `exclude` list rejects an empty pattern with a hard usage error. Ephor ignores the over-broad patterns `/`, `.zig`, `.`, `zig`, and the scan root's first path component with a warning. Untrusted configs skip `exclude` before validation.
 - Threshold values clamp at documented maxima with a warning: 100000 (lines, nesting, params, branches, line length), 10000 (cyclomatic, cognitive), 100000000 (file bytes). Config files and CLI flags clamp alike.
 - CLI threshold flags reject a zero or non-integer value as a hard usage error ("expected a positive integer"). A zero threshold would flag every function, so the flag fails closed instead of silently contradicting the value you typed.
 
@@ -391,7 +409,7 @@ An override that is not absolute or does not resolve prints a warning and falls 
 |------|----------|---------|-------------|
 | **ZA301** | warning | ON | Function exceeds max lines (default: 50; type factories get 3x) |
 | **ZA302** | warning | ON | Function exceeds max nesting depth (default: 3; type factories get 2x) |
-| **ZA303** | warning | ON | Function has too many parameters (default: 4; counted across multi-line signatures). Exempt: `extern` and `callconv(.c)`/`callconv(.C)` declarations — the C ABI pins the signature (EPH-I1059) |
+| **ZA303** | warning | ON | Function has too many parameters (default: 4; counted across multi-line signatures). Exempt: `extern`, `export`, and `callconv(.c)`/`callconv(.C)`/`callconv(.Stdcall)` declarations — a pinned ABI fixes the parameter list (EPH-I1059, EPH-I1093, EPH-I1096) |
 | **ZA304** | warning | ON | Function has too many branches (default: 12; type factories get 3x) |
 | **ZA305** | warning | OFF | Function has high cyclomatic complexity — McCabe CCN (default: 10) |
 | **ZA306** | warning | OFF | Function has high cognitive complexity — Sonar-style weighted nesting (default: 15) |
@@ -715,8 +733,8 @@ Commands:
   upgrade     Upgrade ephor to latest version (alias: update)
   install     Add ephor to project's build.zig (version-pinned)
   init        Create ephor.json config file
-  help        Print the usage text
-  version     Print the version banner
+  help        Print the usage text (aliases: --help, -h)
+  version     Print the version banner (aliases: --version, -v)
 
 Options:
   --entry=<file>       Entry point (default: src/main.zig)
@@ -1251,7 +1269,7 @@ Allocations transferred to stdlib containers (e.g., `list.append(ptr)`) or retur
 
 ### Known Limitations
 
-The line-based analyzers mask string, char, `//` comment, and multiline-string content when they scan for braces, parens, and trigger patterns. This masking includes mid-line `\\` opener tails. Multi-line signatures resolve through a param lookahead, and split-RHS alloc declarations join into one logical line before the analysis. A `.?` inside a string or a trailing comment is prose, never an unwrap. The table below lists the residual shapes the line-model audit identified that the masking still misses. Each row carries its tracker issue ID.
+The line-based analyzers mask string, char, `//` comment, and multiline-string content when they scan for braces, parens, and trigger patterns. This masking includes mid-line `\\` opener tails. Multi-line signatures resolve through a param lookahead, and split-RHS alloc declarations join into one logical line before the analysis. A `.?` inside a string or a trailing comment is prose, never an unwrap. The table below lists the residual shapes the design-line-model audit identified. Each row carries its tracker issue ID.
 
 #### Line-Based Analysis — Residual Blind Spots
 
@@ -1353,9 +1371,10 @@ error value cannot be restyled per site (EPH-I1075). The member scan stops
 at the error-union boundary, so payload and plain return types are never
 flagged as members (EPH-I0274).
 
-**Changed (ZA303 exemption):** `extern` and `callconv(.c)`/`callconv(.C)`
-declarations are exempt from parameter counting — the C ABI pins the
-signature (EPH-I1059).
+**Changed (ZA303 exemption):** `extern`, `export`, and
+`callconv(.c)`/`callconv(.C)`/`callconv(.Stdcall)` declarations are exempt
+from parameter counting — a pinned ABI fixes the parameter list
+(EPH-I1059, EPH-I1093, EPH-I1096).
 
 **Changed (migration required):** Inline-ignore directives are now anchored —
 only plain `//` comments whose first token is `ephor:ignore` /

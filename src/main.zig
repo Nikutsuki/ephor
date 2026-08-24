@@ -40520,6 +40520,8 @@ fn printHelp() void {
         \\  complexity  Function complexity metrics
         \\  fmt-check   Files needing zig fmt (runs zig fmt --check)
         \\  stats       Project statistics
+        \\  help        Print the usage text (aliases: --help, -h)
+        \\  version     Print the version banner (aliases: --version, -v)
         \\
         \\OPTIONS:
         \\  --entry=<file>       Entry point (default: src/main.zig)

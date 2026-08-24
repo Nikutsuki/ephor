@@ -255,16 +255,30 @@ if ! command -v zig >/dev/null 2>&1; then
 fi
 
 # Check that this is a Zig project.
+# EPH-I1111: refuse a symlink at build.zig before any read. sed and grep
+# follow symlinks, so a planted link would feed the victim file's content
+# through the probes and splice it into the repo tree (the same mechanism
+# the Zig side closed in EPH-I0670). The -L test does not follow the
+# link, so it sees the link itself. -L is the XSI test form; it ships in
+# dash, bash 3.2, and the BSD test builtins.
+if [ -L "build.zig" ]; then
+    echo "error: build.zig is a symlink." >&2
+    echo "Replace it with a regular file before installing ephor." >&2
+    exit 1
+fi
+
+# EPH-I1107: this refusal prints to stderr like every other error in the
+# script, so consumers that read stderr for diagnostics see it.
 if [ ! -f "build.zig" ]; then
-    echo "error: no build.zig found in the current directory"
-    echo ""
-    echo "  Ephor requires a Zig project with build.zig and build.zig.zon."
-    echo "  To initialize a Zig project, run:"
-    echo ""
-    echo "    zig init"
-    echo ""
-    echo "  Then re-run the install:"
-    echo "    curl -fsSL ${REPO}/raw/branch/main/install.sh | sh"
+    echo "error: no build.zig found in the current directory" >&2
+    echo "" >&2
+    echo "  Ephor requires a Zig project with build.zig and build.zig.zon." >&2
+    echo "  To initialize a Zig project, run:" >&2
+    echo "" >&2
+    echo "    zig init" >&2
+    echo "" >&2
+    echo "  Then re-run the install:" >&2
+    echo "    curl -fsSL ${REPO}/raw/branch/main/install.sh | sh" >&2
     exit 1
 fi
 
@@ -343,8 +357,8 @@ warn_bad_zig_version() {
 # on garbage, and silently pinned the 0.15-era release even on systems
 # running Zig 0.16+. The outer glob gates only the shape (a glob * is a
 # wildcard, not a digit repetition, so "1a.2b.3c" passes it), so the
-# components get a second gate: a non-numeric component counts as
-# undetectable and takes the latest-tag path with a warning.
+# components get a second gate: a non-numeric or empty component counts
+# as undetectable and takes the latest-tag path with a warning.
 case "$ZIG_VERSION" in
     [0-9]*.[0-9]*.*)
         ZIG_MAJOR=$(printf '%s\n' "$ZIG_VERSION" | cut -d. -f1)
@@ -354,11 +368,21 @@ case "$ZIG_VERSION" in
                 warn_bad_zig_version
                 ;;
             *)
-                # Zig 0.16.0 and later track the latest ephor release. Zig
-                # 0.15.x uses the pinned 0.15-era release by commit hash.
-                if [ "$ZIG_MAJOR" -gt 0 ] || [ "$ZIG_MINOR" -ge 16 ]; then
+                # EPH-I1104: the shape glob accepts an empty component
+                # ("[0-9]*" matches zero digits), and cut then yields an
+                # empty operand. A version like "0..2." would reach the
+                # integer test below with an empty minor: dash prints an
+                # "Illegal number" noise line and the test reads false,
+                # silently taking the 0.15-era pin. Reject the empty
+                # operand like the non-numeric one (warn and latest).
+                if [ -z "$ZIG_MAJOR" ] || [ -z "$ZIG_MINOR" ]; then
+                    warn_bad_zig_version
+                elif [ "$ZIG_MAJOR" -gt 0 ] || [ "$ZIG_MINOR" -ge 16 ]; then
+                    # Zig 0.16.0 and later track the latest ephor release.
                     EPHOR_TAG=$(resolve_ephor_tag)
                 else
+                    # Zig 0.15.x uses the pinned 0.15-era release by
+                    # commit hash.
                     EPHOR_TAG="v0.11.13"
                     EPHOR_URL="${REPO}/archive/${EPHOR_0_15_COMMIT}.tar.gz"
                 fi
@@ -381,6 +405,12 @@ esac
 # search below. The zon probe matches the .ephor = dependency entry
 # line that zig fetch writes; the old '"ephor"' pattern matched no
 # real zon shape, only comments.
+# EPH-I1106 decision: a trailing inline comment on a code line still
+# reaches the anchored probe, because the .* spans into the comment.
+# Stripping trailing comments needs a Zig lexer, which the installer
+# does not carry. The installArtifact search below has the same idiom
+# limit (EPH-I0626). The residual is accepted: it is label-only at this
+# site, and the layout branch below shares the idiom and the limit.
 DEP_PROBE='^[[:space:]]*[^/.\\[:space:]].*dependency\("ephor"'
 ZON_DEP_PROBE='^[[:space:]]*\.ephor[[:space:]]*='
 if grep -qE "$DEP_PROBE" build.zig 2>/dev/null || grep -qE "$ZON_DEP_PROBE" build.zig.zon 2>/dev/null; then
@@ -478,6 +508,18 @@ validate_marker_pair() {
 # lines holds its dependency line. A marker pair without it is drifted
 # or forged, and replacing it would delete the code in between
 # (EPH-I0625/26). Arguments: start line, end line.
+# EPH-I1106 decision: this grep stays unanchored, unlike the action and
+# layout probes. The span's endpoints are themselves anchored
+# code-context markers, and the check's job is to confirm the span
+# holds the dependency line before the whole span is replaced with the
+# canonical block. The unanchored form accepts every real block shape,
+# including a reformatted dependency call whose continuation line starts
+# with ".", which the DEP_PROBE idiom would miss and then falsely
+# refuse. A comment mention inside a marker-bounded span still lets the
+# splice restore the canonical block, the intended upgrade outcome; the
+# forged-marker residual needs an attacker to plant the anchored
+# end-marker code line, at which point the file is already attacker
+# content.
 span_has_dependency_line() {
     sed -n "$1,$(( $2 - 1 ))p" build.zig | grep -q 'dependency("ephor"'
 }
@@ -561,10 +603,16 @@ elif grep -qE "$LEGACY_START" build.zig; then
     mv "$INSTALL_TMP" build.zig
     INSTALL_TMP=""
     echo "Updated ephor build steps in build.zig (migrated from v0.11.x snippet)"
-elif grep -q 'dependency("ephor"' build.zig; then
+elif grep -qE "$DEP_PROBE" build.zig; then
+    # EPH-I1106: the probe anchors to code lines exactly like the action
+    # probe above, so a comment that mentions the dependency no longer
+    # misroutes a fresh install into this branch. The trailing-inline
+    # comment limit is shared and recorded at the DEP_PROBE definition.
     # Has dependency but non-standard block layout - leave it, warn user
-    echo "warning: ephor dependency found but build steps have non-standard layout"
-    echo "Please update your ephor build steps manually (see README)"
+    # EPH-I1110: the warning pair prints to stderr like every other
+    # warning in this script, matching install.ps1's Write-Stderr pair.
+    echo "warning: ephor dependency found but build steps have non-standard layout" >&2
+    echo "Please update your ephor build steps manually (see README)" >&2
 else
     # Fresh install - add the block after the last installArtifact
     # statement. EPH-I0626: the search anchors to code lines, so a

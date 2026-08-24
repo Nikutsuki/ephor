@@ -1,7 +1,8 @@
 #!/bin/sh
 # Regression suite for install.sh (batch B65: EPH-I0625 through EPH-I0630;
 # batch B66: EPH-I0631 through EPH-I0636; batch B67: EPH-I0637 through
-# EPH-I0642; batch B85: EPH-I0205).
+# EPH-I0642; batch B85: EPH-I0205; batch B86f: EPH-I1104/I1106/I1107/
+# I1110/I1111).
 # Runs the real installer against planted fixtures in scratch dirs under
 # .tmp/install-sh-tests. Hermetic: the fake zig on PATH answers version
 # and fetch, and the tags API is a local file, so no network is touched.
@@ -770,8 +771,10 @@ assert_rc 0
 assert_empty "$D/err.log" 'stderr not empty'
 pass "t30 splice preserves mode (F-12, GNU stat arm)"
 
-# --- t31 (EPH-I0641): a comment that mentions the dependency call must
-# not mislabel a fresh install as an upgrade.
+# --- t31 (EPH-I0641, EPH-I1106): a comment that mentions the dependency
+# call must not mislabel a fresh install as an upgrade, and must not
+# misroute it into the non-standard-layout branch. The block lands the
+# standard fresh-install way.
 D="$TEST_ROOT/t31"
 mkdir -p "$D"
 cat > "$D/build.zig" <<'EOF'
@@ -786,8 +789,9 @@ run_installer "$D"
 assert_rc 0
 assert_grep "$D/out.log" 'Installing ephor v0.99.1' 'fresh install labeled as upgrade'
 assert_not_grep "$D/out.log" 'Upgrading' 'comment triggered the upgrade label'
+assert_grep "$D/build.zig" '    // Ephor static analysis' 'block not added (layout branch taken)'
 assert_empty "$D/err.log" 'stderr not empty'
-pass "t31 comment mentioning the dependency stays Installing (F-17)"
+pass "t31 comment mentioning the dependency stays Installing (F-17, EPH-I1106)"
 
 # --- t32 (EPH-I0641): a real zon dependency entry must label the run
 # as an upgrade even when build.zig no longer mentions the dependency.
@@ -852,15 +856,17 @@ assert_grep "$D/out.log" 'v0.14.2' 'fallback floor not applied'
 assert_grep "$D/err.log" 'below the fallback' 'no below-fallback warning'
 pass "t35 below-fallback tags hold the floor (F-13)"
 
-# --- t36 (EPH-I0640): the missing-build.zig error keeps STE prose, and
-# no contraction remains anywhere in the script.
+# --- t36 (EPH-I0640, EPH-I1107): the missing-build.zig error prints to
+# stderr like every other error, and keeps STE prose. stdout stays
+# empty: the refusal is the installer's first output.
 D="$TEST_ROOT/t36"
 mkdir -p "$D"
 run_installer "$D"
 assert_rc 1
-assert_grep "$D/out.log" 'no build.zig found in the current directory' 'article missing'
+assert_grep "$D/err.log" 'no build.zig found in the current directory' 'error missing from stderr'
+assert_empty "$D/out.log" 'stdout not empty'
 assert_not_grep "$INSTALL_SH" "we're" 'contraction remains in install.sh'
-pass "t36 missing-build.zig prose is STE (F-16)"
+pass "t36 missing-build.zig prose is STE (F-16, EPH-I1107)"
 
 # --- t37 (EPH-I0642): make_install_tmp refuses a second call while its
 # single slot still holds a live temp, and still works on a free slot.
@@ -913,6 +919,67 @@ assert_grep "$D/out.log" 'v0.14.2' 'fallback tag not chosen'
 assert_grep "$D/curl-args" 'codeberg.org/api/v1/repos/RhyosLabs/ephor/tags' 'override URL used without the marker'
 assert_grep "$D/out.log" 'Done!' 'install did not complete'
 pass "t38 ambient overrides ignored without EPHOR_TEST_MODE (F-19)"
+
+# --- t39 (EPH-I1104): a degenerate numeric shape with an empty minor
+# component ("0..2.") must take the warn-and-latest path like garbage
+# text. The shape glob accepts an empty component, and cut then hands
+# the integer test an empty operand, which dash reads as "Illegal
+# number" and the old code read as "pin the 0.15-era release".
+D="$TEST_ROOT/t39"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+run_installer_with_zig "0..2." "$D"
+assert_rc 0
+assert_grep "$D/err.log" 'could not parse the zig version' 'missing parse warning'
+assert_grep "$D/out.log" 'v0.99.1' 'did not take the latest-tag path'
+cat "$D/out.log" "$D/err.log" > "$D/both.log"
+assert_not_grep "$D/both.log" 'Illegal number' 'dash noise present'
+assert_not_grep "$D/both.log" 'integer expression' 'bash noise present'
+assert_not_grep "$D/out.log" 'v0.11.13' '0.15-era pin chosen on an empty component'
+pass "t39 empty zig-version component takes latest tag (EPH-I1104)"
+
+# --- t40 (EPH-I1106, positive control; EPH-I1110): a real dependency
+# code line with no block markers must still take the non-standard
+# layout branch, and the warning pair must land on stderr. The anchored
+# probe must keep firing on real code, and the install must not touch
+# build.zig in this branch.
+D="$TEST_ROOT/t40"
+mkdir -p "$D"
+cat > "$D/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) !void {
+    const ephor_dep = b.dependency("ephor", .{});
+    const exe = b.addExecutable(.{ .name = "demo", .root_module = b.createModule(.{}) });
+    b.installArtifact(exe);
+}
+EOF
+cp "$D/build.zig" "$D/build.zig.orig"
+run_installer "$D"
+assert_rc 0
+assert_grep "$D/err.log" 'non-standard layout' 'no layout warning on stderr'
+assert_grep "$D/err.log" 'update your ephor build steps manually' 'no manual-update hint on stderr'
+assert_not_grep "$D/out.log" 'non-standard layout' 'layout warning leaked to stdout'
+assert_not_grep "$D/out.log" 'Adding ephor build steps' 'fresh branch taken for a real dependency'
+assert_grep "$D/out.log" 'Done!' 'install did not complete'
+assert_unchanged "$D/build.zig" "$D/build.zig.orig" 'build.zig'
+pass "t40 real dependency line keeps the layout branch (EPH-I1106, EPH-I1110)"
+
+# --- t41 (EPH-I1111): a build.zig symlink must be refused before any
+# read, so the victim file's content never reaches the install and no
+# file is created or replaced.
+D="$TEST_ROOT/t41"
+VICTIM="$TEST_ROOT/t41-victim"
+mkdir -p "$D"
+printf '%s\n' 'const victim_secret = 1;' > "$VICTIM"
+ln -s "$VICTIM" "$D/build.zig"
+run_installer "$D"
+assert_rc 1
+assert_grep "$D/err.log" 'build.zig is a symlink' 'no refusal error'
+assert_not_grep "$D/out.log" 'Done!' 'Done! printed after the refusal'
+[ -L "$D/build.zig" ] || fail "the installer replaced the symlink"
+[ ! -e "$D/build.zig.zon" ] || fail "the zon was created despite the refusal"
+assert_grep "$VICTIM" 'victim_secret' 'victim content lost'
+pass "t41 build.zig symlink refuses before read (EPH-I1111)"
 
 echo ""
 echo "install-sh tests: $PASS_COUNT passed"

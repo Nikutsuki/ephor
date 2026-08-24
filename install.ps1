@@ -206,6 +206,21 @@ error: zig is not installed or not on PATH.
     )
 
     # Check that this directory is a Zig project.
+    # EPH-I1111: refuse a symlink at build.zig before any read (install.sh
+    # parity). Get-Content follows reparse points, so a planted link would
+    # feed the victim file's content through the probes and the splice
+    # below (the same mechanism the Zig side closed in EPH-I0670).
+    # Get-Item -Force returns the link itself, where the reparse-point
+    # attribute is visible; Test-Path follows the link and cannot see it.
+    # On PowerShell 5.1 a dangling link reports "not found" in the
+    # Test-Path check below, which refuses the install either way.
+    $buildZigItem = Get-Item "build.zig" -Force -ErrorAction SilentlyContinue
+    if ($buildZigItem -and
+        ($buildZigItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        Write-Stderr "error: build.zig is a symlink."
+        Write-Stderr "Replace it with a regular file before installing ephor."
+        return 1
+    }
     if (-not (Test-Path "build.zig")) {
         Write-Stderr @"
 error: no build.zig found in current directory

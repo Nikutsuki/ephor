@@ -547,6 +547,11 @@ test "guarded parse runs the worker and yields the context (EPH-I0597)" {
 test "F12 guard: both AST-tier halves stay under the ZA111 byte cap (EPH-I0601)" {
     try std.testing.expect(@embedFile("ast_tier.zig").len <= max_ast_file_bytes);
     try std.testing.expect(@embedFile("ast_tier_za111.zig").len <= max_ast_file_bytes);
+    // EPH-I1123: pin the AST tier's pre-scan siblings too. LiteralState
+    // lives in types.zig, and sanitize.zig split out of it in the I1123
+    // fix. A re-crossing would silently drop the rule's own second home.
+    try std.testing.expect(@embedFile("types.zig").len <= max_ast_file_bytes);
+    try std.testing.expect(@embedFile("sanitize.zig").len <= max_ast_file_bytes);
 }
 
 test "ZA111: field of local var fires" {

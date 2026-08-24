@@ -10078,7 +10078,10 @@ const SiblingArm = struct {
 /// the inner merge's start there. The else-claim mark closes it:
 /// handleElse sets the mark on the claimed entry's else body, the close
 /// paths never do, so the gate rejects the enclosing-close merge
-/// (EPH-I1032).
+/// (EPH-I1032). The forward direction also requires the construct
+/// header to sit on every continuing path (the reverse gate's walk): a
+/// nested construct skips on the enclosing arm's other paths, so its
+/// else-arm pair stays conditional.
 /// Reverse (EPH-I1086): the branch_false edge into bid names the
 /// construct header; the header's branch_true target is the sibling (the
 /// then body of an if). The reverse direction requires multi-line arms
@@ -10094,24 +10097,27 @@ const SiblingArm = struct {
 /// severity mirror of the same-line both-arms form, which the
 /// elsePrecedesSecondFree gate already reads as definite.
 /// Residuals, mirroring elsePrecedesSecondFree: the forward direction
-/// does not check that the sibling pattern targets the same variable, an
-/// else-if chain's final else body is not the direct sibling of the
-/// first arm (the chain grades arm-by-arm, and an intermediate arm's
-/// sibling is the next condition block, which carries no else-claim mark
-/// and spans only its condition line — an inline same-line else-if body
-/// free keeps the conditional grade, the safe direction), a free nested
-/// inside a construct within the sibling arm lies in a deeper block,
-/// outside the sibling's own span, a top-level single-line arm whose
-/// header block starts on an earlier line (the usual fn-body shape) does
-/// not share the header's start line and stays at the non-upgraded grade
-/// — the single-line both-arms shape with a dominating pre-free reads
-/// definite through the own-line escape (isSameLineBothArmsFree,
-/// EPH-I1030) instead. An own-line `else {` header (the line-start else
-/// body) counts as a genuine arm start like the `}`-prefixed form: its
-/// else-claim mark proves the body (EPH-I1063). The mid-line `} else {`
-/// marker still suppresses the else-arm pair before this gate runs: the
-/// mid-line twin stays silent while the own-line twin grades err — the
-/// accepted-FN asymmetry, pinned by the EPH-I1087 test.
+/// does not check that the sibling pattern targets the same variable, a
+/// free nested inside a construct within the sibling arm lies in a
+/// deeper block, outside the sibling's own span, and a top-level
+/// single-line arm whose header block starts on an earlier line (the
+/// usual fn-body shape) does not share the header's start line and stays
+/// at the non-upgraded grade — the single-line both-arms shape with a
+/// dominating pre-free reads definite through the own-line escape
+/// (isSameLineBothArmsFree, EPH-I1030) instead. The forward direction
+/// requires the construct header to sit on every continuing path,
+/// mirroring the reverse gate (EPH-I1141): an else-if chain grades
+/// arm-by-arm, an intermediate arm's sibling is the chain's fallthrough
+/// block (the marked final-else body for a single-link chain, never the
+/// arm's own pair partner), and the reachability check on the chain
+/// header — which the prefix arm's path skips — keeps the intermediate
+/// arm's free at the conditional grade, the safe direction. An own-line
+/// `else {` header (the line-start else body) counts as a genuine arm
+/// start like the `}`-prefixed form: its else-claim mark proves the body
+/// (EPH-I1063). The mid-line `} else {` marker still suppresses the
+/// else-arm pair before this gate runs: the mid-line twin stays silent
+/// while the own-line twin grades err — the accepted-FN asymmetry,
+/// pinned by the EPH-I1087 test.
 fn siblingArmAlsoFrees(ctx: *const FreeScanCtx, bid: usize) !bool {
     if (branchSibling(ctx.cfg, bid)) |arm| return elseBodyArmFrees(ctx, arm);
     if (elseArmSibling(ctx.cfg, bid)) |arm| return thenBodyArmAlsoFrees(ctx, bid, arm);
@@ -10146,8 +10152,9 @@ fn reverseArmPair(cfg: *const ControlFlowGraph, from: usize) ?SiblingArm {
 }
 
 /// The forward-direction sibling test: the then-arm free pairs with a
-/// genuine else body that also frees.
-fn elseBodyArmFrees(ctx: *const FreeScanCtx, arm: SiblingArm) bool {
+/// genuine else body that also frees, and the construct header sits on
+/// every continuing path (the reverse gate's walk, EPH-I1141).
+fn elseBodyArmFrees(ctx: *const FreeScanCtx, arm: SiblingArm) !bool {
     const block = ctx.cfg.blocks.items[arm.sibling];
     if (block.start_line == 0 or block.end_line < block.start_line or
         block.start_line < ctx.scan.func_line) return false;
@@ -10179,6 +10186,13 @@ fn elseBodyArmFrees(ctx: *const FreeScanCtx, arm: SiblingArm) bool {
     // entry's else body, finishPendingElse and handleBlockEnd never do
     // (EPH-I1032).
     if (!block.is_else_body) return false;
+    // The upgrade reads definite only when every path that continues past
+    // the construct runs it: the construct header must sit on every
+    // continuing path, mirroring the reverse gate (EPH-I1141). A nested
+    // construct skips on the enclosing arm's other paths, and an
+    // else-if chain's intermediate arm skips on the prefix arm's path —
+    // both stay conditional.
+    if (!try blockOnEveryContinuingPath(ctx.allocator, ctx.cfg, arm.header)) return false;
     const last_idx = @min(block.end_line - ctx.scan.func_line, lines.len - 1);
     var idx = first_idx;
     while (idx <= last_idx) : (idx += 1) {
@@ -16115,6 +16129,9 @@ fn extractAllocatorName(t: []const u8) ?[]const u8 {
 /// (fs.zig:521/656/683), and the 0.15.1+/0.16 reader allocs
 /// (.readAlloc/.allocRemaining — allocator is the first arg after the
 /// receiver in both: Io/Reader.zig:682/288 and :739/292) joined.
+/// .allocRemainingAlignedSentinel is 0.16-only (Io/Reader.zig:299): the
+/// v0_15 tables deliberately omit it, so this entry only matches 0.16
+/// code (the I1114 grounding fix, EPH-I1114).
 /// The removed readToEndAlloc/readAllAlloc/stringifyAlloc/allocPrintZ forms
 /// left with B71: they match no released stdlib (gone in both 0.15.1 and
 /// 0.16), so the compat tables never match them and matchAllocArgPattern
@@ -16129,6 +16146,7 @@ const first_arg_alloc_patterns = [_][]const u8{
     ".readFileAllocOptions(",
     ".readAlloc(",
     ".allocRemaining(",
+    ".allocRemainingAlignedSentinel(",
     ".selfExePathAlloc(",
     ".selfExeDirPathAlloc(",
     ".realpathAlloc(",
@@ -49506,6 +49524,69 @@ test "ZA106: cross-block both-arms free grades err, single-arm twin grades warni
     }
     try std.testing.expect(both_err);
     try std.testing.expect(single_warning);
+}
+
+test "ZA106: nested both-arms pair under an outer if grades conditional, top-level twin stays err (EPH-I1141)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The forward both-arms upgrade requires the construct header to sit
+    // on every continuing path (EPH-I1141): the inner if/else sits inside
+    // the outer then arm, so the path outer == false skips the construct
+    // and runs no second free — both inner-arm pairs grade conditional
+    // (warning). Pre-fix the forward gate upgraded the then-arm pair
+    // without the reachability check and the line graded err (the f14
+    // probe shape). The top-level control keeps its err grade: the
+    // construct header is the entry block, so the walk passes trivially.
+    const content =
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+        \\fn nested(allocator: std.mem.Allocator, c: bool, d: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        if (d) {
+        \\            allocator.free(buf);
+        \\        } else {
+        \\            allocator.free(buf);
+        \\        }
+        \\    }
+        \\    use(buf);
+        \\}
+        \\fn both(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    } else {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_nested_both_arms.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_nested_both_arms.zig";
+    // Nested: one ZA106 per inner arm (the pair with the dominating free
+    // at line 6), both conditional. Both: one ZA106 err on the then-arm
+    // line (the mid-line else-arm pair stays silent, EPH-I1087). The
+    // post-nested use fires the ZA105 family, not ZA106.
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 3);
+    var nested_then_warning = false;
+    var nested_else_warning = false;
+    var both_err = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        if (issue.line == 9) nested_then_warning = issue.severity == .warning;
+        if (issue.line == 11) nested_else_warning = issue.severity == .warning;
+        if (issue.line == 20) both_err = issue.severity == .err;
+    }
+    try std.testing.expect(nested_then_warning);
+    try std.testing.expect(nested_else_warning);
+    try std.testing.expect(both_err);
 }
 
 test "ZA106: loop-else both-arms free grades err, plain loop twin stays conditional (EPH-I1017 F1)" {

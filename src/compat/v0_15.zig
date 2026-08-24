@@ -804,10 +804,10 @@ pub const alloc_method_patterns: []const []const u8 = &.{
     ".readFileAllocOptions(",
     ".readAlloc(",
     ".allocRemaining(",
-    // Sentinel-terminated read of the rest of the stream
-    // (Io/Reader.zig:299 — allocator is the first arg after the receiver,
-    // the same shape as .readAlloc/.allocRemaining)
-    ".allocRemainingAlignedSentinel(",
+    // .allocRemainingAlignedSentinel is deliberately absent — 0.16-only
+    // (Io/Reader.zig:299; zero hits in the 0.15.1 and 0.15.2 stdlib).
+    // v0_16 carries it, and main.zig's first_arg_alloc_patterns keeps the
+    // version-agnostic superset entry (EPH-I1114).
     // Path operations (fs.zig:521/656/683)
     ".selfExePathAlloc(",
     ".selfExeDirPathAlloc(",
@@ -836,7 +836,6 @@ pub const alloc_method_short_names: []const []const u8 = &.{
     "readFileAllocOptions",
     "readAlloc",
     "allocRemaining",
-    "allocRemainingAlignedSentinel",
     "selfExePathAlloc",
     "selfExeDirPathAlloc",
     "realpathAlloc",
@@ -1223,10 +1222,12 @@ test "vocabulary alloc_methods includes dupe and dupeZ" {
     try std.testing.expect(found_dupez);
 }
 
-test "alloc tables include allocPrintSentinel and allocRemainingAlignedSentinel (EPH-I1114)" {
+test "alloc tables include allocPrintSentinel, omit 0.16-only allocRemainingAlignedSentinel (EPH-I1114)" {
     // findAllocCall/hasAllocCallPattern read the flat pattern table and
-    // isNonAllocFnCallAt reads the short-name table; both names must land
-    // in both (pinned 0.16 std: fmt.zig:639, Io/Reader.zig:299).
+    // isNonAllocFnCallAt reads the short-name table; a name must land in
+    // both. allocPrintSentinel pins the 0.15 std (fmt.zig:644).
+    // allocRemainingAlignedSentinel is 0.16-only (Io/Reader.zig:299), so
+    // both v0_15 tables deliberately omit it; v0_16 carries it.
     var found_pattern_print = false;
     var found_pattern_remaining = false;
     for (alloc_method_patterns) |p| {
@@ -1234,7 +1235,7 @@ test "alloc tables include allocPrintSentinel and allocRemainingAlignedSentinel 
         if (std.mem.eql(u8, p, ".allocRemainingAlignedSentinel(")) found_pattern_remaining = true;
     }
     try std.testing.expect(found_pattern_print);
-    try std.testing.expect(found_pattern_remaining);
+    try std.testing.expect(!found_pattern_remaining);
     var found_name_print = false;
     var found_name_remaining = false;
     for (alloc_method_short_names) |n| {
@@ -1242,7 +1243,7 @@ test "alloc tables include allocPrintSentinel and allocRemainingAlignedSentinel 
         if (std.mem.eql(u8, n, "allocRemainingAlignedSentinel")) found_name_remaining = true;
     }
     try std.testing.expect(found_name_print);
-    try std.testing.expect(found_name_remaining);
+    try std.testing.expect(!found_name_remaining);
 }
 
 test "vocabulary no_free_init_patterns is non-empty" {

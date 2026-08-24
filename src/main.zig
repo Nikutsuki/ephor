@@ -334,6 +334,9 @@ const DiagCtx = struct {
     depth_cap_note_count: usize = 0,
     /// Entries-widen-scan notes (EPH-I0784).
     entries_widen_note_count: usize = 0,
+    /// Runtime-band findings dropped by dedup or the total cap (EPH-I0211).
+    /// One note per run, when the count is nonzero.
+    runtime_suppressed_count: usize = 0,
     /// Resident-content budget for the corpus warning (EPH-I0199). Real
     /// monorepos sit far below 1 GiB of Zig source. Hostile amplification
     /// (thousands of near-10 MB files) crosses it. A field, not a const, so
@@ -12943,6 +12946,11 @@ const ImportGraph = struct {
     /// that cannot see b.path() compile roots.
     build_zig_read: bool,
 
+    /// Once-guard for the null-root containment warning (EPH-I0172). The
+    /// warning never fires in production (every handler sets scan_root);
+    /// the flag keeps the defensive path from spamming when it does.
+    root_missing_logged: bool,
+
     fn init(allocator: Allocator, diag: *DiagCtx) ImportGraph {
         return .{
             .allocator = allocator,
@@ -12956,15 +12964,38 @@ const ImportGraph = struct {
             .walked_file_inodes = .empty,
             .skipped_files = .empty,
             .build_zig_read = false,
+            .root_missing_logged = false,
         };
     }
 
-    /// Returns true if resolved path is within the scan root (or no root set).
-    /// Component-boundary compare (RED4-3): root "/tmp/repo" must not match
-    /// the sibling "/tmp/repo-evil".
-    fn isWithinScanRoot(self: *const ImportGraph, resolved: []const u8) bool {
-        const root = self.scan_root orelse return true;
+    /// Returns true if resolved path is within the scan root. A null root
+    /// fails closed with one warning (EPH-I0172): every production call
+    /// site sets the root, so the warning is a defensive diagnostic, not
+    /// expected noise. Component-boundary compare (RED4-3): root
+    /// "/tmp/repo" must not match the sibling "/tmp/repo-evil".
+    fn isWithinScanRoot(self: *ImportGraph, resolved: []const u8) bool {
+        const root = self.scan_root orelse return self.refuseMissingRoot(resolved);
         return isPathAncestorOrEqual(root, resolved);
+    }
+
+    /// Fail-closed null-root path with a once-guarded warning (EPH-I0172).
+    /// `resolved` may carry scanned-tree bytes, so it crosses the
+    /// terminal sanitizer before the render.
+    fn refuseMissingRoot(self: *ImportGraph, resolved: []const u8) bool {
+        if (self.root_missing_logged) return false;
+        self.root_missing_logged = true;
+        if (types.sanitizeTerminal(self.allocator, resolved)) |safe_val| {
+            var safe = safe_val;
+            defer safe.deinit(self.allocator);
+            cliDiag(
+                self.diag,
+                "warning: scan root not set; refusing path {s}\n",
+                .{safe.slice},
+            );
+        } else |_| {
+            cliDiag(self.diag, "warning: scan root not set; refusing path\n", .{});
+        }
+        return false;
     }
 
     fn deinit(self: *ImportGraph) void {
@@ -33764,10 +33795,16 @@ fn buildRuntimeArgv(
     opts: RuntimeOptions,
     argv_buf: *[64][]const u8,
     scratch: []u8,
-) usize {
+    allocator: Allocator,
+) !usize {
     if (opts.custom_command) |cmd| {
-        if (opts.verbose and !opts.json_stream)
-            std.debug.print("Running: {s} (with GPA diagnostics)\n", .{cmd});
+        // EPH-I0173: the command is operator-typed argv, which may carry
+        // control bytes; it crosses the terminal sanitizer at the echo.
+        if (opts.verbose and !opts.json_stream) {
+            var safe_cmd = try types.sanitizeTerminal(allocator, cmd);
+            defer safe_cmd.deinit(allocator);
+            std.debug.print("Running: {s} (with GPA diagnostics)\n", .{safe_cmd.slice});
+        }
         const parsed = parseCommandIntoArgv(cmd, argv_buf, scratch);
         if (parsed.truncated and !opts.json_stream)
             std.debug.print(
@@ -33908,6 +33945,9 @@ const RuntimeOptions = struct {
     /// echo and the command-truncation warning) stay off the machine
     /// stream (EPH-I0213).
     json_stream: bool = false,
+    /// When set, runRuntimeAnalysis writes the dedup/cap suppressed count
+    /// here (EPH-I0211). Null skips the report (direct test callers).
+    suppressed_out: ?*usize = null,
 };
 
 fn runRuntimeAnalysis(
@@ -33922,48 +33962,85 @@ fn runRuntimeAnalysis(
     errdefer deinitIssues(&issues, allocator);
     var argv_buf: [64][]const u8 = undefined;
     var argv_scratch: [runtime_argv_scratch_bytes]u8 = undefined;
-    const argv_len = buildRuntimeArgv(opts, &argv_buf, &argv_scratch);
+    const argv_len = try buildRuntimeArgv(opts, &argv_buf, &argv_scratch, allocator);
+
+    // One containment root and one dedup/cap state for every parse pass
+    // (EPH-I0171, EPH-I0211). A null root (unresolvable scan path) keeps
+    // the location gate off, matching the pre-fix behavior.
+    var root_buf: [Fs.max_path_bytes]u8 = undefined;
+    const root_real = scanRootRealpath(io, path, &root_buf);
+    var parse_state = RuntimeParseState{};
+    defer parse_state.deinit(allocator);
+    const parse_ctx = RuntimeEmitCtx{
+        .issues = &issues,
+        .allocator = allocator,
+        .io = io,
+        .root_real = root_real,
+        .state = &parse_state,
+    };
 
     const result = runChildCapped(
         allocator,
         io,
         argv_buf[0..argv_len],
         .{ .path = path },
-    ) catch |err| {
-        const cmd_str = opts.custom_command orelse "zig build test";
-        // The bare line stays off the JSON machine stream (EPH-I0213);
-        // the ZR104 finding below carries the same fact as machine data.
-        if (!opts.json_stream)
-            std.debug.print("error: cannot run {s}: {}\n", .{ cmd_str, err });
-        try reportRunFailure(allocator, &issues, cmd_str, err);
-        return issues;
-    };
+    ) catch |err| return reportSpawnFailure(allocator, &issues, opts, err);
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try parseGPADiagnostics(allocator, &issues, result.stderr, opts.verbose);
-    try parseTestOutput(allocator, &issues, result.stdout, opts.verbose);
+    try parseGPADiagnostics(parse_ctx, result.stderr, opts.verbose);
+    try parseTestOutput(parse_ctx, result.stdout, opts.verbose);
     // Panics land on stderr on the pinned 0.16 runner (probe 2026-08-13:
     // stdout stays empty, the crash block and the "panic:" line both go
     // to stderr). Classify stderr beside stdout so a panicking fixture
     // surfaces ZR105 instead of a bare ZR104 (EPH-I0489).
-    try parseTestOutput(allocator, &issues, result.stderr, opts.verbose);
+    try parseTestOutput(parse_ctx, result.stderr, opts.verbose);
+    try reportRuntimeTerm(allocator, &issues, result.term, opts.custom_command != null);
 
-    // Term is a tagged union in 0.16: a signal-killed child is .signal,
-    // and reading .exited on it is a safety-checked panic (EPH-I0231).
-    switch (result.term) {
+    if (opts.suppressed_out) |out| out.* = parse_state.suppressed;
+    return issues;
+}
+
+/// Failed-spawn path for runRuntimeAnalysis (EPH-I0173): the command
+/// crosses the terminal sanitizer on the bare error line, which stays
+/// off the JSON machine stream (EPH-I0213); the ZR104 finding carries
+/// the same fact as machine data.
+fn reportSpawnFailure(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    opts: RuntimeOptions,
+    err: std.process.RunError,
+) !std.ArrayListUnmanaged(Issue) {
+    const cmd_str = opts.custom_command orelse "zig build test";
+    if (!opts.json_stream) {
+        var safe_cmd = try types.sanitizeTerminal(allocator, cmd_str);
+        defer safe_cmd.deinit(allocator);
+        std.debug.print("error: cannot run {s}: {}\n", .{ safe_cmd.slice, err });
+    }
+    try reportRunFailure(allocator, issues, cmd_str, err);
+    return issues.*;
+}
+
+/// Term-shape findings for the runtime child (EPH-I0231). Term is a
+/// tagged union in 0.16: a signal-killed child is .signal, and reading
+/// .exited on it is a safety-checked panic.
+fn reportRuntimeTerm(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    term: std.process.Child.Term,
+    is_custom: bool,
+) !void {
+    switch (term) {
         .exited => |code| {
             if (code != 0 and issues.items.len == 0)
-                try reportCommandFailure(allocator, &issues, opts.custom_command != null);
+                try reportCommandFailure(allocator, issues, is_custom);
         },
-        .signal => |sig| try reportSignalDeath(allocator, &issues, sig),
+        .signal => |sig| try reportSignalDeath(allocator, issues, sig),
         .stopped, .unknown => {
             if (issues.items.len == 0)
-                try reportCommandFailure(allocator, &issues, opts.custom_command != null);
+                try reportCommandFailure(allocator, issues, is_custom);
         },
     }
-
-    return issues;
 }
 
 /// Check if line matches any of the given patterns (case-insensitive via pairs)
@@ -33978,6 +34055,14 @@ fn matchesAnyPattern(t: []const u8, patterns: []const []const u8) bool {
 const RuntimeEmitCtx = struct {
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
+    /// Containment gate inputs for located findings (EPH-I0171). A null
+    /// root_real disables the gate (legacy test callers), and io then
+    /// stays unread. Production always sets both.
+    io: std.Io = undefined,
+    root_real: ?[]const u8 = null,
+    /// Dedup/cap state (EPH-I0211). Null disables both (legacy test
+    /// callers); production passes the run-scoped state.
+    state: ?*RuntimeParseState = null,
 };
 
 /// Static rule content of a runtime-diagnostic issue
@@ -33987,9 +34072,114 @@ const RuntimeIssueSpec = struct {
     help: []const u8,
 };
 
+/// Shared dedup/cap state for one runtime-analysis run (EPH-I0211). All
+/// three parse passes (GPA stderr, test stdout, test stderr) share one
+/// state, so a line repeated across streams dedups too. The map owns
+/// every inserted key; deinit frees them.
+const RuntimeParseState = struct {
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+    /// Findings dropped as duplicates or past the cap.
+    suppressed: usize = 0,
+
+    fn deinit(self: *RuntimeParseState, allocator: Allocator) void {
+        var it = self.seen.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        self.seen.deinit(allocator);
+    }
+};
+
+/// Print one verbose-mode raw child line (EPH-I0171): the bytes are child
+/// output, so they cross the terminal sanitizer before the render.
+fn printVerboseRuntimeLine(allocator: Allocator, label: []const u8, t: []const u8) !void {
+    var safe = try types.sanitizeTerminal(allocator, t);
+    defer safe.deinit(allocator);
+    std.debug.print("{s}: {s}\n", .{ label, safe.slice });
+}
+
+/// Total cap on kept runtime findings (EPH-I0211). A real failing suite
+/// yields well under this; 10 MB of forged output would otherwise mint
+/// ~10^6 findings. The over-cap tail counts as suppressed.
+const max_runtime_findings = 1000;
+
+/// Dedup/cap gate for the runtime band (EPH-I0211). False means the
+/// finding is a duplicate or past the cap and must not be appended; the
+/// suppressed counter covers both classes. With no state the gate is off.
+/// The key joins rule, file, line, and message with 0x01: the message
+/// carries the leak location, so two distinct leaks must not collapse.
+fn runtimeFindingKept(ctx: RuntimeEmitCtx, issue: Issue) !bool {
+    const st = ctx.state orelse return true;
+    if (ctx.issues.items.len >= max_runtime_findings) {
+        st.suppressed += 1;
+        return false;
+    }
+    const key = try std.fmt.allocPrint(ctx.allocator, "{s}\x01{s}\x01{d}\x01{s}", .{
+        issue.rule, issue.file, issue.line, issue.message,
+    });
+    var transferred = false;
+    defer if (!transferred) ctx.allocator.free(key);
+    const gop = st.seen.getOrPut(ctx.allocator, key) catch |err| return err;
+    if (gop.found_existing) {
+        st.suppressed += 1;
+        return false;
+    }
+    // The map owns the key: RuntimeParseState.deinit frees it even when
+    // a later append fails (the list errdefer frees the partial list).
+    transferred = true;
+    return true;
+}
+
+/// Append one runtime finding through the dedup/cap gate.
+fn tryAppendRuntimeIssue(ctx: RuntimeEmitCtx, issue: Issue) !void {
+    if (!try runtimeFindingKept(ctx, issue)) return;
+    try ctx.issues.append(ctx.allocator, issue);
+}
+
+/// Containment gate for a located runtime finding (EPH-I0171): the bytes
+/// come from child output, so the file must be printable ASCII and must
+/// resolve at or under the scan-root realpath. A null ctx.root_real
+/// disables the gate (legacy callers without a containment root).
+fn runtimeLocationAllowed(ctx: RuntimeEmitCtx, loc: FileLocation) bool {
+    if (ctx.root_real == null) return true;
+    if (!isPrintableAscii(loc.file)) return false;
+    return resolvesInRoot(ctx.io, loc.file, ctx.root_real.?);
+}
+
+/// Append a runtime finding with a location that already passed the
+/// containment gate. The file dupe is the EPH-I0196 ownership pattern:
+/// child output frees before the findings print (EPH-I0202).
+fn emitAnchoredRuntimeIssue(
+    ctx: RuntimeEmitCtx,
+    spec: RuntimeIssueSpec,
+    file: []const u8,
+    line: usize,
+) !void {
+    const issue = Issue{
+        .file = file,
+        .line = line,
+        .col = 1,
+        .severity = .err,
+        .rule = spec.rule,
+        .message = spec.message,
+        .help = spec.help,
+    };
+    if (!try runtimeFindingKept(ctx, issue)) return;
+    const owned_file = try ctx.allocator.dupe(u8, file);
+    errdefer ctx.allocator.free(owned_file);
+    try ctx.issues.append(ctx.allocator, .{
+        .file = owned_file,
+        .file_owned = true,
+        .line = line,
+        .col = 1,
+        .severity = .err,
+        .rule = spec.rule,
+        .message = spec.message,
+        .help = spec.help,
+    });
+}
+
 /// Emit a simple runtime issue (file=runtime, line=1)
 fn emitRuntimeIssue(ctx: RuntimeEmitCtx, spec: RuntimeIssueSpec) !void {
-    try ctx.issues.append(ctx.allocator, .{
+    try tryAppendRuntimeIssue(ctx, .{
         .file = "runtime",
         .line = 1,
         .col = 1,
@@ -34000,24 +34190,45 @@ fn emitRuntimeIssue(ctx: RuntimeEmitCtx, spec: RuntimeIssueSpec) !void {
     });
 }
 
-/// Emit a runtime issue with file location extracted from the line. The
-/// location borrows the child process output, which runRuntimeAnalysis
+/// Emit a runtime issue with a file location extracted from the line. A
+/// forged or unresolvable location anchors at unknown:0 (EPH-I0171). The
+/// kept location borrows the child process output, which runRuntimeAnalysis
 /// frees before the findings print: dupe it and mark file_owned so
 /// deinitIssues frees it (EPH-I0202, the EPH-I0196 pattern).
 fn emitLocatedIssue(ctx: RuntimeEmitCtx, spec: RuntimeIssueSpec, t: []const u8) !void {
     const loc = extractFileLocation(t);
-    const owned_file = try ctx.allocator.dupe(u8, loc.file);
-    errdefer ctx.allocator.free(owned_file);
-    try ctx.issues.append(ctx.allocator, .{
-        .file = owned_file,
-        .file_owned = true,
-        .line = loc.line,
-        .col = 1,
-        .severity = .err,
-        .rule = spec.rule,
-        .message = spec.message,
-        .help = spec.help,
-    });
+    if (runtimeLocationAllowed(ctx, loc))
+        return emitAnchoredRuntimeIssue(ctx, spec, loc.file, loc.line);
+    try emitAnchoredRuntimeIssue(ctx, spec, "unknown", 0);
+}
+
+/// Resolved leak-finding message: owned when the location embedded.
+const LeakMessage = struct {
+    msg: []const u8,
+    owned: bool,
+};
+
+/// Resolve the leak finding's message (EPH-I0171): the next-line location
+/// embeds only when it passes the containment gate, so a forged path
+/// never reaches the message (the generic text survives the finding).
+fn leakFindingMessage(
+    ctx: RuntimeEmitCtx,
+    loc: FileLocation,
+    verbose: bool,
+) !LeakMessage {
+    if (loc.line == 0 or !runtimeLocationAllowed(ctx, loc))
+        return .{ .msg = "memory leak detected at runtime", .owned = false };
+    if (verbose) {
+        var safe = try types.sanitizeTerminal(ctx.allocator, loc.file);
+        defer safe.deinit(ctx.allocator);
+        std.debug.print("  at: {s}:{d}\n", .{ safe.slice, loc.line });
+    }
+    const msg = try std.fmt.allocPrint(
+        ctx.allocator,
+        "memory leak at {s}:{d}",
+        .{ loc.file, loc.line },
+    );
+    return .{ .msg = msg, .owned = true };
 }
 
 /// Handle memory leak detection with next-line stack trace
@@ -34027,43 +34238,38 @@ fn handleMemoryLeak(
     verbose: bool,
     t: []const u8,
 ) !void {
-    if (verbose) std.debug.print("GPA: {s}\n", .{t});
-    var msg: []const u8 = "memory leak detected at runtime";
-    var owned = false;
+    if (verbose) try printVerboseRuntimeLine(ctx.allocator, "GPA", t);
     const loc = if (line_iter.next()) |next_line|
         extractFileLocation(mem.trim(u8, next_line, " \t\r"))
     else
         FileLocation{ .file = "unknown", .line = 0 };
-    if (loc.line > 0) {
-        msg = try std.fmt.allocPrint(
-            ctx.allocator,
-            "memory leak at {s}:{d}",
-            .{ loc.file, loc.line },
-        );
-        owned = true;
-        if (verbose) std.debug.print("  at: {s}:{d}\n", .{ loc.file, loc.line });
-    }
-    try ctx.issues.append(ctx.allocator, .{
+    const message = try leakFindingMessage(ctx, loc, verbose);
+    errdefer if (message.owned) ctx.allocator.free(message.msg);
+    const issue = Issue{
         .file = "runtime",
         .line = 1,
         .col = 1,
         .severity = .err,
         .rule = RULE_RUNTIME_MEMORY_LEAK,
-        .message = msg,
+        .message = message.msg,
         .help = "allocation not freed - check for missing defer or error path",
-        .message_owned = owned,
-    });
+        .message_owned = message.owned,
+    };
+    if (!try runtimeFindingKept(ctx, issue)) {
+        if (message.owned) ctx.allocator.free(message.msg);
+        return;
+    }
+    try ctx.issues.append(ctx.allocator, issue);
 }
 
-/// Parse GPA memory diagnostics from stderr
+/// Parse GPA memory diagnostics from stderr. The ctx carries the
+/// containment root and the shared dedup/cap state (EPH-I0171, EPH-I0211).
 fn parseGPADiagnostics(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
+    ctx: RuntimeEmitCtx,
     stderr_output: []const u8,
     verbose: bool,
 ) !void {
     var line_iter = mem.splitScalar(u8, stderr_output, '\n');
-    const ctx = RuntimeEmitCtx{ .issues = issues, .allocator = allocator };
 
     while (line_iter.next()) |line| {
         const t = mem.trim(u8, line, " \t\r");
@@ -34147,7 +34353,7 @@ fn classifyGPALine(
 fn classifyGPATable(ctx: RuntimeEmitCtx, verbose: bool, t: []const u8) !void {
     for (gpa_classifications) |cls| {
         if (!matchesAnyPattern(t, cls.patterns)) continue;
-        if (verbose) std.debug.print("GPA: {s}\n", .{t});
+        if (verbose) try printVerboseRuntimeLine(ctx.allocator, "GPA", t);
         const spec = RuntimeIssueSpec{
             .rule = cls.rule,
             .message = cls.message,
@@ -34293,15 +34499,10 @@ fn emitBlockAnchoredIssue(
 ) !void {
     if (frame) |f| return emitLocatedIssue(ctx, spec, f);
     if (extractFileLocation(header).line > 0) return emitLocatedIssue(ctx, spec, header);
-    try ctx.issues.append(ctx.allocator, .{
-        .file = "unknown",
-        .line = 0,
-        .col = 1,
-        .severity = .err,
-        .rule = spec.rule,
-        .message = spec.message,
-        .help = spec.help,
-    });
+    // The no-location anchor also crosses the dedup/cap gate (EPH-I0211):
+    // a forged stream of location-less runner headers must not flood the
+    // findings list either.
+    try emitAnchoredRuntimeIssue(ctx, spec, "unknown", 0);
 }
 
 /// Emit the finding for a recognized block shape (EPH-I0732), or return
@@ -34342,7 +34543,7 @@ fn handleRunnerBlock(
     verbose: bool,
     t: []const u8,
 ) !void {
-    if (verbose) std.debug.print("GPA: {s}\n", .{t});
+    if (verbose) try printVerboseRuntimeLine(ctx.allocator, "GPA", t);
     var buf: [max_runner_block_lines][]const u8 = undefined;
     const n = collectRunnerBlock(line_iter, &buf);
     const lines = buf[0..n];
@@ -34366,7 +34567,7 @@ const panic_issue_spec = RuntimeIssueSpec{
 };
 
 fn handlePanicLine(ctx: RuntimeEmitCtx, t: []const u8, verbose: bool) !void {
-    if (verbose) std.debug.print("PANIC: {s}\n", .{t});
+    if (verbose) try printVerboseRuntimeLine(ctx.allocator, "PANIC", t);
     try emitLocatedIssue(ctx, panic_issue_spec, t);
 }
 
@@ -34377,7 +34578,7 @@ const fail_issue_spec = RuntimeIssueSpec{
 };
 
 fn handleFailLine(ctx: RuntimeEmitCtx, t: []const u8, verbose: bool) !void {
-    if (verbose) std.debug.print("TEST FAIL: {s}\n", .{t});
+    if (verbose) try printVerboseRuntimeLine(ctx.allocator, "TEST FAIL", t);
     try emitLocatedIssue(ctx, fail_issue_spec, t);
 }
 
@@ -34387,13 +34588,11 @@ fn handleFailLine(ctx: RuntimeEmitCtx, t: []const u8, verbose: bool) !void {
 /// older runners use stdout. Scanning both streams keeps panics
 /// classifiable as ZR105 instead of a bare ZR104 (EPH-I0489).
 fn parseTestOutput(
-    allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
+    ctx: RuntimeEmitCtx,
     output: []const u8,
     verbose: bool,
 ) !void {
     var lines = mem.splitScalar(u8, output, '\n');
-    const ctx = RuntimeEmitCtx{ .issues = issues, .allocator = allocator };
     while (lines.next()) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (t.len == 0) continue;
@@ -37152,7 +37351,7 @@ fn runInstallCommand(
     project_dir: std.Io.Dir,
     install_version: ?[]const u8,
 ) !void {
-    try requireStrictExplicitVersion(diag, install_version);
+    try requireStrictExplicitVersion(diag, allocator, install_version);
     const ver = install_version orelse EPHOR_VERSION;
 
     if (!checkProjectPrerequisites(diag, project_dir)) return error.InstallFailed;
@@ -37557,7 +37756,7 @@ const UpgradeRun = struct {
     fn run(self: *const UpgradeRun) !void {
         // Validate before the fetch: an explicit version reaches the URL
         // below unchecked without this gate (EPH-I0155).
-        try requireStrictExplicitVersion(self.diag, self.opts.install_version);
+        try requireStrictExplicitVersion(self.diag, self.allocator, self.opts.install_version);
         // If no explicit version, fetch the latest from Codeberg tags API.
         const fetched_ver = if (self.opts.install_version == null)
             self.fetch_fn(self.diag.io, self.allocator)
@@ -37576,14 +37775,25 @@ const UpgradeRun = struct {
     /// `ver` is strict-gated at its ingest point (explicit --version,
     /// tags API, zon fallback). An unparseable target must never reach
     /// buildPackageUrl, the ephor.json splice, the cache write, or the
-    /// printed banner.
+    /// printed banner. The refused value crosses the terminal sanitizer
+    /// before the error render (EPH-I0203).
     fn refuseUnparseableTarget(self: *const UpgradeRun, ver: []const u8) !void {
         if (isStrictSemverTag(ver)) return;
-        cliDiag(
-            self.diag,
-            "error: refusing unparseable upgrade target '{s}' (expected X.Y.Z).\n",
-            .{ver},
-        );
+        if (types.sanitizeTerminal(self.allocator, ver)) |safe_val| {
+            var safe = safe_val;
+            defer safe.deinit(self.allocator);
+            cliDiag(
+                self.diag,
+                "error: refusing unparseable upgrade target '{s}' (expected X.Y.Z).\n",
+                .{safe.slice},
+            );
+        } else |_| {
+            cliDiag(
+                self.diag,
+                "error: refusing unparseable upgrade target (expected X.Y.Z).\n",
+                .{},
+            );
+        }
         return error.UpgradeFailed;
     }
 
@@ -38108,22 +38318,32 @@ fn checkForUpdates(
     };
     defer allocator.free(latest);
     if (!isNewerVersion(EPHOR_VERSION, latest)) return;
-    const msg = std.fmt.allocPrint(
+    update_notification = updateBannerText(allocator, latest) catch null;
+}
+
+/// Build the boxed update banner (EPH-I0203, render half): `latest` is
+/// network-or-cache bytes, so it crosses sanitizeTerminal before the
+/// render — a poisoned tag or cache replay never reaches the terminal
+/// raw. The ingest halves are already strict (isStrictSemverTag at the
+/// API/zon parsers and the cache read), so the sanitize is the second
+/// layer, not the gate. Caller owns the returned slice.
+fn updateBannerText(allocator: Allocator, latest: []const u8) ![]const u8 {
+    var safe_latest = try types.sanitizeTerminal(allocator, latest);
+    defer safe_latest.deinit(allocator);
+    const msg = try std.fmt.allocPrint(
         allocator,
         "  ephor v{s} available (current: v{s}). Run: zig build ephor-upgrade  ",
-        .{ latest, EPHOR_VERSION },
-    ) catch return;
+        .{ safe_latest.slice, EPHOR_VERSION },
+    );
     defer allocator.free(msg);
-
-    const border = allocator.alloc(u8, msg.len) catch return;
+    const border = try allocator.alloc(u8, msg.len);
     defer allocator.free(border);
     @memset(border, '#');
-
-    update_notification = std.fmt.allocPrint(
+    return std.fmt.allocPrint(
         allocator,
         "\n{s}\n{s}\n{s}\n",
         .{ border, msg, border },
-    ) catch null;
+    );
 }
 
 /// True when EPHOR_NO_UPDATE_CHECK is present. Presence-only: the value is
@@ -38150,9 +38370,11 @@ fn resolveUpdateCachePath(allocator: Allocator, home: ?[]const u8) ?[]const u8 {
 }
 
 /// Read and validate the cache file. Returns null on any defect (missing,
-/// unreadable, oversized, non-integer epoch, non-semver version) so callers
-/// fall through to a live fetch — fail-closed on weird input. On success the
-/// returned version is caller-owned.
+/// unreadable, oversized, non-integer epoch, non-strict-semver version) so
+/// callers fall through to a live fetch — fail-closed on weird input. The
+/// version check is the strict tag grammar, not parseSemver's suffix
+/// stripping: a poisoned `99.0.0-<ESC>` replay must not validate
+/// (EPH-I0203). On success the returned version is caller-owned.
 fn readUpdateCache(io: std.Io, allocator: Allocator, path: []const u8) ?CachedCheck {
     const content = Fs.cwd(io).readFileAlloc(allocator, path, UPDATE_CACHE_MAX_BYTES) catch
         return null;
@@ -38161,7 +38383,7 @@ fn readUpdateCache(io: std.Io, allocator: Allocator, path: []const u8) ?CachedCh
     const epoch_line = lines.next() orelse return null;
     const version_line = lines.next() orelse return null;
     const epoch = std.fmt.parseInt(i64, epoch_line, 10) catch return null;
-    if (parseSemver(version_line) == null) return null;
+    if (!isStrictSemverTag(version_line)) return null;
     const owned = allocator.dupe(u8, version_line) catch return null;
     return .{ .epoch = epoch, .version = owned };
 }
@@ -38337,11 +38559,22 @@ fn isStrictSemverTag(ver: []const u8) bool {
 /// (EPH-I0155, EPH-I0166). The grammar is the I0193 strict tag shape
 /// X.Y.Z, and buildPackageUrl splices the value into the URL unchecked, so
 /// anything else is a hard usage error, never a URL component. Null (no
-/// explicit version) always passes.
-fn requireStrictExplicitVersion(diag: *DiagCtx, install_version: ?[]const u8) !void {
+/// explicit version) always passes. The refused value crosses the terminal
+/// sanitizer before the error render (EPH-I0203).
+fn requireStrictExplicitVersion(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    install_version: ?[]const u8,
+) !void {
     const ver = install_version orelse return;
     if (isStrictSemverTag(ver)) return;
-    cliDiag(diag, "error: invalid --version value '{s}' (expected X.Y.Z)\n", .{ver});
+    if (types.sanitizeTerminal(allocator, ver)) |safe_val| {
+        var safe = safe_val;
+        defer safe.deinit(allocator);
+        cliDiag(diag, "error: invalid --version value '{s}' (expected X.Y.Z)\n", .{safe.slice});
+    } else |_| {
+        cliDiag(diag, "error: invalid --version value (expected X.Y.Z)\n", .{});
+    }
     return error.InvalidVersion;
 }
 
@@ -40167,11 +40400,19 @@ fn readKnownIssuesContent(
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             if (!explicit) return null;
-            cliDiag(
-                diag,
-                "error: cannot read known-issues file '{s}' (see ephor --help)\n",
-                .{path},
-            );
+            // EPH-I0212: the path may derive from a hostile cfg.path
+            // (path_dir), so it crosses the terminal sanitizer.
+            if (types.sanitizeTerminal(allocator, path)) |safe_val| {
+                var safe_path = safe_val;
+                defer safe_path.deinit(allocator);
+                cliDiag(
+                    diag,
+                    "error: cannot read known-issues file '{s}' (see ephor --help)\n",
+                    .{safe_path.slice},
+                );
+            } else |_| {
+                cliDiag(diag, "error: cannot read known-issues file (see ephor --help)\n", .{});
+            }
             return error.KnownIssuesUnreadable;
         },
     };
@@ -41516,13 +41757,20 @@ fn handleStats(ctx: *RunCtx) !void {
     printStats(g.getStats(), ctx.cfg.format);
 }
 
-/// Interactive gate for `runtime`: the analysis compiles and executes the
-/// target, so the user confirms unless --yes was passed. Returns false on
-/// any answer other than y/Y (EOF included).
-fn confirmRuntime(ctx: *const RunCtx) bool {
-    if (ctx.cfg.auto_approve) return true;
-    const cmd_str = ctx.cfg.runtime_command orelse "zig build test";
-    std.debug.print(
+/// Render the runtime prompt body (EPH-I0173, EPH-I0212): the scan path
+/// and the command cross sanitizeTerminal before the trust-decision print,
+/// so control bytes in either cannot rewrite the displayed terms. Caller
+/// owns the returned slice.
+fn runtimePromptText(
+    allocator: Allocator,
+    base_path: []const u8,
+    cmd_str: []const u8,
+) ![]const u8 {
+    var safe_path = try types.sanitizeTerminal(allocator, base_path);
+    defer safe_path.deinit(allocator);
+    var safe_cmd = try types.sanitizeTerminal(allocator, cmd_str);
+    defer safe_cmd.deinit(allocator);
+    return std.fmt.allocPrint(allocator,
         \\
         \\WARNING: Runtime analysis will COMPILE AND EXECUTE code in:
         \\  {s}
@@ -41533,7 +41781,18 @@ fn confirmRuntime(ctx: *const RunCtx) bool {
         \\Only run this on projects you trust.
         \\
         \\Proceed? [y/N]
-    , .{ ctx.base_path, cmd_str });
+    , .{ safe_path.slice, safe_cmd.slice });
+}
+
+/// Interactive gate for `runtime`: the analysis compiles and executes the
+/// target, so the user confirms unless --yes was passed. Returns false on
+/// any answer other than y/Y (EOF included).
+fn confirmRuntime(ctx: *const RunCtx) !bool {
+    if (ctx.cfg.auto_approve) return true;
+    const cmd_str = ctx.cfg.runtime_command orelse "zig build test";
+    const prompt = try runtimePromptText(ctx.alloc, ctx.base_path, cmd_str);
+    defer ctx.alloc.free(prompt);
+    std.debug.print("{s}", .{prompt});
     var read_buf: [16]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(ctx.diag.io, &read_buf);
     const n = stdin_reader.interface.readSliceShort(&read_buf) catch 0;
@@ -41547,11 +41806,12 @@ fn confirmRuntime(ctx: *const RunCtx) bool {
 /// `runtime` command: dynamic analysis under the project's own test run.
 /// A declined prompt skips the epilogue (the pre-split bare return).
 fn handleRuntime(ctx: *RunCtx) !void {
-    if (!confirmRuntime(ctx)) {
+    if (!try confirmRuntime(ctx)) {
         ctx.abort_epilogue = true;
         return;
     }
     try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
+    var suppressed: usize = 0;
     var issues = try runRuntimeAnalysis(
         ctx.diag.io,
         ctx.alloc,
@@ -41560,10 +41820,21 @@ fn handleRuntime(ctx: *RunCtx) !void {
             .verbose = ctx.cfg.verbose,
             .custom_command = ctx.cfg.runtime_command,
             .json_stream = ctx.diag.json_stream,
+            .suppressed_out = &suppressed,
         },
     );
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "runtime", ctx.reportOut(null));
+    // EPH-I0211: the dedup/cap note. cliDiag's json latch keeps it off
+    // the machine stream (the band precedent: the truncation warning).
+    if (suppressed > 0) {
+        ctx.diag.runtime_suppressed_count += 1;
+        cliDiag(
+            ctx.diag,
+            "note: {d} further runtime findings suppressed (duplicates or the cap)\n",
+            .{suppressed},
+        );
+    }
     reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg);
     applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
 }
@@ -42168,6 +42439,36 @@ fn reportUnknownVersionWarning(diag: *DiagCtx) void {
     cliDiag(diag, "{s}", .{compat.unknown_version_warning_text});
 }
 
+/// Abort disposition for an unresolved scan root (EPH-I0172, RED4-7):
+/// the path may carry scanned-tree bytes (path_dir from an untrusted
+/// config), so it crosses the terminal sanitizer before the render. On
+/// sanitize OOM the message drops the path rather than print it raw.
+/// The exit code carries the JSON abort object (errorExitCode).
+fn unresolvedScanRootExit(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    path: []const u8,
+    err: anyerror,
+) !u8 {
+    if (types.sanitizeTerminal(allocator, path)) |safe_val| {
+        var safe_path = safe_val;
+        defer safe_path.deinit(allocator);
+        cliDiag(
+            diag,
+            "error: cannot resolve scan path '{s}': {s}\n",
+            .{ safe_path.slice, @errorName(err) },
+        );
+    } else |_| {
+        cliDiag(diag, "error: cannot resolve scan path: {s}\n", .{@errorName(err)});
+    }
+    return errorExitCode(
+        diag,
+        allocator,
+        error.ScanRootUnresolved,
+        diag.last_muted_diag[0..diag.last_muted_diag_len],
+    );
+}
+
 /// Exit code for a failed run (EPH-I1070 follow-up, EPH-I0543). Text
 /// mode keeps the silent exit(1). JSON mode must leave a readable
 /// document on the armed stream, so the abort object rides the code:
@@ -42238,9 +42539,12 @@ fn runEphor(init: std.process.Init) !u8 {
     // them all; the epilogue only prints (EPH-I0545).
     defer freeUpdateNotification(alloc);
 
-    // Get absolute base path for relative path calculation
+    // EPH-I0172 (RED4-7): a failed root realpath aborts with an explicit
+    // error — every containment gate keys on this root, so the raw-path
+    // silent degrade must not come back.
     var base_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const base_path = Fs.cwd(diag.io).realpath(cfg.path, &base_buf) catch cfg.path;
+    const base_path = Fs.cwd(diag.io).realpath(cfg.path, &base_buf) catch |err|
+        return unresolvedScanRootExit(&diag, alloc, cfg.path, err);
 
     // Suppression-fact cache shared by every printIssues/exportIssues call in
     // this run; built lazily per (file, rule), freed at exit.
@@ -42591,6 +42895,9 @@ test "markBuildPathReferences reads with the shared source cap (EPH-I0376)" {
     defer graph.deinit();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
+    // Production shape (EPH-I0172): every handler sets the containment
+    // root; the null-root fail-closed gate must not mask this fixture.
+    graph.scan_root = root;
     const big_path = try std.fmt.allocPrint(allocator, "{s}/big.zig", .{root});
     // The map takes ownership of the key (deinit frees it); the pin must
     // not free it again.
@@ -44213,6 +44520,8 @@ test "extractBareImports still records a real bare @import (EPH-I0227)" {
     defer allocator.free(entry);
     const real = try tmpFilePath(allocator, &tmp, "real.zig");
     defer allocator.free(real);
+    // Production shape (EPH-I0172): handlers set the containment root.
+    graph.scan_root = std.fs.path.dirname(entry) orelse ".";
     try graph.analyzeFile(entry);
     try graph.markReachable(entry);
 
@@ -44260,6 +44569,8 @@ test "build.zig-blind orphan scan skips main roots and imported modules (EPH-I10
     defer allocator.free(compat_path);
     const dead = try tmpFilePath(allocator, &tmp, "dead.zig");
     defer allocator.free(dead);
+    // Production shape (EPH-I0172): handlers set the containment root.
+    graph.scan_root = std.fs.path.dirname(entry) orelse ".";
     try graph.analyzeFile(entry);
     try graph.analyzeFile(util);
     try graph.analyzeFile(probe);
@@ -44381,6 +44692,8 @@ test "build-path scanners still mark refs in real code (EPH-I0227)" {
     defer graph.deinit();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
+    // Production shape (EPH-I0172): handlers set the containment root.
+    graph.scan_root = root;
     try graph.scanContentBuildPathRefs(content, root);
 
     const real_path = try tmpFilePath(allocator, &tmp, "src/r_p.zig");
@@ -45258,7 +45571,10 @@ test "parseGPADiagnostics leak consumes the stack-trace line" {
     // handleMemoryLeak eats the line after the leak marker, so the
     // "double free" text on that line never classifies (EPH-I0230 pin).
     const input = "0x1 leaked:\ndouble free was here\nSegmentation fault next";
-    try parseGPADiagnostics(allocator, &issues, input, false);
+    try parseGPADiagnostics(.{
+        .issues = &issues,
+        .allocator = allocator,
+    }, input, false);
     try std.testing.expectEqual(@as(usize, 2), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_MEMORY_LEAK, issues.items[0].rule);
     try std.testing.expectEqualStrings("memory leak detected at runtime", issues.items[0].message);
@@ -45283,7 +45599,10 @@ test "parseTestOutput classifies failure-summary shapes" {
     for (cases) |c| {
         var issues: std.ArrayListUnmanaged(Issue) = .empty;
         defer deinitIssues(&issues, allocator);
-        try parseTestOutput(allocator, &issues, c.input, false);
+        try parseTestOutput(.{
+            .issues = &issues,
+            .allocator = allocator,
+        }, c.input, false);
         try std.testing.expectEqual(@as(usize, 1), issues.items.len);
         try std.testing.expectEqualStrings(c.rule, issues.items[0].rule);
         try std.testing.expectEqualStrings(c.file, issues.items[0].file);
@@ -45295,7 +45614,10 @@ test "parseTestOutput stays silent on clean output" {
     const allocator = std.testing.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, allocator);
-    try parseTestOutput(allocator, &issues, "1/1 tests passed\nok\n", false);
+    try parseTestOutput(.{
+        .issues = &issues,
+        .allocator = allocator,
+    }, "1/1 tests passed\nok\n", false);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -45307,9 +45629,152 @@ test "parseTestOutput emits one classification for a FAIL panic line (EPH-I0508 
     // line matching both markers emits the panic finding only. The
     // duplicate ZR104 stays silent (band-B12 F23; the EPH-I0230 double
     // classification is superseded).
-    try parseTestOutput(allocator, &issues, "FAIL panic: x", false);
+    try parseTestOutput(.{
+        .issues = &issues,
+        .allocator = allocator,
+    }, "FAIL panic: x", false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
+}
+
+test "runtime dedup collapses repeated identical lines and counts them (EPH-I0211)" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    var state = RuntimeParseState{};
+    defer state.deinit(allocator);
+    // Three identical segmentation-fault lines: one finding survives, the
+    // other two count as suppressed. The 10 MB flood shape would mint
+    // ~10^6 findings without the gate.
+    const input =
+        "Segmentation fault at 0x0\n" ++
+        "Segmentation fault at 0x0\n" ++
+        "Segmentation fault at 0x0\n";
+    try parseGPADiagnostics(
+        .{ .issues = &issues, .allocator = allocator, .state = &state },
+        input,
+        false,
+    );
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
+    try std.testing.expectEqual(@as(usize, 2), state.suppressed);
+}
+
+test "runtime dedup keeps distinct leak locations apart (EPH-I0211)" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    var state = RuntimeParseState{};
+    defer state.deinit(allocator);
+    // Two leak headers whose next-line locations differ: the message
+    // carries the location, so the dedup key must keep both findings.
+    const input =
+        "0x1 leaked:\n/a.zig:1:1 x\n" ++
+        "0x2 leaked:\n/b.zig:1:1 x\n";
+    try parseGPADiagnostics(
+        .{ .issues = &issues, .allocator = allocator, .state = &state },
+        input,
+        false,
+    );
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), state.suppressed);
+    // A repeated identical leak collapses to one.
+    try parseGPADiagnostics(
+        .{ .issues = &issues, .allocator = allocator, .state = &state },
+        "0x1 leaked:\n/a.zig:1:1 x\n",
+        false,
+    );
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqual(@as(usize, 1), state.suppressed);
+}
+
+test "runtime cap drops the over-cap tail and counts it (EPH-I0211)" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    var state = RuntimeParseState{};
+    defer state.deinit(allocator);
+    // Distinct FAIL lines past the cap: max_runtime_findings kept, the
+    // tail suppressed. No containment root here, so each forged path
+    // stays distinct in the dedup key.
+    var input: std.ArrayListUnmanaged(u8) = .empty;
+    defer input.deinit(allocator);
+    var i: usize = 0;
+    while (i < max_runtime_findings + 7) : (i += 1) {
+        var line_buf: [64]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "FAIL /p{d}.zig:1 boom\n", .{i});
+        try input.appendSlice(allocator, line);
+    }
+    try parseTestOutput(
+        .{ .issues = &issues, .allocator = allocator, .state = &state },
+        input.items,
+        false,
+    );
+    try std.testing.expectEqual(max_runtime_findings, issues.items.len);
+    try std.testing.expectEqual(@as(usize, 7), state.suppressed);
+}
+
+test "emitLocatedIssue anchors a forged location at unknown when the root is set (EPH-I0171)" {
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    var root_buf: [Fs.max_path_bytes]u8 = undefined;
+    const root = Fs.cwd(std.testing.io).realpath(".", &root_buf) catch
+        return error.SkipZigTest;
+    const ctx = RuntimeEmitCtx{
+        .issues = &issues,
+        .allocator = allocator,
+        .io = std.testing.io,
+        .root_real = root,
+    };
+    const spec = RuntimeIssueSpec{ .rule = RULE_RUNTIME_PANIC, .message = "m", .help = "h" };
+    // A path that cannot resolve under the root anchors at unknown:0.
+    try emitLocatedIssue(ctx, spec, "boom at /nonexistent/x.zig:9 now");
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings("unknown", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 0), issues.items[0].line);
+    // Non-printable path bytes fail the printable gate the same way.
+    try emitLocatedIssue(ctx, spec, "boom at /x\x1b.zig:9 now");
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqualStrings("unknown", issues.items[1].file);
+    // A real in-root path keeps its location.
+    var abs_buf: [Fs.max_path_bytes]u8 = undefined;
+    const abs_src = Fs.cwd(std.testing.io).realpath("src/main.zig", &abs_buf) catch
+        return error.SkipZigTest;
+    const line = try std.fmt.allocPrint(allocator, "boom at {s}:42 now", .{abs_src});
+    defer allocator.free(line);
+    try emitLocatedIssue(ctx, spec, line);
+    try std.testing.expectEqual(@as(usize, 3), issues.items.len);
+    try std.testing.expectEqualStrings(abs_src, issues.items[2].file);
+    try std.testing.expectEqual(@as(usize, 42), issues.items[2].line);
+}
+
+test "runtimePromptText sanitizes the command and the scan path (EPH-I0173, EPH-I0212)" {
+    const allocator = std.testing.allocator;
+    // ESC in the command and CR in the path: both render as visible '?'
+    // placeholders, and no control byte reaches the prompt text.
+    const prompt = try runtimePromptText(allocator, "/evil\x0ddir", "sh run\x1b[2Jx");
+    defer allocator.free(prompt);
+    try std.testing.expect(mem.indexOf(u8, prompt, "\x1b") == null);
+    try std.testing.expect(mem.indexOf(u8, prompt, "\x0d") == null);
+    try std.testing.expect(mem.indexOf(u8, prompt, "/evil?dir") != null);
+    try std.testing.expect(mem.indexOf(u8, prompt, "sh run?") != null);
+    // A clean pair passes through unchanged.
+    const clean = try runtimePromptText(allocator, "/src", "zig build test");
+    defer allocator.free(clean);
+    try std.testing.expect(mem.indexOf(u8, clean, "/src") != null);
+    try std.testing.expect(mem.indexOf(u8, clean, "zig build test") != null);
+}
+
+test "printVerboseRuntimeLine sanitizes child bytes before the render (EPH-I0171)" {
+    // The verbose band prints raw child lines; this seam must strip
+    // control bytes. The sanitized output lands in the test log, where
+    // the '?' placeholder keeps it inert.
+    const allocator = std.testing.allocator;
+    try printVerboseRuntimeLine(allocator, "GPA", "boom \x1b[2J leaked");
+    // The sanitize path borrows clean input without allocation; the
+    // hostile path owns a copy. Both must stay byte-balanced.
+    try printVerboseRuntimeLine(allocator, "GPA", "clean line");
 }
 
 test "handleMemoryLeak builds an owned message from the next line" {
@@ -45368,7 +45833,10 @@ test "parseGPADiagnostics findings own their file bytes after the source frees" 
         u8,
         "/x/proj/src/main.zig:7:19: 0xabc in test.double free repro (test)",
     );
-    try parseGPADiagnostics(allocator, &issues, source, false);
+    try parseGPADiagnostics(.{
+        .issues = &issues,
+        .allocator = allocator,
+    }, source, false);
     // Free the source before the reads, replicating runRuntimeAnalysis's
     // free-then-print order. Safe builds poison freed bytes with 0xAA, so
     // a borrowed file slice fails the comparison below.
@@ -45405,7 +45873,10 @@ test "parseGPADiagnostics locates a 0.16 double-free crash block at the user fra
         \\       ???:?:?: 0x1841444e3 in start (/usr/lib/dyld)
         \\failed command: ./test --listen=-
     );
-    try parseGPADiagnostics(allocator, &issues, source, false);
+    try parseGPADiagnostics(.{
+        .issues = &issues,
+        .allocator = allocator,
+    }, source, false);
     // Free before the reads, replicating runRuntimeAnalysis (EPH-I0202).
     allocator.free(source);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
@@ -45432,7 +45903,10 @@ test "parseGPADiagnostics locates a no-free-frame crash block as ZR105, never ZR
         \\       ???:?:?: 0x1841444e3 in start (/usr/lib/dyld)
         \\failed command: ./test --listen=-
     ;
-    try parseGPADiagnostics(allocator, &issues, source, false);
+    try parseGPADiagnostics(.{
+        .issues = &issues,
+        .allocator = allocator,
+    }, source, false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
     try std.testing.expectEqualStrings(
@@ -45465,7 +45939,10 @@ test "parseGPADiagnostics locates a clean double-free log block at the second fr
         \\       /tool/zig/lib/compiler/test_runner.zig:140:68: 0x1 in mainServer (test)
         \\failed command: ./test --listen=-
     ;
-    try parseGPADiagnostics(allocator, &issues, source, false);
+    try parseGPADiagnostics(.{
+        .issues = &issues,
+        .allocator = allocator,
+    }, source, false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
     try std.testing.expectEqualStrings("/x/proj/src/main.zig", issues.items[0].file);
@@ -45486,7 +45963,10 @@ test "parseGPADiagnostics replays an unrecognized runner block through the table
         \\       stack overflow while recursing
         \\failed command: x
     ;
-    try parseGPADiagnostics(allocator, &issues, source, false);
+    try parseGPADiagnostics(.{
+        .issues = &issues,
+        .allocator = allocator,
+    }, source, false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
     try std.testing.expectEqualStrings("runtime", issues.items[0].file);
@@ -45507,7 +45987,10 @@ test "parseGPADiagnostics caps runner block consumption at 64 lines" {
         "failed command: x\n");
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, allocator);
-    try parseGPADiagnostics(allocator, &issues, src.items, false);
+    try parseGPADiagnostics(.{
+        .issues = &issues,
+        .allocator = allocator,
+    }, src.items, false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
     try std.testing.expectEqualStrings("runtime", issues.items[0].file);
@@ -45526,7 +46009,10 @@ test "parseGPADiagnostics falls back to the first user frame without a Second fr
         \\       /x/proj/src/main.zig:5:9: 0x104991843 in test.double free repro (test)
         \\failed command: x
     ;
-    try parseGPADiagnostics(allocator, &issues, source, false);
+    try parseGPADiagnostics(.{
+        .issues = &issues,
+        .allocator = allocator,
+    }, source, false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
     try std.testing.expectEqualStrings("/x/proj/src/main.zig", issues.items[0].file);
@@ -45546,7 +46032,10 @@ test "parseGPADiagnostics reports unknown:0 for a crash block with only toolchai
         \\       /tool/zig/lib/compiler/test_runner.zig:140:68: 0x1 in mainServer (test)
         \\failed command: x
     ;
-    try parseGPADiagnostics(allocator, &issues, source, false);
+    try parseGPADiagnostics(.{
+        .issues = &issues,
+        .allocator = allocator,
+    }, source, false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
     try std.testing.expectEqualStrings("unknown", issues.items[0].file);
@@ -45567,7 +46056,10 @@ test "parseGPADiagnostics keeps unknown:0 when the header names a zig step" {
         \\       /tool/zig/lib/std/mem/Allocator.zig:448:5: 0x1 in free__anon_19 (test)
         \\failed command: x
     ;
-    try parseGPADiagnostics(allocator, &issues, source, false);
+    try parseGPADiagnostics(.{
+        .issues = &issues,
+        .allocator = allocator,
+    }, source, false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
     try std.testing.expectEqualStrings("unknown", issues.items[0].file);
@@ -45588,7 +46080,10 @@ test "parseGPADiagnostics filters Windows toolchain frames in a trace" {
         \\       C:\proj\src\main.zig:10:19: 0x10499193b in test.crash (test)
         \\failed command: x
     ;
-    try parseGPADiagnostics(allocator, &issues, source, false);
+    try parseGPADiagnostics(.{
+        .issues = &issues,
+        .allocator = allocator,
+    }, source, false);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
     try std.testing.expectEqualStrings("C:\\proj\\src\\main.zig", issues.items[0].file);
@@ -45627,7 +46122,10 @@ test "parseTestOutput located findings own their file bytes after the source fre
         u8,
         "thread 1 panic: boom at /x/proj/src/main.zig:42 now",
     );
-    try parseTestOutput(allocator, &issues, source, false);
+    try parseTestOutput(.{
+        .issues = &issues,
+        .allocator = allocator,
+    }, source, false);
     allocator.free(source);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
@@ -45675,14 +46173,24 @@ test "buildRuntimeArgv builds default and custom argv" {
     var scratch: [1024]u8 = undefined;
     try std.testing.expectEqual(
         @as(usize, 3),
-        buildRuntimeArgv(.{ .verbose = false, .custom_command = null }, &buf, &scratch),
+        buildRuntimeArgv(
+            .{ .verbose = false, .custom_command = null },
+            &buf,
+            &scratch,
+            std.testing.allocator,
+        ),
     );
     try std.testing.expectEqualStrings("zig", buf[0]);
     try std.testing.expectEqualStrings("build", buf[1]);
     try std.testing.expectEqualStrings("test", buf[2]);
     try std.testing.expectEqual(
         @as(usize, 2),
-        buildRuntimeArgv(.{ .verbose = false, .custom_command = "sh run.sh" }, &buf, &scratch),
+        buildRuntimeArgv(
+            .{ .verbose = false, .custom_command = "sh run.sh" },
+            &buf,
+            &scratch,
+            std.testing.allocator,
+        ),
     );
     try std.testing.expectEqualStrings("sh", buf[0]);
     try std.testing.expectEqualStrings("run.sh", buf[1]);
@@ -45700,15 +46208,17 @@ test "buildRuntimeArgv truncation is detected with and without JSON mode" {
     }
     var buf: [64][]const u8 = undefined;
     var scratch: [1024]u8 = undefined;
-    const plain = buildRuntimeArgv(
+    const plain = try buildRuntimeArgv(
         .{ .verbose = false, .custom_command = cmd.items },
         &buf,
         &scratch,
+        allocator,
     );
-    const json = buildRuntimeArgv(
+    const json = try buildRuntimeArgv(
         .{ .verbose = false, .custom_command = cmd.items, .json_stream = true },
         &buf,
         &scratch,
+        allocator,
     );
     try std.testing.expectEqual(@as(usize, 64), plain);
     try std.testing.expectEqual(@as(usize, 64), json);
@@ -46392,9 +46902,50 @@ test "runRuntimeAnalysis reports ZR105 for a stderr panic (EPH-I0489)" {
     );
     defer deinitIssues(&issues, allocator);
 
+    // EPH-I0171 (re-derived pin, B86): the child location is a forged
+    // absolute path that does not resolve under the scan root, so the
+    // containment gate anchors it at unknown:0 instead of printing it.
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
-    try std.testing.expectEqualStrings("/x/proj/src/main.zig", issues.items[0].file);
+    try std.testing.expectEqualStrings("unknown", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 0), issues.items[0].line);
+}
+
+test "runRuntimeAnalysis keeps a located ZR105 when the child path resolves in-root (EPH-I0171)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The positive half of the containment gate: a panic whose frame path
+    // resolves under the scan root keeps its location through the
+    // subprocess seam. The path is the repo's own src/main.zig (the test
+    // cwd), resolved so the fixture stays hermetic.
+    var abs_buf: [Fs.max_path_bytes]u8 = undefined;
+    const abs_src = Fs.cwd(std.testing.io).realpath("src/main.zig", &abs_buf) catch
+        return error.SkipZigTest;
+    const script_body = try std.fmt.allocPrint(
+        allocator,
+        "echo 'thread 1 panic: boom at {s}:42 now' >&2\nexit 1\n",
+        .{abs_src},
+    );
+    defer allocator.free(script_body);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "panic2.sh", .data = script_body });
+    const script = try tmpFilePath(allocator, &tmp, "panic2.sh");
+    defer allocator.free(script);
+    const cmd = try std.fmt.allocPrint(allocator, "sh {s}", .{script});
+    defer allocator.free(cmd);
+
+    var issues = try runRuntimeAnalysis(
+        std.testing.io,
+        allocator,
+        ".",
+        .{ .verbose = false, .custom_command = cmd },
+    );
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
+    try std.testing.expectEqualStrings(abs_src, issues.items[0].file);
     try std.testing.expectEqual(@as(usize, 42), issues.items[0].line);
 }
 
@@ -46427,11 +46978,53 @@ test "runRuntimeAnalysis reports a located ZR101 for child GPA leak text (band-T
     );
     defer deinitIssues(&issues, allocator);
 
-    // The leak header plus its location line yield exactly one located
-    // leak finding; the nonzero exit must not add a bare ZR104.
+    // The leak header plus its location line yield exactly one leak
+    // finding; the nonzero exit must not add a bare ZR104. EPH-I0171
+    // (re-derived pin, B86): the forged location fails the containment
+    // gate, so the finding keeps the generic message instead of
+    // embedding the forged path.
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_MEMORY_LEAK, issues.items[0].rule);
-    try std.testing.expectEqualStrings("memory leak at /x/proj/src/main.zig:7", issues.items[0].message);
+    try std.testing.expectEqualStrings("memory leak detected at runtime", issues.items[0].message);
+    try std.testing.expect(!issues.items[0].message_owned);
+}
+
+test "runRuntimeAnalysis embeds an in-root leak location in the ZR101 message (EPH-I0171)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The positive half: a leak frame path that resolves under the scan
+    // root stays in the owned message. The path is the repo's own
+    // src/main.zig resolved from the test cwd.
+    var abs_buf: [Fs.max_path_bytes]u8 = undefined;
+    const abs_src = Fs.cwd(std.testing.io).realpath("src/main.zig", &abs_buf) catch
+        return error.SkipZigTest;
+    const script_body = try std.fmt.allocPrint(
+        allocator,
+        "echo 'error(gpa): memory address 0x104000000 leaked:' >&2\necho '{s}:7:9: 0x104000123 in leaky (test)' >&2\nexit 1\n",
+        .{abs_src},
+    );
+    defer allocator.free(script_body);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "leak2.sh", .data = script_body });
+    const script = try tmpFilePath(allocator, &tmp, "leak2.sh");
+    defer allocator.free(script);
+    const cmd = try std.fmt.allocPrint(allocator, "sh {s}", .{script});
+    defer allocator.free(cmd);
+
+    var issues = try runRuntimeAnalysis(
+        std.testing.io,
+        allocator,
+        ".",
+        .{ .verbose = false, .custom_command = cmd },
+    );
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_MEMORY_LEAK, issues.items[0].rule);
+    const expected_msg = try std.fmt.allocPrint(allocator, "memory leak at {s}:7", .{abs_src});
+    defer allocator.free(expected_msg);
+    try std.testing.expectEqualStrings(expected_msg, issues.items[0].message);
     try std.testing.expect(issues.items[0].message_owned);
 }
 
@@ -72153,6 +72746,37 @@ test "readUpdateCache fails closed on a valid epoch with a bad version (band-T04
     try std.testing.expect(readUpdateCache(std.testing.io, allocator, path) == null);
 }
 
+test "readUpdateCache rejects a suffix-carrying version replay (EPH-I0203)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // RED5-6: parseSemver's suffix stripping let `99.0.0-<ESC>` validate
+    // and replay the FULL bytes into the render path. The strict tag
+    // grammar rejects the whole entry instead.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "cache",
+        .data = "1800000000\n99.0.0-\x1b[2J\n",
+    });
+    const path = try tmpFilePath(allocator, &tmp, "cache");
+    defer allocator.free(path);
+    try std.testing.expect(readUpdateCache(std.testing.io, allocator, path) == null);
+}
+
+test "updateBannerText sanitizes hostile version bytes before the render (EPH-I0203)" {
+    const allocator = std.testing.allocator;
+    // A poisoned cache/API tag reaches the banner only through the
+    // sanitizer: the ESC sequence becomes a visible '?' and no control
+    // byte survives into the printed box.
+    const banner = try updateBannerText(allocator, "99.0.0-\x1b[2J");
+    defer allocator.free(banner);
+    try std.testing.expect(mem.indexOf(u8, banner, "\x1b") == null);
+    try std.testing.expect(mem.indexOf(u8, banner, "ephor v99.0.0-?") != null);
+    // A clean strict version renders unchanged.
+    const clean = try updateBannerText(allocator, "0.15.0");
+    defer allocator.free(clean);
+    try std.testing.expect(mem.indexOf(u8, clean, "ephor v0.15.0 available") != null);
+}
+
 test "readUpdateCache fails closed on an oversized cache file (band-T04 F-6)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -72492,7 +73116,7 @@ test "requireStrictExplicitVersion accepts null and strict X.Y.Z (EPH-I0155)" {
     var diag = testDiagCtx();
     const good = [_]?[]const u8{ null, "0.14.3", "10.20.30" };
     for (good) |value| {
-        try requireStrictExplicitVersion(&diag, value);
+        try requireStrictExplicitVersion(&diag, std.testing.allocator, value);
         // The gate's acceptance grammar is exactly the I0193 tag grammar.
         try std.testing.expect(value == null or isStrictSemverTag(value.?));
     }
@@ -72509,7 +73133,7 @@ test "requireStrictExplicitVersion rejects non-strict values (EPH-I0155)" {
     for (bad) |value| {
         try std.testing.expectError(
             error.InvalidVersion,
-            requireStrictExplicitVersion(&diag, value),
+            requireStrictExplicitVersion(&diag, std.testing.allocator, value),
         );
     }
 }
@@ -101846,6 +102470,21 @@ test "isWithinScanRoot rejects sibling-prefix paths (RED4-3)" {
     try std.testing.expect(!g.isWithinScanRoot("/tmp/repo-evil/x.zig"));
     try std.testing.expect(g.isWithinScanRoot("/tmp/repo/sub/x.zig"));
     try std.testing.expect(g.isWithinScanRoot("/tmp/repo"));
+}
+
+test "isWithinScanRoot fails closed on a null root with one warning (EPH-I0172)" {
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    var g = ImportGraph.init(std.testing.allocator, &diag);
+    defer g.deinit();
+    // RED4-7: the pre-fix null root read as contained. Fail closed and
+    // say so once; the second miss stays silent (once-guard).
+    try std.testing.expect(!g.isWithinScanRoot("/tmp/repo/x.zig"));
+    try std.testing.expect(mem.indexOf(u8, capture.slice(), "scan root not set") != null);
+    const after_first = capture.len;
+    try std.testing.expect(!g.isWithinScanRoot("/tmp/repo/y.zig"));
+    try std.testing.expectEqual(after_first, capture.len);
 }
 
 test "scanDirectory failure routes through the diagnostics channel (EPH-I0213)" {

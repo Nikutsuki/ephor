@@ -281,6 +281,7 @@ Example config:
 | `enable` | Rule IDs to enable (overrides disable) |
 | `strict` | `true` to exit 1 when any warning/error is found (CI gate) |
 | `fail_on` | Finer CI gate: `error`, `warning`, `note`, `never` (overrides `strict`) |
+| `coverage` | Coverage gate block (see the gate recipe in Development): `unreached_pub_fn_ratio_max` (f32 percent, `< 0` = off), `min_tests` (0 = off), `require_all_passed` (bool). Absent block = no gate; a malformed value warns and leaves that key off |
 | `error_naming` | ZA703 convention for error set member declarations: `TitleCase` (default; `PascalCase` accepted as an alias) or `snake_case` |
 | `thresholds` | Complexity and style thresholds. Values clamp at documented maxima (see Config trust model) |
 
@@ -290,7 +291,7 @@ Keys parse in file order. A repeated scalar key (`path_dir`, `strict`, `fail_on`
 
 A config file is trusted when its directory is the working directory or an ancestor of it (realpath compare). Every other config is untrusted. `--trust-target-config` declares a scanned target's config trusted.
 
-Ephor honors only `entries` from an untrusted config. It ignores the suppression and CI-gate keys (`disable`, `enable`, `exclude`, `orphan_exclude`, `strict`, `fail_on`, `thresholds`, `error_naming`) and prints one note per offending file:
+Ephor honors only `entries` from an untrusted config. It ignores the suppression and CI-gate keys (`disable`, `enable`, `exclude`, `orphan_exclude`, `strict`, `fail_on`, `thresholds`, `error_naming`, `coverage`) and prints one note per offending file:
 
 ```
 note: ignoring suppression/gate keys from untrusted <path> (use --trust-target-config to honor)
@@ -1531,6 +1532,59 @@ zig build ephor
 3. **build.zig** — canonical block present with both `ephor` and `ephor-upgrade` steps
 4. **`zig build ephor`** — compiles and runs without errors
 5. **`zig build ephor-upgrade`** — idempotent on already-up-to-date projects
+
+### Layer-1 Gate Recipe
+
+`scripts/gate.sh` is the commit gate. Its legs, in order: fmt, ReleaseSafe
+build, the test ratchet (Build Summary counts), a per-test capture run
+(the runner's `i/N name...OK` lines — `--summary all` suppresses them, so
+a second cached-compile run collects them), the discovery cross-check,
+the dogfood ratchet (`check src/`, fail_on warning posture), the coverage
+gate, and the corpus A/B. Ratchet baselines live in
+`scripts/gate-baselines.txt` (update `tests` in the commit that adds
+tests; update `dogfood` in the commit that fixes warnings).
+
+**Test discovery cross-check:** `ephor list-tests src/` lists every test
+block the static scan finds (file, line, name; `--format=json` for the
+machine shape). The gate requires the listing count to equal the runner's
+`i/N` denominator and the Build Summary total — the static twin must
+match what `zig test` executes. The scan reuses the ZT1xx opener
+machinery (masking, Allman carry, block tracking), so its known residuals
+are the two unhandled Allman shapes and two decls on one line.
+
+**Coverage gate:** the ephor.json `coverage` block:
+
+```json
+"coverage": {
+  "unreached_pub_fn_ratio_max": 5.0,
+  "min_tests": 0,
+  "require_all_passed": true
+}
+```
+
+`unreached_pub_fn_ratio_max` gates the ZT105 census: the percentage of
+unreached pub fns the scan collected (the ratio prints on every gated run
+as `ephor: coverage: N% of M public functions unreached by tests (limit
+X%)`). `min_tests` and `require_all_passed` evaluate only when the run
+carries `--coverage-evidence=<file>` with the runner's counts
+(`{"passed": N, "total": M}` — the gate writes it from the test ratchet).
+A tripped leg prints an `ephor: coverage gate:` line and exits 1; a
+broken evidence file warns and leaves the runner legs unevaluated. The
+block is optional: an old config without it parses unchanged, and a
+malformed value warns and leaves that key off. Untrusted target configs
+never honor `coverage` (it is a gate key). The coverage block is a
+static proxy — Zig 0.16.0 has no line-coverage flag and external
+coverage tools are banned — so it measures what the scanner can prove,
+not line coverage.
+
+**Fuzz smoke stage — documented deferral (EPH-I1090):** the gate wires no
+fuzz stage yet. Evidence: ephor's own tree carries zero `std.testing.fuzz`
+annotations, and a live probe shows `zig build test --fuzz=N` exits 1
+with "no fuzz tests found" on a fuzz-less tree (0.16.0 parses only the
+`--fuzz=N` form). A stage over an empty inventory would fail permanently
+or skip forever. When the first fuzzable module lands, wire the stage
+behind an opt-in latch, e.g. `GATE_FUZZ=1000 zig build test --fuzz=1000`,
+with N bounded and the run kept off the default path.
 
 ### CDN Cache Consideration
 

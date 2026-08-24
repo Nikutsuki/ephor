@@ -20368,6 +20368,121 @@ fn analyzeFileTests(
     for (0..all_lines.items.len) |idx| try scanTestLine(&ctx, idx, &state);
 }
 
+// --- list-tests: static test discovery (EPH-I1088) ---
+// `zig test` on 0.16.0 has no --test-list flag, so a machine-verifiable
+// discovery count comes from ephor's own test-block scan. The walk mirrors
+// scanTestLine's opener machinery (same masking, same Allman carry, same
+// block tracking), so the discovered count is the static twin of what the
+// runner executes. Known residual (documented, near-zero prevalence): two
+// test decls on one line count as one block, and the two unhandled Allman
+// shapes resolveTestOpener names skip discovery entirely.
+
+/// One discovered test block: the file, the opener's line, and the name
+/// string (empty for unnamed `test {` blocks). `file` and `name` borrow
+/// graph keys / file content, so the list must not outlive the graph.
+const TestBlockInfo = struct {
+    file: []const u8,
+    line: usize,
+    name: []const u8,
+};
+
+/// Extract the name string from a trimmed test-opener line. An unnamed
+/// `test {` opener or an unterminated literal yields "".
+fn testOpenerName(t: []const u8) []const u8 {
+    var i: usize = 4; // past the `test` keyword
+    while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
+    if (i >= t.len or t[i] != '"') return "";
+    const start = i + 1;
+    i = start;
+    while (i < t.len) {
+        if (t[i] == '\\') {
+            i += 2;
+            continue;
+        }
+        if (t[i] == '"') return t[start..i];
+        i += 1;
+    }
+    return "";
+}
+
+/// Mutable state for one file's test-block discovery pass. Only the
+/// fields the opener machinery reads: block membership, brace depth, the
+/// pending Allman opener, and the literal-blanking scratch buffer.
+const TestBlockScanState = struct {
+    in_test: bool = false,
+    depth: usize = 0,
+    pending: PendingTest = .{},
+    blank_buf: [16 * 1024]u8 = undefined,
+};
+
+/// Collect every test block in one file, mirroring scanTestLine's opener
+/// resolution so the discovery count matches the quality scan's model.
+fn collectFileTestBlocks(
+    allocator: Allocator,
+    path: []const u8,
+    content: []const u8,
+    out: *std.ArrayListUnmanaged(TestBlockInfo),
+) !void {
+    var all_lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer all_lines.deinit(allocator);
+    var split = mem.splitScalar(u8, content, '\n');
+    while (split.next()) |l| try all_lines.append(allocator, l);
+
+    var state = TestBlockScanState{};
+    for (0..all_lines.items.len) |idx| {
+        const line_num = idx + 1;
+        const line = all_lines.items[idx];
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const code_end = findCommentStart(line) orelse line.len;
+        const code = line[0..code_end];
+
+        const was_in_test = state.in_test;
+        const opener = resolveTestOpener(&state.pending, t, was_in_test, line_num);
+        const neutral = mem.trim(u8, blankLiteralContents(code, &state.blank_buf), " \t\r");
+        const ts = trackTestBlock(neutral, state.in_test or opener.pending_open, state.depth);
+        state.in_test = ts.in_test;
+        state.depth = ts.depth;
+
+        if (!opener.starts_test) continue;
+        const anchor_line = if (opener.pending_open) opener.open_line_num else line_num;
+        const anchor = all_lines.items[anchor_line - 1];
+        try out.append(allocator, .{
+            .file = path,
+            .line = anchor_line,
+            .name = testOpenerName(mem.trim(u8, anchor, " \t\r")),
+        });
+    }
+}
+
+/// Discover every test block across the scanned graph, sorted by file
+/// then line so the output is deterministic across runs.
+fn collectTestBlocks(
+    allocator: Allocator,
+    graph: *ImportGraph,
+) !std.ArrayListUnmanaged(TestBlockInfo) {
+    var out: std.ArrayListUnmanaged(TestBlockInfo) = .empty;
+    errdefer out.deinit(allocator);
+    var iter = graph.files.iterator();
+    while (iter.next()) |entry| {
+        try collectFileTestBlocks(
+            allocator,
+            entry.value_ptr.path,
+            entry.value_ptr.content,
+            &out,
+        );
+    }
+    const less = struct {
+        fn lt(_: void, a: TestBlockInfo, b: TestBlockInfo) bool {
+            const file_order = mem.order(u8, a.file, b.file);
+            if (file_order != .eq) return file_order == .lt;
+            return a.line < b.line;
+        }
+    }.lt;
+    mem.sort(TestBlockInfo, out.items, {}, less);
+    return out;
+}
+
 // --- ZT105: untested public functions (project-level) ---
 // `zig build test` can only report on tests that exist; it cannot see the
 // public API surface no test exercises at all. ZT105 collects every pub fn
@@ -20972,15 +21087,25 @@ fn scanFileForUntestedFns(ctx: *const UntestedFnScanCtx) !void {
     }
 }
 
+/// ZT105 coverage-gate counts (EPH-I1091): every pub fn declaration the
+/// pass collected, and how many no test evidence reached.
+const UntestedFnCounts = struct {
+    decls: usize = 0,
+    unreached: usize = 0,
+};
+
 /// ZT105: report each collected pub fn absent from both evidence sets.
+/// Returns the number of unreached declarations reported.
 fn reportUntestedPubFns(
     allocator: Allocator,
     evidence: *const UntestedFnEvidence,
     issues: *std.ArrayListUnmanaged(Issue),
-) !void {
+) !usize {
+    var unreached: usize = 0;
     for (evidence.decls.items) |decl| {
         if (evidence.tested.contains(decl.name)) continue;
         if (evidence.aliased.contains(decl.name)) continue;
+        unreached += 1;
         const msg = try std.fmt.allocPrint(
             allocator,
             "public function '{s}' is never called from any test",
@@ -21005,6 +21130,7 @@ fn reportUntestedPubFns(
                 "suppresses a same-named pub fn (EPH-I0434)",
         });
     }
+    return unreached;
 }
 
 /// Project-level ZT105 pass: gather test-corpus and alias evidence across
@@ -21017,7 +21143,7 @@ fn analyzeUntestedPubFns(
     graph: *ImportGraph,
     facts_cache: *const std.StringHashMapUnmanaged(FnCallFacts),
     issues: *std.ArrayListUnmanaged(Issue),
-) !void {
+) !UntestedFnCounts {
     var evidence = UntestedFnEvidence{};
     defer evidence.deinit(allocator);
     var iter = graph.files.iterator();
@@ -21034,7 +21160,8 @@ fn analyzeUntestedPubFns(
         try scanFileForUntestedFns(&ctx);
     }
     try addProjectReachableTested(allocator, &evidence, facts_cache);
-    try reportUntestedPubFns(allocator, &evidence, issues);
+    const unreached = try reportUntestedPubFns(allocator, &evidence, issues);
+    return .{ .decls = evidence.decls.items.len, .unreached = unreached };
 }
 
 /// Per-project test-analysis facts: every file's call graph built once
@@ -21073,6 +21200,7 @@ fn collectProjectTestFacts(allocator: Allocator, graph: *ImportGraph) !TestProje
 fn analyzeTests(
     allocator: Allocator,
     graph: *ImportGraph,
+    out_coverage: ?*UntestedFnCounts,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     errdefer deinitIssues(&issues, allocator);
@@ -21091,7 +21219,8 @@ fn analyzeTests(
     }
     // ZT105 judges a pub fn against the WHOLE project's test corpus, so it
     // runs as a second, project-level pass after the per-file scans.
-    try analyzeUntestedPubFns(allocator, graph, &project.cache, &issues);
+    const coverage = try analyzeUntestedPubFns(allocator, graph, &project.cache, &issues);
+    if (out_coverage) |out| out.* = coverage;
     return issues;
 }
 
@@ -35490,6 +35619,7 @@ const Command = enum {
     complexity,
     fmt_check,
     stats,
+    list_tests,
     check,
     runtime,
     help,
@@ -35543,6 +35673,14 @@ const Config = struct {
     // Config "fail_on" is more specific than config "strict"; CLI always wins.
     fail_on: FailOn = .never,
     fail_on_source: FailOnSource = .unset,
+    // Coverage gate (EPH-I1091): the ephor.json "coverage" block. The
+    // static proxy is the ZT105 unreached-pub-fn ratio plus runner
+    // evidence supplied via --coverage-evidence. An absent block (or an
+    // all-unset one) gates nothing: plain check runs stay unchanged.
+    coverage: CoverageConfig = .{},
+    // --coverage-evidence=<file>: a JSON object with the runner's test
+    // counts ({"passed": N, "total": M}), written by the gate script.
+    coverage_evidence_path: ?[]const u8 = null,
     // ZA703 error-name convention. Absent config key = TitleCase (the
     // community standard); "snake_case" restores the pre-flip behavior.
     error_naming: ErrorNaming = .title_case,
@@ -35583,13 +35721,20 @@ const Config = struct {
         self.disabled_rules.deinit(allocator);
         for (self.enabled_rules.items) |r| allocator.free(r);
         self.enabled_rules.deinit(allocator);
-        if (self.export_path) |p| allocator.free(p);
-        if (self.known_issues_path) |p| allocator.free(p);
+        // The optional owned paths free through one loop: each is a plain
+        // ?[]const u8, and batching them keeps the branch count under the
+        // ZA304 cap as the option set grows.
+        const owned_paths = [_]?[]const u8{
+            self.export_path,
+            self.known_issues_path,
+            self.runtime_command,
+            self.error_naming_from_path,
+            self.coverage_evidence_path,
+            self.install_version,
+        };
+        for (owned_paths) |p| if (p) |v| allocator.free(v);
         for (self.known_issues.items) |k| allocator.free(k);
         self.known_issues.deinit(allocator);
-        if (self.runtime_command) |c| allocator.free(c);
-        if (self.error_naming_from_path) |p| allocator.free(p);
-        if (self.install_version) |v| allocator.free(v);
     }
 
     /// Determine if a rule is enabled considering enable list and disable list
@@ -35644,6 +35789,20 @@ const Config = struct {
 };
 
 const CONFIG_FILENAME = "ephor.json";
+
+/// Coverage-gate block (EPH-I1091), parsed from ephor.json "coverage".
+/// `present` distinguishes an absent key from an all-default block.
+/// `unreached_pub_fn_ratio_max` < 0 means unset (no ratio gate);
+/// `min_tests` 0 means unset (no test-count gate). The ratio is a
+/// percentage of ZT105-unreached pub fns over all pub fns the scan
+/// collected; the runner legs evaluate only when --coverage-evidence
+/// supplies the runner's own counts.
+const CoverageConfig = struct {
+    present: bool = false,
+    unreached_pub_fn_ratio_max: f32 = -1.0,
+    min_tests: usize = 0,
+    require_all_passed: bool = false,
+};
 
 /// Report a config parse failure. CI-gate and fail-closed validation errors
 /// are hard (propagated to the caller as usage errors); every other parse
@@ -36791,8 +36950,9 @@ fn parseThresholdsObject(ctx: ConfigParseCtx, start: usize) usize {
 /// containment-checked then discarded by the loader.
 fn isSuppressionGateKey(key: []const u8) bool {
     const keys = [_][]const u8{
-        "disable", "enable", "exclude",    "orphan_exclude",
-        "fail_on", "strict", "thresholds", "error_naming",
+        "disable",  "enable", "exclude",    "orphan_exclude",
+        "fail_on",  "strict", "thresholds", "error_naming",
+        "coverage",
     };
     for (keys) |k| {
         if (mem.eql(u8, key, k)) return true;
@@ -36907,6 +37067,7 @@ fn handleConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !usize {
     }
     if (try parseFailOnConfigKey(ctx, start, key)) |end| return end;
     if (try parseErrorNamingConfigKey(ctx, start, key)) |end| return end;
+    if (try parseCoverageConfigKey(ctx, start, key)) |end| return end;
     return skipJsonValue(content, start);
 }
 
@@ -36963,6 +37124,142 @@ fn parseErrorNamingConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8)
     if (ctx.cfg.error_naming_from_path) |old| ctx.allocator.free(old);
     ctx.cfg.error_naming_from_path = try ctx.allocator.dupe(u8, ctx.source.path);
     return result.end;
+}
+
+/// Handle the ephor.json "coverage" block (null if not that key,
+/// EPH-I1091). The block parses only when the value opens an object;
+/// a non-object value warns and disables the block for the run.
+fn parseCoverageConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !?usize {
+    const content = ctx.content;
+    if (!mem.eql(u8, key, "coverage")) return null;
+    if (start >= content.len or content[start] != '{') {
+        cliDiag(
+            ctx.diag,
+            "warning: {s}: ignoring non-object coverage value (expected an object) — coverage gate off\n",
+            .{CONFIG_FILENAME},
+        );
+        return skipJsonValue(content, start);
+    }
+    ctx.cfg.coverage.present = true;
+    var i = start + 1;
+    while (i < content.len and content[i] != '}') {
+        i = skipWhitespaceAndComments(content, i);
+        if (i >= content.len or content[i] == '}') break;
+        i = try parseCoveragePair(ctx, i);
+    }
+    return if (i < content.len) i + 1 else i;
+}
+
+/// Parse one `"key": value` pair inside the coverage block. Unknown keys
+/// skip their value (warn-and-continue like unknown top-level keys).
+fn parseCoveragePair(ctx: ConfigParseCtx, start: usize) !usize {
+    const content = ctx.content;
+    var i = start;
+    if (i >= content.len or content[i] != '"') return i + 1;
+    const key_result = parseJsonString(content, i);
+    const sep_stop = findKeySeparator(content, key_result.end);
+    if (sep_stop >= content.len or content[sep_stop] != ':') {
+        return skipSeparatorlessPairValue(content, sep_stop);
+    }
+    i = sep_stop + 1;
+    while (i < content.len and (content[i] == ' ' or content[i] == '\t')) i += 1;
+    const key_val = key_result.val;
+    if (mem.eql(u8, key_val, "unreached_pub_fn_ratio_max"))
+        return parseCoverageRatio(ctx, key_val, i);
+    if (mem.eql(u8, key_val, "min_tests"))
+        return parseCoverageMinTests(ctx, key_val, i);
+    if (mem.eql(u8, key_val, "require_all_passed"))
+        return parseCoverageBool(ctx, i);
+    return skipJsonValue(content, i);
+}
+
+/// Parse the unreached_pub_fn_ratio_max float: a digit/dot run. A negative
+/// value is refused (a negative limit can never gate).
+fn parseCoverageRatio(ctx: ConfigParseCtx, key: []const u8, start: usize) usize {
+    const content = ctx.content;
+    var i = start;
+    const num_start = i;
+    while (i < content.len and ((content[i] >= '0' and content[i] <= '9') or
+        content[i] == '.')) i += 1;
+    const raw = content[num_start..i];
+    const val = std.fmt.parseFloat(f32, raw) catch return badCoverageValue(ctx, key, raw, i);
+    if (val < 0) return badCoverageValue(ctx, key, raw, i);
+    ctx.cfg.coverage.unreached_pub_fn_ratio_max = val;
+    return i;
+}
+
+/// Parse the min_tests unsigned count: a digit run, overflow refused.
+fn parseCoverageMinTests(ctx: ConfigParseCtx, key: []const u8, start: usize) usize {
+    const content = ctx.content;
+    var i = start;
+    const num_start = i;
+    while (i < content.len and content[i] >= '0' and content[i] <= '9') i += 1;
+    const raw = content[num_start..i];
+    ctx.cfg.coverage.min_tests = std.fmt.parseInt(usize, raw, 10) catch
+        return badCoverageValue(ctx, key, raw, i);
+    return i;
+}
+
+/// Parse the require_all_passed boolean. A non-boolean value never echoes
+/// (arbitrary config content — the EPH-I0147 terminal-sanitizer class):
+/// a fixed message reports the pair. "trueXYZ" is not the boolean: the
+/// boundary rule mirrors the strict key's (B13-7).
+fn parseCoverageBool(ctx: ConfigParseCtx, start: usize) usize {
+    const content = ctx.content;
+    if (mem.startsWith(u8, content[start..], "true")) {
+        const after = start + 4;
+        if (after >= content.len or isStrictValueBoundary(content[after]) or
+            isStrictCommentBoundary(content, after))
+        {
+            ctx.cfg.coverage.require_all_passed = true;
+            return after;
+        }
+        return badCoverageBool(ctx, start);
+    }
+    if (mem.startsWith(u8, content[start..], "false")) {
+        const after = start + 5;
+        if (after >= content.len or isStrictValueBoundary(content[after]) or
+            isStrictCommentBoundary(content, after))
+        {
+            ctx.cfg.coverage.require_all_passed = false;
+            return after;
+        }
+        return badCoverageBool(ctx, start);
+    }
+    return badCoverageBool(ctx, start);
+}
+
+/// Warn about a non-boolean require_all_passed value and leave the field
+/// at its default.
+fn badCoverageBool(ctx: ConfigParseCtx, i: usize) usize {
+    cliDiag(
+        ctx.diag,
+        "warning: {s}: ignoring invalid coverage 'require_all_passed' value (expected true or false) — runner gate off\n",
+        .{CONFIG_FILENAME},
+    );
+    return i;
+}
+
+/// Warn about one malformed coverage-block value and leave its field at
+/// the default (fail open on the ratio gate, inert runner legs). `raw`
+/// only ever carries digit/dot runs, so echoing it is safe.
+fn warnBadCoverageValue(ctx: ConfigParseCtx, key: []const u8, raw: []const u8) void {
+    cliDiag(
+        ctx.diag,
+        "warning: {s}: ignoring invalid coverage '{s}' value '{s}' — coverage gate off for that key\n",
+        .{ CONFIG_FILENAME, key, raw },
+    );
+}
+
+/// Warn and hand the parse cursor back on a bad coverage value.
+fn badCoverageValue(
+    ctx: ConfigParseCtx,
+    key: []const u8,
+    raw: []const u8,
+    i: usize,
+) usize {
+    warnBadCoverageValue(ctx, key, raw);
+    return i;
 }
 
 /// Handle the "strict"/"fail_on" CI-gate config keys (null if not one of them).
@@ -39018,6 +39315,7 @@ fn parseCommand(cmd: []const u8) ?Command {
         .{ .name = "complexity", .cmd = .complexity },
         .{ .name = "fmt-check", .cmd = .fmt_check },
         .{ .name = "stats", .cmd = .stats },
+        .{ .name = "list-tests", .cmd = .list_tests },
         .{ .name = "check", .cmd = .check },
         .{ .name = "runtime", .cmd = .runtime },
         .{ .name = "init", .cmd = .init },
@@ -40042,6 +40340,8 @@ fn handleOptionalPathArg(
         return setOptionalPath(allocator, &cfg.export_path, arg[9..]);
     if (mem.startsWith(u8, arg, "--known-issues="))
         return setOptionalPath(allocator, &cfg.known_issues_path, arg[15..]);
+    if (mem.startsWith(u8, arg, "--coverage-evidence="))
+        return setOptionalPath(allocator, &cfg.coverage_evidence_path, arg[20..]);
     if (mem.startsWith(u8, arg, "--command=")) {
         try requireCommandScope(diag, cfg, "--command=", command_scope);
         return setOptionalPath(allocator, &cfg.runtime_command, arg[10..]);
@@ -40520,6 +40820,7 @@ fn printHelp() void {
         \\  complexity  Function complexity metrics
         \\  fmt-check   Files needing zig fmt (runs zig fmt --check)
         \\  stats       Project statistics
+        \\  list-tests  Static test-block discovery (the zig runner's twin)
         \\  help        Print the usage text (aliases: --help, -h)
         \\  version     Print the version banner (aliases: --version, -v)
         \\
@@ -40554,6 +40855,10 @@ fn printHelp() void {
         \\  -b, --build          With 'init': also show build.zig integration
         \\  --export=<file>      Export issues to file with code snippets
         \\  --known-issues=<file> Filter out known true positives (file:line format)
+        \\  --coverage-evidence=<file> For 'check': JSON runner counts
+        \\                       ({"passed": N, "total": M}) that feed the
+        \\                       ephor.json coverage block's min_tests and
+        \\                       require_all_passed legs (EPH-I1091)
         \\  --command=<cmd>      For 'runtime': custom command instead of 'zig build test'
         \\  -y, --yes            Skip interactive confirmation (e.g., runtime approval)
         \\  --version=<X.Y.Z>   For 'install'/'upgrade'/'init': pin a specific version
@@ -41404,6 +41709,164 @@ fn applyStrictGate(total: PrintCounts, cfg: *const Config, findings_fail: *bool)
     findings_fail.* = true;
 }
 
+/// Runner test evidence for the coverage gate (EPH-I1091): the counts the
+/// gate script parses from the zig runner's summary and hands to `check`
+/// via --coverage-evidence.
+const CoverageEvidence = struct {
+    passed: usize = 0,
+    total: usize = 0,
+};
+
+/// Read and parse the --coverage-evidence JSON file. Any failure (missing
+/// file, unreadable, malformed, wrong shape) is reported by the caller as
+/// an unevaluated runner leg — never as a silent skip and never as a gate
+/// trip: the file is operator-supplied plumbing, and its breakage must
+/// stop the gate visibly (the gate script greps for the warning).
+fn loadCoverageEvidence(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    path: []const u8,
+) !CoverageEvidence {
+    const content = try Fs.cwd(diag.io).readFileAlloc(allocator, path, 64 * 1024);
+    defer allocator.free(content);
+    var parsed = try std.json.parseFromSlice(CoverageEvidence, allocator, content, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    return parsed.value;
+}
+
+/// Decide whether the coverage block gates this scan (EPH-I1091): the
+/// block is present AND the scan root sits inside the invocation cwd
+/// (where the trusted cwd config lives). A foreign scan target — the
+/// corpus A/B scans, a neighbor project checked from this cwd — runs
+/// ungated: the ratio limit is a self-measurement. A failed cwd realpath
+/// fails open (the scan itself still resolves its root independently).
+fn coverageGateAppliesToScan(ctx: *const RunCtx) bool {
+    if (!ctx.cfg.coverage.present) return false;
+    var cwd_buf: [Fs.max_path_bytes]u8 = undefined;
+    const cwd = Fs.cwd(ctx.diag.io).realpath(".", &cwd_buf) catch return false;
+    return isPathAncestorOrEqual(cwd, ctx.base_path);
+}
+
+/// Read the runner-evidence JSON into the run context (EPH-I1091). A
+/// missing or broken file warns and leaves the runner legs unevaluated —
+/// never a silent skip and never a gate trip: the file is operator-
+/// supplied plumbing, and the gate script fails on the warning.
+fn loadRunCoverageEvidence(ctx: *RunCtx) void {
+    const path = ctx.cfg.coverage_evidence_path orelse return;
+    if (loadCoverageEvidence(ctx.diag, ctx.alloc, path)) |evidence| {
+        ctx.coverage_evidence = evidence;
+    } else |err| {
+        if (ctx.cfg.format == .json) return;
+        std.debug.print(
+            "ephor: coverage: could not read evidence file '{s}': {} — runner legs not evaluated\n",
+            .{ path, err },
+        );
+    }
+}
+
+/// Apply the ephor.json coverage block to one check run (EPH-I1091).
+/// The ratio leg compares the ZT105 unreached-pub-fn percentage against
+/// `unreached_pub_fn_ratio_max`; the runner legs (min_tests,
+/// require_all_passed) evaluate only when --coverage-evidence supplied
+/// the runner's counts. Text mode prints one informational ratio line and
+/// one failure line per tripped leg; JSON mode stays silent (the exit
+/// code carries the gate), the same contract as applyStrictGate.
+fn applyCoverageGate(ctx: *RunCtx, counts: UntestedFnCounts) void {
+    if (!ctx.cfg.coverage.present) return;
+    const ratio = coverageRatio(counts);
+    printCoverageRatio(ctx, counts, ratio);
+    gateCoverageRatio(ctx, ratio);
+    gateCoverageRunnerLegs(ctx);
+}
+
+/// The ZT105 census ratio: unreached pub fns over all collected pub fns,
+/// as a percentage. A zero census reads as a zero ratio (no gate data).
+fn coverageRatio(counts: UntestedFnCounts) f32 {
+    if (counts.decls == 0) return 0.0;
+    return @as(f32, @floatFromInt(counts.unreached)) * 100.0 /
+        @as(f32, @floatFromInt(counts.decls));
+}
+
+/// The informational ratio line (text mode only).
+fn printCoverageRatio(ctx: *const RunCtx, counts: UntestedFnCounts, ratio: f32) void {
+    if (ctx.cfg.format == .json) return;
+    std.debug.print(
+        "ephor: coverage: {d:.2}% of {d} public function{s} unreached by tests (limit {d:.2}%)\n",
+        .{
+            ratio,
+            counts.decls,
+            if (counts.decls == 1) "" else "s",
+            ctx.cfg.coverage.unreached_pub_fn_ratio_max,
+        },
+    );
+}
+
+/// The ratio trip: unreached percentage above the configured maximum.
+fn gateCoverageRatio(ctx: *RunCtx, ratio: f32) void {
+    const limit = ctx.cfg.coverage.unreached_pub_fn_ratio_max;
+    if (limit < 0 or ratio <= limit) return;
+    if (ctx.cfg.format != .json) {
+        std.debug.print(
+            "ephor: coverage gate: unreached ratio {d:.2}% exceeds limit {d:.2}% (exit 1)\n",
+            .{ ratio, limit },
+        );
+    }
+    ctx.coverage_fail = true;
+}
+
+/// The runner-evidence trips: min_tests and require_all_passed. Inert
+/// without evidence — the runner counts are operator-supplied, so absence
+/// is reported, never assumed.
+fn gateCoverageRunnerLegs(ctx: *RunCtx) void {
+    const cov = ctx.cfg.coverage;
+    const evidence = ctx.coverage_evidence orelse {
+        noteCoverageEvidenceAbsent(ctx, cov);
+        return;
+    };
+    gateCoverageMinTests(ctx, cov, evidence);
+    gateCoverageAllPassed(ctx, cov, evidence);
+}
+
+/// The absent-evidence note: fires only when the block sets a runner key
+/// and no --coverage-evidence path was passed at all (a broken path
+/// already warned at load time).
+fn noteCoverageEvidenceAbsent(ctx: *RunCtx, cov: CoverageConfig) void {
+    if (ctx.cfg.format != .json and (cov.min_tests > 0 or cov.require_all_passed) and
+        ctx.cfg.coverage_evidence_path == null)
+    {
+        std.debug.print(
+            "ephor: coverage: runner evidence absent — min_tests/require_all_passed not evaluated (pass --coverage-evidence=<file>)\n",
+            .{},
+        );
+    }
+}
+
+/// The min_tests trip: the runner ran fewer tests than the block demands.
+fn gateCoverageMinTests(ctx: *RunCtx, cov: CoverageConfig, evidence: CoverageEvidence) void {
+    if (cov.min_tests == 0 or evidence.total >= cov.min_tests) return;
+    if (ctx.cfg.format != .json) {
+        std.debug.print(
+            "ephor: coverage gate: {d} test(s) ran, minimum {d} (exit 1)\n",
+            .{ evidence.total, cov.min_tests },
+        );
+    }
+    ctx.coverage_fail = true;
+}
+
+/// The require_all_passed trip: the runner reported a failing test.
+fn gateCoverageAllPassed(ctx: *RunCtx, cov: CoverageConfig, evidence: CoverageEvidence) void {
+    if (!cov.require_all_passed or evidence.passed == evidence.total) return;
+    if (ctx.cfg.format != .json) {
+        std.debug.print(
+            "ephor: coverage gate: {d}/{d} tests passed, all must pass (exit 1)\n",
+            .{ evidence.passed, evidence.total },
+        );
+    }
+    ctx.coverage_fail = true;
+}
+
 /// First pass of issue reporting: classify every finding, account each
 /// suppression into out.suppression, and count what reaches the output.
 /// Kept separate from the printing pass so tests exercise the accounting
@@ -41895,6 +42358,10 @@ const RunCtx = struct {
     should_exit_error: bool = false,
     /// Strict CI gate: findings met the --strict/--fail-on level.
     strict_fail: bool = false,
+    /// Coverage gate (EPH-I1091): the ratio or a runner leg tripped.
+    coverage_fail: bool = false,
+    /// Runner evidence parsed from --coverage-evidence at gate time.
+    coverage_evidence: ?CoverageEvidence = null,
     /// Runtime-prompt abort: return from main without the epilogue (no
     /// update notification, no exit-code application).
     abort_epilogue: bool = false,
@@ -41948,6 +42415,7 @@ const command_table = std.EnumArray(Command, CommandEntry).init(.{
     .complexity = .{ .check_updates = true, .handler = .{ .fallible = handleComplexity } },
     .fmt_check = .{ .check_updates = true, .handler = .{ .fallible = handleFmtCheck } },
     .stats = .{ .check_updates = true, .handler = .{ .fallible = handleStats } },
+    .list_tests = .{ .check_updates = true, .handler = .{ .fallible = handleListTests } },
     .runtime = .{ .check_updates = true, .handler = .{ .fallible = handleRuntime } },
     .check = .{ .check_updates = true, .handler = .{ .fallible = handleCheck } },
 });
@@ -42152,6 +42620,68 @@ fn handleStats(ctx: *RunCtx) !void {
     printStats(g.getStats(), ctx.cfg.format);
 }
 
+/// `list-tests` command: static test discovery over the scanned path. The
+/// count is the gate's cross-check twin for the zig runner's test total
+/// (EPH-I1088). No diagnostics print between the listing and the footer
+/// line, so the JSON stream stays a single machine document.
+fn handleListTests(ctx: *RunCtx) !void {
+    var g = ImportGraph.init(ctx.alloc, ctx.diag);
+    defer g.deinit();
+    g.scan_root = ctx.base_path;
+    try scanPath(&g, ctx.cfg.path);
+    var blocks = try collectTestBlocks(ctx.alloc, &g);
+    defer blocks.deinit(ctx.alloc);
+    printTestListing(ctx.alloc, blocks.items, ctx.cfg.format);
+}
+
+/// Print the discovery listing: one `file:line test "name"` per block in
+/// text mode, a machine object in JSON mode. The final text line carries
+/// the count the gate cross-checks against the runner's total.
+fn printTestListing(
+    allocator: Allocator,
+    blocks: []const TestBlockInfo,
+    format: OutputFormat,
+) void {
+    if (format == .json) {
+        var obj = types.OutBuf{ .allocator = allocator };
+        defer obj.deinit();
+        buildTestListingJson(&obj, allocator, blocks) catch return;
+        std.debug.print("{s}", .{obj.buf.items});
+        return;
+    }
+    for (blocks) |b| {
+        std.debug.print("{s}:{d} test \"{s}\"\n", .{ b.file, b.line, b.name });
+    }
+    std.debug.print(
+        "{d} test block{s} found\n",
+        .{ blocks.len, if (blocks.len == 1) "" else "s" },
+    );
+}
+
+/// Render the list-tests machine object: file, line, and name per block
+/// plus the count. File and name cross escapeJson (repo-derived fields,
+/// EPH-I0146); the line and the count are plain integers.
+fn buildTestListingJson(
+    obj: *types.OutBuf,
+    allocator: Allocator,
+    blocks: []const TestBlockInfo,
+) !void {
+    try obj.buf.appendSlice(allocator, "{\"tests\":[");
+    for (blocks, 0..) |b, i| {
+        if (i > 0) try obj.buf.appendSlice(allocator, ",");
+        var file = try types.escapeJson(allocator, b.file);
+        defer file.deinit(allocator);
+        var name = try types.escapeJson(allocator, b.name);
+        defer name.deinit(allocator);
+        try obj.buf.print(
+            allocator,
+            "{{\"file\":\"{s}\",\"line\":{d},\"name\":\"{s}\"}}",
+            .{ file.slice, b.line, name.slice },
+        );
+    }
+    try obj.buf.print(allocator, "],\"count\":{d}}}\n", .{blocks.len});
+}
+
 /// Render the runtime prompt body (EPH-I0173, EPH-I0212): the scan path
 /// and the command cross sanitizeTerminal before the trust-decision print,
 /// so control bytes in either cannot rewrite the displayed terms. Caller
@@ -42266,6 +42796,8 @@ const CheckFindings = struct {
     test_issues: std.ArrayListUnmanaged(Issue),
     conc_issues: std.ArrayListUnmanaged(Issue),
     ast_stats: ast_tier.Stats,
+    /// ZT105 pub-fn census for the coverage gate (EPH-I1091).
+    coverage: UntestedFnCounts = .{},
 
     fn deinit(self: *CheckFindings, alloc: Allocator) void {
         deinitIssues(&self.orphan_issues, alloc);
@@ -42532,7 +43064,8 @@ fn collectCheckFindings(ctx: *const RunCtx, g: *ImportGraph) !CheckFindings {
     errdefer deinitIssues(&style_issues, alloc);
     var naming_issues = try analyzeNaming(alloc, g, ctx.cfg.error_naming);
     errdefer deinitIssues(&naming_issues, alloc);
-    var test_issues = try analyzeTests(alloc, g);
+    var coverage_counts: UntestedFnCounts = .{};
+    var test_issues = try analyzeTests(alloc, g, &coverage_counts);
     errdefer deinitIssues(&test_issues, alloc);
     var conc_issues = try analyzeConcurrency(alloc, g);
     errdefer deinitIssues(&conc_issues, alloc);
@@ -42554,6 +43087,7 @@ fn collectCheckFindings(ctx: *const RunCtx, g: *ImportGraph) !CheckFindings {
         .test_issues = test_issues,
         .conc_issues = conc_issues,
         .ast_stats = ast_stats,
+        .coverage = coverage_counts,
     };
 }
 
@@ -42605,6 +43139,17 @@ fn reportCheckFindings(ctx: *RunCtx, g: *ImportGraph, findings: *CheckFindings) 
     printResultFooter(counts.total(), ctx.cfg.format);
     // Findings are informational unless --strict/--fail-on gates them.
     applyStrictGate(counts.total(), ctx.cfg, &ctx.strict_fail);
+    // Coverage gate (EPH-I1091): the ratio leg runs on the scan's ZT105
+    // census; the runner legs run only when --coverage-evidence supplied
+    // the runner's counts. The block applies only to the operator's own
+    // tree (the scan root inside the invocation cwd) — a coverage limit
+    // is a self-measurement, never a verdict on a foreign scan target. A
+    // broken evidence file warns (the gate script fails on the warning)
+    // and leaves the runner legs unevaluated.
+    if (coverageGateAppliesToScan(ctx)) {
+        loadRunCoverageEvidence(ctx);
+        applyCoverageGate(ctx, findings.coverage);
+    }
     try exportCheckIssues(ctx, out, findings, &filtered);
 }
 
@@ -42889,7 +43434,7 @@ fn unresolvedScanRootExit(
 /// runEphor's defers hold; the entry wrapper applies the code after
 /// they run.
 fn failedRunExitCode(diag: *DiagCtx, allocator: Allocator, ctx: *const RunCtx) u8 {
-    if (!(ctx.should_exit_error or ctx.strict_fail)) return 0;
+    if (!(ctx.should_exit_error or ctx.strict_fail or ctx.coverage_fail)) return 0;
     if (diag.json_stream) {
         printAbortJson(
             allocator,
@@ -57649,18 +58194,12 @@ test "analyzeCFGMemory no false positive for catch-free-return pattern (ZA105)" 
     var issues = try analyzeCFGMemory(allocator, &graph);
     defer deinitIssues(&issues, allocator);
 
-    // Should NOT detect use-after-free - data is still valid after catch block
+    // Should NOT detect use-after-free - data is still valid after catch
+    // block. Single-file run: assert rule-absence across all issues so an
+    // FP with an empty or mangled file field cannot slip the filter
+    // (band-T02 F-02 shape, EPH-I1102; swept at B64:55450).
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_catch_free_return.zig") and
-            mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
-        {
-            // False positive found - this is the bug that CFG should prevent
-            std.debug.print(
-                "FALSE POSITIVE: {s}:{d}: {s}\n",
-                .{ issue.file, issue.line, issue.message },
-            );
-            try std.testing.expect(false);
-        }
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE));
     }
 }
 
@@ -57723,14 +58262,14 @@ test "analyzeCFGMemory no false positive for proper defer" {
     var issues = try analyzeCFGMemory(allocator, &graph);
     defer deinitIssues(&issues, allocator);
 
-    // Should NOT detect issues for properly deferred allocation
+    // Should NOT detect issues for properly deferred allocation. The run
+    // carries one file path, so a file filter is a no-op — assert
+    // rule-absence across all issues so an FP with an empty or mangled
+    // file field cannot slip the filter (band-T02 F-02 shape, EPH-I1102).
     for (issues.items) |issue| {
-        // Filter to issues from our test file only
-        if (mem.eql(u8, issue.file, "test_good.zig")) {
-            // If we find ZA105 or ZA106 in properly written code, that's a false positive
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE));
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE));
-        }
+        // If we find ZA105 or ZA106 in properly written code, that's a false positive
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE));
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE));
     }
 }
 
@@ -57761,11 +58300,10 @@ test "analyzeCFGMemory no false positive for switch arm frees (ZA106)" {
     var issues = try analyzeCFGMemory(allocator, &graph);
     defer deinitIssues(&issues, allocator);
 
-    // Should NOT detect double-free for switch arm frees
+    // Should NOT detect double-free for switch arm frees. Single-file
+    // run: assert rule-absence across all issues (EPH-I1102).
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_switch_free.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE));
-        }
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE));
     }
 }
 
@@ -57813,11 +58351,10 @@ test "analyzeCFGMemory no false positive for catch/orelse frees (ZA106)" {
     var issues = try analyzeCFGMemory(allocator, &graph);
     defer deinitIssues(&issues, allocator);
 
-    // Should NOT detect double-free for catch/orelse branch frees
+    // Should NOT detect double-free for catch/orelse branch frees.
+    // Single-file run: assert rule-absence across all issues (EPH-I1102).
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_catch_orelse.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE));
-        }
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE));
     }
 }
 
@@ -59881,11 +60418,10 @@ test "analyzeCFGErrdeferCoverage no false positive for proper errdefer (ZA103)" 
     var issues = try analyzeCFGMemory(allocator, &graph);
     defer deinitIssues(&issues, allocator);
 
-    // Should NOT detect ZA103 for properly errdeferred allocation
+    // Should NOT detect ZA103 for properly errdeferred allocation.
+    // Single-file run: assert rule-absence across all issues (EPH-I1102).
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_good_errdefer.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
-        }
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
 
@@ -73332,14 +73868,11 @@ test "integration: no false positive for valid catch-free-return" {
     var issues = try analyzeCFGMemory(allocator, &graph);
     defer deinitIssues(&issues, allocator);
 
-    // Should NOT have any UAF for this valid pattern
+    // Should NOT have any UAF for this valid pattern. Single-file run:
+    // assert rule-absence across all issues so an FP with an empty or
+    // mangled file field cannot slip the filter (EPH-I1102).
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "valid_catch.zig") and
-            mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE))
-        {
-            std.debug.print("FALSE POSITIVE: line {d}: {s}\n", .{ issue.line, issue.message });
-            try std.testing.expect(false); // Fail if we find UAF in valid code
-        }
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE));
     }
 }
 
@@ -74410,7 +74943,7 @@ fn runCheckAnalysisBattery(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !
     defer deinitIssues(&style_issues, allocator);
     var naming_issues = try analyzeNaming(allocator, &g, cfg.error_naming);
     defer deinitIssues(&naming_issues, allocator);
-    var test_issues = try analyzeTests(allocator, &g);
+    var test_issues = try analyzeTests(allocator, &g, null);
     defer deinitIssues(&test_issues, allocator);
     var conc_issues = try analyzeConcurrency(allocator, &g);
     defer deinitIssues(&conc_issues, allocator);
@@ -78233,9 +78766,11 @@ test "analyzeCFGDeferCoverage no false positive for dupe with defer (ZA101)" {
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_dupe_good.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-        }
+        // Should NOT detect a missing defer: the dupe's defer covers the
+        // value. Single-file run: assert rule-absence across all issues
+        // so an FP with an empty or mangled file field cannot slip the
+        // filter (band-T02 F-02 shape, EPH-I1102).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
     }
 }
 
@@ -78276,9 +78811,10 @@ test "analyzeCFGDeferCoverage no false positive for allocPrint with defer (ZA101
     defer deinitIssues(&issues, allocator);
 
     for (issues.items) |issue| {
-        if (mem.eql(u8, issue.file, "test_allocPrint_good.zig")) {
-            try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
-        }
+        // Should NOT detect a missing defer: the allocPrint's defer covers
+        // the value. Single-file run: assert rule-absence across all
+        // issues (band-T02 F-02 shape, EPH-I1102).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
     }
 }
 
@@ -81336,7 +81872,7 @@ test "ZT104 fires on comment-only catch body in test context (I0151)" {
     const analysis = try createTestFileAnalysis(allocator, "zt104_comment_body.zig", test_content);
     try graph.files.put(analysis.path, analysis);
 
-    var issues = try analyzeTests(allocator, &graph);
+    var issues = try analyzeTests(allocator, &graph, null);
     defer deinitIssues(&issues, allocator);
 
     var found = false;
@@ -92078,7 +92614,7 @@ test "analyzer drivers free their issue lists on the happy path (EPH-I0882)" {
 
     var cfg_mem_issues = try analyzeCFGMemory(allocator, &graph);
     defer deinitIssues(&cfg_mem_issues, allocator);
-    var test_issues = try analyzeTests(allocator, &graph);
+    var test_issues = try analyzeTests(allocator, &graph, null);
     defer deinitIssues(&test_issues, allocator);
     var conc_issues = try analyzeConcurrency(allocator, &graph);
     defer deinitIssues(&conc_issues, allocator);
@@ -93963,7 +94499,7 @@ fn runTestQualityCheck(
     const analysis = try createTestFileAnalysis(allocator, path, content);
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, path), {});
-    var issues = try analyzeTests(allocator, &graph);
+    var issues = try analyzeTests(allocator, &graph, null);
     errdefer deinitIssues(&issues, allocator);
     return .{ .graph = graph, .issues = issues };
 }
@@ -95510,7 +96046,7 @@ fn runBothPipelines(
     try graph.reachable.put(try allocator.dupe(u8, path), {});
     var err_issues = try analyzeErrors(allocator, &graph);
     errdefer deinitIssues(&err_issues, allocator);
-    var test_issues = try analyzeTests(allocator, &graph);
+    var test_issues = try analyzeTests(allocator, &graph, null);
     errdefer deinitIssues(&test_issues, allocator);
     return .{
         .graph = graph,
@@ -96051,7 +96587,7 @@ fn runTestQualityCheckFiles(
         try graph.files.put(analysis.path, analysis);
         try graph.reachable.put(try allocator.dupe(u8, f.path), {});
     }
-    var issues = try analyzeTests(allocator, &graph);
+    var issues = try analyzeTests(allocator, &graph, null);
     errdefer deinitIssues(&issues, allocator);
     return .{ .graph = graph, .issues = issues };
 }
@@ -102846,6 +103382,306 @@ test "ZA904: broken ) } continuations in invalid regions stay masked (EPH-I0974)
 // count shape; a table-drive would move both into rows and hide the
 // level-by-level reasoning in a loop. This choice is documented, not
 // pending.
+test "collectTestBlocks discovers named, unnamed, and Allman openers (EPH-I1088)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // One file carries three discoverable shapes: the same-line named
+    // form, the anonymous `test {` form, and the Allman form (brace on
+    // the next line) whose pending opener survives a comment line —
+    // without the masking skip the comment drops the pending opener and
+    // the Allman block vanishes from the count.
+    const content =
+        \\test "named one" {
+        \\}
+        \\test {
+        \\}
+        \\test "allman"
+        \\// comment keeps the pending opener alive
+        \\{
+        \\}
+    ;
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, "listing_a.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "listing_a.zig"), {});
+
+    var blocks = try collectTestBlocks(allocator, &graph);
+    defer blocks.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), blocks.items.len);
+    try std.testing.expectEqualStrings("named one", blocks.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), blocks.items[0].line);
+    try std.testing.expectEqualStrings("", blocks.items[1].name);
+    try std.testing.expectEqual(@as(usize, 3), blocks.items[1].line);
+    try std.testing.expectEqualStrings("allman", blocks.items[2].name);
+    // The Allman anchor is the opener line, not the brace line.
+    try std.testing.expectEqual(@as(usize, 5), blocks.items[2].line);
+}
+
+test "collectTestBlocks sorts by file then line (EPH-I1088)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const b_content = "test \"bee\" {\n}\n";
+    const a_content = "test \"aye\" {\n}\ntest \"aye two\" {\n}\n";
+    const analysis_b = try createTestFileAnalysis(allocator, "listing_b.zig", b_content);
+    try graph.files.put(analysis_b.path, analysis_b);
+    try graph.reachable.put(try allocator.dupe(u8, "listing_b.zig"), {});
+    const analysis_a = try createTestFileAnalysis(allocator, "listing_a.zig", a_content);
+    try graph.files.put(analysis_a.path, analysis_a);
+    try graph.reachable.put(try allocator.dupe(u8, "listing_a.zig"), {});
+
+    var blocks = try collectTestBlocks(allocator, &graph);
+    defer blocks.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), blocks.items.len);
+    try std.testing.expectEqualStrings("listing_a.zig", blocks.items[0].file);
+    try std.testing.expectEqualStrings("aye", blocks.items[0].name);
+    try std.testing.expectEqualStrings("aye two", blocks.items[1].name);
+    try std.testing.expectEqualStrings("listing_b.zig", blocks.items[2].file);
+    try std.testing.expectEqualStrings("bee", blocks.items[2].name);
+}
+
+test "testOpenerName extracts names and skips unnamed forms (EPH-I1088)" {
+    try std.testing.expectEqualStrings("foo", testOpenerName("test \"foo\" {"));
+    try std.testing.expectEqualStrings("foo", testOpenerName("test\"foo\" {"));
+    try std.testing.expectEqualStrings("", testOpenerName("test {"));
+    try std.testing.expectEqualStrings("", testOpenerName("test{"));
+    try std.testing.expectEqualStrings("a\\\"b", testOpenerName("test \"a\\\"b\" {"));
+    try std.testing.expectEqualStrings("", testOpenerName("test \"unterminated"));
+}
+
+test "list-tests JSON listing parses and counts (EPH-I1088)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    const blocks = [_]TestBlockInfo{
+        .{ .file = "src/main.zig", .line = 7, .name = "named one" },
+        .{ .file = "src/main.zig", .line = 12, .name = "" },
+    };
+    var obj = types.OutBuf{ .allocator = allocator };
+    defer obj.deinit();
+    try buildTestListingJson(&obj, allocator, &blocks);
+
+    // The rendered document must re-parse and carry both entries plus the
+    // count — the machine contract the gate's cross-check reads.
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, obj.buf.items, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 2), root.get("count").?.integer);
+    const tests = root.get("tests").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), tests.len);
+    try std.testing.expectEqualStrings(
+        "named one",
+        tests[0].object.get("name").?.string,
+    );
+    try std.testing.expectEqual(@as(i64, 7), tests[0].object.get("line").?.integer);
+}
+
+test "config coverage block parses the three keys (EPH-I1091)" {
+    var diag = testDiagCtx();
+    var cfg = testConfig();
+    defer cfg.deinit(std.testing.allocator);
+    try parseConfigJson(&diag, std.testing.allocator,
+        \\{"coverage": {"unreached_pub_fn_ratio_max": 5.5, "min_tests": 100, "require_all_passed": true}}
+    , &cfg);
+    try std.testing.expect(cfg.coverage.present);
+    try std.testing.expectEqual(@as(f32, 5.5), cfg.coverage.unreached_pub_fn_ratio_max);
+    try std.testing.expectEqual(@as(usize, 100), cfg.coverage.min_tests);
+    try std.testing.expect(cfg.coverage.require_all_passed);
+}
+
+test "config coverage defaults when absent (EPH-I1091 backward compat)" {
+    var diag = testDiagCtx();
+    var cfg = testConfig();
+    defer cfg.deinit(std.testing.allocator);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"fail_on\": \"warning\"}", &cfg);
+    try std.testing.expect(!cfg.coverage.present);
+    try std.testing.expectEqual(@as(f32, -1.0), cfg.coverage.unreached_pub_fn_ratio_max);
+    try std.testing.expectEqual(@as(usize, 0), cfg.coverage.min_tests);
+    try std.testing.expect(!cfg.coverage.require_all_passed);
+}
+
+test "config coverage malformed values warn and default (EPH-I1091)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    var cfg = testConfig();
+    defer cfg.deinit(std.testing.allocator);
+    try parseConfigJson(&diag, std.testing.allocator,
+        \\{"coverage": {"unreached_pub_fn_ratio_max": "abc", "min_tests": -3, "require_all_passed": 1, "unknown_key": 1}}
+    , &cfg);
+    // The block is present, every malformed field keeps its default, and
+    // the unknown key skips without disturbing the parse.
+    try std.testing.expect(cfg.coverage.present);
+    try std.testing.expectEqual(@as(f32, -1.0), cfg.coverage.unreached_pub_fn_ratio_max);
+    try std.testing.expectEqual(@as(usize, 0), cfg.coverage.min_tests);
+    try std.testing.expect(!cfg.coverage.require_all_passed);
+}
+
+test "config coverage non-object value warns and stays off (EPH-I1091)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    var cfg = testConfig();
+    defer cfg.deinit(std.testing.allocator);
+    try parseConfigJson(&diag, std.testing.allocator, "{\"coverage\": 5}", &cfg);
+    try std.testing.expect(!cfg.coverage.present);
+}
+
+test "untrusted config keeps the coverage gate off (EPH-I1091)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    diag.cli_diagnostics_enabled = false;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    try writeTestConfig(dir_path,
+        \\{"coverage": {"unreached_pub_fn_ratio_max": 1.0}, "entries": []}
+    );
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, dir_path);
+    try loadConfigFromTargetPath(&diag, allocator, &cfg, cfg.path);
+    try std.testing.expect(!cfg.coverage.present);
+    try std.testing.expectEqual(@as(usize, 1), diag.untrusted_config_note_count);
+}
+
+test "applyCoverageGate trips the ratio and runner legs (EPH-I1091)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Absent block: the gate is inert even on a lopsided census.
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var ignore_cache = IgnoreCache.init(allocator);
+    defer ignore_cache.deinit();
+    var ctx = RunCtx{
+        .alloc = allocator,
+        .cfg = &cfg,
+        .diag = &diag,
+        .base_path = ".",
+        .ignore_cache = &ignore_cache,
+    };
+    applyCoverageGate(&ctx, .{ .decls = 10, .unreached = 10 });
+    try std.testing.expect(!ctx.coverage_fail);
+
+    // Ratio trip: 20% of the census unreached against a 5% limit.
+    ctx.cfg.coverage = .{ .present = true, .unreached_pub_fn_ratio_max = 5.0 };
+    applyCoverageGate(&ctx, .{ .decls = 10, .unreached = 2 });
+    try std.testing.expect(ctx.coverage_fail);
+
+    // Clean census under the same limit: no trip.
+    ctx.coverage_fail = false;
+    applyCoverageGate(&ctx, .{ .decls = 95, .unreached = 0 });
+    try std.testing.expect(!ctx.coverage_fail);
+
+    // Runner legs: min_tests and require_all_passed with evidence.
+    ctx.cfg.coverage = .{
+        .present = true,
+        .unreached_pub_fn_ratio_max = -1.0,
+        .min_tests = 100,
+        .require_all_passed = true,
+    };
+    ctx.coverage_evidence = .{ .passed = 90, .total = 90 };
+    applyCoverageGate(&ctx, .{});
+    try std.testing.expect(ctx.coverage_fail);
+
+    ctx.coverage_fail = false;
+    ctx.coverage_evidence = .{ .passed = 100, .total = 101 };
+    applyCoverageGate(&ctx, .{});
+    try std.testing.expect(ctx.coverage_fail);
+
+    // All legs satisfied: no trip.
+    ctx.coverage_fail = false;
+    ctx.coverage_evidence = .{ .passed = 100, .total = 100 };
+    applyCoverageGate(&ctx, .{});
+    try std.testing.expect(!ctx.coverage_fail);
+
+    // No evidence: the runner legs are inert, never a trip.
+    ctx.coverage_evidence = null;
+    applyCoverageGate(&ctx, .{});
+    try std.testing.expect(!ctx.coverage_fail);
+}
+
+test "loadCoverageEvidence parses counts and rejects garbage (EPH-I1091)" {
+    const allocator = std.testing.allocator;
+    var diag = testDiagCtx();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "evidence.json",
+        .data = "{\"passed\": 2549, \"total\": 2549, \"extra\": true}",
+    });
+    const good_path = try tmpFilePath(allocator, &tmp, "evidence.json");
+    defer allocator.free(good_path);
+
+    const evidence = try loadCoverageEvidence(&diag, allocator, good_path);
+    try std.testing.expectEqual(@as(usize, 2549), evidence.passed);
+    try std.testing.expectEqual(@as(usize, 2549), evidence.total);
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "broken.json",
+        .data = "not json",
+    });
+    const bad_path = try tmpFilePath(allocator, &tmp, "broken.json");
+    defer allocator.free(bad_path);
+    try std.testing.expectError(
+        error.SyntaxError,
+        loadCoverageEvidence(&diag, allocator, bad_path),
+    );
+    const missing_path = try tmpFilePath(allocator, &tmp, "missing.json");
+    defer allocator.free(missing_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        loadCoverageEvidence(&diag, allocator, missing_path),
+    );
+}
+
+test "coverage gate applies only to the operator's own tree (EPH-I1091)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var ignore_cache = IgnoreCache.init(allocator);
+    defer ignore_cache.deinit();
+    var ctx = RunCtx{
+        .alloc = allocator,
+        .cfg = &cfg,
+        .diag = &diag,
+        .base_path = dir_path,
+        .ignore_cache = &ignore_cache,
+    };
+
+    // Block absent: never applies.
+    try std.testing.expect(!coverageGateAppliesToScan(&ctx));
+
+    // Own tree (under the invocation cwd): applies.
+    ctx.cfg.coverage.present = true;
+    try std.testing.expect(coverageGateAppliesToScan(&ctx));
+
+    // Foreign tree: a neighbor project's ratio is not this project's gate.
+    ctx.base_path = "/some/foreign/tree";
+    try std.testing.expect(!coverageGateAppliesToScan(&ctx));
+}
+
 test "computeExitCode: default (never) passes with warnings" {
     const counts = PrintCounts{ .warnings = 1 };
     try std.testing.expectEqual(@as(u8, 0), computeExitCode(counts, .never));

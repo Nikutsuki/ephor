@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ephor Layer-1 gate (EPH-I1074; serves REL-GATE-2 and REL-AB-5).
 #
-# Steps: fmt, ReleaseSafe build, test ratchet, dogfood ratchet (fail_on:
-# warning posture), corpus A/B (zls/ghostty/sig/tigerbeetle).
+# Steps: fmt, ReleaseSafe build, test ratchet, per-test capture + discovery
+# cross-check, dogfood ratchet (fail_on: warning posture), coverage gate,
+# corpus A/B (zls/ghostty/sig/tigerbeetle).
 #
 # Shape rules (core-rules gate lessons):
 # - Every step writes its command output to a named file under .tmp/gate/.
@@ -120,9 +121,14 @@ STEPS_TOTAL="$(printf '%s\n' "$TESTS_LINE" | sed -nE 's/^Build Summary: ([0-9]+)
 TESTS_BASE="$(awk '$1 == "tests" {print $2}' "$BASELINES")"
 # The baseline must be exactly one decimal token before any arithmetic
 # comparison: the glob rejects empty, non-numeric (the "tests abc" typo
-# class), and multi-line values from duplicated keys in one test.
+# class), and multi-line values from duplicated keys in one test. The
+# ??????????* arm rejects digit runs of 10+ characters ahead of the
+# arithmetic path (EPH-I1128): an intmax-overflow run would pass the
+# token glob and make the -lt comparison fail with bash "integer
+# expression expected" (exit 2), which evaluates false in the elif chain
+# and falls through to the ok branch.
 case "$TESTS_BASE" in
-    '' | *[!0-9]*)
+    '' | *[!0-9]* | ??????????*)
         fail "test ratchet (baseline missing or malformed in $BASELINES)"
         ;;
     *)
@@ -140,6 +146,55 @@ case "$TESTS_BASE" in
         ;;
 esac
 
+# --- 3b. per-test capture (EPH-I1088) ---------------------------------------
+# The build runner hides the test binary's per-test lines at every summary
+# level on a green run (child stderr is captured, not forwarded), so the
+# test binary runs directly: each `i/N name...OK` line is the runner's own
+# per-test evidence and the final "All N tests passed." line carries the
+# total. The same root module and cache namespace as the build test step
+# (--name test) keep the compile cached from leg 3.
+if zig test -ODebug -Mroot=src/main.zig --cache-dir .zig-cache \
+    --global-cache-dir .zenv/cache --name test > "$GATE_DIR/test-perline.log" 2>&1; then
+    ok "test (per-test run completed)"
+else
+    fail "test (per-test run failed; see $GATE_DIR/test-perline.log)"
+fi
+# Interleaved test output can split an OK token onto its own line, so the
+# exact OK count is not load-bearing. The signals that matter: the stream
+# exists, no per-test FAIL line, the last denominator equals the Build
+# Summary total, and the All-passed line agrees.
+PER_FIRST="$(grep -E '^[0-9]+/[0-9]+ ' "$GATE_DIR/test-perline.log" | head -1 || true)"
+PER_N="$(grep -E '^[0-9]+/[0-9]+ ' "$GATE_DIR/test-perline.log" | tail -1 | sed -nE 's|^[0-9]+/([0-9]+) .*|\1|p')"
+ALL_PASSED="$(sed -nE 's/^All ([0-9]+) tests passed\.$/\1/p' "$GATE_DIR/test-perline.log" | tail -1 || true)"
+PER_FAIL="$(grep -cE '^[0-9]+/[0-9]+ .*\.\.\.FAIL' "$GATE_DIR/test-perline.log" || true)"
+if [ -z "$PER_FIRST" ]; then
+    fail "test per-test (no per-test lines captured)"
+elif [ "$PER_FAIL" -ne 0 ]; then
+    fail "test per-test ($PER_FAIL failing line(s); see $GATE_DIR/test-perline.log)"
+elif [ "$PER_N" != "$TESTS_TOTAL" ]; then
+    fail "test per-test (runner denominator ${PER_N:-missing} != $TESTS_TOTAL total)"
+elif [ "$ALL_PASSED" != "$TESTS_TOTAL" ]; then
+    fail "test per-test (All-passed line ${ALL_PASSED:-missing} != $TESTS_TOTAL total)"
+else
+    ok "test per-test ($PER_N lines, all passed)"
+fi
+
+# --- 3c. test discovery cross-check (EPH-I1088) ----------------------------
+# The ephor-side static listing is the runner count's twin: every `i/N`
+# denominator and the Build Summary total must agree with it. A mismatch
+# means either the discovery walk regressed or a test file dropped out of
+# the scan path.
+if ./zig-out/bin/ephor list-tests src/ > "$GATE_DIR/tests-list.txt" 2>&1; then
+    LIST_COUNT="$(sed -nE 's/^([0-9]+) test blocks? found$/\1/p' "$GATE_DIR/tests-list.txt" | tail -1 || true)"
+    if [ "$LIST_COUNT" = "$TESTS_TOTAL" ]; then
+        ok "test discovery (listing $LIST_COUNT == runner $TESTS_TOTAL)"
+    else
+        fail "test discovery (listing ${LIST_COUNT:-missing} != runner $TESTS_TOTAL)"
+    fi
+else
+    fail "test discovery (list-tests failed; see $GATE_DIR/tests-list.txt)"
+fi
+
 # --- 4. dogfood ratchet ----------------------------------------------------
 # fail_on: warning is the intended posture: the check exits 1 while
 # warnings exist. The ratchet is tracked, not green.
@@ -156,10 +211,11 @@ DOGFOOD_EXIT=$?
 set -e
 DOG_COUNT="$(sed -nE 's/^ephor: ([0-9]+) warnings?(, [0-9]+ notes?)? found$/\1/p' "$GATE_DIR/dogfood.log" | tail -1 || true)"
 DOG_BASE="$(awk '$1 == "dogfood" {print $2}' "$BASELINES")"
-# Same token validation as the test ratchet: empty, non-numeric, or
-# multi-line values must fail before any -gt comparison.
+# Same token validation as the test ratchet: empty, non-numeric, 10+
+# character digit runs (EPH-I1128), or multi-line values must fail
+# before any -gt comparison.
 case "$DOG_BASE" in
-    '' | *[!0-9]*)
+    '' | *[!0-9]* | ??????????*)
         fail "dogfood ratchet (baseline missing or malformed in $BASELINES)"
         ;;
     *)
@@ -187,6 +243,32 @@ else
     else
         ok "dogfood fail_on pairing (warnings=$DOG_COUNT, exit=$DOGFOOD_EXIT)"
     fi
+fi
+
+# --- 4b. coverage gate (EPH-I1091) ------------------------------------------
+# The ephor.json coverage block gates the ZT105 unreached-pub-fn ratio
+# inside `check`; --coverage-evidence feeds the runner's counts so
+# min_tests/require_all_passed evaluate. Exit 1 is expected here (fail_on
+# warning plus the dogfood warnings), so the leg reads the coverage lines:
+# a "coverage gate:" line is a trip, a "could not read evidence" line is a
+# plumbing break, and a "coverage:" ratio line is the dogfood-clean ratio.
+if [ -n "$TESTS_PASSED" ] && [ -n "$TESTS_TOTAL" ]; then
+    printf '{"passed": %s, "total": %s}\n' "$TESTS_PASSED" "$TESTS_TOTAL" > "$GATE_DIR/coverage-evidence.json"
+    set +e
+    ./zig-out/bin/ephor check src/ --summary --coverage-evidence="$GATE_DIR/coverage-evidence.json" > "$GATE_DIR/coverage.log" 2>&1
+    set -e
+    if grep -qE '^ephor: coverage gate:' "$GATE_DIR/coverage.log"; then
+        fail "coverage gate (see $GATE_DIR/coverage.log)"
+        grep -E '^ephor: coverage gate:' "$GATE_DIR/coverage.log" >> "$LOG" || true
+    elif grep -q 'could not read evidence file' "$GATE_DIR/coverage.log"; then
+        fail "coverage gate (evidence file broken; see $GATE_DIR/coverage.log)"
+    elif grep -qE '^ephor: coverage:' "$GATE_DIR/coverage.log"; then
+        ok "coverage gate ($(grep -E '^ephor: coverage:' "$GATE_DIR/coverage.log" | tail -1))"
+    else
+        note "coverage gate (no ephor.json coverage block — leg inert; recipe in README)"
+    fi
+else
+    fail "coverage gate (cannot parse test counts for the evidence file)"
 fi
 
 # --- 5. corpus A/B ----------------------------------------------------------

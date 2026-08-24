@@ -334,9 +334,6 @@ const DiagCtx = struct {
     depth_cap_note_count: usize = 0,
     /// Entries-widen-scan notes (EPH-I0784).
     entries_widen_note_count: usize = 0,
-    /// Runtime-band findings dropped by dedup or the total cap (EPH-I0211).
-    /// One note per run, when the count is nonzero.
-    runtime_suppressed_count: usize = 0,
     /// Resident-content budget for the corpus warning (EPH-I0199). Real
     /// monorepos sit far below 1 GiB of Zig source. Hostile amplification
     /// (thousands of near-10 MB files) crosses it. A field, not a const, so
@@ -41828,7 +41825,6 @@ fn handleRuntime(ctx: *RunCtx) !void {
     // EPH-I0211: the dedup/cap note. cliDiag's json latch keeps it off
     // the machine stream (the band precedent: the truncation warning).
     if (suppressed > 0) {
-        ctx.diag.runtime_suppressed_count += 1;
         cliDiag(
             ctx.diag,
             "note: {d} further runtime findings suppressed (duplicates or the cap)\n",
@@ -102485,6 +102481,60 @@ test "isWithinScanRoot fails closed on a null root with one warning (EPH-I0172)"
     const after_first = capture.len;
     try std.testing.expect(!g.isWithinScanRoot("/tmp/repo/y.zig"));
     try std.testing.expectEqual(after_first, capture.len);
+}
+
+test "unresolvedScanRootExit text mode sanitizes the cannot-resolve line (EPH-I1137)" {
+    // RED4-7 regression pin (EPH-I0172 abort half): the scan path may
+    // carry scanned-tree bytes, so the raw-path render must never return.
+    // The error propagates and the captured line carries the sanitized
+    // path (the ESC sequence becomes '?').
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.ScanRootUnresolved,
+        unresolvedScanRootExit(&diag, allocator, "/tmp/scan\x1b[2mroot", error.FileNotFound),
+    );
+    try std.testing.expect(std.mem.indexOfScalar(u8, capture.slice(), 0x1b) == null);
+    try std.testing.expectEqualStrings(
+        "error: cannot resolve scan path '/tmp/scan?[2mroot': FileNotFound\n",
+        capture.slice(),
+    );
+    // Text mode never stashes: the message went to the sink.
+    try std.testing.expectEqual(@as(usize, 0), diag.last_muted_diag_len);
+}
+
+test "unresolvedScanRootExit JSON mode aborts with the sanitized message (EPH-I1137)" {
+    // The same pin in the machine shape: the stream latch mutes the bare
+    // line and stashes the sanitized text, the call returns the error
+    // code, and the abort object that rides the code carries the stashed
+    // message as its message member.
+    var diag = testDiagCtx();
+    diag.json_stream = true;
+    const allocator = std.testing.allocator;
+    const code = try unresolvedScanRootExit(
+        &diag,
+        allocator,
+        "/tmp/scan\x1b[2mroot",
+        error.FileNotFound,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    const stashed = diag.last_muted_diag[0..diag.last_muted_diag_len];
+    try std.testing.expect(std.mem.indexOfScalar(u8, stashed, 0x1b) == null);
+    var obj = types.OutBuf{ .allocator = allocator };
+    defer obj.deinit();
+    try buildAbortJson(&obj, allocator, error.ScanRootUnresolved, stashed);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, obj.buf.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "ScanRootUnresolved",
+        parsed.value.object.get("error").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "error: cannot resolve scan path '/tmp/scan?[2mroot': FileNotFound\n",
+        parsed.value.object.get("message").?.string,
+    );
 }
 
 test "scanDirectory failure routes through the diagnostics channel (EPH-I0213)" {

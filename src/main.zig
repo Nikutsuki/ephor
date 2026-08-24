@@ -41762,7 +41762,7 @@ fn loadRunCoverageEvidence(ctx: *RunCtx) void {
     } else |err| {
         if (ctx.cfg.format == .json) {
             // No diagnostics may print on the machine stream: the exit
-            // code and the abort object carry the failure (EPH-I1147 r1).
+            // code and the abort object carry the failure (EPH-I1091).
             ctx.coverage_fail = true;
             return;
         }
@@ -41797,7 +41797,7 @@ fn coverageRatio(counts: UntestedFnCounts) f32 {
 }
 
 /// The informational ratio line (text mode only). An unset limit reads
-/// "no limit", never the raw negative sentinel (EPH-I1147 r1).
+/// "no limit", never the raw negative sentinel (EPH-I1091).
 fn printCoverageRatio(ctx: *const RunCtx, counts: UntestedFnCounts, ratio: f32) void {
     if (ctx.cfg.format == .json) return;
     const limit = ctx.cfg.coverage.unreached_pub_fn_ratio_max;
@@ -43163,9 +43163,10 @@ fn reportCheckFindings(ctx: *RunCtx, g: *ImportGraph, findings: *CheckFindings) 
     // census; the runner legs run only when --coverage-evidence supplied
     // the runner's counts. The block applies only to the operator's own
     // tree (the scan root inside the invocation cwd) — a coverage limit
-    // is a self-measurement, never a verdict on a foreign scan target. A
-    // broken evidence file warns (the gate script fails on the warning)
-    // and leaves the runner legs unevaluated.
+    // is a self-measurement, never a verdict on a foreign scan target. In
+    // text mode a broken evidence file warns (the gate script fails on
+    // the warning) and leaves the runner legs unevaluated; in JSON mode
+    // the run fails closed with the abort object.
     if (coverageGateAppliesToScan(ctx)) {
         loadRunCoverageEvidence(ctx);
         applyCoverageGate(ctx, findings.coverage);
@@ -103614,7 +103615,7 @@ test "coverage gate applies only to the operator's own tree (EPH-I1091)" {
     try std.testing.expect(!coverageGateAppliesToScan(&ctx));
 }
 
-test "loadRunCoverageEvidence JSON mode fails closed on a broken file (EPH-I1147 r1)" {
+test "loadRunCoverageEvidence JSON mode fails closed on a broken file (EPH-I1091)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");

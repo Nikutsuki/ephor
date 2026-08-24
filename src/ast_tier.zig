@@ -903,13 +903,16 @@ test "ZA111: optional pointer payload address fires (EPH-I0590)" {
 
 test "ZA111: slice slot fields fire, backing memory stays silent (EPH-I1122)" {
     const a = std.testing.allocator;
-    // &v.len / &v.ptr on a by-value slice (or many pointer) address the
-    // len/ptr components of the fat-pointer stack copy — real stack UB.
-    // The pre-fix short-circuit (bind.is_pointer => silent) missed every
-    // slot shape while correctly keeping the backing-memory neighbors
-    // silent: &v[i] addresses caller-owned memory, &v[i].len addresses an
-    // element's own field, &p.len on a *R addresses the pointee's field,
-    // and an inferred local's type is unprovable (FN-only).
+    // &v.len / &v.ptr on a by-value slice address the len/ptr components
+    // of the fat-pointer stack copy — real stack UB. The pre-fix
+    // short-circuit (bind.is_pointer => silent) missed every slot shape
+    // while correctly keeping the backing-memory neighbors silent: &v[i]
+    // addresses caller-owned memory, &v[i].len addresses an element's own
+    // field, &p.len on a *R addresses the pointee's field, and an
+    // inferred local's type is unprovable (FN-only). The many_len_slot
+    // row pins the defensive .many arm: Zig [*]T carries no .len/.ptr
+    // field access, so that fixture cannot compile — the scanner sees
+    // its text regardless and the arm fires defensively.
     var issues = try runZa111(a,
         \\fn len_slot(v: []u32) *usize {
         \\    return &v.len;

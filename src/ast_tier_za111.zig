@@ -1001,15 +1001,17 @@ fn chainIsUnsafe(sctx: ScanCtx, info: ChainInfo, bind: Bind) bool {
 }
 
 /// The slot-address discrimination for pointer/slice roots (EPH-I1122):
-/// a lone `.len`/`.ptr` field hop on a slice root (or on a many
-/// pointer — `[*]T` carries the same fat-pointer slot) addresses the
-/// pointer value stored in the root's own stack slot, so the chain is
-/// unsafe. Every other hop shape stays caller-owned memory and silent:
-/// an index into the backing array (`&v[i]`), a pointee field through a
+/// a lone `.len`/`.ptr` field hop on a slice root addresses the pointer
+/// value stored in the root's own stack slot, so the chain is unsafe.
+/// Every other hop shape stays caller-owned memory and silent: an index
+/// into the backing array (`&v[i]`), a pointee field through a
 /// single-item pointer (`&p.len` on a `*S` addresses `(*S).len`), and any
 /// deeper chain (`&v[i].len` addresses the element's field). A root whose
 /// type is unprovable from the AST (an inferred local) stays silent too —
-/// the FN-only direction.
+/// the FN-only direction. The `.many` arm is defensive coverage only:
+/// Zig's `[*]T` carries no `.len`/`.ptr` field access (std.mem.len scans
+/// for a sentinel), so `&p.len` on a many-pointer binding is a compile
+/// error — the scanner sees the text regardless and fires defensively.
 fn finalHopIsOwnSlot(sctx: ScanCtx, info: ChainInfo, bind: Bind) bool {
     if (info.hop_count != 1) return false;
     const field = switch (info.hops[0]) {

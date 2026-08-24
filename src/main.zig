@@ -10081,10 +10081,13 @@ fn predArmFreesTrackedVar(ctx: *const FreeScanCtx, pred: usize) bool {
 /// AND the chain root sits on every continuing path. The walk follows
 /// branch_false in-edges: the skip path of one link is the predecessor
 /// header's branch_true arm, so every predecessor's arm must free. A
-/// non-freeing prefix arm (the prefix path runs no second free), a
-/// nested chain root (an enclosing arm's other paths skip the whole
-/// chain), and a loop-false exit all keep the conditional grade — the
-/// safe direction.
+/// loop header joins the walk only when its false exit wires a
+/// branch_true (the loop body): the body span must then free and the
+/// loop header must dominate the construct. A non-freeing prefix arm
+/// (the prefix path runs no second free), a nested chain root (an
+/// enclosing arm's other paths skip the whole chain), and a
+/// chain-inside-a-loop zero-trip exit all keep the conditional grade
+/// through the root's reachability check — the safe direction.
 fn headerOnEveryPathOrChainArmsFree(ctx: *const FreeScanCtx, header: usize) !bool {
     if (try blockOnEveryContinuingPath(ctx.allocator, ctx.cfg, header)) return true;
     var cur = header;

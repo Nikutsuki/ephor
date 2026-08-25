@@ -9806,12 +9806,14 @@ fn detectErrdeferDirectFree(
 }
 
 /// Collect frees registered through single-line `errdefer free(x);`
-/// statements. Frees inside `errdefer { ... }` blocks are excluded: the
-/// block closes (disarming the errdefer) before any later direct free can
-/// pair with it. A CONDITIONAL errdefer free (`errdefer if (flag)
+/// statements — the issue's named class (EPH-I0006). Frees inside
+/// `errdefer { ... }` blocks are excluded because the collection walk
+/// matches only the single-line prefix: the block IS the deferred
+/// expression (it runs at scope exit on error and disarms nothing), so a
+/// block-body free is a real pairing candidate the single-line walk never
+/// sees — accepted FN. A CONDITIONAL errdefer free (`errdefer if (flag)
 /// free(x);`) is excluded too: the guard flag couples the free to an
-/// ownership handoff the line model cannot track, and the unguarded shape
-/// is the issue's named class (EPH-I0006). Accepted FN: a guarded
+/// ownership handoff the line model cannot track. Accepted FN: a guarded
 /// errdefer whose guard stays true past a direct free still double-frees.
 fn collectErrdeferFrees(
     allocator: Allocator,
@@ -9837,6 +9839,10 @@ fn collectErrdeferFrees(
         try frees.append(allocator, .{
             .line = ctx.func_line + idx,
             .indent = countIndent(line),
+            // Informational only: the errdefer pairing grades every pair
+            // warning unconditionally (each errdefer free is path-
+            // conditional by nature), so no consumer reads this field for
+            // errdefer entries.
             .is_conditional = true,
         });
     }
@@ -9889,13 +9895,17 @@ fn pairDirectFreeWithErrdefers(
 ///
 /// Reachability guard (EPH-I0006 FP class): only a fallible statement
 /// inside the free's innermost block is credited. The first line at a
-/// shallower indent closes that block — past it, code runs either when
-/// the free did not run (an else arm) or after the free's branch
-/// terminated (`if (c) { free(x); return true; }`), so the errdefer is
-/// disarmed or single-firing there. Accepted FNs: a bare-block wrapper
-/// around the free and a brace-less branch body both stop the scan
-/// early, and a bare `return e;` / `catch |e| return e;` propagation is
-/// not a trigger at all (EPH-I0006).
+/// shallower indent closes that block and the walk stops there. Past the
+/// close a later fallible statement may double-free on the paths where
+/// the free ran — a conditional free without a return (`if (c) {
+/// free(x); } try f();`) double-fires on the c-true error path — or may
+/// run only where the free did not run (an else-arm error return, a
+/// return-before-close branch). The line model cannot tell those apart,
+/// so the stop prefers silence over a wrong warning. Accepted FNs: the
+/// conditional-free-without-return shape, a bare-block wrapper around the
+/// free, a brace-less branch body, and a bare `return e;` /
+/// `catch |e| return e;` propagation, which is not a trigger at all
+/// (EPH-I0006).
 fn hasFallibleStatementAfter(
     lines: []const []const u8,
     from_line: usize,
@@ -30993,8 +31003,9 @@ fn lineDeclaresSignedVar(ctx: []const u8, var_name: []const u8) bool {
 /// not apply (a float decrement cannot wrap an unsigned integer into the
 /// sentinel the rule guards against). Mirrors isSignedVarInContext's
 /// 10-line window and boundary-ident walk (EPH-I0018). An inferred float
-/// (`var score = 0.0;`) has no annotation and stays unflagged — accepted
-/// false positive, the annotation-only scope the issue names.
+/// (`var score = 0.0;`) carries no annotation, so the suppression cannot
+/// engage and the decrement still fires — accepted false positive, the
+/// annotation-only scope the issue names.
 fn isFloatVarInContext(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
     const check_start = if (current_idx > 10) current_idx - 10 else 0;
     for (lines[check_start .. current_idx + 1]) |line| {
@@ -31006,6 +31017,9 @@ fn isFloatVarInContext(lines: []const []const u8, current_idx: usize, var_name: 
 
 /// True when any identifier-bounded occurrence of `var_name` on the line
 /// is followed by a float type annotation (`var x: f64 = 0` — EPH-I0018).
+/// The list is the issue's named set: f16, f32, f64, comptime_float. An
+/// f80 or f128 annotation is not suppressed, so a decrement on those
+/// still fires — accepted residual, the issue did not name them.
 fn lineDeclaresFloatVar(ctx: []const u8, var_name: []const u8) bool {
     const float_types = [_][]const u8{ ": f16", ": f32", ": f64", ": comptime_float" };
     var from: usize = 0;

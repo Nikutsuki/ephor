@@ -947,6 +947,13 @@ fn isArmHeaderLine(t: []const u8) bool {
 
 /// Detect the control-flow pattern of a trimmed line; first table match
 /// wins, and non-control lines fall through to the catch and prong tests.
+/// Documented approximation (EPH-I0750): a whole switch on one line
+/// (`switch (v) { 1 => { x = 1; }, _ => {}, }`) matches the switch_start
+/// table entry first, so no prong line dispatches handleSwitchArm and the
+/// arm bodies attribute to the header block. The unformatted single-line
+/// shape is rare; zig fmt expands it to the multi-line form that scans
+/// correctly (the EPH-I0679 machinery). The pin lives in the buildCFG
+/// switch test family.
 fn detectCFPattern(t: []const u8) CFPattern {
     const trimmed = mem.trim(u8, t, " \t\r");
 
@@ -28158,10 +28165,19 @@ fn startsWithVerdict(code: []const u8, comptime verdict: []const u8) bool {
 /// Probe for a split catch verdict (EPH-I0152): the valid multi-line form
 /// `foo() catch\n    unreachable;` puts the verdict on a following code
 /// line. Only the FIRST code line past blank/comment padding can carry it
-/// — anything else means the catch payload is that line's expression.
+/// — anything else means the catch payload is that line's expression. A
+/// split payload (EPH-I0308) puts a `|err|` capture on that line before
+/// the verdict (`foo() catch\n    |err| unreachable;`): the capture is
+/// stripped and the remainder judged as the verdict. A leading `|` with
+/// no closing pipe is not a capture, and the probe stays silent.
 fn probeSplitVerdict(next_lines: []const []const u8, comptime verdict: []const u8) bool {
     const code = firstCodeLine(next_lines) orelse return false;
-    return startsWithVerdict(code, verdict);
+    var candidate = mem.trimStart(u8, code, " \t");
+    if (candidate.len > 0 and candidate[0] == '|') {
+        const close = mem.indexOfScalarPos(u8, candidate, 1, '|') orelse return false;
+        candidate = mem.trimStart(u8, candidate[close + 1 ..], " \t");
+    }
+    return startsWithVerdict(candidate, verdict);
 }
 
 /// ZA202: catch unreachable will panic on error
@@ -28251,9 +28267,17 @@ fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u
     // unreachable;` closes the opener, so the catch is runtime code and
     // must not suppress. A closed opener is skipped; an earlier opener
     // may still hold the catch open.
-    var i = pos;
-    while (i > 0) {
-        i -= 1;
+    // Mask the scan to code positions (EPH-I0929): opener text inside a
+    // string is data. The pre-fix backward scan accepted it, and
+    // parensStayOpen then started mid-string with QuoteMode .none, so the
+    // string's closing quote inverted the mask and skipped real parens —
+    // `const s = "@TypeOf(x"; y() catch unreachable;` suppressed a
+    // runtime catch. The forward walk checks every code-position opener;
+    // the predicate is existence, so the order is irrelevant.
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var i: usize = 0;
+    while (i < pos) : (i += 1) {
+        _ = lit.updateForChar(t, i) orelse continue;
         const opener_len: usize = if (i + 8 <= t.len and mem.eql(u8, t[i .. i + 8], "@TypeOf("))
             8
         else if (i + 7 <= t.len and mem.eql(u8, t[i .. i + 7], "@typeOf("))
@@ -28261,8 +28285,6 @@ fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u
         else
             continue;
         if (parensStayOpen(t, i + opener_len, pos)) return true;
-        // The opener closed before the catch — keep scanning left for an
-        // earlier opener that may still hold it.
     }
     // Multi-line: accumulate paren depth from current line backwards.
     // If we find @TypeOf( on a line where depth > 0, we're nested inside it.
@@ -35508,12 +35530,17 @@ fn parseDirective(comment: []const u8) Directive {
     return .{ .kind = directiveKind(body[0..tok_end]), .rest = rest };
 }
 
-/// Classify a comment's first token as a directive keyword. The legacy
-/// `disable-*` forms (e.g. disable-next-line) are line directives that never
-/// fall back to bare all-rule suppression.
+/// Classify a comment's first token as a directive keyword. `ephor:ignore`
+/// and `ephor:disable` are aliases, and their `-next-line` forms alias the
+/// same kinds (EPH-I0250): `ignore-next-line` is no longer inert, and a
+/// bare `disable-next-line` suppresses all rules exactly like a bare
+/// `ephor:ignore`. Unknown `disable-*` variants stay line directives that
+/// never fall back to bare all-rule suppression.
 fn directiveKind(tok: []const u8) Directive.Kind {
     if (mem.eql(u8, tok, "ephor:ignore")) return .ignore;
+    if (mem.eql(u8, tok, "ephor:ignore-next-line")) return .ignore;
     if (mem.eql(u8, tok, "ephor:disable")) return .disable;
+    if (mem.eql(u8, tok, "ephor:disable-next-line")) return .disable;
     if (mem.eql(u8, tok, "ephor:ignore-file")) return .ignore_file;
     if (mem.startsWith(u8, tok, "ephor:disable-")) return .disable_variant;
     return .none;
@@ -41231,6 +41258,9 @@ fn printHelp() void {
         \\  // ephor:ignore ZA201       (above fn/block: suppresses entire scope)
         \\  // ephor:ignore-file ZA201  (suppresses rule for entire file)
         \\  // ephor:ignore             (omit rule to suppress all)
+        \\  // ephor:ignore-next-line   (alias of ephor:ignore, all forms)
+        \\  // ephor:disable            (legacy alias of ephor:ignore)
+        \\  // ephor:disable-next-line  (legacy alias of ephor:ignore)
         \\  Rule ids match exactly: ZA3 does not suppress ZA301. Config
         \\  disable/enable accept category prefixes. Directives do not.
         \\  Doc comments (/// and //!) never carry directives (B13-13/14).
@@ -41278,6 +41308,9 @@ fn printHelp() void {
         \\                     ZA607: read-before-assign, semantic check)
         \\  ZA7xx  Style      (ZA701: line-too-long, ZA702: file-too-long,
         \\                     ZA703: naming)
+        \\    ZA701 counts columns outside string literals: a line whose
+        \\    code fits the limit stays silent when a long string tail
+        \\    runs past it. Split code that exceeds the limit with ++.
         \\  ZR1xx  Runtime    (ZR101: memory-leak, ZR102: double-free,
         \\                     ZR103: use-after-free, ZR104: test-failure,
         \\                     ZR105: panic, ZR106: signal-death)
@@ -46674,6 +46707,26 @@ test "parseCommandIntoArgv strips quotes and honors escapes (EPH-I0507)" {
     try std.testing.expectEqual(@as(usize, 2), parsed2.argc);
     try std.testing.expect(!parsed2.truncated);
     try std.testing.expectEqualStrings("it's", buf[1]);
+}
+
+test "parseCommandIntoArgv unclosed quote consumes the tail; tabs split (EPH-I0244)" {
+    var buf: [64][]const u8 = undefined;
+    var scratch: [1024]u8 = undefined;
+    // An unterminated quote consumes the rest of the command as one
+    // token; the quote byte itself is stripped (the d383904 contract,
+    // EPH-I0244). The pre-fix tokenizer kept the quote bytes and lumped
+    // the remainder into the last token silently.
+    const parsed = parseCommandIntoArgv("\"echo", &buf, &scratch);
+    try std.testing.expectEqual(@as(usize, 1), parsed.argc);
+    try std.testing.expect(!parsed.truncated);
+    try std.testing.expectEqualStrings("echo", buf[0]);
+    // A tab splits unquoted tokens exactly like a space; inside quotes a
+    // tab is a literal byte.
+    const parsed2 = parseCommandIntoArgv("a\tb\t\"c\td\"", &buf, &scratch);
+    try std.testing.expectEqual(@as(usize, 3), parsed2.argc);
+    try std.testing.expectEqualStrings("a", buf[0]);
+    try std.testing.expectEqualStrings("b", buf[1]);
+    try std.testing.expectEqualStrings("c\td", buf[2]);
 }
 
 test "parseCommandIntoArgv fits exactly 64 tokens without truncation" {
@@ -62174,6 +62227,28 @@ test "isInlineDisabled detects disable-next-line" {
     try std.testing.expect(!isInlineDisabled(content, 4, "ZA201"));
 }
 
+test "next-line aliases suppress; bare disable-next-line suppresses all (EPH-I0250)" {
+    const content =
+        \\// ephor:ignore-next-line ZA201
+        \\const x = foo() catch {};
+        \\// ephor:disable-next-line
+        \\const y = foo() catch {};
+        \\const z = val orelse unreachable;
+    ;
+    // The ignore-next-line directive on line 1 suppresses line 2. The
+    // pre-fix directiveKind returned .none for the token, so this
+    // assertion is the RED for the inert form.
+    try std.testing.expect(isInlineDisabled(content, 2, "ZA201"));
+    // The bare disable-next-line on line 3 suppresses all rules on
+    // line 4, symmetric with a bare ephor:ignore. The pre-fix
+    // ruleListMatches gate rejected the empty rule list, so these two
+    // assertions are the RED for the bare form.
+    try std.testing.expect(isInlineDisabled(content, 4, "ZA201"));
+    try std.testing.expect(isInlineDisabled(content, 4, "ZA203"));
+    // Line 5 sits past the one-line reach of both directives.
+    try std.testing.expect(!isInlineDisabled(content, 5, "ZA203"));
+}
+
 test "ephor:ignore suppresses same-line issue" {
     const content =
         \\const x = foo() catch {}; // ephor:ignore ZA201
@@ -63699,6 +63774,40 @@ test "buildCFG: int, range, discard, and string prongs open arm blocks (EPH-I067
             return error.TestUnexpectedResult;
         try std.testing.expect(cfgHasEdge(&cfg, str_header, arm, .branch_true));
     }
+}
+
+test "buildCFG: single-line switch arms attribute to the header (EPH-I0750 approximation)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    const lines = [_][]const u8{
+        "fn f(x: u8) void {", // 1
+        "    switch (x) { 1 => { g(); }, _ => { h(); }, }", // 2
+        "}", // 3
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    // EPH-I0750 documented approximation: a whole switch on one line
+    // classifies as switch_start only, so no prong dispatches an arm
+    // block and the arm bodies attribute to the header block. The
+    // idiomatic per-line prong form (EPH-I0679) opens arm blocks. This
+    // pin flips when prong dispatch lands, forcing the doc update.
+    const single_line = "switch (v) { 1 => { x = 1; }, _ => {}, }";
+    try std.testing.expectEqual(CFPattern.switch_start, detectCFPattern(single_line));
+    // The same line's code-position arrow satisfies the prong test, so
+    // the table ordering owns the residual, not the prong detector.
+    try std.testing.expect(isSwitchArmLine(single_line));
+    // The CFG evidence: the header block owns line 2 and branches to no
+    // arm block.
+    const header = findBlockForLine(&cfg, 2) orelse return error.TestUnexpectedResult;
+    var arm_edges: usize = 0;
+    for (cfg.edges.items) |e| {
+        if (e.from == header and e.kind == .branch_true) arm_edges += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), arm_edges);
 }
 
 test "buildCFG: arrow text in a body string opens no phantom arm (EPH-I0679)" {
@@ -82385,6 +82494,52 @@ test "ZA202 silent when payload precedes an unrelated unreachable (I0152 pin)" {
     try std.testing.expect(issue == null);
 }
 
+test "ZA202 fires through a split payload (EPH-I0308)" {
+    // `foo() catch NEWLINE |err| unreachable;`: the catch line carries no
+    // verdict, and the payload capture sits between catch and verdict.
+    // Pre-fix the probe judged only the first code line's start, saw the
+    // capture, and stayed silent (the RED for this pin).
+    const next = [_][]const u8{"    |err| unreachable;"};
+    const issue = checkCatchUnreachable(.{
+        .t = "const x = bar() catch",
+        .path = "test.zig",
+        .line = 1,
+        .preceding_lines = null,
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue != null);
+    try std.testing.expectEqualStrings(RULE_CATCH_UNREACHABLE, issue.?.rule);
+}
+
+test "ZA202 silent when a split payload carries real handling (EPH-I0308 pin)" {
+    // The capture strips, but the remainder is the payload's handling,
+    // not the verdict: the catch does not panic.
+    const next = [_][]const u8{"    |err| return err;"};
+    const issue = checkCatchUnreachable(.{
+        .t = "const x = bar() catch",
+        .path = "test.zig",
+        .line = 1,
+        .preceding_lines = null,
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue == null);
+}
+
+test "ZA207 fires through a split payload (EPH-I0308 shared probe)" {
+    // The probe is shared with ZA207; the payload-strip must hold for
+    // the undefined verdict too.
+    const next = [_][]const u8{"    |err| undefined;"};
+    const issue = checkCatchUndefined(.{
+        .t = "const x = bar() catch",
+        .path = "test.zig",
+        .line = 1,
+        .preceding_lines = null,
+        .next_lines = &next,
+    });
+    try std.testing.expect(issue != null);
+    try std.testing.expectEqualStrings(RULE_CATCH_UNDEFINED, issue.?.rule);
+}
+
 test "ZA202 silent when split verdict sits past the window (I0152 bound)" {
     const next = [_][]const u8{ "", "// a", "", "// b", "    unreachable;" };
     const issue = checkCatchUnreachable(.{
@@ -84013,7 +84168,7 @@ test "banner tokens past the head do not mark a file generated (EPH-I1062)" {
     ));
 }
 
-test "ZA701 exempts lines over-length solely due to string literals" {
+test "ZA701 exempts lines over-length solely due to string literals (EPH-I0267)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
@@ -84119,6 +84274,26 @@ test "ZA701: a long CJK comment line is silent, a long ASCII+CJK line fires (EPH
 test "isInsideTypeOf detects @TypeOf context" {
     try std.testing.expect(isInsideTypeOf("const T = @TypeOf(foo() catch unreachable);", 30, null));
     try std.testing.expect(!isInsideTypeOf("const x = foo() catch unreachable;", 22, null));
+}
+
+test "isInsideTypeOf ignores a string-carried @TypeOf opener (EPH-I0929)" {
+    // The opener scan must match at code positions: `@TypeOf(` inside a
+    // string is data, and the catch after it is runtime code. The pre-fix
+    // backward scan accepted the string text, and parensStayOpen then
+    // started mid-string with QuoteMode .none, so the string's closing
+    // quote inverted the mask and the catch suppressed (the RED).
+    const line = "const s = \"@TypeOf(x\"; y() catch unreachable;";
+    const col = mem.indexOf(u8, line, "catch").?;
+    try std.testing.expect(!isInsideTypeOf(line, col, null));
+    // Control: the same catch without the string-carried opener text is
+    // still runtime code.
+    const plain = "const s = 1; y() catch unreachable;";
+    const plain_col = mem.indexOf(u8, plain, "catch").?;
+    try std.testing.expect(!isInsideTypeOf(plain, plain_col, null));
+    // Control: a REAL @TypeOf opener at a code position still suppresses.
+    const real = "const T = @TypeOf(foo() catch unreachable);";
+    const real_col = mem.indexOf(u8, real, "catch").?;
+    try std.testing.expect(isInsideTypeOf(real, real_col, null));
 }
 
 test "isInsideTypeOf detects multi-line @TypeOf with inner call spanning lines" {

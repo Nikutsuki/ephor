@@ -39444,16 +39444,20 @@ const ThresholdsSpan = struct {
 /// (EPH-I0511). The key and both braces are located in code position: a
 /// comment or a string value mentioning "thresholds" cannot retarget the
 /// splice, and a `}` inside a string value of the object cannot close the
-/// span early. The value after the key's colon must OPEN with a code `{`
-/// (EPH-I0065): in `{"thresholds": 5, "x": {...}}` the pre-fix scan bound
-/// the NEXT object's brace and migrateThresholds inserted keys into the
-/// wrong object, so a scalar or string value now fails closed. Whitespace
-/// and `//` comments between the colon and the brace stay allowed.
+/// span early. The value walk starts past the actual separator, so
+/// whitespace between the key and its colon stays valid; the first code
+/// byte after it must be a `{` (EPH-I0065). In `{"thresholds": 5,
+/// "x": {...}}` the pre-fix scan bound the NEXT object's brace and
+/// migrateThresholds inserted keys into the wrong object, so a scalar or
+/// string value now fails closed. Whitespace and `//` comments between
+/// the colon and the brace stay allowed.
 fn findThresholdsSpan(content: []const u8) ?ThresholdsSpan {
     const key_pos = findConfigKey(content, "\"thresholds\"") orelse return null;
     // findConfigKey accepts the key only when a `:` separates it, so the
-    // scan resumes just past that colon (EPH-I0065).
-    const brace_start = findValueOpener(content, key_pos + "\"thresholds\"".len + 1);
+    // separator lookup reuses that guarantee and the value walk starts
+    // past the real colon, not a fixed offset past the key (EPH-I1171).
+    const sep = findKeySeparator(content, key_pos + "\"thresholds\"".len);
+    const brace_start = findValueOpener(content, sep + 1);
     if (brace_start >= content.len or content[brace_start] != '{') return null;
     const brace_end = findConfigObjectEnd(content, brace_start) orelse return null;
     return .{ .brace_start = brace_start, .brace_end = brace_end };
@@ -77392,6 +77396,30 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\{
         \\  "thresholds": // keys for the complexity gate
         \\  {
+        \\    "max_function_lines": 50,
+        \\    "max_cyclomatic": 10,
+        \\    "max_cognitive": 15
+        \\  }
+        \\}
+        ,
+    },
+    .{
+        // EPH-I1171: findConfigKey accepts whitespace between the key and
+        // its colon (findKeySeparator walks past spaces), so the
+        // migration must too. The F3 walk started at a fixed offset past
+        // the key, landed on the colon, and silently skipped this valid
+        // hand-edited shape.
+        .name = "spaced colon between the key and its value still migrates (EPH-I1171)",
+        .input =
+        \\{
+        \\  "thresholds" : {
+        \\    "max_function_lines": 50
+        \\  }
+        \\}
+        ,
+        .expected =
+        \\{
+        \\  "thresholds" : {
         \\    "max_function_lines": 50,
         \\    "max_cyclomatic": 10,
         \\    "max_cognitive": 15

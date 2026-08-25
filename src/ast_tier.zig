@@ -228,14 +228,17 @@ const NestingScan = struct {
 /// nesting and sequential right-recursion runs. The run counter
 /// increments on `! - ~ & ? *`, on `-%`, on `[`, on `anyframe->`, and on
 /// the right-recursive keywords (grammar-audit table below). It resets
-/// only at statement boundaries (`;`, `=`, `,`), where the frames of a
-/// prefix chain provably return. It never resets on whitespace,
-/// identifiers, or delimiters: prefix frames stay live across the
-/// operand, and error-union chains interleave operators with operands.
-/// Over-counting is deliberate and fail-safe. Infix chains of `- & *`,
-/// deep index chains, and keyword-dense statements can force a skip. A
-/// skip degrades one file to line-tier coverage. An under-count defeats
-/// only this gate. The byte cap and the parse stack absorb it
+/// only at statement boundaries (`;`, `,`, a bare assignment `=`), where
+/// the frames of a prefix chain provably return. Two-char `=` tokens
+/// (`+=`, `==`, `=>`, `<=`, ...) are not boundaries (EPH-I0269): the
+/// while-continue shape keeps its while frame live across the `+=`, and
+/// a reset there would under-count live parser frames. It never resets
+/// on whitespace, identifiers, or delimiters: prefix frames stay live
+/// across the operand, and error-union chains interleave operators with
+/// operands. Over-counting is deliberate and fail-safe. Infix chains of
+/// `- & *`, deep index chains, and keyword-dense statements can force a
+/// skip. A skip degrades one file to line-tier coverage. An under-count
+/// defeats only this gate. The byte cap and the parse stack absorb it
 /// (EPH-I0268). Operators inside strings, char literals, `\\`
 /// multiline bodies, and `//` comments are data and do not count.
 ///
@@ -273,7 +276,12 @@ const NestingScan = struct {
 ///   switch prongs                      iterative list    not counted
 ///   defer/errdefer payloads            block statements  not counted
 ///   fn declarations `fn name(`         container loop    not counted
-///   statement boundary `;` `=` `,`     frames return     resets run
+///   statement boundary `;` `,` or a    frames return     resets run
+///   bare `=` (two-char `=` tokens      (EPH-I0269)
+///   — `+=`, `==`, `=>`, `<=`, ... —
+///   are not boundaries: the while-
+///   continue shape keeps its frame
+///   live across `+=`)
 ///   strings/chars/comments/`\\` bodies data              masked
 fn exceedsNestingBudget(source: []const u8, budget: usize) bool {
     var scan = NestingScan{};
@@ -353,14 +361,14 @@ fn scanCodeChar(line: []const u8, i: *usize, scan: *NestingScan) void {
 
 /// Identifiers keep the run: error-union chains interleave operands with
 /// `!`, and infix `- & *` sequences must over-count toward a safe skip.
-/// Only statement boundaries (`;`, `=`, `,`) reset: every other non-word
-/// char can sit inside an operand (`.` `@` `:` in types) where parent
-/// operator frames are still live (audit table, hole A). Right-recursive
-/// keywords increment. `anyframe` arms the arrow watch.
+/// Only statement boundaries (`;`, `,`, a bare `=`) reset: every other
+/// non-word char can sit inside an operand (`.` `@` `:` in types) where
+/// parent operator frames are still live (audit table, hole A). Two-char
+/// `=` tokens keep the run (EPH-I0269). Right-recursive keywords
+/// increment. `anyframe` arms the arrow watch.
 fn scanWordOrReset(line: []const u8, i: *usize, scan: *NestingScan) void {
     if (!types.isIdent(line[i.*])) {
-        const c = line[i.*];
-        if (c == ';' or c == '=' or c == ',') scan.run = 0;
+        if (isRunBoundary(line, i.*)) scan.run = 0;
         return;
     }
     const start = i.*;
@@ -385,6 +393,31 @@ fn scanWordOrReset(line: []const u8, i: *usize, scan: *NestingScan) void {
         scan.arrow_run = scan.run;
         scan.run = 0;
     }
+}
+
+/// True when the char at `i` ends the current prefix chain: `;`, `,`, or
+/// a bare assignment `=`. Two-char `=` tokens are not boundaries
+/// (EPH-I0269): the while-continue shape `while (c) : (i += 1)` keeps its
+/// while frame live across the `+=`, and an early reset there under-counts
+/// the frames the parser still holds.
+fn isRunBoundary(line: []const u8, i: usize) bool {
+    const c = line[i];
+    if (c == ';' or c == ',') return true;
+    if (c != '=') return false;
+    return !isEqPartOfTwoCharToken(line, i);
+}
+
+/// True when the `=` at `i` belongs to a two-char token: a compound
+/// assignment (`+=`, `<<=`, ...), a comparison (`==`, `!=`, `<=`, `>=`),
+/// or the switch-prong arrow `=>`. The token's other half sits
+/// immediately before the `=` (or after it, for `==` and `=>`), so the
+/// neighbor byte marks it (EPH-I0269).
+fn isEqPartOfTwoCharToken(line: []const u8, i: usize) bool {
+    const compound_prev = "+-*/%&|^!<>==";
+    const compound_next = "=>";
+    if (i > 0 and mem.indexOfScalar(u8, compound_prev, line[i - 1]) != null) return true;
+    if (i + 1 < line.len and mem.indexOfScalar(u8, compound_next, line[i + 1]) != null) return true;
+    return false;
 }
 
 /// True when the next non-space char after `i` is `(`: the fn-type form.
@@ -462,6 +495,11 @@ pub fn analyzeFileAstTier(
 // Tests
 // ============================================================================
 
+// The suite-join shim is an include, not a test: its body calls nothing
+// by design (EPH-I0601). ZT106 names test blocks whose body carries no
+// call site, so the shim carries the same directive the main.zig shim
+// carries (EPH-I1152).
+// ephor:ignore ZT106
 test {
     // Test-reference idiom: the ast_tier_za111 split's tests must join
     // the suite (EPH-I0601). Body-only references do not force analysis
@@ -1119,6 +1157,35 @@ test "exceedsNestingBudget: broken anyframe watch restores the parked run (EPH-I
     // discarding them, so chains past the break keep counting.
     try std.testing.expect(exceedsNestingBudget("?anyframe.x*", 1));
     try std.testing.expect(!exceedsNestingBudget("?anyframe.x*", 2));
+}
+
+test "exceedsNestingBudget: !anyframe arrow-break restores the parked run (EPH-I0269)" {
+    // The `!` prefix parks while a bare `anyframe` operand resolves, and
+    // the non-arrow break restores the parked frames (EPH-I0599). The
+    // `!anyframe` spelling is the pre-scan under-count shape the issue
+    // names; `?anyframe` above pins the same restore via the `?` prefix.
+    try std.testing.expect(exceedsNestingBudget("!anyframe.x*", 1));
+    try std.testing.expect(!exceedsNestingBudget("!anyframe.x*", 2));
+}
+
+test "exceedsNestingBudget: two-char = tokens keep the run, bare = resets (EPH-I0269)" {
+    // The while-continue shape keeps its while frame live across the
+    // `+=`; reading the compound token's `=` as a boundary reset the run
+    // while the frames stayed on the parser stack (under-count). Nested
+    // chains pin the fix: the run reaches 2 across the `+=`, `==`, and
+    // `>=` tokens while the depth never leaves 1.
+    try std.testing.expect(exceedsNestingBudget("while (a) : (b += 1) while (c) : (d += 1) f();", 1));
+    try std.testing.expect(!exceedsNestingBudget("while (a) : (b += 1) while (c) : (d += 1) f();", 2));
+    // Comparison forms carry the same live frame.
+    try std.testing.expect(exceedsNestingBudget("if (a == b) if (c == d) f();", 1));
+    try std.testing.expect(!exceedsNestingBudget("if (a == b) if (c == d) f();", 2));
+    try std.testing.expect(exceedsNestingBudget("while (i >= 10) while (j >= 10) f();", 1));
+    try std.testing.expect(!exceedsNestingBudget("while (i >= 10) while (j >= 10) f();", 2));
+    // The switch-prong arrow `=>` never resets a live outer chain.
+    try std.testing.expect(exceedsNestingBudget("if (a) switch (x) { 1 => try f() };", 1));
+    try std.testing.expect(!exceedsNestingBudget("if (a) switch (x) { 1 => try f() };", 2));
+    // A bare assignment still resets: each `!` run ends at the `=`.
+    try std.testing.expect(!exceedsNestingBudget("!!!!x = !!!!y;", 4));
 }
 
 /// Valid Zig with `n` nested grouped expressions: `const x = (((1)));`.

@@ -95,6 +95,7 @@ pub const RULE_TEST_NO_ASSERTIONS = "ZT102";
 pub const RULE_TEST_TRIVIAL_ASSERT = "ZT103";
 pub const RULE_TEST_SWALLOWED_ERROR = "ZT104";
 pub const RULE_TEST_UNTESTED_PUBLIC_FN = "ZT105";
+pub const RULE_TEST_NO_CALLS = "ZT106";
 
 // ZC1xx - Concurrency
 pub const RULE_LOCK_NO_DEFER_UNLOCK = "ZC101";
@@ -476,8 +477,35 @@ pub fn deinitIssues(
     issues.deinit(allocator);
 }
 
+/// Path separator test accepting both '/' and the host separator, so
+/// containment checks behave on Windows, where both forms appear.
+/// Private: only isPathAncestorOrEqual calls it.
+fn isPathSep(c: u8) bool {
+    return c == '/' or c == std.fs.path.sep;
+}
+
+/// Component-boundary "ancestor or same" test on two paths. A raw
+/// startsWith would accept "/repo-evil" for root "/repo" (RED4-3 shape);
+/// the byte after the matched prefix must be a separator. The test strips
+/// trailing separators from `ancestor` first, so both forms of a directory
+/// name match. Moved from main.zig (EPH-I0176) so relativePath can guard
+/// its strip without importing main.zig. The B89 serialized tail adopted
+/// this copy in main.zig and deleted the private duplicate there.
+pub fn isPathAncestorOrEqual(ancestor: []const u8, path: []const u8) bool {
+    var root = ancestor;
+    while (root.len > 1 and isPathSep(root[root.len - 1]))
+        root = root[0 .. root.len - 1];
+    if (mem.eql(u8, root, path)) return true;
+    if (root.len == 0 or path.len <= root.len) return false;
+    if (!mem.startsWith(u8, path, root)) return false;
+    return isPathSep(path[root.len]) or isPathSep(root[root.len - 1]);
+}
+
 pub fn relativePath(path: []const u8, base: []const u8) []const u8 {
-    if (mem.startsWith(u8, path, base)) {
+    // Strip base only on a component boundary (EPH-I0176): a raw prefix
+    // strip mangles "/repo-evil/x.zig" for base "/repo" into
+    // "-evil/x.zig". A path outside the base renders in full instead.
+    if (isPathAncestorOrEqual(base, path)) {
         var result = path[base.len..];
         while (result.len > 0 and result[0] == '/') {
             result = result[1..];
@@ -699,6 +727,32 @@ pub fn skipWhitespace(
 test "relativePath removes base" {
     const result = relativePath("/foo/bar/baz.zig", "/foo/bar");
     try std.testing.expectEqualStrings("baz.zig", result);
+}
+
+test "relativePath strips base only on a component boundary (EPH-I0176)" {
+    // A raw prefix strip would mangle "/repo-evil/x.zig" for base
+    // "/repo" into "-evil/x.zig"; the guarded form renders the full
+    // path instead.
+    try std.testing.expectEqualStrings("/repo-evil/x.zig", relativePath("/repo-evil/x.zig", "/repo"));
+    try std.testing.expectEqualStrings("sub/file.zig", relativePath("/repo/sub/file.zig", "/repo"));
+    try std.testing.expectEqualStrings("/repo", relativePath("/repo", "/repo"));
+    try std.testing.expectEqualStrings("x.zig", relativePath("/repo/x.zig", "/repo/"));
+    try std.testing.expectEqualStrings("x.zig", relativePath("/x.zig", "/"));
+    // An empty base is no base: the guarded semantics return the path
+    // unchanged (the deleted main.zig copy behaved the same, EPH-I0176).
+    try std.testing.expectEqualStrings("/abs/x.zig", relativePath("/abs/x.zig", ""));
+}
+
+test "isPathAncestorOrEqual requires a component boundary (EPH-I0176)" {
+    try std.testing.expect(isPathAncestorOrEqual("/repo", "/repo"));
+    try std.testing.expect(isPathAncestorOrEqual("/repo", "/repo/sub/file"));
+    try std.testing.expect(isPathAncestorOrEqual("/", "/anything"));
+    try std.testing.expect(!isPathAncestorOrEqual("/repo", "/repo-evil/x"));
+    try std.testing.expect(!isPathAncestorOrEqual("/repo/sub", "/repo"));
+    try std.testing.expect(!isPathAncestorOrEqual("", "/repo"));
+    try std.testing.expect(isPathAncestorOrEqual("/repo/", "/repo"));
+    try std.testing.expect(isPathAncestorOrEqual("/repo/", "/repo/x"));
+    try std.testing.expect(!isPathAncestorOrEqual("/repo/", "/repo-evil"));
 }
 
 test "countOccurrences counts correctly" {

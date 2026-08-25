@@ -547,10 +547,7 @@ const RULE_TEST_NO_ASSERTIONS = types.RULE_TEST_NO_ASSERTIONS;
 const RULE_TEST_TRIVIAL_ASSERT = types.RULE_TEST_TRIVIAL_ASSERT;
 const RULE_TEST_SWALLOWED_ERROR = types.RULE_TEST_SWALLOWED_ERROR;
 const RULE_TEST_UNTESTED_PUBLIC_FN = types.RULE_TEST_UNTESTED_PUBLIC_FN;
-// ZT106 is main.zig-local: the batch's file set excludes types.zig, where
-// the sibling ZT constants live. Move it into types.zig when a batch owns
-// that file (the tracker note on EPH-I1089 carries the follow-up).
-const RULE_TEST_NO_CALLS = "ZT106";
+const RULE_TEST_NO_CALLS = types.RULE_TEST_NO_CALLS;
 const RULE_LOCK_NO_DEFER_UNLOCK = types.RULE_LOCK_NO_DEFER_UNLOCK;
 const RULE_DOUBLE_LOCK = types.RULE_DOUBLE_LOCK;
 const RULE_UNLOCK_WITHOUT_LOCK = types.RULE_UNLOCK_WITHOUT_LOCK;
@@ -571,6 +568,7 @@ const countOccurrences = types.countOccurrences;
 const countLines = types.countLines;
 const isIdent = types.isIdent;
 const isInsideString = types.isInsideString;
+const isPathAncestorOrEqual = types.isPathAncestorOrEqual;
 const LineClassifier = types.LineClassifier;
 const skipWhitespace = types.skipWhitespace;
 
@@ -35391,22 +35389,6 @@ fn parseLocationLine(text: []const u8, file_end: usize) ?usize {
 // Utilities
 // ============================================================================
 
-fn relativePath(path: []const u8, base: []const u8) []const u8 {
-    // Strip base only on a component boundary: a raw prefix strip would
-    // mangle "/repo-evil/x.zig" for base "/repo" (RED4-3 shape).
-    if (path.len >= base.len and isPathAncestorOrEqual(base, path)) {
-        var rel = path[base.len..];
-        while (rel.len > 0 and rel[0] == '/') rel = rel[1..];
-        if (rel.len > 0) return rel;
-    }
-    // Try to strip common absolute path prefix
-    if (mem.indexOf(u8, path, "/src/")) |idx| {
-        return path[idx + 1 ..];
-    }
-    // Return as-is if we can't make it relative
-    return path;
-}
-
 // countOccurrences, countLines, isIdent imported from types.zig
 
 // isInsideString imported from types.zig
@@ -37641,27 +37623,6 @@ fn skipWhitespaceAndComments(content: []const u8, start: usize) usize {
         }
     }
     return i;
-}
-
-/// Path separator test accepting both '/' and the host separator, so
-/// containment checks behave on Windows, where both forms appear.
-fn isPathSep(c: u8) bool {
-    return c == '/' or c == std.fs.path.sep;
-}
-
-/// Component-boundary "ancestor or same" test on two paths. A raw
-/// startsWith would accept "/repo-evil" for root "/repo" (RED4-3 shape);
-/// the byte after the matched prefix must be a separator. The test strips
-/// trailing separators from `ancestor` first, so both forms of a directory
-/// name match.
-fn isPathAncestorOrEqual(ancestor: []const u8, path: []const u8) bool {
-    var root = ancestor;
-    while (root.len > 1 and isPathSep(root[root.len - 1]))
-        root = root[0 .. root.len - 1];
-    if (mem.eql(u8, root, path)) return true;
-    if (root.len == 0 or path.len <= root.len) return false;
-    if (!mem.startsWith(u8, path, root)) return false;
-    return isPathSep(path[root.len]) or isPathSep(root[root.len - 1]);
 }
 
 /// True when every byte of `s` is printable ASCII (0x20..0x7E inclusive).
@@ -44043,17 +44004,6 @@ test "isIdent" {
     try std.testing.expect(isIdent('0'));
     try std.testing.expect(!isIdent(' '));
     try std.testing.expect(!isIdent('-'));
-}
-
-test "relativePath" {
-    try std.testing.expectEqualStrings(
-        "api/core.zig",
-        relativePath("/home/user/project/src/api/core.zig", "/home/user/project/src"),
-    );
-    try std.testing.expectEqualStrings(
-        "src/main.zig",
-        relativePath("/foo/bar/src/main.zig", "/other/path"),
-    );
 }
 
 test "ImportGraph.isSkippableDir skips dot-prefixed directories" {

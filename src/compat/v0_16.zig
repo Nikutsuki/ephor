@@ -1217,6 +1217,113 @@ test "checkDeprecated flags the removed GeneralPurposeAllocator (EPH-I0612)" {
     try std.testing.expect(checkDeprecated(canonical) == null);
 }
 
+// The v0_15 table tests mirror here with 0.16 expectations (EPH-I0245).
+// The fifth class of the filing, arrayListAppend, needs no mirror: B72
+// deleted the dormant wrapper from both version modules (feb7499).
+
+test "checkDeprecated flags the generic linked-list spellings (EPH-I1118)" {
+    // 0.15 de-genericified the linked lists, so the generic `(T)` spelling
+    // is the deprecated form (ZAV205/ZAV206).
+    const singly = "const node = std.SinglyLinkedList(u32).Node{};";
+    const singly_result = checkDeprecated(singly);
+    try std.testing.expect(singly_result != null);
+    try std.testing.expectEqualStrings("ZAV205", singly_result.?.rule);
+    const doubly = "var list = std.DoublyLinkedList(u8){};";
+    const doubly_result = checkDeprecated(doubly);
+    try std.testing.expect(doubly_result != null);
+    try std.testing.expectEqualStrings("ZAV206", doubly_result.?.rule);
+    // The non-generic form must NOT be flagged.
+    const canonical = "var list = std.SinglyLinkedList{};";
+    try std.testing.expect(checkDeprecated(canonical) == null);
+}
+
+test "checkDeprecated flags the deprecated ArrayListUnmanaged alias (F5)" {
+    // 0.15 made ArrayList the unmanaged default, so the Unmanaged
+    // spelling is the deprecated form (ZAV207).
+    const line = "var list = std.ArrayListUnmanaged(u8){};";
+    const result = checkDeprecated(line);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("ZAV207", result.?.rule);
+    // The canonical form must NOT be flagged.
+    const canonical = "var list = std.ArrayList(u8){};";
+    try std.testing.expect(checkDeprecated(canonical) == null);
+}
+
+test "vocabulary no_free_init_patterns is non-empty" {
+    try std.testing.expect(no_free_init_patterns.len > 0);
+}
+
+test "vocabulary no_free_field_type_patterns covers ArenaAllocator and FixedBufferAllocator" {
+    try std.testing.expect(no_free_field_type_patterns.len > 0);
+    var found_arena = false;
+    var found_fba = false;
+    for (no_free_field_type_patterns) |p| {
+        if (std.mem.eql(u8, p, "std.heap.ArenaAllocator")) found_arena = true;
+        if (std.mem.eql(u8, p, "std.heap.FixedBufferAllocator")) found_fba = true;
+    }
+    try std.testing.expect(found_arena);
+    try std.testing.expect(found_fba);
+}
+
+test "vocabulary all_init_patterns includes MemoryPool and omits the removed 0.16 names" {
+    var found_pool = false;
+    var found_gpa = false;
+    var found_threadsafe = false;
+    for (all_init_patterns) |p| {
+        if (std.mem.eql(u8, p, "MemoryPool(")) found_pool = true;
+        // 0.16 removed both names from std.heap; they exist only as
+        // deprecated patterns (ZAV202/ZAV208).
+        if (std.mem.eql(u8, p, "GeneralPurposeAllocator(")) found_gpa = true;
+        if (std.mem.eql(u8, p, "ThreadSafeAllocator.init(")) found_threadsafe = true;
+    }
+    try std.testing.expect(found_pool);
+    try std.testing.expect(!found_gpa);
+    try std.testing.expect(!found_threadsafe);
+}
+
+/// Parity assertion for EPH-I0246: a deprecated spelling and a current
+/// init/vocab string must not coincide, and the deprecated string must
+/// not sit inside the candidate.
+fn expectNoDeprecatedOverlap(deprecated: []const u8, candidate: []const u8) !void {
+    try std.testing.expect(!std.mem.eql(u8, deprecated, candidate));
+    try std.testing.expect(std.mem.indexOf(u8, candidate, deprecated) == null);
+}
+
+test "deprecated and init/vocab tables agree per symbol (EPH-I0246)" {
+    // A symbol listed as both a current init/vocab pattern and a
+    // deprecated spelling would flag canonical code (the filing's GPA
+    // and SinglyLinkedList contradictions). The parity check holds
+    // exact-match disjointness and forbids a deprecated string inside a
+    // valid string. The reverse direction is by design and stays out:
+    // the valid non-generic "SinglyLinkedList"/"DoublyLinkedList" names
+    // sit inside the deprecated generic markers "SinglyLinkedList("/
+    // "DoublyLinkedList(", "ArrayListUnmanaged(" inside
+    // "std.ArrayListUnmanaged(", and "c_allocator" inside
+    // "raw_c_allocator" — each pair flags only the deprecated spelling.
+    for (deprecated_patterns) |dep| {
+        for (allocator_types) |t| {
+            try expectNoDeprecatedOverlap(dep.pattern, t.name);
+            try expectNoDeprecatedOverlap(dep.pattern, t.full_path);
+            try expectNoDeprecatedOverlap(dep.pattern, t.init_pattern);
+        }
+        for (global_allocators) |g| {
+            try expectNoDeprecatedOverlap(dep.pattern, g.name);
+            try expectNoDeprecatedOverlap(dep.pattern, g.full_path);
+        }
+        for (alloc_methods) |m| try expectNoDeprecatedOverlap(dep.pattern, m.pattern);
+        for (cleanup_methods) |m| try expectNoDeprecatedOverlap(dep.pattern, m.pattern);
+        for (container_methods) |m| try expectNoDeprecatedOverlap(dep.pattern, m.pattern);
+        for (no_free_init_patterns) |p| try expectNoDeprecatedOverlap(dep.pattern, p);
+        for (no_free_field_type_patterns) |p| try expectNoDeprecatedOverlap(dep.pattern, p);
+        for (all_init_patterns) |p| try expectNoDeprecatedOverlap(dep.pattern, p);
+        for (global_alloc_names) |p| try expectNoDeprecatedOverlap(dep.pattern, p);
+        for (alloc_method_patterns) |p| try expectNoDeprecatedOverlap(dep.pattern, p);
+        for (alloc_method_short_names) |p| try expectNoDeprecatedOverlap(dep.pattern, p);
+        for (stdlib_container_init_patterns) |p| try expectNoDeprecatedOverlap(dep.pattern, p);
+        for (managed_container_type_patterns) |p| try expectNoDeprecatedOverlap(dep.pattern, p);
+    }
+}
+
 test "managed_container_type_patterns: heap-backed in, inline-storage out" {
     var found_arraylist = false;
     var found_hashmap = false;

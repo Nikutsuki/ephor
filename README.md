@@ -66,6 +66,11 @@ If you already have the `ephor-upgrade` step in `build.zig`:
 zig build ephor-upgrade
 ```
 
+On Zig 0.15.x, the install and upgrade commands — standalone and via
+`zig build ephor-upgrade` — refuse with a named error. No ephor release
+newer than v0.11.13 builds with this Zig. Use install.sh instead. It
+detects the Zig version and installs v0.11.13 for 0.15.x projects.
+
 ### Upgrade Integrity
 
 The first install or upgrade fetches whatever the release tag points to.
@@ -1001,7 +1006,7 @@ Install the **Run on Save** extension, then add to `.vscode/settings.json`:
 | Code | Meaning |
 |------|---------|
 | 0 | Analysis completed; no findings at the configured fail-on level |
-| 1 | Usage error (no entry points, bad arguments, init/install failures), findings met the `--strict`/`--fail-on` level, or a declined runtime prompt |
+| 1 | Usage error (no entry points, bad arguments, init/install failures), findings met the `--strict`/`--fail-on` level, a declined runtime prompt, or a runtime run that could not start |
 
 Findings are informational by default: `ephor check` exits 0 whether or not issues are found. For CI gating, opt into strict mode:
 
@@ -1013,7 +1018,7 @@ Findings are informational by default: `ephor check` exits 0 whether or not issu
 | `--fail-on=note` | `"fail_on": "note"` | any finding, notes included |
 | `--fail-on=never` | `"fail_on": "never"` | never — lets the CLI override a strict config off |
 
-CLI flags override `ephor.json` — including a target-directory `ephor.json` loaded for the analyzed path. Inside one config file, `fail_on` is more specific than `strict` and wins regardless of key order. An invalid fail-on value — in the CLI flag or in any `ephor.json` — is a usage error (exit 1): a misspelled CI gate must never fail open. When the gate trips, the footer says so, e.g. `ephor: strict mode: failing with 12 warnings (exit 1)`. A declined runtime prompt exits 1 by design: the analysis did not run, so a CI pipeline without `--yes` fails instead of passing silently (see [Run dynamic analysis](#run-dynamic-analysis)).
+CLI flags override `ephor.json` — including a target-directory `ephor.json` loaded for the analyzed path. Inside one config file, `fail_on` is more specific than `strict` and wins regardless of key order. An invalid fail-on value — in the CLI flag or in any `ephor.json` — is a usage error (exit 1): a misspelled CI gate must never fail open. When the gate trips, the footer says so, e.g. `ephor: strict mode: failing with 12 warnings (exit 1)`. A declined runtime prompt exits 1 by design: the analysis did not run, so a CI pipeline without `--yes` fails instead of passing silently (see [Run dynamic analysis](#run-dynamic-analysis)). A runtime run that could not start — a spawn failure, a capture overflow, or a missing target directory — also exits 1, regardless of `fail_on`: the analysis never ran, so a CI gate must not pass on it.
 
 ## Examples
 
@@ -1524,6 +1529,7 @@ Every ephor release is validated against five scenarios before tagging:
 | Fresh install | 0.15.2 | No ephor | Installs v0.11.13, `zig build ephor` passes |
 | Upgrade | 0.16.0 | v0.11.x snippet | Upgrades to v0.14.x, old snippet replaced with canonical block |
 | Upgrade | 0.15.2 | v0.11.x snippet | Upgrades to v0.11.13, old snippet replaced with canonical block |
+| Build-step upgrade | 0.15.2 | ephor dependency present | Refuses with a named error; install.sh pins v0.11.13 |
 | Re-run | 0.16.0 | v0.14.3 canonical | Idempotent — block replaced with identical content, zon pin unchanged |
 
 ### Running the Tests Locally

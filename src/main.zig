@@ -38259,9 +38259,10 @@ fn checkProjectPrerequisites(diag: *DiagCtx, project_dir: std.Io.Dir) bool {
 /// Network boundary for install/upgrade (band-T05 F5, EPH-I0572): every
 /// hermetic install/upgrade test must fail before this point. The
 /// no-network test property rests on the callers' validation order
-/// (version, floor, prerequisites, dependency before the fetch), not on an
-/// injected spawn seam. A reorder that reaches this spawn turns the
-/// hermetic tests into network clients inside the test runner.
+/// (version, prerequisites, dependency, and Zig-version gates before the
+/// fetch), not on an injected spawn seam. A reorder that reaches this
+/// spawn turns the hermetic tests into network clients inside the test
+/// runner.
 fn runZigFetchSave(diag: *DiagCtx, project_dir: std.Io.Dir, url_z: [:0]const u8) !u8 {
     var child = try std.process.spawn(diag.io, .{
         .argv = &.{ tool_zig_path, "fetch", "--save=ephor", url_z },
@@ -38269,6 +38270,99 @@ fn runZigFetchSave(diag: *DiagCtx, project_dir: std.Io.Dir, url_z: [:0]const u8)
     });
     const term = try child.wait(diag.io);
     return term.exited;
+}
+
+/// Cap on the captured `zig version` output (EPH-I0239). A release
+/// toolchain prints one short line; the cap bounds a hostile PATH zig.
+const zig_version_capture_limit_bytes = 4096;
+
+/// Newest ephor release a Zig below the 0.16.0 floor can build
+/// (EPH-I0239). Every remote tag v0.12.3 and later declares
+/// minimum_zig_version 0.16.0, and the 0.16 migration landed in v0.12.0,
+/// so v0.11.13 is the newest 0.15-era release. install.sh carries the
+/// same pin (EPHOR_0_15_COMMIT, install.sh:89).
+const zig015_era_release = "v0.11.13";
+
+/// Minor version of the ephor Zig floor (EPH-I0239): ephor 0.15.0
+/// requires Zig 0.16.0, so a detected 0.15.x toolchain cannot build any
+/// release the install/upgrade fetch can land.
+const zig_version_floor_minor: u32 = 16;
+
+/// Run `zig version` on the resolved tool path and parse the leading
+/// MAJOR.MINOR components (EPH-I0239). The spawn uses the same zig the
+/// fetch child will use, so the gate sees the toolchain that would build
+/// the fetched release. Returns null when the spawn fails or the output
+/// does not parse: the caller treats undetectable as proceed, mirroring
+/// install.sh's default-to-latest warning.
+fn detectZigVersion(io: std.Io, allocator: Allocator) ?[2]u32 {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ tool_zig_path, "version" },
+        .stdout_limit = .limited(zig_version_capture_limit_bytes),
+        .stderr_limit = .limited(zig_version_capture_limit_bytes),
+    }) catch return null;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) return null;
+    return parseZigVersionOutput(result.stdout);
+}
+
+/// Parse the leading MAJOR.MINOR components of a `zig version` line
+/// (EPH-I0239). Dev toolchains print "0.16.0-dev.1645+<hash>": the minor
+/// still names the release family, so the parse cuts the minor at the
+/// first non-digit. Returns null when either leading component is
+/// missing or non-numeric (install.sh's undetectable-warning shape).
+fn parseZigVersionOutput(out: []const u8) ?[2]u32 {
+    const trimmed = mem.trim(u8, out, " \t\r\n");
+    var it = mem.splitScalar(u8, trimmed, '.');
+    const major_str = it.next() orelse return null;
+    const major = std.fmt.parseUnsigned(u32, major_str, 10) catch return null;
+    const minor_str = it.next() orelse return null;
+    var minor_end: usize = 0;
+    while (minor_end < minor_str.len and std.ascii.isDigit(minor_str[minor_end])) {
+        minor_end += 1;
+    }
+    if (minor_end == 0) return null;
+    const minor = std.fmt.parseUnsigned(u32, minor_str[0..minor_end], 10) catch return null;
+    return .{ major, minor };
+}
+
+/// True when the detected Zig meets the ephor floor (EPH-I0239).
+fn zigMeetsEphorFloor(version: [2]u32) bool {
+    return version[0] != 0 or version[1] >= zig_version_floor_minor;
+}
+
+/// Zig-version gate for install and upgrade (EPH-I0239). Returns
+/// error.ZigTooOld when the detected Zig predates 0.16.0: no release
+/// the fetch could land builds on it. An undetectable Zig warns and
+/// proceeds (the fetch's own failure reporting then applies). The
+/// callers map the refusal to their command's failure code
+/// (error.InstallFailed / error.UpgradeFailed) per EPH-I0235.
+fn requireZigFloor(diag: *DiagCtx, allocator: Allocator) error{ZigTooOld}!void {
+    const detected = detectZigVersion(diag.io, allocator) orelse {
+        cliDiag(
+            diag,
+            "warning: could not detect the zig version. Assuming it is Zig 0.16.0 or newer.\n",
+            .{},
+        );
+        return;
+    };
+    if (zigMeetsEphorFloor(detected)) return;
+    cliDiag(
+        diag,
+        "error: ephor requires Zig 0.16.0 or newer. Detected Zig {d}.{d}.\n",
+        .{ detected[0], detected[1] },
+    );
+    cliDiag(
+        diag,
+        "No ephor release newer than {s} builds with this Zig.\n",
+        .{zig015_era_release},
+    );
+    cliDiag(
+        diag,
+        "Use install.sh instead. It installs {s}, the newest release this Zig builds.\n",
+        .{zig015_era_release},
+    );
+    return error.ZigTooOld;
 }
 
 /// Run the install command: adds ephor to project's build system.
@@ -38282,8 +38376,9 @@ fn runZigFetchSave(diag: *DiagCtx, project_dir: std.Io.Dir, url_z: [:0]const u8)
 /// (EPH-I0155). Every other failure path returns error.InstallFailed
 /// (EPH-I0235): a CI step doing `ephor install && zig build ephor` must
 /// not proceed on a failed install. The zig-fetch spawn must stay after
-/// the version and prerequisite gates: the hermetic tests rely on that
-/// order (band-T05 F5, EPH-I0572 — the pin lives at runZigFetchSave).
+/// the version, prerequisite, and Zig-version gates: the hermetic tests
+/// rely on that order (band-T05 F5, EPH-I0572 — the pin lives at
+/// runZigFetchSave).
 fn runInstallCommand(
     diag: *DiagCtx,
     allocator: Allocator,
@@ -38295,6 +38390,13 @@ fn runInstallCommand(
 
     if (!checkProjectPrerequisites(diag, project_dir)) return error.InstallFailed;
 
+    // The Zig-version gate precedes the fetch (EPH-I0239): a Zig older
+    // than 0.16.0 cannot build any release the install can land, so the
+    // install refuses with the install.sh remedy instead of fetching a
+    // release the project cannot build. Only error.ZigTooOld exits this
+    // gate, and EPH-I0235 maps every install failure to InstallFailed.
+    requireZigFloor(diag, allocator) catch return error.InstallFailed;
+
     const package_url = try buildPackageUrl(allocator, install_version);
     defer allocator.free(package_url);
 
@@ -38303,7 +38405,12 @@ fn runInstallCommand(
     const url_z = try allocator.dupeZ(u8, package_url);
     defer allocator.free(url_z);
 
-    try installFetchOutcome(diag, try runZigFetchSave(diag, project_dir, url_z), package_url);
+    try runInstallFetch(
+        diag,
+        allocator,
+        project_dir,
+        .{ .url_z = url_z, .package_url = package_url },
+    );
 
     printRecordedHash(diag.io, allocator, ver);
     std.debug.print("\n", .{});
@@ -38324,6 +38431,142 @@ fn installFetchOutcome(diag: *DiagCtx, exited: u8, package_url: []const u8) !voi
     if (exited == 0) return;
     printFetchFailedHelp(diag, package_url);
     return error.InstallFailed;
+}
+
+/// Cap on the captured zig-fetch output (EPH-I0718). The hint and the
+/// error lines are short; the cap bounds a hostile PATH zig.
+const fetch_capture_limit_bytes = 256 * 1024;
+
+/// One install fetch's targets: the nul-terminated spawn URL and the
+/// printable package URL for the failure help.
+const InstallFetchTarget = struct {
+    url_z: [:0]const u8,
+    package_url: []const u8,
+};
+
+/// Install-side fetch with the 0x0-fingerprint repair (EPH-I0718). A
+/// hand-made build.zig.zon (install.sh creates one) carries
+/// `.fingerprint = 0x0`, and zig fetch answers with a "use this value"
+/// hint naming the computed fingerprint after the package fetch. The
+/// first attempt captures the output; a failure whose output carries the
+/// hint patches the zon and refetches once, matching install.sh's repair
+/// (install.sh:443-461). A failure without the hint relays the captured
+/// error, then fails the install. The second fetch is authoritative.
+fn runInstallFetch(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    project_dir: std.Io.Dir,
+    target: InstallFetchTarget,
+) !void {
+    const result = std.process.run(allocator, diag.io, .{
+        .argv = &.{ tool_zig_path, "fetch", "--save=ephor", target.url_z },
+        .cwd = .{ .dir = project_dir },
+        .stdout_limit = .limited(fetch_capture_limit_bytes),
+        .stderr_limit = .limited(fetch_capture_limit_bytes),
+    }) catch {
+        // A spawn failure is a fetch failure: report and fail the install.
+        printFetchFailedHelp(diag, target.package_url);
+        return error.InstallFailed;
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    const exited = result.term == .exited;
+    const code = if (exited) result.term.exited else 1;
+    if (code == 0) return;
+
+    const hint = parseFingerprintHintFromResult(allocator, result.stdout, result.stderr) orelse {
+        relayFetchStderr(diag, allocator, result.stderr);
+        printFetchFailedHelp(diag, target.package_url);
+        return error.InstallFailed;
+    };
+    defer allocator.free(hint);
+    if (!patchZonFingerprint(diag.io, allocator, project_dir, hint)) {
+        relayFetchStderr(diag, allocator, result.stderr);
+        printFetchFailedHelp(diag, target.package_url);
+        return error.InstallFailed;
+    }
+    const second = runZigFetchSave(diag, project_dir, target.url_z) catch {
+        printFetchFailedHelp(diag, target.package_url);
+        return error.InstallFailed;
+    };
+    try installFetchOutcome(diag, second, target.package_url);
+}
+
+/// Relay a failed fetch's captured stderr through the terminal sanitizer
+/// (EPH-I0718): the pre-fix spawn inherited the stream, so the user saw
+/// zig's error. The capture must not swallow that detail on a real fetch
+/// failure. The bytes come from the spawned tool, so they cross the
+/// sanitizer before the render (EPH-I0203). An empty or unsanitizable
+/// stream prints nothing: the help the caller prints still names the
+/// remedy.
+fn relayFetchStderr(diag: *DiagCtx, allocator: Allocator, stderr: []const u8) void {
+    if (stderr.len == 0) return;
+    if (types.sanitizeTerminal(allocator, stderr)) |safe_val| {
+        var safe = safe_val;
+        defer safe.deinit(allocator);
+        if (safe.slice.len > 0) cliDiag(diag, "{s}\n", .{safe.slice});
+    } else |_| {
+        // OOM on the diagnostic render: the caller's help still names the remedy.
+    }
+}
+
+/// Fingerprint hint from a failed zig fetch, searching stderr first then
+/// stdout (EPH-I0718). zig prints "use this value: 0x<hex>" on the error
+/// stream; the stdout arm covers a toolchain that prints diagnostics on
+/// the merged stream. Caller frees the result.
+fn parseFingerprintHintFromResult(
+    allocator: Allocator,
+    stdout: []const u8,
+    stderr: []const u8,
+) ?[]u8 {
+    return parseFingerprintHint(allocator, stderr) orelse parseFingerprintHint(allocator, stdout);
+}
+
+/// Parse the first fingerprint hint in one stream (EPH-I0718). The value
+/// must carry at least one hex digit after the "0x" prefix (a bare "0x"
+/// would write a broken zon — the install.sh EPH-I0634 guard). Returns
+/// the "0x"-prefixed hex value zig names, so the patched zon carries the
+/// value byte-for-byte as zig computed it. Caller frees the result.
+fn parseFingerprintHint(allocator: Allocator, output: []const u8) ?[]u8 {
+    const marker = "use this value: ";
+    const idx = mem.indexOf(u8, output, marker) orelse return null;
+    const start = idx + marker.len;
+    if (start + 2 > output.len or !mem.eql(u8, output[start .. start + 2], "0x")) return null;
+    var end = start + 2;
+    while (end < output.len and std.ascii.isHex(output[end])) end += 1;
+    if (end == start + 2) return null;
+    return allocator.dupe(u8, output[start..end]) catch null;
+}
+
+/// Patch `.fingerprint = 0x0` to the hinted value in build.zig.zon
+/// (EPH-I0718). The marker is masked to code positions like every
+/// install/upgrade zon splice: a mention inside a comment or a string
+/// must not be rewritten. Returns true only when the marker sat in code
+/// and the write succeeded.
+fn patchZonFingerprint(
+    io: std.Io,
+    allocator: Allocator,
+    project_dir: std.Io.Dir,
+    hint: []const u8,
+) bool {
+    const content = project_dir.readFileAlloc(
+        io,
+        "build.zig.zon",
+        allocator,
+        .limited(64 * 1024),
+    ) catch return false;
+    defer allocator.free(content);
+    const marker = ".fingerprint = 0x0";
+    const pos = indexOfCode(content, 0, marker) orelse return false;
+    var new_content: std.ArrayListUnmanaged(u8) = .empty;
+    defer new_content.deinit(allocator);
+    new_content.appendSlice(allocator, content[0..pos]) catch return false;
+    new_content.appendSlice(allocator, ".fingerprint = ") catch return false;
+    new_content.appendSlice(allocator, hint) catch return false;
+    new_content.appendSlice(allocator, content[pos + marker.len ..]) catch return false;
+    writeFileAtomic(io, project_dir, "build.zig.zon", new_content.items) catch return false;
+    return true;
 }
 
 /// Patch the project's build.zig after a successful fetch (EPH-I0235). A
@@ -38498,7 +38741,15 @@ fn patchBuildZig(diag: *DiagCtx, allocator: Allocator, project_dir: std.Io.Dir) 
     return insert_after + 2;
 }
 
-/// True when build.zig.zon exists and declares an ephor dependency.
+/// True when build.zig.zon exists and declares an ephor dependency
+/// (EPH-I1157). The check is code-aware and field-anchored: `.ephor =` is
+/// the dependency-entry shape zig fetch writes (top level or inside a
+/// `.dependencies` map), so the match must sit in code — isCodeMatch
+/// rejects a `//` comment, a string value, and a `\\` multiline line —
+/// and carry the `=` field anchor, which `.ephor_extra`-style names
+/// lack. Pre-fix, a raw ".ephor" substring matched a commented-out entry
+/// or a quoted mention and let the upgrade proceed into zig fetch,
+/// re-adding a dependency the user had disabled.
 fn projectHasEphorDependency(io: std.Io, allocator: Allocator, project_dir: std.Io.Dir) bool {
     const content = project_dir.readFileAlloc(
         io,
@@ -38507,7 +38758,7 @@ fn projectHasEphorDependency(io: std.Io, allocator: Allocator, project_dir: std.
         .limited(64 * 1024),
     ) catch return false;
     defer allocator.free(content);
-    return mem.indexOf(u8, content, ".ephor") != null;
+    return indexOfCode(content, 0, ".ephor =") != null;
 }
 
 /// True when column `col` of `line` sits in code: not on a `\\`
@@ -38651,12 +38902,14 @@ fn printRecordedHash(io: std.Io, allocator: Allocator, ver: []const u8) void {
 /// same directory in production. An invalid --version returns
 /// error.InvalidVersion before any fetch (EPH-I0155). Every other failure
 /// path returns error.UpgradeFailed (EPH-I0235): a script must see a
-/// nonzero exit. The version, floor, and dependency gates must stay before
-/// the zig-fetch spawn: the hermetic upgrade tests rely on that order
-/// (band-T05 F5, EPH-I0572 — the pin lives at runZigFetchSave). The
-/// implicit-version fetch (fetchLatestVersion) is exempt from that order:
-/// the floor must compare the resolved target (B13-20), and the hermetic
-/// suite reaches it only through the fetch seam below.
+/// nonzero exit. The version, dependency, and Zig-version gates must stay
+/// before the zig-fetch spawn: the hermetic upgrade tests rely on that
+/// order (band-T05 F5, EPH-I0572 — the pin lives at runZigFetchSave). The
+/// dependency gate precedes the implicit-version fetch too (EPH-I0719):
+/// a no-dependency project must see the install hint, never a downgrade
+/// refusal. The fetch stays before the floor: the floor must compare the
+/// resolved target (B13-20), and the hermetic suite reaches the implicit
+/// fetch only through the fetch seam below.
 /// CLI options for one upgrade run: an optional explicit version pin plus
 /// the downgrade-override latch (--force, EPH-I0193).
 const UpgradeOptions = struct {
@@ -38696,6 +38949,16 @@ const UpgradeRun = struct {
         // Validate before the fetch: an explicit version reaches the URL
         // below unchecked without this gate (EPH-I0155).
         try requireStrictExplicitVersion(self.diag, self.allocator, self.opts.install_version);
+        // The dependency gate precedes the version resolution (EPH-I0719):
+        // a no-dependency project must never fetch first, or the resolved
+        // downgrade target would read as a floor refusal instead of the
+        // install hint.
+        try self.refuseMissingDependency();
+        // The Zig-version gate also precedes the fetch (EPH-I0239): a Zig
+        // too old to build any fetchable release refuses here. Only
+        // error.ZigTooOld exits this gate, and EPH-I0235 maps every
+        // upgrade failure to UpgradeFailed.
+        requireZigFloor(self.diag, self.allocator) catch return error.UpgradeFailed;
         // If no explicit version, fetch the latest from Codeberg tags API.
         const fetched_ver = if (self.opts.install_version == null)
             self.fetch_fn(self.diag.io, self.allocator)
@@ -38708,6 +38971,22 @@ const UpgradeRun = struct {
         const package_url = try buildPackageUrl(self.allocator, ver);
         defer self.allocator.free(package_url);
         try self.completeUpgrade(ver, package_url);
+    }
+
+    /// Dependency gate (EPH-I0719): fires before the implicit-version
+    /// fetch, so a project without an ephor dependency gets the install
+    /// hint instead of resolving a target first. Pre-fix, the fetch ran
+    /// before this check, and a resolved tag below the binary read as
+    /// "refusing to downgrade" — the wrong message for the state.
+    fn refuseMissingDependency(self: *const UpgradeRun) !void {
+        if (projectHasEphorDependency(self.diag.io, self.allocator, self.project_dir)) return;
+        cliDiag(self.diag,
+            \\No ephor dependency found in build.zig.zon.
+            \\
+            \\Run 'ephor install' first to add ephor to your project.
+            \\
+        , .{});
+        return error.UpgradeFailed;
     }
 
     /// Pins the splice-boundary contract (EPH-I0668): every source of
@@ -38750,23 +39029,15 @@ const UpgradeRun = struct {
         return error.UpgradeFailed;
     }
 
-    /// The post-gate upgrade steps: dependency check, symlink pre-flight,
-    /// zig fetch, config version, and the build.zig integration.
+    /// The post-gate upgrade steps: symlink pre-flight, zig fetch, config
+    /// version, and the build.zig integration. The dependency and
+    /// Zig-version gates fire in run() before this point (EPH-I0719,
+    /// EPH-I0239).
     fn completeUpgrade(
         self: *const UpgradeRun,
         ver: []const u8,
         package_url: []const u8,
     ) !void {
-        if (!projectHasEphorDependency(self.diag.io, self.allocator, self.project_dir)) {
-            cliDiag(self.diag,
-                \\No ephor dependency found in build.zig.zon.
-                \\
-                \\Run 'ephor install' first to add ephor to your project.
-                \\
-            , .{});
-            return error.UpgradeFailed;
-        }
-
         // Pre-flight the symlink refusal before any mutation (EPH-I1112):
         // a refusal after the fetch left the zon and ephor.json rewritten
         // while the integration refused. The integration step keeps its
@@ -108981,14 +109252,18 @@ test "install with an invalid --version returns InvalidVersion (EPH-I0155)" {
 
 test "upgrade downgrade refusal returns UpgradeFailed (EPH-I0235)" {
     var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
     // Regression: the downgrade-floor refusal printed and exited 0, so a
-    // script could not detect the refusal. Fails before the spawn: the
-    // no-network property rests on the validation order pinned at
-    // runZigFetchSave (band-T05 F5, EPH-I0572).
-    diag.cli_diagnostics_enabled = false;
+    // script could not detect the refusal. The zon must carry a real
+    // dependency so the EPH-I0719 gate passes and the floor fires.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig.zon",
+        .data = ".{ .name = .demo, .version = \"0.1.0\", .ephor = .{ .url = \"x\", .hash = \"x\" } }\n",
+    });
     try std.testing.expectError(
         error.UpgradeFailed,
         runUpgradeCommand(
@@ -108997,6 +109272,9 @@ test "upgrade downgrade refusal returns UpgradeFailed (EPH-I0235)" {
             tmp.dir,
             .{ .install_version = "0.0.1", .force = false },
         ),
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, capture.slice(), "refusing to downgrade") != null,
     );
 }
 
@@ -109023,6 +109301,31 @@ test "upgrade without ephor dependency returns UpgradeFailed (EPH-I0235)" {
     );
 }
 
+test "upgrade no-dependency refusal precedes the implicit-version fetch (EPH-I0719)" {
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Pre-fix the fetch seam ran first, and the resolved downgrade target
+    // (0.0.1) read as a floor refusal. The dependency gate must fire
+    // first: no seam call, and the install hint instead of the floor.
+    resetFetchSeam("0.0.1");
+    const run: UpgradeRun = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .project_dir = tmp.dir,
+        .opts = .{ .install_version = null, .force = false },
+        .fetch_fn = testFetchFn,
+    };
+    try std.testing.expectError(error.UpgradeFailed, run.run());
+    try std.testing.expectEqual(@as(usize, 0), test_fetch_calls);
+    try std.testing.expect(
+        std.mem.indexOf(u8, capture.slice(), "No ephor dependency found") != null,
+    );
+}
+
 test "upgrade refuses an unparseable implicit target before the URL splice (EPH-I0668)" {
     var diag = testDiagCtx();
     var capture = CaptureSink{};
@@ -109030,6 +109333,13 @@ test "upgrade refuses an unparseable implicit target before the URL splice (EPH-
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    // The EPH-I0719 dependency gate now precedes the fetch seam: the zon
+    // must carry a real dependency, or the run stops at the gate before
+    // the seam counts a call.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig.zon",
+        .data = ".{ .name = .demo, .version = \"0.1.0\", .ephor = .{ .url = \"x\", .hash = \"x\" } }\n",
+    });
     // The fetch seam returns a hostile implicit target. The refusal must
     // fire before buildPackageUrl and before any spawn, so the hermetic
     // property holds (band-T05 F5). The garbage shape passes the floor by
@@ -109076,6 +109386,280 @@ test "upgrade zig-fetch failure maps to UpgradeFailed (EPH-I0235)" {
         upgradeFetchOutcome(&diag, 1, "0.14.3"),
     );
     try upgradeFetchOutcome(&diag, 0, "0.14.3");
+}
+
+test "projectHasEphorDependency is code-aware and field-anchored (EPH-I1157)" {
+    const allocator = std.testing.allocator;
+
+    const live_top_level =
+        \\.{
+        \\    .name = .demo,
+        \\    .version = "0.1.0",
+        \\    .ephor = .{ .url = "x", .hash = "x" },
+        \\}
+        \\
+    ;
+    const live_nested =
+        \\.{
+        \\    .name = .demo,
+        \\    .version = "0.1.0",
+        \\    .dependencies = .{ .ephor = .{ .url = "x", .hash = "x" } },
+        \\}
+        \\
+    ;
+    const comment_mention =
+        \\.{
+        \\    .name = .demo,
+        \\    // .ephor = .{ .url = "x", .hash = "x" } stays disabled
+        \\    .version = "0.1.0",
+        \\}
+        \\
+    ;
+    const string_mention =
+        \\.{
+        \\    .name = .demo,
+        \\    .version = ".ephor",
+        \\}
+        \\
+    ;
+    const extra_field =
+        \\.{
+        \\    .name = .demo,
+        \\    .version = "0.1.0",
+        \\    .ephor_extra = .{ .url = "x" },
+        \\}
+        \\
+    ;
+
+    const cases = [_]struct { content: []const u8, expect: bool }{
+        .{ .content = live_top_level, .expect = true },
+        .{ .content = live_nested, .expect = true },
+        .{ .content = comment_mention, .expect = false },
+        .{ .content = string_mention, .expect = false },
+        .{ .content = extra_field, .expect = false },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig.zon", .data = case.content });
+        try std.testing.expectEqual(
+            case.expect,
+            projectHasEphorDependency(std.testing.io, allocator, tmp.dir),
+        );
+    }
+
+    // A missing zon never reads as a dependency.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expect(!projectHasEphorDependency(std.testing.io, allocator, tmp.dir));
+}
+
+test "parseZigVersionOutput reads the leading major and minor (EPH-I0239)" {
+    try std.testing.expectEqual([2]u32{ 0, 16 }, parseZigVersionOutput("0.16.0\n").?);
+    try std.testing.expectEqual(
+        [2]u32{ 0, 16 },
+        parseZigVersionOutput("0.16.0-dev.1645+abcdef0123456789").?,
+    );
+    try std.testing.expectEqual([2]u32{ 0, 15 }, parseZigVersionOutput("0.15.2").?);
+    try std.testing.expectEqual([2]u32{ 1, 0 }, parseZigVersionOutput("1.0.0").?);
+    try std.testing.expect(parseZigVersionOutput("garbage") == null);
+    try std.testing.expect(parseZigVersionOutput("abc.def") == null);
+    try std.testing.expect(parseZigVersionOutput("0.") == null);
+    try std.testing.expect(parseZigVersionOutput("0.x") == null);
+    try std.testing.expect(parseZigVersionOutput("") == null);
+}
+
+test "zigMeetsEphorFloor boundary (EPH-I0239)" {
+    try std.testing.expect(!zigMeetsEphorFloor(.{ 0, 14 }));
+    try std.testing.expect(!zigMeetsEphorFloor(.{ 0, 15 }));
+    try std.testing.expect(zigMeetsEphorFloor(.{ 0, 16 }));
+    try std.testing.expect(zigMeetsEphorFloor(.{ 0, 17 }));
+    try std.testing.expect(zigMeetsEphorFloor(.{ 1, 0 }));
+}
+
+test "requireZigFloor warns and proceeds when the zig version is undetectable (EPH-I0239)" {
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const saved_zig_path = tool_zig_path;
+    defer tool_zig_path = saved_zig_path;
+    tool_zig_path = "/nonexistent/ephor-i0239-version";
+    try requireZigFloor(&diag, std.testing.allocator);
+    try std.testing.expect(
+        std.mem.indexOf(u8, capture.slice(), "could not detect the zig version") != null,
+    );
+}
+
+/// Write an executable fake zig with the given script body into the tmp
+/// dir, and return its absolute path (EPH-I0239/EPH-I0718 tests). The
+/// caller frees the path and restores tool_zig_path. The exec-bit step
+/// needs the mode-based Permissions enum, so the chmod compiles only on
+/// POSIX targets.
+fn installFakeZig(tmp: *std.testing.TmpDir, allocator: Allocator, body: []const u8) ![]const u8 {
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fakezig", .data = body });
+    if (comptime @import("builtin").os.tag != .windows and std.posix.mode_t != u0) {
+        const fake_file = try tmp.dir.openFile(std.testing.io, "fakezig", .{});
+        try fake_file.setPermissions(std.testing.io, std.Io.File.Permissions.fromMode(0o755));
+        fake_file.close(std.testing.io);
+    }
+    return tmpFilePath(allocator, tmp, "fakezig");
+}
+
+test "requireZigFloor refuses a detected Zig below 0.16.0 (EPH-I0239)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // A fake zig that reports a 0.15.x toolchain: the gate must refuse
+    // with the named error before any fetch.
+    const fake_path = try installFakeZig(&tmp, allocator, "#!/bin/sh\necho 0.15.2\n");
+    defer allocator.free(fake_path);
+    const saved_zig_path = tool_zig_path;
+    defer tool_zig_path = saved_zig_path;
+    tool_zig_path = fake_path;
+    try std.testing.expectError(error.ZigTooOld, requireZigFloor(&diag, allocator));
+    try std.testing.expect(
+        std.mem.indexOf(u8, capture.slice(), "requires Zig 0.16.0 or newer") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, capture.slice(), "Detected Zig 0.15") != null);
+}
+
+test "install refuses a detected Zig below 0.16.0 before the fetch (EPH-I0239)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig.zon", .data = ".{ .name = .demo }\n" });
+    // The same fake-zig seam as the gate test: the prerequisites pass,
+    // then the Zig gate refuses and maps to InstallFailed (EPH-I0235).
+    const fake_path = try installFakeZig(&tmp, allocator, "#!/bin/sh\necho 0.15.2\n");
+    defer allocator.free(fake_path);
+    const saved_zig_path = tool_zig_path;
+    defer tool_zig_path = saved_zig_path;
+    tool_zig_path = fake_path;
+    try std.testing.expectError(
+        error.InstallFailed,
+        runInstallCommand(&diag, allocator, tmp.dir, null),
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, capture.slice(), "requires Zig 0.16.0 or newer") != null,
+    );
+}
+
+test "parseFingerprintHint takes the first hint and needs hex digits (EPH-I0718)" {
+    const allocator = std.testing.allocator;
+    const real_line =
+        "build.zig.zon:1:2: error: invalid fingerprint: 0x0; if this is a new or forked " ++
+        "package, use this value: 0xd75e6f2a0588dd40\n";
+    const hint = parseFingerprintHint(allocator, real_line) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(hint);
+    try std.testing.expectEqualStrings("0xd75e6f2a0588dd40", hint);
+
+    // The first hint wins, mirroring install.sh's grep -m1 (EPH-I0634).
+    const two_hints = "use this value: 0xaaa\nuse this value: 0xbbb\n";
+    const first = parseFingerprintHint(allocator, two_hints) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(first);
+    try std.testing.expectEqualStrings("0xaaa", first);
+
+    // A bare "0x" would write a broken zon: rejected.
+    try std.testing.expect(parseFingerprintHint(allocator, "use this value: 0x ") == null);
+    try std.testing.expect(parseFingerprintHint(allocator, "no hint here") == null);
+}
+
+test "patchZonFingerprint patches code positions only (EPH-I0718)" {
+    const allocator = std.testing.allocator;
+    // The 0x0 marker in code is patched to the hinted value.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig.zon",
+        .data = ".{ .name = .demo, .fingerprint = 0x0, .paths = .{ \"build.zig\" } }\n",
+    });
+    try std.testing.expect(patchZonFingerprint(std.testing.io, allocator, tmp.dir, "0xd75e6f2a0588dd40"));
+    const after = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "build.zig.zon",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(after);
+    try std.testing.expect(mem.indexOf(u8, after, ".fingerprint = 0xd75e6f2a0588dd40") != null);
+    try std.testing.expect(mem.indexOf(u8, after, "0x0") == null);
+
+    // A comment-only mention is not a fingerprint: the patch refuses.
+    var tmp_comment = std.testing.tmpDir(.{});
+    defer tmp_comment.cleanup();
+    try tmp_comment.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig.zon",
+        .data = ".{ .name = .demo, .paths = .{ \"build.zig\" } } // .fingerprint = 0x0\n",
+    });
+    try std.testing.expect(!patchZonFingerprint(
+        std.testing.io,
+        allocator,
+        tmp_comment.dir,
+        "0xd75e6f2a0588dd40",
+    ));
+}
+
+test "runInstallFetch repairs a 0x0 fingerprint and refetches (EPH-I0718)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig.zon",
+        .data = ".{ .name = .demo, .fingerprint = 0x0, .paths = .{ \"build.zig\" } }\n",
+    });
+    // A fake zig fetch: the first call prints the 0x0-fingerprint hint
+    // and exits 2, the second call exits 0. The count file lives in the
+    // project dir, which is the spawn cwd. A fake seam replaces the real
+    // zig here because a real fetch's hinted value is per-invocation and
+    // can never sit in a fixture.
+    const script =
+        "#!/bin/sh\n" ++
+        "n=0\n" ++
+        "[ -f fetchcount ] && n=$(cat fetchcount)\n" ++
+        "n=$((n+1)); echo $n > fetchcount\n" ++
+        "if [ \"$n\" -eq 1 ]; then\n" ++
+        "  echo 'build.zig.zon:1:2: error: invalid fingerprint: 0x0; if this is a new or forked package, use this value: 0xabc123def' >&2\n" ++
+        "  exit 2\n" ++
+        "fi\n" ++
+        "exit 0\n";
+    const fake_path = try installFakeZig(&tmp, allocator, script);
+    defer allocator.free(fake_path);
+    const saved_zig_path = tool_zig_path;
+    defer tool_zig_path = saved_zig_path;
+    tool_zig_path = fake_path;
+    const url_z = try allocator.dupeZ(u8, "https://example.invalid/ephor.tar.gz");
+    defer allocator.free(url_z);
+
+    // The first fetch fails with the fingerprint hint; the repair
+    // patches the zon and the second fetch succeeds.
+    try runInstallFetch(&diag, allocator, tmp.dir, .{
+        .url_z = url_z,
+        .package_url = "https://example.invalid/ephor.tar.gz",
+    });
+
+    const after = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "build.zig.zon",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(after);
+    try std.testing.expect(mem.indexOf(u8, after, ".fingerprint = 0xabc123def") != null);
+    try std.testing.expect(mem.indexOf(u8, after, ".fingerprint = 0x0") == null);
 }
 
 test "setOwnedPath OOM keeps the old path freeable exactly once" {

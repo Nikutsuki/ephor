@@ -9918,8 +9918,14 @@ fn bracedBodyExtent(
 /// reviewer F1: the CFG merges that statement into the back-edge block).
 /// A while/for continue tail (`: (expr)`) is skipped and the scan resumes
 /// past its paren group, so the idiomatic while-continue loop keeps its
-/// body extent (EPH-I0749). A multi-line continue expression is handled
-/// by the same paren-group walk. Accepted bound (EPH-I0749): a fused
+/// body extent (EPH-I0749). The paren-group walk itself handles a
+/// multi-line continue expression, but the VOTE never reaches it: the
+/// header line the vote passes is the CFG header block's end_line, which
+/// is the condition's last line for a multi-line header, not the while
+/// keyword line — the `(` lookup misses and the extent is null, so the
+/// multi-line-tail shape stays silent end-to-end (EPH-I0749 bound,
+/// verified live on the wc_multi_paren/wc_multi2 probes). Accepted bound
+/// (EPH-I0749): a fused
 /// single-line braced body (`while (c) { f(); }`) still yields null —
 /// the column-aware arm proved disproportionate (the CFG leaves same-line
 /// body blocks without a line span, and the free's block includes the
@@ -9990,9 +9996,13 @@ fn loopBodyLineExtent(
 /// before free in a loop body stays silent (EPH-I0676)". The double-free
 /// direction stays loud through this vote (pinned by "ZA106: loop-body
 /// free double-frees on the next iteration (EPH-I0676)"). Since EPH-I0749
-/// the vote covers the while/for continue tail (`: (expr)`); the fused
-/// single-line body stays silent — the documented bound of
-/// loopBodyLineExtent (EPH-I0749), pinned by "ZA106: fused single-line
+/// the vote covers the while/for continue tail (`: (expr)`) on a
+/// single-line header; a multi-line header keeps the shape silent — the
+/// header_line here is the CFG header block's end_line (the condition's
+/// last line, not the keyword line), so the extent lookup misses the `(`
+/// and the vote never runs (EPH-I0749 bound, named on loopBodyLineExtent
+/// too). The fused single-line body stays silent — the documented bound
+/// of loopBodyLineExtent (EPH-I0749), pinned by "ZA106: fused single-line
 /// loop body stays silent (EPH-I0749)".
 fn loopCarriedFreeVote(ctx: *const FreeScanCtx, bid: usize, actual_line: usize) !bool {
     for (ctx.cfg.edges.items) |edge| {
@@ -21637,14 +21647,11 @@ fn isDiscardedAcquire(code: []const u8, call_start: usize) bool {
 /// attributed that depth, not their own — the defer registers at the
 /// opener's scope. The caller computes the keyword depth, so a
 /// `} defer {` continuation registers at the post-close depth (EPH-I0439).
-/// The opener line's brace walk starts AT the keyword (`keyword_code_pos`
-/// is the code-relative offset, null on lines without a defer keyword) —
-/// but only for the line's own FRESH arm: the defer block's own `{`
-/// counts from there, and a leading `}` — the close of the block the
-/// defer follows — belongs to the enclosing context and never disarms
-/// the fresh arm (EPH-I0926). A non-armed line inside an open defer
-/// block walks from the line start, so a leading `}` closes the block
-/// and in_defer does not leak past the close to the next line. A
+/// The brace walk covers the WHOLE line from the carried depth on every
+/// line, armed or not (EPH-I0928 F1): the pre-keyword segment keeps the
+/// carried open-defer count honest at the keyword — a leading `}` closing
+/// an enclosing defer block disarms it, a leading `{` (a bare block or an
+/// if open holding the defer) counts as part of the context. A
 /// single-statement defer opens no block: when the keyword segment
 /// carries no brace, in_defer never arms for the line.
 fn trackConcurrencyDefer(
@@ -21660,28 +21667,37 @@ fn trackConcurrencyDefer(
         state.defer_stmt_depth = defer_stmt_depth;
     }
     if (!state.in_defer) return;
-    // The keyword start applies only to the fresh arm above: a non-armed
-    // line inside an open defer block walks from the line start, so a
-    // leading `}` closes the block and in_defer cannot leak to the next
-    // line (EPH-I0926).
-    const walk_start = if (armed) keyword_code_pos.? else 0;
-    // The walk carries the open defer depth for armed lines too
-    // (EPH-I0928): a nested `defer { ... }` inside an open defer block
-    // counts its braces on TOP of the outer depth, so the inner close
-    // returns the walk to the carried depth and in_defer stays true —
-    // the outer block is still open. Pre-fix the armed walk restarted at
-    // zero, the inner close hit 0, and the outer block disarmed one line
-    // early: an acquire after the inner close recorded plain and could
-    // draw a ZC101 warning the defer block should cover. Residual: the
-    // statement depth attributed to lines after the inner close is the
-    // inner keyword's (the closer of two stacked depths) — a ZC102
-    // depth-attribution residual on this pathological shape, disclosed
-    // here.
+    // The walk covers the WHOLE line from the carried depth — armed and
+    // non-armed lines share one walk (EPH-I0928 F1). The carried depth is
+    // the open-defer-block count at the line start; the pre-keyword
+    // segment must keep it honest at the keyword: a leading `}` closing
+    // an enclosing defer block drops the depth before the keyword's own
+    // block opens, and a leading `{` (a bare block or an if open holding
+    // the defer) counts as part of the context. A leading `}` at a zero
+    // carried depth closes a NON-defer block and stays clamped — it
+    // never disarms the fresh arm (EPH-I0926); disarming requires a real
+    // decrement to zero. The B86j form walked armed lines from the
+    // keyword and silently skipped that segment, so a `} defer {`
+    // continuation after a CLOSED defer block left in_defer armed — an
+    // acquire after it recorded deferred and a real lock-leak defect
+    // stayed silent (reviewer F1). The walk's own bookkeeping mixes
+    // defer braces with nested non-defer braces inside the defer
+    // context, which is exactly what the close detection needs: a defer
+    // block's `}` returns the depth to its pre-block level. Residual
+    // (unchanged, disclosed): the statement depth attributed to lines
+    // after an inner defer close is the inner keyword's — a ZC102
+    // depth-attribution residual on the nested-defer shape (EPH-I0928).
     var walk_depth = state.defer_depth;
-    for (blanked[walk_start..]) |c| {
+    for (blanked) |c| {
         if (c == '{') walk_depth += 1;
         if (c == '}') {
-            if (walk_depth > 0) walk_depth -= 1;
+            // A `}` at depth 0 closes a non-defer block (the if the
+            // continuation follows) and must not disarm the fresh arm
+            // the keyword just armed (EPH-I0926); disarming requires a
+            // real decrement to zero — the close of a carried defer
+            // brace.
+            if (walk_depth == 0) continue;
+            walk_depth -= 1;
             if (walk_depth == 0) state.in_defer = false;
         }
     }
@@ -98253,6 +98269,181 @@ test "ZC101: nested defer block keeps the outer defer context armed (EPH-I0928)"
 
     // f is silent (the acquire sits in the outer defer block); g still
     // warns — the control proves the flag path ran.
+    try expectZC101Counts(run.issues.items, 1, 0);
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: } defer { continuation after a closed defer block keeps the acquire loud (EPH-I0928 F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The reviewer F1 regression: the leading `}` closes the OUTER defer
+    // block before the continuation's own defer block opens, so the
+    // acquire after the continuation line is genuinely uncovered. The
+    // B86j armed walk skipped the pre-keyword segment, the line balanced
+    // against the carried depth, in_defer stayed true, and the real
+    // lock-leak defect recorded deferred — silent. The whole-line walk
+    // counts the leading close and disarms.
+    const content =
+        \\fn foo() void {}
+        \\fn doWork() void {}
+        \\fn bar() void {}
+        \\fn f(c: bool) void {
+        \\    defer {
+        \\        defer { foo(); }
+        \\    } defer { bar(); }
+        \\    mu.lock();
+        \\    doWork();
+        \\}
+        \\fn g(c: bool) void {
+        \\    mutex.lock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_cont_after_defer.zig", content);
+    defer run.deinit(allocator);
+
+    // f's uncovered acquire fires, g's control fires — two warnings.
+    try expectZC101Counts(run.issues.items, 2, 0);
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: } defer { continuation closing an if keeps the acquire covered (EPH-I0928 F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The sibling battery shape: the same textual line, but the leading
+    // `}` closes an if — the defer release covers the acquire, so f stays
+    // silent and only the control warns. The whole-line walk counts the
+    // if close against a zero carried depth (clamped) and the deferred
+    // release still registers at the post-close depth.
+    const content =
+        \\fn foo() void {}
+        \\fn doWork() void {}
+        \\fn f(c: bool) void {
+        \\    mu.lock();
+        \\    if (c) {
+        \\        foo();
+        \\    } defer {
+        \\        mu.unlock();
+        \\    }
+        \\    doWork();
+        \\}
+        \\fn g(c: bool) void {
+        \\    mutex.lock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_cont_after_if.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: defer block holding an if keeps the post-close acquire loud (EPH-I0928 F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The walk-base discriminator: a non-defer if inside an open defer
+    // block, then a `} defer {` continuation on the if's close line. The
+    // carried depth mixes the defer brace with the if brace (2); the
+    // whole-line walk counts the if's close first, so the outer defer
+    // close later disarms and the acquire after the block fires. A
+    // keyword-start walk (B86j) or the min(stmt_depth, carried)
+    // candidate leaves the depth over-counted, in_defer stays true past
+    // the outer close, and the post-close acquire records deferred —
+    // the silent-class seed.
+    const content =
+        \\fn foo() void {}
+        \\fn doWork() void {}
+        \\fn bar() void {}
+        \\fn f(c: bool) void {
+        \\    defer {
+        \\        if (c) {
+        \\            foo();
+        \\        } defer { bar(); }
+        \\        mu.lock();
+        \\    }
+        \\    mutex.lock();
+        \\    doWork();
+        \\}
+        \\fn g(c: bool) void {
+        \\    mutex2.lock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_defer_if_cont.zig", content);
+    defer run.deinit(allocator);
+
+    // mu is deferred inside the block (dropped); mutex after the close
+    // and g's mutex2 both fire — two warnings.
+    try expectZC101Counts(run.issues.items, 2, 0);
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: acquire after a same-line defer close inside an if records plain (EPH-I0928 F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The battery's if-nested shape, multi-line: the defer closed on its
+    // own line, so the acquire on the next line is not deferred — it
+    // fires. (The one-line form records deferred via the whole-line
+    // defer_ctx — pre-existing granularity, unchanged by every walk base.)
+    const content =
+        \\fn foo() void {}
+        \\fn doWork() void {}
+        \\fn f(c: bool) void {
+        \\    if (c) {
+        \\        defer { foo(); }
+        \\        mu.lock();
+        \\    }
+        \\    doWork();
+        \\}
+        \\fn g(c: bool) void {
+        \\    mutex.lock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_if_nested.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 2, 0);
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: single-line nested defer keeps the whole-line defer context (EPH-I0928 F1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Battery v3: the one-line nested form — the acquire shares the line
+    // with the defer keyword, so the whole-line defer context drops it
+    // and only the control warns. Unchanged by every walk base.
+    const content =
+        \\fn foo() void {}
+        \\fn doWork() void {}
+        \\fn f() void {
+        \\    defer { defer { foo(); } mu.lock(); }
+        \\    doWork();
+        \\}
+        \\fn g() void {
+        \\    mutex.lock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_single_nested.zig", content);
+    defer run.deinit(allocator);
+
     try expectZC101Counts(run.issues.items, 1, 0);
     try expectZC102Counts(run.issues.items, 0, 0);
 }

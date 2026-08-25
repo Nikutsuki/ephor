@@ -5,5 +5,5 @@
 #   Update this line only in the commit that fixes dogfood warnings.
 # tests: the minimum test count from `zig build test --summary all`
 #   (the test ratchet). Update this line only in the commit that adds tests.
-dogfood 216
-tests 2569
+dogfood 214
+tests 2574

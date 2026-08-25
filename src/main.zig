@@ -13627,6 +13627,12 @@ const ImportGraph = struct {
     /// are masked to code positions (EPH-I0227): a match whose `@` sits in
     /// a string or comment is text — `const s = "see @import(" ;` must not
     /// extract the bytes after the string's closing quote as a path.
+    /// ACCEPTED MISS (EPH-I0300): a const whose @import value opens on the
+    /// NEXT line (`const x =\n@import("y.zig");`) is not extracted, and
+    /// neither is the multiline-paren shape (`@import(\n"y.zig",\n)`).
+    /// extractBareImports covers the bare-import side; the continuation
+    /// shapes are missed by design and stay pinned as accepted until a
+    /// future scan covers them deliberately.
     fn findImportPath(content: []const u8, start: usize) ?[]const u8 {
         const import_tag = "@import(\"";
         const line_start = if (mem.lastIndexOfScalar(u8, content[0..start], '\n')) |nl|
@@ -23756,8 +23762,16 @@ fn countSwitchArms(t: []const u8) usize {
 /// Count branches in a line (control flow decision points)
 fn countLineBranches(t: []const u8) usize {
     var b: usize = 0;
-    if (hasToken(t, "if")) b += 1;
-    if (hasElseBranch(t)) b += 1;
+    const has_if = hasToken(t, "if");
+    if (has_if) b += 1;
+    // EPH-I0058: on a ternary-style if/else expression (`const x = if (a)
+    // 4 else 6;`) the else is the alternative of the already-counted if,
+    // not a separate branch — countLineCyclomatic collapses the pair and
+    // ZA304 inflated by 1 vs ZA305. The signal is a same-line if with no
+    // code-position brace: block forms keep a brace on the line
+    // (`} else {`) and keep the else count, and a brace-less else without
+    // a same-line if (Allman `} else`) keeps its count too.
+    if (hasElseBranch(t) and (!has_if or hasCodePositionBrace(t))) b += 1;
     if (hasToken(t, "switch")) b += 1;
     b += countSwitchArms(t);
     if (hasRuntimeLoop(t, "while")) b += 1;
@@ -38152,38 +38166,46 @@ fn handleConfigCreateError(err: anyerror) !void {
     return err;
 }
 
+/// Init-time config template body (EPH-I1126 posture, EPH-I0255 entries
+/// caveat). writeDefaultConfig splices the version object in front of
+/// default_config_template[1..] — the template's leading brace is the
+/// splice seam, so the rendered file opens with `{"version": ...`.
+const default_config_template =
+    \\{
+    \\  // Directory to analyze - auto-detected from build.zig during install
+    \\  // (e.g., "src", "lib", "app", or "." for project root)
+    \\  "path_dir": "src",
+    \\
+    \\  // Entry points for import graph analysis (orphan detection).
+    \\  // Add your main files and build.zig here. An entry outside
+    \\  // "path_dir" joins the import graph only: findings print only
+    \\  // for files inside the scan root (EPH-I0255).
+    \\  "entries": ["src/main.zig", "build.zig"],
+    \\
+    \\  // Directories to exclude from analysis
+    \\  "exclude": ["test", "vendor", "third_party"],
+    \\
+    \\  // Patterns to exclude from orphan detection only
+    \\  "orphan_exclude": ["_test.zig", "/test/", "/tests/"],
+    \\
+    \\  // Complexity rules to enable: cyclomatic (ZA305) and cognitive
+    \\  // (ZA306). Both are off unless enabled here — the standard
+    \\  // project posture turns them on (EPH-I1126).
+    \\  "enable": ["ZA305", "ZA306"],
+    \\
+    \\  // CI gating: exit 1 when findings reach this level.
+    \\  // Values: error, warning, note, never.
+    \\  "fail_on": "warning",
+    \\
+    \\  // Error naming convention for ZA703 (default: TitleCase, the
+    \\  // community standard — error.FileNotFound; "PascalCase" is an alias)
+    \\  // "error_naming": "snake_case"  — pre-flip behavior (error.file_not_found)
+    \\}
+    \\
+;
+
 fn writeDefaultConfig(io: std.Io) !void {
-    const default_config =
-        \\{
-        \\  // Directory to analyze - auto-detected from build.zig during install
-        \\  // (e.g., "src", "lib", "app", or "." for project root)
-        \\  "path_dir": "src",
-        \\
-        \\  // Entry points for import graph analysis (orphan detection)
-        \\  // Add your main files and build.zig here
-        \\  "entries": ["src/main.zig", "build.zig"],
-        \\
-        \\  // Directories to exclude from analysis
-        \\  "exclude": ["test", "vendor", "third_party"],
-        \\
-        \\  // Patterns to exclude from orphan detection only
-        \\  "orphan_exclude": ["_test.zig", "/test/", "/tests/"],
-        \\
-        \\  // Complexity rules to enable: cyclomatic (ZA305) and cognitive
-        \\  // (ZA306). Both are off unless enabled here — the standard
-        \\  // project posture turns them on (EPH-I1126).
-        \\  "enable": ["ZA305", "ZA306"],
-        \\
-        \\  // CI gating: exit 1 when findings reach this level.
-        \\  // Values: error, warning, note, never.
-        \\  "fail_on": "warning",
-        \\
-        \\  // Error naming convention for ZA703 (default: TitleCase, the
-        \\  // community standard — error.FileNotFound; "PascalCase" is an alias)
-        \\  // "error_naming": "snake_case"  — pre-flip behavior (error.file_not_found)
-        \\}
-        \\
-    ;
+    const default_config = default_config_template;
 
     var buf: [default_config.len + 64]u8 = undefined;
     const content = try std.fmt.bufPrint(
@@ -38452,7 +38474,10 @@ fn buildInstallConfigContent(
         \\  // (e.g., "src", "lib", "app", or "." for project root)
         \\  "path_dir": "{s}",
         \\
-        \\  // Entry points for import graph analysis (orphan detection)
+        \\  // Entry points for import graph analysis (orphan detection).
+        \\  // Add your main files and build.zig here. An entry outside
+        \\  // "path_dir" joins the import graph only: findings print only
+        \\  // for files inside the scan root (EPH-I0255).
         \\  "entries": {s},
         \\
         \\  // Directories to exclude from analysis
@@ -39419,12 +39444,45 @@ const ThresholdsSpan = struct {
 /// (EPH-I0511). The key and both braces are located in code position: a
 /// comment or a string value mentioning "thresholds" cannot retarget the
 /// splice, and a `}` inside a string value of the object cannot close the
-/// span early.
+/// span early. The value after the key's colon must OPEN with a code `{`
+/// (EPH-I0065): in `{"thresholds": 5, "x": {...}}` the pre-fix scan bound
+/// the NEXT object's brace and migrateThresholds inserted keys into the
+/// wrong object, so a scalar or string value now fails closed. Whitespace
+/// and `//` comments between the colon and the brace stay allowed.
 fn findThresholdsSpan(content: []const u8) ?ThresholdsSpan {
     const key_pos = findConfigKey(content, "\"thresholds\"") orelse return null;
-    const brace_start = findConfigObjectBrace(content, key_pos) orelse return null;
+    // findConfigKey accepts the key only when a `:` separates it, so the
+    // scan resumes just past that colon (EPH-I0065).
+    const brace_start = findValueOpener(content, key_pos + "\"thresholds\"".len + 1);
+    if (brace_start >= content.len or content[brace_start] != '{') return null;
     const brace_end = findConfigObjectEnd(content, brace_start) orelse return null;
     return .{ .brace_start = brace_start, .brace_end = brace_end };
+}
+
+/// True when the byte is horizontal or vertical whitespace (EPH-I0065).
+fn isWsByte(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+/// Find the value opener after a key's colon (EPH-I0065): skip
+/// whitespace, `//` comments, and string values, and return the first
+/// code byte, or content.len when none precedes the end. isCodeAt never
+/// steps the byte AT the target, so `/` and `"` are stepped explicitly —
+/// otherwise a comment opener at the walk position reads as code.
+fn findValueOpener(content: []const u8, start: usize) usize {
+    var scanner = JsonCodeScanner{ .content = content };
+    var i = start;
+    while (i < content.len) : (i += 1) {
+        const c = content[i];
+        if (isWsByte(c)) continue;
+        if (c == '/' or c == '"') {
+            _ = scanner.isCodeAt(i + 1);
+            continue;
+        }
+        if (!scanner.isCodeAt(i)) continue;
+        return i;
+    }
+    return i;
 }
 
 const BracePadding = struct {
@@ -41800,7 +41858,8 @@ fn printHelp() void {
         \\                       disable/exclude still apply.
         \\  --                  Stop flag parsing: the rest of the arguments
         \\                      are scan paths (use for a path that starts
-        \\                      with '-')
+        \\                      with '-'). One run scans one path: a second
+        \\                      scan path is a usage error
         \\  -b, --build          With 'init': also show build.zig integration
         \\  --export=<file>      Export issues to file with code snippets
         \\  --known-issues=<file> Filter out known true positives (file:line format)
@@ -45291,6 +45350,19 @@ test "install config template carries the standard posture (EPH-I1146)" {
     try std.testing.expect(mem.indexOf(u8, content, "\"entries\": [\"src/main.zig\"]") != null);
 }
 
+test "config templates state out-of-root entries are graph-only (EPH-I0255)" {
+    // Both shipped config templates list build.zig as an entry while
+    // path_dir names a subdirectory. Findings print only for files under
+    // the scan root (classifyIssue path_scope), so an out-of-root entry
+    // joins the import graph only. Each template must say so, or a clean
+    // run reads as covering build.zig when it does not.
+    const allocator = std.testing.allocator;
+    try std.testing.expect(mem.indexOf(u8, default_config_template, "joins the import graph only") != null);
+    const content = try buildInstallConfigContent(allocator, "0.14.3", "src", "[\"src/main.zig\", \"build.zig\"]");
+    defer allocator.free(content);
+    try std.testing.expect(mem.indexOf(u8, content, "joins the import graph only") != null);
+}
+
 test "ImportGraph.deinit frees reachable keys when the key list append fails (EPH-I0375)" {
     // deinit collects owned map keys into a list before freeing them.
     // A failed append must free the key on the spot: the table deinit
@@ -46830,6 +46902,29 @@ test "extractBareImports still records a real bare @import (EPH-I0227)" {
     try graph.markReachable(entry);
 
     try std.testing.expect(graph.reachable.contains(real));
+}
+
+test "findImportPath accepts the continuation-line miss as documented (EPH-I0300)" {
+    // The tag scan is line-bounded by design: a const whose @import
+    // value opens on the NEXT line is not extracted. The miss is
+    // documented as accepted on findImportPath; this pin keeps it until
+    // a future scan covers the shape deliberately.
+    const continuation =
+        \\const x =
+        \\@import("y.zig");
+        \\
+    ;
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        ImportGraph.findImportPath(continuation, 8),
+    );
+
+    // The same-line form still extracts.
+    const same_line = "const x = @import(\"y.zig\");\n";
+    try std.testing.expectEqualStrings(
+        "y.zig",
+        ImportGraph.findImportPath(same_line, 10) orelse return error.TestUnexpectedResult,
+    );
 }
 
 // ============================================================================
@@ -76717,6 +76812,76 @@ test "buildIntegrationUpdate reports an already-canonical block (EPH-I0168)" {
     try std.testing.expect(update == .current);
 }
 
+test "buildIntegrationUpdate replaces the v0.11.x snippet block (EPH-I0055)" {
+    // The marker-pair patching carries two pairs: the canonical block and
+    // the old v0.11.x snippet. The old pair must splice to the canonical
+    // block like the new one, and both old markers must be gone after.
+    const allocator = std.testing.allocator;
+    const content =
+        \\pub fn build(b: *std.Build) void {
+        \\    const exe = 1;
+        \\    _ = exe;
+        \\    _ = b;
+        \\    // === Ephor Static Analysis ===
+        \\    const ephor_exe = b.addExecutable(.{ .name = "ephor" });
+        \\    ephor_step.dependOn(&b.addRunArtifact(ephor_exe).step);
+        \\}
+        \\
+    ;
+    const update = try buildIntegrationUpdate(allocator, content);
+    const new_content = switch (update) {
+        .replaced => |nc| nc,
+        else => return error.TestUnexpectedResult,
+    };
+    defer allocator.free(new_content);
+
+    try std.testing.expect(mem.indexOf(u8, new_content, EPHOR_BUILD_BLOCK) != null);
+    try std.testing.expect(mem.startsWith(u8, new_content, "pub fn build"));
+    try std.testing.expect(mem.endsWith(u8, new_content, "}\n"));
+    try std.testing.expect(mem.indexOf(u8, new_content, "=== Ephor Static Analysis ===") == null);
+    try std.testing.expect(mem.indexOf(u8, new_content, "ephor_exe") == null);
+}
+
+test "updateBuildFnScanBraces: only code braces move the depth (EPH-I0055)" {
+    var scan: BuildFnScan = .{ .in_build_fn = true, .brace_depth = 1 };
+    // Braces inside a string, a char literal, and a comment are data.
+    updateBuildFnScanBraces(&scan, "const s = \"{ }\";", 0);
+    updateBuildFnScanBraces(&scan, "const c = '}';", 1);
+    updateBuildFnScanBraces(&scan, "// { }", 2);
+    try std.testing.expectEqual(@as(i32, 1), scan.brace_depth);
+    try std.testing.expect(scan.build_fn_end == null);
+    try std.testing.expect(scan.in_build_fn);
+    // A real code brace opens; its matching close returns to depth 1.
+    updateBuildFnScanBraces(&scan, "if (x) {", 3);
+    try std.testing.expectEqual(@as(i32, 2), scan.brace_depth);
+    updateBuildFnScanBraces(&scan, "}", 4);
+    try std.testing.expectEqual(@as(i32, 1), scan.brace_depth);
+    try std.testing.expect(scan.build_fn_end == null);
+    // The close that reaches depth 0 ends the build fn at that line.
+    updateBuildFnScanBraces(&scan, "}", 5);
+    try std.testing.expectEqual(@as(i32, 0), scan.brace_depth);
+    try std.testing.expectEqual(@as(?usize, 5), scan.build_fn_end);
+    try std.testing.expect(!scan.in_build_fn);
+}
+
+test "updateBuildFnScanBraces: multiline string braces are data (EPH-I0055)" {
+    var scan: BuildFnScan = .{ .in_build_fn = true, .brace_depth = 1 };
+    // A `\\` opener makes the rest of the line string data, and a body
+    // line (leading `\\`) returns early from LiteralState.forLine, so an
+    // unbalanced brace inside the format string cannot close the build
+    // fn early (EPH-I0512 doc).
+    updateBuildFnScanBraces(&scan, "const s = \\\\", 0);
+    try std.testing.expectEqual(@as(i32, 1), scan.brace_depth);
+    updateBuildFnScanBraces(&scan, "\\\\ unbalanced { }", 1);
+    try std.testing.expectEqual(@as(i32, 1), scan.brace_depth);
+    try std.testing.expect(scan.build_fn_end == null);
+    try std.testing.expect(scan.in_build_fn);
+    // A real close after the multiline string still ends the fn.
+    updateBuildFnScanBraces(&scan, "}", 2);
+    try std.testing.expectEqual(@as(?usize, 2), scan.build_fn_end);
+    try std.testing.expect(!scan.in_build_fn);
+}
+
 test "zigContentParses gates the replacement on a clean parse (EPH-I0168)" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -77209,6 +77374,31 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\}
         ,
     },
+    .{
+        // EPH-I0065: the object-opener check skips whitespace and `//`
+        // comments but still requires the first CODE char after the colon
+        // to be `{`. A comment between the colon and the brace stays a
+        // valid span, so the migration still runs.
+        .name = "comment between the colon and the brace still migrates (EPH-I0065)",
+        .input =
+        \\{
+        \\  "thresholds": // keys for the complexity gate
+        \\  {
+        \\    "max_function_lines": 50
+        \\  }
+        \\}
+        ,
+        .expected =
+        \\{
+        \\  "thresholds": // keys for the complexity gate
+        \\  {
+        \\    "max_function_lines": 50,
+        \\    "max_cyclomatic": 10,
+        \\    "max_cognitive": 15
+        \\  }
+        \\}
+        ,
+    },
 };
 
 const migrate_null_cases = [_]MigrateNullCase{
@@ -77234,6 +77424,20 @@ const migrate_null_cases = [_]MigrateNullCase{
     .{
         .name = "thresholds is not an object",
         .input = "{\"thresholds\": 5}",
+    },
+    .{
+        // EPH-I0065: a scalar thresholds key followed by ANOTHER object
+        // must stay inert. Pre-fix the brace scan bound the next object's
+        // brace, so the migration inserted threshold keys into "x".
+        .name = "scalar thresholds before another object is not an anchor (EPH-I0065)",
+        .input = "{\"thresholds\": 5, \"x\": {\"deep\": 1}}",
+    },
+    .{
+        // EPH-I0065: the key must bind an object value, so a string value
+        // before another object stays inert too (the pre-fix scan found
+        // the next object's brace past the string).
+        .name = "string thresholds value before another object is not an anchor (EPH-I0065)",
+        .input = "{\"thresholds\": \"none\", \"x\": {\"deep\": 1}}",
     },
     .{
         // EPH-I0511: a string VALUE mentioning "thresholds" with no real
@@ -94065,6 +94269,20 @@ test "countLineBranches counts unspaced control flow" {
     try std.testing.expectEqual(@as(usize, 0), countLineBranches("inline for(xs) |x| {"));
     try std.testing.expectEqual(@as(usize, 0), countLineBranches("const s = \"while(x)\";"));
     try std.testing.expectEqual(@as(usize, 0), countLineBranches("foo(); // while(x)"));
+}
+
+test "countLineBranches: ternary if/else expression counts one branch (EPH-I0058)" {
+    // The else of a same-line if-expression is the alternative of the
+    // already-counted if, not a separate branch (ZA305 never counts it).
+    try std.testing.expectEqual(@as(usize, 1), countLineBranches("const x = if (a) 4 else 6;"));
+    try std.testing.expectEqual(@as(usize, 1), countLineBranches("} else if (a) return;"));
+    // Block forms keep a brace on the line and keep the else count.
+    try std.testing.expectEqual(@as(usize, 2), countLineBranches("if (a) { return 1; } else return 2;"));
+    try std.testing.expectEqual(@as(usize, 1), countLineBranches("} else {"));
+    // A brace-less else without a same-line if (Allman) keeps its count.
+    try std.testing.expectEqual(@as(usize, 1), countLineBranches("} else"));
+    // A brace inside a char literal is not a code-position brace.
+    try std.testing.expectEqual(@as(usize, 1), countLineBranches("const x = if (c == '{') 1 else 2;"));
 }
 
 test "countLineCognitive counts unspaced control flow" {

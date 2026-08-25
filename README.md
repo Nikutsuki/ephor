@@ -291,7 +291,7 @@ Example config:
 |--------|-------------|
 | `version` | Pinned ephor version (set by `install`/`upgrade`) |
 | `path_dir` | Directory to analyze (also accepts `code`, `src`, or `root` as aliases). Must resolve inside the config's own directory |
-| `entries` | Entry points for orphan detection |
+| `entries` | Entry points for orphan detection. An entry outside the scan root joins the import graph only: findings print only for files inside the scan root |
 | `exclude` | Paths to exclude from all checks (substring match). Empty is a hard error. Ephor ignores the over-broad patterns `/`, `.zig`, `.`, `zig`, and the scan root's first path component with a warning |
 | `orphan_exclude` | Patterns to exclude from orphan detection only |
 | `disable` | Rule IDs to disable (prefix matching: `ZA3` disables all) |
@@ -344,7 +344,7 @@ Entries extracted from build.zig files in the scanned tree pass the same check, 
 note: ignoring <N> outside-root entries extracted from target tree <path>
 ```
 
-Operator channels stay exempt: `--entry`, a trusted config's `entries`, and the working directory's own build.zig may point outside the scan root. Orphan detection then stays complete for files the scan root does not cover.
+Operator channels stay exempt: `--entry`, a trusted config's `entries`, and the working directory's own build.zig may point outside the scan root. Orphan detection then stays complete for files the scan root does not cover. Those files do not produce findings: the scan root bounds the finding scope, and an out-of-root entry is graph-only.
 
 The containment gates realpath a path to decide, then open the original textual path. The final path component opens no-follow, so a symlink swapped in there fails the open instead of redirecting the read, and a symlinked scan root fails closed. An intermediate path component swapped between the gate and the open could still redirect the read. That residual is the accepted posture for a batch scanner.
 

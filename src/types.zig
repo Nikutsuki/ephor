@@ -524,14 +524,17 @@ pub fn countOccurrences(h: []const u8, n: []const u8) usize {
     return count;
 }
 
-/// Line count of `content`: one per newline plus one for the final line.
-/// Empty content has zero lines (EPH-I0586).
+/// Line count of `content`: one per newline, plus one for a final line
+/// that no newline terminates. A trailing newline closes the last line
+/// instead of opening a phantom empty one (EPH-I0724). Empty content has
+/// zero lines (EPH-I0586).
 pub fn countLines(content: []const u8) usize {
     if (content.len == 0) return 0;
-    var count: usize = 1;
+    var count: usize = 0;
     for (content) |c| {
         if (c == '\n') count += 1;
     }
+    if (content[content.len - 1] != '\n') count += 1;
     return count;
 }
 
@@ -764,6 +767,12 @@ test "countLines counts newlines" {
     try std.testing.expectEqual(@as(usize, 0), countLines(""));
     try std.testing.expectEqual(@as(usize, 3), countLines("a\nb\nc"));
     try std.testing.expectEqual(@as(usize, 1), countLines("no newlines"));
+    // A trailing newline closes the last line instead of opening a
+    // phantom one (EPH-I0724): "a\nb\nc\n" is 3 lines, not 4.
+    try std.testing.expectEqual(@as(usize, 3), countLines("a\nb\nc\n"));
+    try std.testing.expectEqual(@as(usize, 1), countLines("\n"));
+    try std.testing.expectEqual(@as(usize, 2), countLines("\n\n"));
+    try std.testing.expectEqual(@as(usize, 1), countLines("single\n"));
 }
 
 test "isInsideString detects strings" {

@@ -199,17 +199,33 @@ fi
 # fail_on: warning is the intended posture: the check exits 1 while
 # warnings exist. The ratchet is tracked, not green.
 #
-# Footer contract (printResultFooter, src/main.zig:40530-40551): the run
-# prints "ephor: N warning(s)[, M note(s)] found" when warnings exist,
-# "ephor: N note(s) found" when only notes exist, and NO footer when the
-# tree is clean (0 warnings + 0 notes). The counts singularize at 1. The
-# summary TOTAL: includes notes (src/main.zig:40762), so the footer is the
+# Footer contract (renderResultFooter, src/main.zig:42377): the run
+# prints "ephor: E error(s)[, W warning(s)[, N note(s)] found]" with the
+# severity segments in that order, zero-count segments skipped, counts
+# singularized at 1, and NO footer when the run has no findings. The
+# error segment prints only when error-severity findings exist
+# (EPH-I0740). The ratchet tracks the fail_on:warning count, which
+# includes errors (tallyIssues folds errors into warnings), so the
+# tracked number is errors + warnings. The summary TOTAL: line includes
+# notes (printCheckSummary, src/main.zig:43735), so the footer is the
 # warning-count source.
 set +e
 ./zig-out/bin/ephor check src/ --summary > "$GATE_DIR/dogfood.log" 2>&1
 DOGFOOD_EXIT=$?
 set -e
-DOG_COUNT="$(sed -nE 's/^ephor: ([0-9]+) warnings?(, [0-9]+ notes?)? found$/\1/p' "$GATE_DIR/dogfood.log" | tail -1 || true)"
+# Two extractions cover every form: the error count (present only in the
+# error forms) and the warning count (the warnings segment of the error
+# forms, or the plain warnings forms). Each sed prints only on a match,
+# so a missing form leaves the variable empty and the arithmetic default
+# covers it.
+DOG_ERRS="$(sed -nE 's/^ephor: ([0-9]+) errors?(, .*)? found$/\1/p' "$GATE_DIR/dogfood.log" | tail -1 || true)"
+DOG_WARNINGS="$(sed -nE 's/^ephor: ([0-9]+) errors?, ([0-9]+) warnings?(, .*)? found$/\2/p; s/^ephor: ([0-9]+) warnings?(, .*)? found$/\1/p' "$GATE_DIR/dogfood.log" | tail -1 || true)"
+DOG_TOTAL="$(( ${DOG_ERRS:-0} + ${DOG_WARNINGS:-0} ))"
+if [ "$DOG_TOTAL" -eq 0 ]; then
+    DOG_COUNT=""
+else
+    DOG_COUNT="$DOG_TOTAL"
+fi
 DOG_BASE="$(awk '$1 == "dogfood" {print $2}' "$BASELINES")"
 # Same token validation as the test ratchet: empty, non-numeric, 10+
 # character digit runs (EPH-I1128), or multi-line values must fail
@@ -288,16 +304,19 @@ for corpus in $CORPORA; do
     ./zig-out/bin/ephor check "$cdir" --export="$AB_DIR/current-$corpus.md" > "$txt" 2>&1
     scan_exit=$?
     set -e
-    # Scan contract (printResultFooter, src/main.zig:40530-40551): a clean
-    # scan exits 0 (no footer at 0 warnings + 0 notes); a findings scan
-    # exits 1 and prints one of the three footer forms (warnings, warnings
-    # + notes, notes only — counts singularize at 1); a crash (exit 128+)
-    # or a run error (exit 1 without a footer) fails the leg.
+    # Scan contract (renderResultFooter, src/main.zig:42377): a clean
+    # scan exits 0 (no footer when no findings); a findings scan exits 1
+    # and prints one footer with the severity segments in order —
+    # "ephor: E error(s)[, W warning(s)[, N note(s)] found]", zero-count
+    # segments skipped, counts singularized at 1, and the error segment
+    # present only when error-severity findings exist (EPH-I0740); a
+    # crash (exit 128+) or a run error (exit 1 without a footer) fails
+    # the leg.
     if [ "$scan_exit" -gt 1 ]; then
         fail "corpus A/B: $corpus scan (exit $scan_exit; see $txt)"
         continue
     fi
-    if [ "$scan_exit" -eq 1 ] && ! grep -qE '^ephor: ([0-9]+ warnings?(, [0-9]+ notes?)?|[0-9]+ notes?) found$' "$txt"; then
+    if [ "$scan_exit" -eq 1 ] && ! grep -qE '^ephor: ([0-9]+ errors?(, ([0-9]+ warnings?(, [0-9]+ notes?)?|[0-9]+ notes?))?|[0-9]+ warnings?(, [0-9]+ notes?)?|[0-9]+ notes?) found$' "$txt"; then
         fail "corpus A/B: $corpus scan (exit 1 without a findings footer; see $txt)"
         continue
     fi

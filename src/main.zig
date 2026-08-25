@@ -285,6 +285,12 @@ const DiagCtx = struct {
     /// fine for a diagnostic.
     last_muted_diag: [diag_msg_buf_bytes]u8 = undefined,
     last_muted_diag_len: usize = 0,
+    /// True once an "error:" diagnostic printed this run (EPH-I0728).
+    /// errorExitCode consults the latch: a failure whose cause already
+    /// printed must not repeat as the runtime's bare error line, so the
+    /// exit code returns silently instead. Set by cliDiag on the printed
+    /// or stashed message, never by any other channel.
+    error_diag_printed: bool = false,
     /// "ignoring suppression/gate keys from untrusted" notes printed. One
     /// per offending config file.
     untrusted_config_note_count: usize = 0,
@@ -384,6 +390,15 @@ const bad_gate_value_buf_bytes = 64;
 /// same truncation policy as the stashBadGateValue clamp (B13-17).
 const diag_msg_buf_bytes = 8192;
 
+/// Latch the printed-error flag for error-keyword messages (EPH-I0728):
+/// errorExitCode reads the latch to keep one error line per failure. The
+/// comptime prefix check makes the branch vanish for every non-error
+/// message, and the branch lives here so cliDiag keeps its complexity
+/// budget.
+fn latchErrorDiag(diag: *DiagCtx, comptime fmt: []const u8) void {
+    if (comptime mem.startsWith(u8, fmt, "error: ")) diag.error_diag_printed = true;
+}
+
 /// Print a CLI/config diagnostic unless the run has muted the channel or
 /// the output stream is the JSON machine contract (EPH-I0213). With a
 /// sink installed (EPH-I1051) the message formats once into a fixed
@@ -392,6 +407,10 @@ const diag_msg_buf_bytes = 8192;
 /// with the pre-sink code.
 fn cliDiag(diag: *DiagCtx, comptime fmt: []const u8, args: anytype) void {
     if (!diag.cli_diagnostics_enabled) return;
+    // An error-keyword message latches the printed-error flag for
+    // errorExitCode's one-line-per-failure contract (EPH-I0728). The
+    // branch lives in the helper so cliDiag keeps its complexity budget.
+    latchErrorDiag(diag, fmt);
     if (diag.json_stream) {
         // The machine latch mutes the message, but the abort path must
         // still carry it: stash the formatted text (EPH-I1067). The
@@ -11777,6 +11796,25 @@ fn buildPartialCoverageIssue(file_path: []const u8, alloc: CFGAlloc) Issue {
     };
 }
 
+/// Build a missing-defer issue for an alloc with no defer anywhere in the
+/// function (EPH-I0725): "not on all code paths" would claim partial
+/// coverage that does not exist. A direct free on some branch does not
+/// change the verdict — the rule reports the missing defer.
+fn buildMissingDeferIssue(file_path: []const u8, alloc: CFGAlloc) Issue {
+    return Issue{
+        .file = file_path,
+        .line = alloc.line,
+        .col = alloc.col,
+        .severity = .warning,
+        .rule = if (alloc.is_create) RULE_CREATE_NO_DEFER else RULE_ALLOC_NO_DEFER,
+        .message = if (alloc.is_create)
+            "missing defer destroy(): no defer frees this allocation"
+        else
+            "missing defer free(): no defer frees this allocation",
+        .help = "add a defer right after the allocation so it runs on every exit path",
+    };
+}
+
 fn checkDeferCoverageForAlloc(
     ctx: *const DeferCoverageCtx,
     alloc: CFGAlloc,
@@ -11824,7 +11862,12 @@ fn checkDeferCoverageForAlloc(
         alloc.line - ctx.body.func_line,
     )) return null;
 
-    return buildPartialCoverageIssue(ctx.body.file_path, alloc);
+    // The message names the actual shape (EPH-I0725): a defer free for
+    // this alloc in some block means partial coverage; total absence
+    // means a missing defer.
+    if (state.anyDeferExists())
+        return buildPartialCoverageIssue(ctx.body.file_path, alloc);
+    return buildMissingDeferIssue(ctx.body.file_path, alloc);
 }
 
 /// True when a word-bounded `return` keyword sits in masked code outside
@@ -14450,7 +14493,13 @@ const ImportGraph = struct {
             const fixme = countOccurrences(a.content, "FIX" ++ "ME");
             s.todo_count += todo + fixme;
 
-            var lines = mem.splitScalar(u8, a.content, '\n');
+            // A trailing newline closes the last line instead of opening
+            // a phantom empty one, so the split runs on the content minus
+            // that newline (EPH-I0724): Blank stays consistent with the
+            // fixed countLines total. Empty content keeps its pre-fix
+            // one-empty-segment split (zero-byte files are not this class).
+            const body = contentForLineSplit(a.content);
+            var lines = mem.splitScalar(u8, body, '\n');
             while (lines.next()) |line| {
                 const t = mem.trim(u8, line, " \t\r");
                 if (t.len == 0)
@@ -14464,6 +14513,16 @@ const ImportGraph = struct {
         return s;
     }
 };
+
+/// Content for the stats line-classification split: one trailing newline
+/// is a line TERMINATOR, so the split runs on the content minus it
+/// (EPH-I0724). Kept out of getStats so the conditional does not push
+/// that function past its complexity budget. Empty content passes
+/// through: the zero-byte file is not the newline class.
+fn contentForLineSplit(content: []const u8) []const u8 {
+    if (content.len == 0 or content[content.len - 1] != '\n') return content;
+    return content[0 .. content.len - 1];
+}
 
 // ============================================================================
 // Memory Analysis Helpers
@@ -34669,6 +34728,12 @@ const RuntimeOptions = struct {
     /// echo and the command-truncation warning) stay off the machine
     /// stream (EPH-I0213).
     json_stream: bool = false,
+    /// When set, runRuntimeAnalysis writes whether the analysis ran here
+    /// (EPH-I0734): false means the can't-run path fired (spawn failure,
+    /// capture overflow, missing target directory), and the caller must
+    /// not read the run as a clean pass. Null skips the report (direct
+    /// test callers).
+    analysis_ran: ?*bool = null,
     /// When set, runRuntimeAnalysis writes the dedup/cap suppressed count
     /// here (EPH-I0211). Null skips the report (direct test callers).
     suppressed_out: ?*usize = null,
@@ -34684,6 +34749,11 @@ fn runRuntimeAnalysis(
     // Findings own heap payloads (EPH-I0196/I0202): an unwind mid-parse
     // must free the partial list, not drop it (EPH-I0767).
     errdefer deinitIssues(&issues, allocator);
+    // The report is authoritative in both directions (EPH-I0734): the
+    // default is not-run, and only a successful child spawn flips it.
+    // A caller-initialized true would otherwise survive the can't-run
+    // path and read a failed run as a pass.
+    if (opts.analysis_ran) |ran| ran.* = false;
     var argv_buf: [64][]const u8 = undefined;
     var argv_scratch: [runtime_argv_scratch_bytes]u8 = undefined;
     const argv_len = try buildRuntimeArgv(opts, &argv_buf, &argv_scratch, allocator);
@@ -34712,6 +34782,10 @@ fn runRuntimeAnalysis(
         argv_buf[0..argv_len],
         .{ .path = path },
     ) catch |err| return reportSpawnFailure(allocator, &issues, opts, err);
+    // The spawn succeeded, so the analysis infrastructure ran (EPH-I0734):
+    // only the can't-run shapes (spawn failure, StreamTooLong, a missing
+    // target directory) leave the report false.
+    if (opts.analysis_ran) |ran| ran.* = true;
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
@@ -40689,6 +40763,14 @@ fn parseCliArg(ctx: CliParseCtx, arg: []const u8) !void {
         ctx.no_more_flags.* = true;
         return;
     }
+    // --help/-h after a command selects the help command instead of
+    // erroring as an unknown flag (EPH-I0727): the documented single-help
+    // decision — the top-level help covers every command, so the request
+    // prints it. After the `--` marker the token stays a scan path.
+    if (mem.eql(u8, arg, "--help") or mem.eql(u8, arg, "-h")) {
+        ctx.cfg.command = .help;
+        return;
+    }
     if (try parseFailOnArg(ctx.diag, arg, ctx.cfg)) return;
     if (mem.startsWith(u8, arg, "--entry="))
         return handleEntryArg(ctx.allocator, arg, ctx.cfg, ctx.cli_entries);
@@ -41121,6 +41203,10 @@ fn printHelp() void {
         \\  --force             For 'upgrade': allow a downgrade below the
         \\                       binary's own version (refused by default)
         \\
+        \\--help (or -h) after a command, for example 'ephor memory --help',
+        \\prints the top-level help above. Per-command help does not exist
+        \\by design: one help surface covers every command (EPH-I0727).
+        \\
         \\ENVIRONMENT VARIABLES:
         \\  EPHOR_NO_UPDATE_CHECK   When set (any value, including empty), skip the
         \\                          version update check entirely: no network fetch,
@@ -41297,7 +41383,10 @@ fn printHelp() void {
         \\  confirmation gate arms unless --yes was passed. A declined
         \\  prompt (n, or EOF on a non-interactive stdin) prints "Aborted."
         \\  and exits 1: a CI run without --yes fails instead of passing
-        \\  silently.
+        \\  silently. A run that cannot start — the child spawn fails, the
+        \\  target directory is missing, or the capture cap trips —
+        \\  reports a ZR104 finding and exits 1 the same way: the analysis
+        \\  did not run.
         \\
         \\INTELLIJ IDEA SETUP:
         \\  1. Settings > Tools > External Tools > Add
@@ -42251,31 +42340,80 @@ fn printIssues(issues: []const Issue, title: []const u8, out: ReportOutCtx) Prin
     return counts;
 }
 
-/// Print the trailing "N warning(s), M note(s) found" line. Text mode
-/// only: JSON mode emits no footer, because the machine stream must
-/// stay pure JSON (EPH-I0213) and the per-analyzer counts plus the
-/// exit code carry the same information.
+/// Print the trailing findings-count line. Text mode only: JSON mode
+/// emits no footer, because the machine stream must stay pure JSON
+/// (EPH-I0213) and the per-analyzer counts plus the exit code carry the
+/// same information. The render is separated from the print so tests pin
+/// the text without writing to stderr (EPH-I0740).
 fn printResultFooter(total: PrintCounts, format: OutputFormat) void {
-    // JSON mode emits no footer: the stream is a machine contract and must
-    // stay pure JSON (EPH-I0213). The per-analyzer counts and the exit
-    // code carry the same information.
     if (format == .json) return;
-    if (total.warnings == 0 and total.notes == 0) return;
-    std.debug.print("\nephor: ", .{});
-    if (total.warnings > 0) {
-        std.debug.print("{d} warning{s}", .{
-            total.warnings,
-            if (total.warnings == 1) "" else "s",
-        });
-        if (total.notes > 0) std.debug.print(", ", .{});
+    var buf: [footer_buf_bytes]u8 = undefined;
+    const text = renderResultFooter(total, &buf) orelse return;
+    std.debug.print("{s}", .{text});
+}
+
+/// Stack buffer for one footer line. The longest render is "ephor: "
+/// plus three segments (errors, warnings, notes), each at most
+/// "20 digits + label" — the 128-byte buffer covers every countable
+/// usize run with room to spare (EPH-I0740).
+const footer_buf_bytes = 128;
+
+/// One footer segment: the count and its pluralized noun, precomputed so
+/// the render loop carries no inline branch (EPH-I0740).
+const FooterSegment = struct { count: usize, text: []const u8 };
+
+/// Build one segment with the correct plural form. `noun` is comptime,
+/// so the `++` concatenation resolves to a static string.
+fn footerSegment(count: usize, comptime noun: []const u8) FooterSegment {
+    return .{ .count = count, .text = if (count == 1) noun else noun ++ "s" };
+}
+
+/// Render the trailing footer into `buf`, or null when the run has no
+/// findings (EPH-I0740): errors print separately from warnings, so an
+/// error-severity finding no longer reads as a warning. `warnings`
+/// includes the error subset (the gate arithmetic's historical
+/// semantics, computeExitCode), so the render subtracts it. The segments
+/// print in severity order, error first.
+fn renderResultFooter(total: PrintCounts, buf: []u8) ?[]const u8 {
+    const warnings_only = total.warnings - total.errors;
+    const segments = [3]FooterSegment{
+        footerSegment(total.errors, "error"),
+        footerSegment(warnings_only, "warning"),
+        footerSegment(total.notes, "note"),
+    };
+    var w: std.Io.Writer = .fixed(buf);
+    w.print("\nephor: ", .{}) catch return null;
+    var printed = false;
+    for (segments) |seg| {
+        if (seg.count == 0) continue;
+        if (printed) w.print(", ", .{}) catch return null;
+        w.print("{d} {s}", .{ seg.count, seg.text }) catch return null;
+        printed = true;
     }
-    if (total.notes > 0) {
-        std.debug.print("{d} note{s}", .{
-            total.notes,
-            if (total.notes == 1) "" else "s",
-        });
-    }
-    std.debug.print(" found\n", .{});
+    if (!printed) return null;
+    w.print(" found\n", .{}) catch return null;
+    return w.buffered();
+}
+
+test "footer renders errors separately from warnings (EPH-I0740)" {
+    var buf: [footer_buf_bytes]u8 = undefined;
+    // Errors no longer fold into the warning count.
+    try std.testing.expectEqualStrings(
+        "\nephor: 1 error, 2 warnings, 3 notes found\n",
+        renderResultFooter(.{ .warnings = 3, .errors = 1, .notes = 3 }, &buf).?,
+    );
+    // Error-only and warning/note-only runs render the pre-fix shapes
+    // for their segments, and a clean run renders nothing.
+    try std.testing.expectEqualStrings(
+        "\nephor: 1 error found\n",
+        renderResultFooter(.{ .warnings = 1, .errors = 1, .notes = 0 }, &buf).?,
+    );
+    try std.testing.expectEqualStrings(
+        "\nephor: 2 warnings, 1 note found\n",
+        renderResultFooter(.{ .warnings = 2, .errors = 0, .notes = 1 }, &buf).?,
+    );
+    const empty = renderResultFooter(.{ .warnings = 0, .errors = 0, .notes = 0 }, &buf);
+    try std.testing.expect(empty == null);
 }
 
 /// Label for the stats Quality line. Spelled via comptime concatenation
@@ -42627,6 +42765,25 @@ fn scanPath(g: *ImportGraph, path: []const u8) !void {
     }
 }
 
+/// Usage error when a scan resolved to zero Zig files (EPH-I0726): a
+/// non-zig path argument or a Zig-less directory is a typo-class
+/// mistake, and every other zero-scan shape already errors (missing
+/// dir, empty entries). A silent exit 0 would read as ran-clean. The
+/// path crosses the terminal sanitizer: scan roots can derive from
+/// config files (EPH-I0147), so their bytes are not necessarily the
+/// operator's own.
+fn requireScannedFiles(ctx: *RunCtx, g: *const ImportGraph) void {
+    if (g.files.count() > 0) return;
+    if (types.sanitizeTerminal(ctx.alloc, ctx.cfg.path)) |safe_val| {
+        var safe_path = safe_val;
+        defer safe_path.deinit(ctx.alloc);
+        cliDiag(ctx.diag, "error: no Zig files found at '{s}'\n", .{safe_path.slice});
+    } else |_| {
+        cliDiag(ctx.diag, "error: no Zig files found at the scan path\n", .{});
+    }
+    ctx.should_exit_error = true;
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -42805,6 +42962,8 @@ fn handleOrphans(ctx: *RunCtx) !void {
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try scanPath(&g, ctx.cfg.path);
+    requireScannedFiles(ctx, &g);
+    if (ctx.should_exit_error) return;
     for (ctx.cfg.entries.items) |e| try g.markReachable(e);
     try g.markBuildPathReferences(ctx.cfg);
     var issues = try g.getOrphanIssues(ctx.alloc, ctx.cfg);
@@ -42823,6 +42982,8 @@ fn handleMemory(ctx: *RunCtx) !void {
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try scanPath(&g, ctx.cfg.path);
+    requireScannedFiles(ctx, &g);
+    if (ctx.should_exit_error) return;
     var issues = try analyzeCFGMemory(ctx.alloc, &g);
     defer deinitIssues(&issues, ctx.alloc);
     // AST tier (ZA111) is a memory-family rule — include it here too.
@@ -42838,6 +42999,10 @@ fn handleMemory(ctx: *RunCtx) !void {
     try moveIssues(ctx.alloc, &issues, &ast_issues);
     ast_issues.deinit(ctx.alloc);
     ast_issues = .empty;
+    // The shared CFG pass emits ZA2/ZA6/ZA8/ZA9 families too (EPH-I0723):
+    // the memory command's promise is the memory category, so drop every
+    // non-ZA1 finding before printing.
+    filterMemoryFamily(&issues, ctx.alloc);
     const c = printIssues(issues.items, "memory", ctx.reportOut(&g));
     reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg, null);
     applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
@@ -42850,6 +43015,8 @@ fn handleErrors(ctx: *RunCtx) !void {
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try scanPath(&g, ctx.cfg.path);
+    requireScannedFiles(ctx, &g);
+    if (ctx.should_exit_error) return;
     var issues = try analyzeErrors(ctx.alloc, &g);
     defer deinitIssues(&issues, ctx.alloc);
     // ZA205: discarded error union results
@@ -42875,6 +43042,8 @@ fn handleUnused(ctx: *RunCtx) !void {
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try scanPath(&g, ctx.cfg.path);
+    requireScannedFiles(ctx, &g);
+    if (ctx.should_exit_error) return;
     var issues = try analyzeUnused(ctx.alloc, &g);
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "unused", ctx.reportOut(&g));
@@ -42889,6 +43058,8 @@ fn handleComplexity(ctx: *RunCtx) !void {
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try scanPath(&g, ctx.cfg.path);
+    requireScannedFiles(ctx, &g);
+    if (ctx.should_exit_error) return;
     var issues = try analyzeComplexity(ctx.alloc, &g, ctx.cfg.thresholds);
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "complexity", ctx.reportOut(&g));
@@ -42912,6 +43083,8 @@ fn handleStats(ctx: *RunCtx) !void {
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try scanPath(&g, ctx.cfg.path);
+    requireScannedFiles(ctx, &g);
+    if (ctx.should_exit_error) return;
     printStats(g.getStats(), ctx.cfg.format);
 }
 
@@ -42924,6 +43097,8 @@ fn handleListTests(ctx: *RunCtx) !void {
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try scanPath(&g, ctx.cfg.path);
+    requireScannedFiles(ctx, &g);
+    if (ctx.should_exit_error) return;
     var blocks = try collectTestBlocks(ctx.alloc, &g);
     defer blocks.deinit(ctx.alloc);
     printTestListing(ctx.alloc, blocks.items, ctx.cfg.format);
@@ -43050,6 +43225,7 @@ fn handleRuntime(ctx: *RunCtx) !void {
     }
     try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
     var suppressed: usize = 0;
+    var analysis_ran = false;
     var issues = try runRuntimeAnalysis(
         ctx.diag.io,
         ctx.alloc,
@@ -43059,9 +43235,16 @@ fn handleRuntime(ctx: *RunCtx) !void {
             .custom_command = ctx.cfg.runtime_command,
             .json_stream = ctx.diag.json_stream,
             .suppressed_out = &suppressed,
+            .analysis_ran = &analysis_ran,
         },
     );
     defer deinitIssues(&issues, ctx.alloc);
+    // Can't-run class (EPH-I0734): a spawn failure, a capture overflow,
+    // or a missing target directory means the analysis never ran. The
+    // ZR104 finding names the cause, and the exit code fails the run
+    // like a declined prompt (EPH-I0261) regardless of fail_on — a CI
+    // gate must not pass on a run that analyzed nothing.
+    if (!analysis_ran) ctx.should_exit_error = true;
     const c = printIssues(issues.items, "runtime", ctx.reportOut(null));
     // EPH-I0211: the dedup/cap note. cliDiag's json latch keeps it off
     // the machine stream (the band precedent: the truncation warning).
@@ -43109,6 +43292,27 @@ const CheckFindings = struct {
         deinitIssues(&self.conc_issues, alloc);
     }
 };
+
+/// Keep only memory-family findings in the list (EPH-I0723): the CFG
+/// pass the memory command shares with check emits the error tier
+/// (ZA202/ZA203, runCFGSafetyAnalyses → analyzeCFGErrors), the
+/// definite-assignment rule (ZA607), and the null-safety and panic
+/// families too, and the specialized command's promise is the memory
+/// category (ZA1xx). In-place compaction keeps ownership single: a
+/// dropped item's payloads free here, the kept ones stay with the list
+/// for the caller's deinit. Infallible by construction (no allocation).
+fn filterMemoryFamily(issues: *std.ArrayListUnmanaged(Issue), allocator: Allocator) void {
+    var write: usize = 0;
+    for (issues.items) |*issue| {
+        if (mem.startsWith(u8, issue.rule, "ZA1")) {
+            issues.items[write] = issue.*;
+            write += 1;
+        } else {
+            issue.deinit(allocator);
+        }
+    }
+    issues.items.len = write;
+}
 
 /// The cfg_mem_issues list split by rule family: ZA8 → null-safety, ZA9 →
 /// panic, everything else → memory. ZA2 drops out (analyzeErrors owns those
@@ -43192,6 +43396,8 @@ fn handleCheck(ctx: *RunCtx) !void {
     defer g.deinit();
     g.scan_root = ctx.base_path;
     try buildCheckGraph(ctx, &g);
+    requireScannedFiles(ctx, &g);
+    if (ctx.should_exit_error) return;
     var findings = try collectCheckFindings(ctx, &g);
     defer findings.deinit(ctx.alloc);
     try reportCheckFindings(ctx, &g, &findings);
@@ -43639,9 +43845,17 @@ fn collectAllIssues(
 /// wrapper applies the code through std.process.exit from a scope with
 /// no pending defers.
 fn errorExitCode(diag: *DiagCtx, allocator: Allocator, err: anyerror, msg: []const u8) !u8 {
-    if (!diag.json_stream) return err;
-    printAbortJson(allocator, err, msg);
-    return 1;
+    if (diag.json_stream) {
+        printAbortJson(allocator, err, msg);
+        return 1;
+    }
+    // One error line per failure (EPH-I0728): when a diagnostic already
+    // named the failure, propagating the error would make the runtime
+    // print a second bare "error: X" line. The exit code returns
+    // silently instead. An error no diagnostic named (an OOM mid-run)
+    // still propagates so the runtime line stays the only signal.
+    if (diag.error_diag_printed) return 1;
+    return err;
 }
 
 /// Print the JSON-mode abort object once (EPH-I1067): the error name and
@@ -44083,6 +44297,84 @@ test "main walk prunes dependency dirs with the shared skip predicate (EPH-I0377
     try std.testing.expectEqual(@as(usize, 1), graph.files.count());
     var iter = graph.files.keyIterator();
     try std.testing.expect(mem.endsWith(u8, iter.next().?.*, "/src/a.zig"));
+}
+
+test "stats: a trailing newline adds no phantom line or blank (EPH-I0724)" {
+    // Pre-fix, countLines counted 1 + count('\n'), so a newline-terminated
+    // file reported one extra Total Line, and the splitScalar walk counted
+    // the phantom trailing segment as a blank line. A one-line file must
+    // read 1 total, 1 code, 0 blank.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "pub fn a() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "b.zig",
+        .data = "pub fn b() void {}\n// comment\n\npub fn c() void {}\n",
+    });
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    try graph.scanDirectory(root);
+    const s = graph.getStats();
+    try std.testing.expectEqual(@as(usize, 2), s.total_files);
+    try std.testing.expectEqual(@as(usize, 5), s.total_lines);
+    try std.testing.expectEqual(@as(usize, 3), s.code_lines);
+    try std.testing.expectEqual(@as(usize, 1), s.comment_lines);
+    try std.testing.expectEqual(@as(usize, 1), s.blank_lines);
+}
+
+test "zero-zig-files scan is a usage error (EPH-I0726)" {
+    // A non-zig path argument resolves to zero Zig files. Silent exit 0
+    // would read as ran-clean; the run must fail with one diagnostic and
+    // the usage-error exit. A scan that finds a Zig file stays silent.
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "notes.txt", .data = "hello\n" });
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cache = IgnoreCache.init(allocator);
+    defer cache.deinit();
+    var ctx = RunCtx{
+        .alloc = allocator,
+        .cfg = &cfg,
+        .diag = &diag,
+        .base_path = ".",
+        .ignore_cache = &cache,
+    };
+
+    // The graph holds zero files after scanning the non-zig path.
+    const txt_path = try tmpFilePath(allocator, &tmp, "notes.txt");
+    defer allocator.free(txt_path);
+    var g = ImportGraph.init(allocator, &diag);
+    defer g.deinit();
+    g.scan_root = ctx.base_path;
+    try scanPath(&g, txt_path);
+    try std.testing.expectEqual(@as(usize, 0), g.files.count());
+    requireScannedFiles(&ctx, &g);
+    try std.testing.expect(ctx.should_exit_error);
+    try std.testing.expect(mem.indexOf(u8, capture.slice(), "error: no Zig files found at") != null);
+
+    // A Zig file scan does not trip the gate.
+    ctx.should_exit_error = false;
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "real.zig", .data = "pub fn main() void {}\n" });
+    const zig_path = try tmpFilePath(allocator, &tmp, "real.zig");
+    defer allocator.free(zig_path);
+    var g2 = ImportGraph.init(allocator, &diag);
+    defer g2.deinit();
+    g2.scan_root = ctx.base_path;
+    try scanPath(&g2, zig_path);
+    try std.testing.expectEqual(@as(usize, 1), g2.files.count());
+    requireScannedFiles(&ctx, &g2);
+    try std.testing.expect(!ctx.should_exit_error);
 }
 
 test "stats file count is the graph count: joined out-of-root entries count once (EPH-I0541)" {
@@ -45093,6 +45385,60 @@ test "check ZA2 ownership: every dropped CFG ZA2 has an errors twin (EPH-I0174)"
         try std.testing.expect(!mem.startsWith(u8, issue.rule, "ZA2"));
     for (filtered.panic.items) |issue|
         try std.testing.expect(!mem.startsWith(u8, issue.rule, "ZA2"));
+}
+
+test "memory command filter keeps only the ZA1 memory family (EPH-I0723)" {
+    // The memory command shares the CFG pass with check, and that pass
+    // emits the error tier (ZA202), the definite-assignment rule (ZA607),
+    // and the null-safety/panic families beside the memory findings. The
+    // command's promise is the memory category, so filterMemoryFamily
+    // must drop every non-ZA1 rule. The pre-filter asserts pin that the
+    // fixture really produced the leak families: the filter, not a
+    // missing emission, is what narrows the list.
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn mayFail() !void {
+        \\    return error.Fail;
+        \\}
+        \\fn leak(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    _ = buf;
+        \\}
+        \\fn catchesUnreachable() void {
+        \\    const v = mayFail() catch unreachable;
+        \\    _ = v;
+        \\}
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn whileElseBreak(c: bool, d: bool) void {
+        \\    var x: u32 = undefined;
+        \\    while (c) {
+        \\        if (d) {
+        \\            break;
+        \\        }
+        \\        x = 1;
+        \\    } else {
+        \\        x = 2;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "memory_filter.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "memory_filter.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_ALLOC_NO_DEFER) == 1);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_CATCH_UNREACHABLE) == 1);
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DEFINITE_ASSIGNMENT) == 1);
+
+    filterMemoryFamily(&run.issues, allocator);
+    try std.testing.expectEqual(@as(usize, 1), run.issues.items.len);
+    try std.testing.expectEqualStrings(RULE_ALLOC_NO_DEFER, run.issues.items[0].rule);
 }
 
 test "countOutOfRootEntries counts only .zig entries outside the scan path (EPH-I0784)" {
@@ -47661,6 +48007,75 @@ test "reportRunFailure distinguishes spawn failure from output overflow" {
     }
 }
 
+test "runtime spawn failure reports the analysis as not-run (EPH-I0734)" {
+    // A spawn failure means the analysis never ran; the run must not
+    // read as a pass. The exit arm keys on analysis_ran, which
+    // runRuntimeAnalysis reports false by default and true only after
+    // the child spawn succeeds. The target is a deleted tmpdir's
+    // absolute path: chdir into it fails before any binary lookup, so
+    // the failure is unconditional inside the suite (under zig build
+    // test, zig is on PATH, so a stripped-PATH induction is not
+    // hermetic). No test binary executes.
+    const diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    const dead_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(dead_path);
+    tmp.cleanup();
+    var ran = true;
+    var issues = try runRuntimeAnalysis(diag.io, allocator, dead_path, .{
+        .verbose = false,
+        .custom_command = null,
+        .json_stream = false,
+        .analysis_ran = &ran,
+        .suppressed_out = null,
+    });
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expect(!ran);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
+    try std.testing.expectEqual(Severity.err, issues.items[0].severity);
+}
+
+test "runtime can't-run failure exits nonzero regardless of fail_on (EPH-I0734)" {
+    // handleRuntime turns the not-run report into a usage-error exit:
+    // the decline path (EPH-I0261) already fails a run that analyzed
+    // nothing, and a spawn failure is the same fact. The default
+    // fail_on=never must not soften it. The target is a deleted
+    // tmpdir's absolute path (the same unconditional-failure induction
+    // as the not-run pin): the spawn fails before any binary runs, so
+    // the test never nests a zig build test under the gate. JSON mode
+    // keeps the finding on the machine stream and the abort object
+    // rides the exit code.
+    var diag = testDiagCtx();
+    diag.json_stream = true;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    const dead_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(dead_path);
+    tmp.cleanup();
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.format = .json;
+    cfg.auto_approve = true;
+    cfg.path = dead_path;
+    var cache = IgnoreCache.init(allocator);
+    defer cache.deinit();
+    var ctx = RunCtx{
+        .alloc = allocator,
+        .cfg = &cfg,
+        .diag = &diag,
+        .base_path = ".",
+        .ignore_cache = &cache,
+    };
+    try handleRuntime(&ctx);
+    try std.testing.expect(ctx.should_exit_error);
+    try std.testing.expect(!ctx.strict_fail);
+    try std.testing.expect(!ctx.abort_epilogue);
+}
+
 test "reportFmtFailure reports a missing zig as a command failure" {
     // EPH-I0232: the fmt band's spawn failure becomes a ZR104 finding
     // (not ZA601). A missing zig is not a format finding.
@@ -49185,6 +49600,54 @@ test "ZA101: indexed write through the owner is not a transfer (EPH-I0825)" {
         "test_indexed_write.zig",
         RULE_ALLOC_NO_DEFER,
     ) == 1);
+}
+
+test "ZA101: zero-defer alloc reports the missing-defer message (EPH-I0725)" {
+    // Total absence must not read as partial coverage: a function with no
+    // defer at all gets the missing-defer message, while a defer on one
+    // branch only keeps the partial-coverage message.
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn leak(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    _ = buf;
+        \\}
+        \\fn branch_defer(allocator: std.mem.Allocator, a: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    if (a) {
+        \\        defer allocator.free(buf);
+        \\    }
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "missing_defer.zig", content);
+    defer run.deinit(allocator);
+
+    var missing = false;
+    var partial = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER)) continue;
+        if (issue.line == 2) {
+            try std.testing.expectEqualStrings(
+                "missing defer free(): no defer frees this allocation",
+                issue.message,
+            );
+            missing = true;
+        }
+        if (issue.line == 6) {
+            try std.testing.expectEqualStrings(
+                "defer free() not on all code paths",
+                issue.message,
+            );
+            partial = true;
+        }
+    }
+    try std.testing.expect(missing);
+    try std.testing.expect(partial);
 }
 
 test "ZA101/ZA103: container init without deinit stays silent (EPH-I0360 doc-arm)" {
@@ -105355,16 +105818,20 @@ test "isWithinScanRoot fails closed on a null root with one warning (EPH-I0172)"
 test "unresolvedScanRootExit text mode sanitizes the cannot-resolve line (EPH-I1137)" {
     // RED4-7 regression pin (EPH-I0172 abort half): the scan path may
     // carry scanned-tree bytes, so the raw-path render must never return.
-    // The error propagates and the captured line carries the sanitized
-    // path (the ESC sequence becomes '?').
+    // The sanitized line prints once and the call returns the failure
+    // exit code — the I0728 one-line contract replaces the pre-fix
+    // propagate-and-reprint shape with a silent code.
     var diag = testDiagCtx();
     var capture = CaptureSink{};
     diag.diag_sink = capture.sink();
     const allocator = std.testing.allocator;
-    try std.testing.expectError(
-        error.ScanRootUnresolved,
-        unresolvedScanRootExit(&diag, allocator, "/tmp/scan\x1b[2mroot", error.FileNotFound),
+    const code = try unresolvedScanRootExit(
+        &diag,
+        allocator,
+        "/tmp/scan\x1b[2mroot",
+        error.FileNotFound,
     );
+    try std.testing.expectEqual(@as(u8, 1), code);
     try std.testing.expect(std.mem.indexOfScalar(u8, capture.slice(), 0x1b) == null);
     try std.testing.expectEqualStrings(
         "error: cannot resolve scan path '/tmp/scan?[2mroot': FileNotFound\n",
@@ -105404,6 +105871,47 @@ test "unresolvedScanRootExit JSON mode aborts with the sanitized message (EPH-I1
         "error: cannot resolve scan path '/tmp/scan?[2mroot': FileNotFound\n",
         parsed.value.object.get("message").?.string,
     );
+}
+
+test "errorExitCode keeps one error line per failure (EPH-I0728)" {
+    // Text mode: a failure whose diagnostic already printed returns the
+    // silent exit code instead of propagating (the runtime would add a
+    // second bare "error: X" line). An error no diagnostic named still
+    // propagates so the runtime line stays the only signal. JSON mode
+    // keeps the abort-object contract.
+    var quiet = testDiagCtx();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        errorExitCode(&quiet, std.testing.allocator, error.OutOfMemory, ""),
+    );
+
+    var spoken = testDiagCtx();
+    spoken.error_diag_printed = true;
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        try errorExitCode(&spoken, std.testing.allocator, error.FileNotFound, ""),
+    );
+
+    var json = testDiagCtx();
+    json.json_stream = true;
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        try errorExitCode(&json, std.testing.allocator, error.FileNotFound, ""),
+    );
+}
+
+test "cliDiag latches the printed-error flag on the error keyword (EPH-I0728)" {
+    // The latch keys on the comptime "error: " prefix: a warning or note
+    // never arms it, and the armed latch drives the one-line exit
+    // contract in errorExitCode.
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    cliDiag(&diag, "note: something\n", .{});
+    cliDiag(&diag, "warning: something\n", .{});
+    try std.testing.expect(!diag.error_diag_printed);
+    cliDiag(&diag, "error: something failed\n", .{});
+    try std.testing.expect(diag.error_diag_printed);
 }
 
 test "scanDirectory failure routes through the diagnostics channel (EPH-I0213)" {
@@ -107280,6 +107788,55 @@ test "CLI unknown flags are a hard usage error (EPH-I0234)" {
             parseCliArg(cli_ctx, flag),
         );
     }
+}
+
+test "CLI --help after a command selects the help command (EPH-I0727)" {
+    // The flag parser used to reject --help after a command as unknown.
+    // The documented single-help decision: the request selects the help
+    // command, which prints the top-level help. After `--` the token
+    // stays a scan path.
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+
+    const help_flags = [_][]const u8{ "--help", "-h" };
+    for (help_flags) |flag| {
+        var cfg = testConfig();
+        defer cfg.deinit(allocator);
+        cfg.command = .memory;
+        var cli_entries = false;
+        var cli_path = false;
+        var no_more_flags = false;
+        const cli_ctx: CliParseCtx = .{
+            .diag = &diag,
+            .allocator = allocator,
+            .cfg = &cfg,
+            .cli_entries = &cli_entries,
+            .cli_path = &cli_path,
+            .no_more_flags = &no_more_flags,
+        };
+        try parseCliArg(cli_ctx, flag);
+        try std.testing.expectEqual(Command.help, cfg.command);
+    }
+
+    // After the `--` marker the same token is a scan path, not a command.
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    var cli_path = false;
+    var no_more_flags = true;
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
+    };
+    try parseCliArg(cli_ctx, "--help");
+    try std.testing.expectEqual(Command.check, cfg.command);
+    try std.testing.expect(mem.eql(u8, cfg.path, "--help"));
+    try std.testing.expect(cfg.path_owned);
 }
 
 test "CLI a second positional path is a hard usage error (EPH-I0807)" {

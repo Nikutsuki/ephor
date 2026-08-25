@@ -13,8 +13,12 @@
 | **errors** | Silent `catch {}`, `catch unreachable`, `orelse unreachable`, `catch undefined`, `exit()` bypassing defers, `@panic()`, discarded errors |
 | **unused** | Unused imports, const, and var declarations |
 | **complexity** | Long functions, deep nesting, too many params/branches |
-| **style** | Lines too long, files too large, naming conventions |
+| **style** (check-only) | Lines too long, files too large, naming conventions |
 | **fmt-check** | Files that need `zig fmt` |
+
+`style` is not a command: the ZA7xx style rules run under `check` only.
+A bare word that names no command is a scan path, so `ephor style` scans
+a directory named `style`.
 
 ## Installation
 
@@ -51,7 +55,10 @@ curl -fsSL https://codeberg.org/RhyosLabs/ephor/raw/branch/main/install.sh | sh
 The script detects if ephor is already present and upgrades it in place:
 - Updates the dependency in `build.zig.zon`
 - Replaces the `build.zig` integration block (handles both old v0.11.x and current formats)
-- Creates/updates `ephor.json`
+
+The script does not touch `ephor.json`. Run `ephor init` (or
+`zig build ephor -- init`) to create the config. The `ephor install`
+command writes one when it detects your project (see Version Management).
 
 If you already have the `ephor-upgrade` step in `build.zig`:
 
@@ -174,6 +181,9 @@ src/main.zig:506:25: warning[ZA201]: silent catch {} discards error without hand
 ephor check --format=json
 ```
 
+`-f=json` is an alias of `--format=json`. `-f=text` (or `--format=text`)
+switches back to the human format.
+
 `--format=json` writes one stream of top-level JSON objects to stderr: one
 object per analyzer (orphans, memory, errors, null-safety, panic, unused,
 complexity, format, naming, style, tests, concurrency), then the summary
@@ -263,6 +273,8 @@ Example config:
     "max_params": 4,
     "max_branches": 12,
     "max_line_length": 100,
+    "max_cyclomatic": 10,
+    "max_cognitive": 15,
     "max_file_bytes": 50000
   }
 }
@@ -285,7 +297,7 @@ Example config:
 | `error_naming` | ZA703 convention for error set member declarations: `TitleCase` (default; `PascalCase` accepted as an alias) or `snake_case` |
 | `thresholds` | Complexity and style thresholds. Values clamp at documented maxima (see Config trust model) |
 
-Keys parse in file order. A repeated scalar key (`path_dir`, `strict`, `fail_on`, `error_naming`) resolves last-wins. A repeated list key (`entries`, `exclude`, `orphan_exclude`, `disable`, `enable`) accumulates. `fail_on` outranks `strict` regardless of key order (see Exit Codes).
+Keys parse in file order. A repeated scalar key (`path_dir`, `strict`, `fail_on`, `error_naming`) resolves last-wins. A repeated list key (`entries`, `exclude`, `orphan_exclude`, `disable`, `enable`) accumulates. `fail_on` outranks `strict` regardless of key order (see Exit Codes). Threshold keys are `max_lines` (alias `max_function_lines`), `max_nesting`, `max_params`, `max_branches`, `max_line_length`, `max_file_bytes`, `max_cyclomatic`, and `max_cognitive`.
 
 ### Config trust model
 
@@ -660,6 +672,10 @@ fn legacy_handler() void {
 
 Omit the rule to suppress all rules: `// ephor:ignore`
 
+Aliases: `// ephor:ignore-next-line` is an alias of `ephor:ignore` in all
+forms. The legacy spellings `// ephor:disable` and
+`// ephor:disable-next-line` alias `ephor:ignore` the same way.
+
 Directives are anchored: the keyword must be the first token of a plain `//`
 comment — keywords mentioned inside prose or in `///` and `//!` doc comments
 are ignored. Directives match rule ids exactly: `ZA3` does not suppress
@@ -744,7 +760,7 @@ Commands:
 
 Options:
   --entry=<file>       Entry point (default: src/main.zig)
-  --format=text|json   Output format (default: text)
+  --format=text|json   Output format (default: text; aliases: -f=text, -f=json)
   --disable=<rule>     Disable rule (e.g., ZA301, ZA3 for all ZA3xx)
   --enable=<rule>      Enable rule (overrides disable)
   --max-lines=N        Max function lines (default: 50)
@@ -985,7 +1001,7 @@ Install the **Run on Save** extension, then add to `.vscode/settings.json`:
 | Code | Meaning |
 |------|---------|
 | 0 | Analysis completed; no findings at the configured fail-on level |
-| 1 | Usage error (no entry points, bad arguments, init/install failures) **or** findings met the `--strict`/`--fail-on` level |
+| 1 | Usage error (no entry points, bad arguments, init/install failures), findings met the `--strict`/`--fail-on` level, or a declined runtime prompt |
 
 Findings are informational by default: `ephor check` exits 0 whether or not issues are found. For CI gating, opt into strict mode:
 
@@ -997,7 +1013,7 @@ Findings are informational by default: `ephor check` exits 0 whether or not issu
 | `--fail-on=note` | `"fail_on": "note"` | any finding, notes included |
 | `--fail-on=never` | `"fail_on": "never"` | never — lets the CLI override a strict config off |
 
-CLI flags override `ephor.json` — including a target-directory `ephor.json` loaded for the analyzed path. Inside one config file, `fail_on` is more specific than `strict` and wins regardless of key order. An invalid fail-on value — in the CLI flag or in any `ephor.json` — is a usage error (exit 1): a misspelled CI gate must never fail open. When the gate trips, the footer says so, e.g. `ephor: strict mode: failing with 12 warnings (exit 1)`.
+CLI flags override `ephor.json` — including a target-directory `ephor.json` loaded for the analyzed path. Inside one config file, `fail_on` is more specific than `strict` and wins regardless of key order. An invalid fail-on value — in the CLI flag or in any `ephor.json` — is a usage error (exit 1): a misspelled CI gate must never fail open. When the gate trips, the footer says so, e.g. `ephor: strict mode: failing with 12 warnings (exit 1)`. A declined runtime prompt exits 1 by design: the analysis did not run, so a CI pipeline without `--yes` fails instead of passing silently (see [Run dynamic analysis](#run-dynamic-analysis)).
 
 ## Examples
 
@@ -1060,10 +1076,26 @@ at compile time and does not count (EPH-I0538, EPH-I1053). `ephor check
 
 ```bash
 $ ephor runtime
+
+WARNING: Runtime analysis will COMPILE AND EXECUTE code in:
+  .
+
+Command: zig build test
+
+This runs untrusted code with your user privileges.
+Only run this on projects you trust.
+
+Proceed? [y/N] y
 Running: zig build test (with GPA diagnostics)
 src/memory.zig:45:1: error[ZR101]: memory leak detected at runtime
   help: allocation not freed - check for missing defer or error path
 ```
+
+Runtime compiles and executes the target, so the interactive confirmation
+prints before anything runs. Pass `-y` (`--yes`) to skip it in CI. A
+declined prompt (an answer other than `y`, or EOF on a non-interactive
+stdin) prints `Aborted.` and exits 1, so a CI run without `--yes` fails
+instead of passing silently.
 
 ## Compatibility
 
@@ -1383,13 +1415,14 @@ from parameter counting — a pinned ABI fixes the parameter list
 (EPH-I1059, EPH-I1093, EPH-I1096).
 
 **Changed (migration required):** Inline-ignore directives are now anchored —
-only plain `//` comments whose first token is `ephor:ignore` /
-`ephor:disable` / `ephor:ignore-file` are directives. Migration:
+only plain `//` comments whose first token is `ephor:ignore`,
+`ephor:ignore-next-line`, `ephor:disable`, `ephor:disable-next-line`, or
+`ephor:ignore-file` are directives. Migration:
 
 - `///` doc-comment directives → change to `//`
 - comma-joined rule lists → space-separated (`ZA201,` ends the rule list)
-- `ephor:ignore-next-line` → plain `ephor:ignore` (a directive-only line
-  already suppresses the next line)
+- `ephor:ignore-next-line` works again as an alias of `ephor:ignore`
+  (re-enabled in this release, EPH-I0250). No migration needed.
 - rule ids in prose no longer count — previously hidden issues may surface
   (fail-closed)
 - `//ephor:ignore` (no space) now works

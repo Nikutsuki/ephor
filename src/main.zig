@@ -41081,7 +41081,8 @@ fn printHelp() void {
         \\
         \\OPTIONS:
         \\  --entry=<file>       Entry point (default: src/main.zig)
-        \\  --format=text|json   Output format (default: text)
+        \\  --format=text|json   Output format (default: text). Aliases:
+        \\                       -f=text, -f=json
         \\  --disable=<rule>     Disable rule (e.g., ZA301, ZA1)
         \\  --enable=<rule>      Enable rule (overrides disable)
         \\  --max-lines=N        Max function lines (default: 50)
@@ -41144,6 +41145,7 @@ fn printHelp() void {
         \\
         \\RUNTIME COMMAND EXAMPLES:
         \\  ephor runtime .                         # Run 'zig build test'
+        \\  ephor runtime . --yes                   # Skip the confirmation (CI)
         \\  ephor runtime . --command="./myapp"     # Run custom command
         \\  ephor runtime . --command="zig run src/main.zig"
         \\
@@ -41190,6 +41192,7 @@ fn printHelp() void {
         \\  "err" and "warn" are rejected: the CI gate fails closed on a
         \\  misspelled level. error_naming accepts TitleCase, PascalCase (alias
         \\  for TitleCase), and snake_case. "title_case" is rejected (EPH-I0587).
+        \\  Threshold key max_lines accepts max_function_lines as an alias.
         \\
         \\CONFIG TRUST MODEL:
         \\  A config file is trusted when its directory is the working
@@ -41250,14 +41253,17 @@ fn printHelp() void {
         \\                     ZA105: use-after-free, ZA106: double-free,
         \\                     ZA110: must-return-ref, ZA111: returned-stack-ref)
         \\  ZA2xx  ErrHandle  (ZA201: silent-catch, ZA202: catch-unreachable,
-        \\                     ZA203: orelse-unreachable, ZA204: undefined,
-        \\                     ZA205: ignored-error, ZA206: exit-bypasses-defer,
-        \\                     ZA207: catch-undefined, ZA208: panic,
+        \\                     ZA203: orelse-unreachable,
+        \\                     ZA204: undefined (off by default),
+        \\                     ZA205: ignored-error (note, off by default),
+        \\                     ZA206: exit-bypasses-defer, ZA207: catch-undefined,
+        \\                     ZA208: panic,
         \\                     ZA209: useless-error-return (note),
         \\                     ZA210: no-catch-return (note, off by default))
-        \\  ZA8xx  NullSafety (ZA801: unsafe-optional-unwrap, ZA802: unsafe-deref)
-        \\  ZA9xx  Panic      (ZA901: decrement-no-guard,
-        \\                     ZA903: index-arithmetic,
+        \\  ZA8xx  NullSafety (ZA801: unsafe-optional-unwrap (off by default),
+        \\                     ZA802: unsafe-deref (off by default))
+        \\  ZA9xx  Panic      (ZA901: decrement-no-guard (off by default),
+        \\                     ZA903: index-arithmetic (off by default),
         \\                     ZA904: intcast-no-bounds (note, off by default))
         \\  ZA3xx  Complexity (ZA301: func-too-long, ZA302: nesting-too-deep,
         \\                     ZA303: too-many-params, ZA304: too-many-branches,
@@ -41267,7 +41273,8 @@ fn printHelp() void {
         \\  ZA5xx  Structure  (ZA501: orphan-file, ZA502: file-too-large)
         \\  ZA6xx  Format     (ZA601: needs-format,
         \\                     ZA607: read-before-assign, semantic check)
-        \\  ZA7xx  Style      (ZA701: line-too-long, ZA702: file-too-long,
+        \\  ZA7xx  Style      (ZA701: line-too-long,
+        \\                     ZA702: file-too-long (off by default),
         \\                     ZA703: naming)
         \\    ZA701 counts columns outside string literals: a line whose
         \\    code fits the limit stays silent when a long string tail
@@ -41286,6 +41293,11 @@ fn printHelp() void {
         \\  Runs 'zig build test' with GeneralPurposeAllocator diagnostics enabled.
         \\  Detects actual memory leaks, use-after-free, double-free at runtime.
         \\  Requires project to use std.testing.allocator or accept allocator param.
+        \\  Runtime compiles and executes the target, so an interactive
+        \\  confirmation gate arms unless --yes was passed. A declined
+        \\  prompt (n, or EOF on a non-interactive stdin) prints "Aborted."
+        \\  and exits 1: a CI run without --yes fails instead of passing
+        \\  silently.
         \\
         \\INTELLIJ IDEA SETUP:
         \\  1. Settings > Tools > External Tools > Add
@@ -42645,7 +42657,8 @@ const RunCtx = struct {
     /// Runner evidence parsed from --coverage-evidence at gate time.
     coverage_evidence: ?CoverageEvidence = null,
     /// Runtime-prompt abort: return from main without the epilogue (no
-    /// update notification, no exit-code application).
+    /// update notification). The exit code still applies: a declined
+    /// prompt is a failed run (EPH-I0261), so CI fails closed.
     abort_epilogue: bool = false,
 
     /// Shape the run state for printIssues/exportIssues.
@@ -43015,7 +43028,8 @@ fn confirmRuntime(ctx: *const RunCtx) !bool {
 }
 
 /// `runtime` command: dynamic analysis under the project's own test run.
-/// A declined prompt skips the epilogue (the pre-split bare return).
+/// A declined prompt skips the epilogue (no update notification); the run
+/// still exits with the decline code (EPH-I0261).
 fn handleRuntime(ctx: *RunCtx) !void {
     if (!try confirmRuntime(ctx)) {
         // JSON mode: the decline rides the epilogue abort object
@@ -43708,6 +43722,14 @@ fn unresolvedScanRootExit(
     );
 }
 
+/// Exit code for a declined text-mode runtime prompt (EPH-I0261): the
+/// requested analysis did not run, so the decline is a failure. The
+/// deliberate choice is documented in printHelp and the README: a CI
+/// run without --yes fails instead of passing silently.
+fn declinedRuntimeExitCode() u8 {
+    return 1;
+}
+
 /// Exit code for a failed run (EPH-I1070 follow-up, EPH-I0543). Text
 /// mode keeps the silent exit(1). JSON mode must leave a readable
 /// document on the armed stream, so the abort object rides the code:
@@ -43806,10 +43828,11 @@ fn runEphor(init: std.process.Init) !u8 {
         // code (EPH-I0213, EPH-I1067).
         .fallible => |h| h(&ctx) catch |err| return errorExitCode(&diag, alloc, err, ""),
     }
-    // A declined runtime prompt returns 0 before the epilogue (no update
-    // notification print, no exit-code application), exactly like the
-    // pre-split bare return from main.
-    if (ctx.abort_epilogue) return 0;
+    // A declined runtime prompt skips the epilogue (no update
+    // notification print), but the decline is a failed run: the exit
+    // code carries it, so a CI pipeline without --yes fails instead of
+    // passing silently while running nothing (EPH-I0261).
+    if (ctx.abort_epilogue) return declinedRuntimeExitCode();
 
     // Unknown-version fallback warning (EPH-I1054): compat recorded the
     // flag during analysis; the epilogue routes the message through
@@ -47093,6 +47116,14 @@ test "runtime JSON decline stashes the remedy and fails the run (EPH-I1099)" {
     defer obj.deinit();
     try buildAbortJson(&obj, allocator, error.RunFailed, stashed);
     try std.testing.expect(mem.indexOf(u8, obj.buf.items, "RunFailed") != null);
+}
+
+test "declined runtime prompt carries a nonzero exit code (EPH-I0261)" {
+    // The exit code is the CI contract: a declined prompt means the
+    // analysis did not run, and the run must not read as a pass. The
+    // prompt's stdin read is not injectable in-process, so the pin lives
+    // on the exit-code decision the abort branch returns.
+    try std.testing.expectEqual(@as(u8, 1), declinedRuntimeExitCode());
 }
 
 test "printVerboseRuntimeLine sanitizes child bytes before the render (EPH-I0171)" {

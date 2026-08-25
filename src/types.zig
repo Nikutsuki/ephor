@@ -261,24 +261,19 @@ pub const Issue = struct {
         defer rel.deinit(out.allocator);
         var msg = try sanitizeTerminal(out.allocator, self.message);
         defer msg.deinit(out.allocator);
-        // File-level issues (line=1, col=1) show just filename, no confusing :1:1
-        if (self.line == 1 and self.col == 1) {
-            try out.print("{s}: {s}[{s}]: {s}\n", .{
-                rel.slice,
-                self.severity.str(),
-                self.rule,
-                msg.slice,
-            });
-        } else {
-            try out.print("{s}:{d}:{d}: {s}[{s}]: {s}\n", .{
-                rel.slice,
-                self.line,
-                self.col,
-                self.severity.str(),
-                self.rule,
-                msg.slice,
-            });
-        }
+        // Every finding renders the positioned form, file-level findings
+        // included (`path:1:1:`) (EPH-I0739). The pre-fix drop branch
+        // keyed on (line == 1, col == 1), which also de-positioned REAL
+        // findings at 1:1 and left file-level findings invisible to the
+        // documented VS Code problemMatcher regex.
+        try out.print("{s}:{d}:{d}: {s}[{s}]: {s}\n", .{
+            rel.slice,
+            self.line,
+            self.col,
+            self.severity.str(),
+            self.rule,
+            msg.slice,
+        });
         if (self.help) |h| {
             var help = try sanitizeTerminal(out.allocator, h);
             defer help.deinit(out.allocator);
@@ -1171,7 +1166,11 @@ test "formatText sanitizes hostile file and message bytes" {
     );
 }
 
-test "formatText sanitizes help and drops position for file-level issues" {
+test "formatText sanitizes help and keeps the position for file-level issues (EPH-I0739)" {
+    // File-level findings render the positioned form (`f.zig:1:1:`), so
+    // the single documented VS Code problemMatcher regex matches every
+    // finding line. The pre-fix drop branch printed no position here
+    // (and also de-positioned real findings at 1:1).
     const issue = Issue{
         .file = "f.zig",
         .line = 1,
@@ -1185,7 +1184,7 @@ test "formatText sanitizes help and drops position for file-level issues" {
     defer out.deinit();
     try issue.formatText("/repo", &out);
     try std.testing.expectEqualStrings(
-        "f.zig: note[ZA501]: orphan\n  help: drop it?now\n",
+        "f.zig:1:1: note[ZA501]: orphan\n  help: drop it?now\n",
         out.buf.items,
     );
 }

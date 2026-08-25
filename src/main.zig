@@ -17336,12 +17336,117 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
     return false;
 }
 
+/// Fill state for a pending undefined var (EPH-I0729). `none` means
+/// nothing wrote the var since its `= undefined` decl — the pre-I0729
+/// firing shape at scope end. `partial` means an element or bounded
+/// slice was written: the remaining bytes stay undefined, a sensitive-
+/// data leak when the var escapes. A complete fill (direct assignment,
+/// full-slice write, address passed to a writer) drops the var from the
+/// pending set.
+const FillState = enum { none, partial };
+
+/// True when the line writes only PART of the pending var: an element
+/// write (`buf[0] = v`) or a bounded slice write (`buf[0..n] = v`,
+/// `@memset(buf[0..n], v)`). The remaining bytes stay undefined — the
+/// shape ZA204 must catch when the var escapes (EPH-I0729). The
+/// full-slice form (`buf[0..] = v`) and the address form
+/// (`@memset(&buf, v)`) cover the whole var and stay complete fills.
+/// A line holding both a partial and a complete write reads partial
+/// (conservative fire direction); the shape is vanishingly rare.
+fn isPartialFill(t: []const u8, var_name: []const u8) bool {
+    if (isCommentOrMultilineString(t)) return false;
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
+    var i: usize = 0;
+    while (i + var_name.len <= t.len) : (i += 1) {
+        if (!mem.eql(u8, t[i .. i + var_name.len], var_name)) continue;
+        const end_i = i + var_name.len;
+        if (end_i < t.len and isIdent(t[end_i])) continue;
+        if (cls.isInsideString(i)) continue;
+        if (comment_start != null and i >= comment_start.?) continue;
+        if (i > 0 and (isIdent(t[i - 1]) or hasLeftDot(t, i))) continue;
+        if (end_i >= t.len or t[end_i] != '[') continue;
+        if (classifyBracketUse(t, end_i) != .fill) continue;
+        const close = skipBracketed(t, end_i) orelse continue;
+        const contents = t[end_i + 1 .. close - 1];
+        if (!hasTopLevelRange(contents)) return true; // element write
+        // Bounded slices (`buf[0..n]`, `buf[a..b]`, `buf[a..]`) leave
+        // bytes undefined; only `buf[0..]` covers the whole var.
+        const trimmed = mem.trim(u8, contents, " \t");
+        if (!mem.eql(u8, trimmed, "0..")) return true;
+    }
+    return false;
+}
+
+/// Column of the escaping occurrence of `var_name` on a return line, or
+/// null (EPH-I0729). A partially filled pending var that escapes — the
+/// whole var returned by value, or a slice of it — leaks the undefined
+/// remainder and must fire ZA204 at the return. A bare element read
+/// (`return buf[0];`) escapes only the written byte and stays silent,
+/// as do field reads (`return buf.len;`) and pointer-to-local returns
+/// (`return &buf;`, a Zig compile error anyway). The keyword and the
+/// occurrence are both string-masked, so `const s = "return buf";`
+/// stays inert.
+fn returnEscapeCol(t: []const u8, var_name: []const u8) ?usize {
+    if (mem.indexOf(u8, t, "return") == null) return null;
+    const code_len = findCommentStart(t) orelse t.len;
+    const code = t[0..code_len];
+    const kw_pos = returnKwCol(code) orelse return null;
+    return escapingOccurrenceCol(code, var_name, kw_pos + 6);
+}
+
+/// Column of the `return` keyword in code-position text, or null. The
+/// keyword is string-masked and identifier-bounded (`returnValue` and
+/// `"return"` stay inert).
+fn returnKwCol(code: []const u8) ?usize {
+    var cls = LineClassifier.init(code);
+    var i: usize = 0;
+    while (i + 6 <= code.len) : (i += 1) {
+        if (!mem.startsWith(u8, code[i..], "return")) continue;
+        if (cls.isInsideString(i)) continue;
+        const before_ok = i == 0 or !isIdent(code[i - 1]);
+        const after_i = i + 6;
+        const after_ok = after_i >= code.len or !isIdent(code[after_i]);
+        if (before_ok and after_ok) return i;
+    }
+    return null;
+}
+
+/// Column of the first escaping occurrence of `var_name` at or after
+/// `from` on a return line, or null. The classification lives in
+/// isEscapingOccurrence; this walk adds the string mask.
+fn escapingOccurrenceCol(code: []const u8, var_name: []const u8, from: usize) ?usize {
+    var cls = LineClassifier.init(code);
+    var iter = VarOccurrenceIter{ .t = code, .name = var_name, .from = from };
+    while (iter.next()) |pos| {
+        if (cls.isInsideString(pos)) continue;
+        if (isEscapingOccurrence(code, var_name, pos)) return pos;
+    }
+    return null;
+}
+
+/// True when the occurrence escapes the pending var's value (EPH-I0729).
+/// Escaping forms: the whole var (`return buf;`) and slices
+/// (`return buf[0..n];`). Non-escaping forms: element reads
+/// (`return buf[0];`), field reads (`return buf.len;`), and
+/// address-of returns (`return &buf;`, a Zig compile error anyway).
+fn isEscapingOccurrence(code: []const u8, var_name: []const u8, pos: usize) bool {
+    if (pos > 0 and code[pos - 1] == '&') return false;
+    const after = pos + var_name.len;
+    if (after >= code.len) return true;
+    if (code[after] == '.') return false;
+    if (code[after] != '[') return true;
+    const close = skipBracketed(code, after) orelse return false;
+    return hasTopLevelRange(code[after + 1 .. close - 1]);
+}
+
 /// Pending undefined variable to check within function scope
 const PendingUndefined = struct {
     name: []const u8,
     line: usize,
     col: usize,
     brace_depth: usize = 1, // Track nesting to detect scope end
+    fill: FillState = .none, // Partial-fill tracking (EPH-I0729)
 };
 
 /// Pending struct field that was set to undefined
@@ -17577,33 +17682,89 @@ const UndefinedLineCtx = struct {
     line: usize,
 };
 
-/// Update all pending undefineds for a new line: drop filled vars, report
-/// vars whose scope ended unfilled.
+/// Settle context bundle for the pending-undefined per-line pass
+/// (EPH-I0729): the line inputs plus the set and the issue sink. The
+/// bundle keeps the settle helpers under the ZA303 parameter cap.
+const UndefinedSetCtx = struct {
+    line: UndefinedLineCtx,
+    set: *PendingUndefinedSet,
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+};
+
+/// Update all pending undefineds for a new line: drop fully filled
+/// vars, report vars whose scope ended unfilled, and fire at the return
+/// when a partially filled var escapes (EPH-I0729).
 fn updatePendingUndefinedSet(
     ctx: UndefinedLineCtx,
     set: *PendingUndefinedSet,
     issues: *std.ArrayListUnmanaged(Issue),
     allocator: Allocator,
 ) !void {
+    const s: UndefinedSetCtx = .{
+        .line = ctx,
+        .set = set,
+        .issues = issues,
+        .allocator = allocator,
+    };
     var i: usize = 0;
     while (i < set.len) {
-        const item = set.items[i];
-        if (isFillPattern(ctx.t, item.name)) {
-            set.removeAt(i);
-            continue;
-        }
-        var depth = item.brace_depth;
-        updateBraceDepth(ctx.t, &depth);
-        if (!isScopeEnd(ctx.t, depth)) {
-            set.items[i].brace_depth = depth;
-            i += 1;
-            continue;
-        }
-        if (makeUndefinedIssue(ctx.path, item.line, item.col)) |issue| {
-            try issues.append(allocator, issue);
-        }
-        set.removeAt(i);
+        // settlePendingItem removes the item itself when it leaves the
+        // set (swap-remove), so the index advances only on a kept item.
+        if (try settlePendingItem(s, i)) continue;
+        i += 1;
     }
+}
+
+/// Settle one pending item for a line (EPH-I0729): classify fills, fire
+/// the partial-fill escape, track brace depth, and fire the scope-end
+/// shape. Returns true when the item left the set.
+fn settlePendingItem(s: UndefinedSetCtx, i: usize) !bool {
+    const item = s.set.items[i];
+    // A partial fill keeps the var tracked: the undefined remainder
+    // leaks when the var escapes. A complete fill drops it. The
+    // partial arm runs first because element writes also satisfy
+    // isFillPattern (hasDirectFill Pattern 2).
+    if (isPartialFill(s.line.t, item.name)) {
+        s.set.items[i].fill = .partial;
+    } else if (isFillPattern(s.line.t, item.name)) {
+        s.set.removeAt(i);
+        return true;
+    }
+    if (try firePartialEscape(s, i)) return true;
+    var depth = item.brace_depth;
+    updateBraceDepth(s.line.t, &depth);
+    if (!isScopeEnd(s.line.t, depth)) {
+        s.set.items[i].brace_depth = depth;
+        return false;
+    }
+    // A never-filled var fires at its scope end (the pre-I0729 shape).
+    // A partially filled var leaks nothing here: no undefined bytes
+    // escaped the scope.
+    if (s.set.items[i].fill == .none) {
+        if (makeUndefinedIssue(s.line.path, item.line, item.col)) |issue| {
+            try s.issues.append(s.allocator, issue);
+        }
+    }
+    s.set.removeAt(i);
+    return true;
+}
+
+/// Fire the partial-fill escape (EPH-I0729): a partially filled var on
+/// a return line escapes with undefined bytes and reports at the
+/// return (the occurrence column reads 1-based, like the decl records).
+/// Test files mint no issue but the escape still settles the var, so
+/// the scope end cannot double-report it. Returns true when the item
+/// left the set.
+fn firePartialEscape(s: UndefinedSetCtx, i: usize) !bool {
+    const item = s.set.items[i];
+    if (item.fill == .none) return false;
+    const col = returnEscapeCol(s.line.t, item.name) orelse return false;
+    if (makeUndefinedIssue(s.line.path, s.line.line, col + 1)) |issue| {
+        try s.issues.append(s.allocator, issue);
+    }
+    s.set.removeAt(i);
+    return true;
 }
 
 /// Check if a `var `/`const ` keyword at `pos` starts a declaration: it must
@@ -34139,10 +34300,12 @@ fn analyzeIntCastGuards(
 /// read as ran-clean, so the failure becomes a finding. ZR104, not
 /// ZA601: a missing zig is a command failure, not a format finding.
 /// A StreamTooLong names the capture cap like the runtime band's
-/// reportRunFailure does (EPH-I0501).
+/// reportRunFailure does (EPH-I0501). The finding pins the real
+/// scanned path at 1:1, never a fictional build.zig (EPH-I0735).
 fn reportFmtFailure(
     allocator: Allocator,
     issues: *std.ArrayListUnmanaged(Issue),
+    path: []const u8,
     err: std.process.RunError,
 ) !void {
     const msg = if (err == error.StreamTooLong)
@@ -34165,7 +34328,7 @@ fn reportFmtFailure(
     else
         "check that zig is installed and on PATH";
     try issues.append(allocator, .{
-        .file = "build.zig",
+        .file = path,
         .line = 1,
         .col = 1,
         .severity = .err,
@@ -34309,7 +34472,7 @@ fn runFmtCheck(
         // issue list carries an errdefer deinitIssues. reportFmtFailure
         // guards its own message, but the sweep rule stays uniform.
         errdefer deinitIssues(&issues, allocator);
-        try reportFmtFailure(allocator, &issues, err);
+        try reportFmtFailure(allocator, &issues, path, err);
         return issues;
     };
     defer allocator.free(result.stdout);
@@ -34739,6 +34902,18 @@ const RuntimeOptions = struct {
     suppressed_out: ?*usize = null,
 };
 
+/// True when the target carries its own build.zig (EPH-I0733). The
+/// default runtime command is `zig build test`, and zig resolves a
+/// build file by walking UP from the target cwd: without this check a
+/// scratch dir ran the nearest ancestor project. A failed stat reads
+/// as missing — the check fails closed toward the pre-flight error.
+fn targetHasBuildZig(io: std.Io, allocator: Allocator, path: []const u8) !bool {
+    const zb_path = try std.fs.path.join(allocator, &.{ path, "build.zig" });
+    defer allocator.free(zb_path);
+    const stat = Fs.cwd(io).statFile(zb_path) catch return false;
+    return stat.kind == .file;
+}
+
 fn runRuntimeAnalysis(
     io: std.Io,
     allocator: Allocator,
@@ -34757,6 +34932,14 @@ fn runRuntimeAnalysis(
     var argv_buf: [64][]const u8 = undefined;
     var argv_scratch: [runtime_argv_scratch_bytes]u8 = undefined;
     const argv_len = try buildRuntimeArgv(opts, &argv_buf, &argv_scratch, allocator);
+
+    // Pre-flight (EPH-I0733): the DEFAULT command requires the
+    // target's own build.zig, so it only ever runs the named project.
+    // Custom commands run anywhere and skip the check.
+    if (opts.custom_command == null and !try targetHasBuildZig(io, allocator, path)) {
+        try reportNoBuildZig(allocator, &issues, path);
+        return issues;
+    }
 
     // One containment root and one dedup/cap state for every parse pass
     // (EPH-I0171, EPH-I0211). A null root fails the location gate closed
@@ -34820,6 +35003,37 @@ fn reportSpawnFailure(
     }
     try reportRunFailure(allocator, issues, cmd_str, err);
     return issues.*;
+}
+
+/// ZR104 for a default runtime run whose target carries no build.zig
+/// (EPH-I0733): zig walks UP from the target cwd to find a build file,
+/// so a scratch dir silently ran the nearest ancestor project before
+/// this pre-check. The finding names the target, and the run fails the
+/// can't-run class (analysis_ran stays false, so handleRuntime exits
+/// nonzero). The path crosses the terminal sanitizer (EPH-I0147).
+fn reportNoBuildZig(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    path: []const u8,
+) !void {
+    var safe_path = try types.sanitizeTerminal(allocator, path);
+    defer safe_path.deinit(allocator);
+    const msg = try std.fmt.allocPrint(
+        allocator,
+        "no build.zig found at {s}: the default runtime command requires the target project's build.zig",
+        .{safe_path.slice},
+    );
+    errdefer allocator.free(msg);
+    try issues.append(allocator, .{
+        .file = "runtime",
+        .line = 1,
+        .col = 1,
+        .severity = .err,
+        .rule = RULE_RUNTIME_TEST_FAILURE,
+        .message = msg,
+        .help = "run ephor runtime from a Zig project root or pass --command",
+        .message_owned = true,
+    });
 }
 
 /// Term-shape findings for the runtime child (EPH-I0231). Term is a
@@ -35026,9 +35240,13 @@ fn emitLocatedIssue(ctx: RuntimeEmitCtx, spec: RuntimeIssueSpec, t: []const u8) 
 }
 
 /// Resolved leak-finding message: owned when the location embedded.
+/// `located` records the containment-gate verdict so the caller can
+/// mirror it into the structured file/line fields (EPH-I0736) without
+/// re-running the gate.
 const LeakMessage = struct {
     msg: []const u8,
     owned: bool,
+    located: bool,
 };
 
 /// Resolve the leak finding's message (EPH-I0171): the next-line location
@@ -35039,8 +35257,9 @@ fn leakFindingMessage(
     loc: FileLocation,
     verbose: bool,
 ) !LeakMessage {
-    if (loc.line == 0 or !runtimeLocationAllowed(ctx, loc))
-        return .{ .msg = "memory leak detected at runtime", .owned = false };
+    const located = loc.line > 0 and runtimeLocationAllowed(ctx, loc);
+    if (!located)
+        return .{ .msg = "memory leak detected at runtime", .owned = false, .located = false };
     if (verbose) {
         var safe = try types.sanitizeTerminal(ctx.allocator, loc.file);
         defer safe.deinit(ctx.allocator);
@@ -35051,7 +35270,7 @@ fn leakFindingMessage(
         "memory leak at {s}:{d}",
         .{ loc.file, loc.line },
     );
-    return .{ .msg = msg, .owned = true };
+    return .{ .msg = msg, .owned = true, .located = true };
 }
 
 /// Handle memory leak detection with next-line stack trace
@@ -35068,9 +35287,20 @@ fn handleMemoryLeak(
         FileLocation{ .file = "unknown", .line = 0 };
     const message = try leakFindingMessage(ctx, loc, verbose);
     errdefer if (message.owned) ctx.allocator.free(message.msg);
+    // The structured fields carry the located frame too (EPH-I0736):
+    // the GCC-style prefix points at the alloc site, so editors can
+    // jump to the most common runtime finding. The dupe is the
+    // EPH-I0196 ownership pattern — child output frees before the
+    // findings print (EPH-I0202).
+    const owned_file: ?[]u8 = if (message.located)
+        try ctx.allocator.dupe(u8, loc.file)
+    else
+        null;
+    errdefer if (owned_file) |f| ctx.allocator.free(f);
     const issue = Issue{
-        .file = "runtime",
-        .line = 1,
+        .file = owned_file orelse "runtime",
+        .file_owned = message.located,
+        .line = if (message.located) loc.line else 1,
         .col = 1,
         .severity = .err,
         .rule = RULE_RUNTIME_MEMORY_LEAK,
@@ -35079,6 +35309,7 @@ fn handleMemoryLeak(
         .message_owned = message.owned,
     };
     if (!try runtimeFindingKept(ctx, issue)) {
+        if (owned_file) |f| ctx.allocator.free(f);
         if (message.owned) ctx.allocator.free(message.msg);
         return;
     }
@@ -36054,6 +36285,11 @@ const Config = struct {
     // deinit). The disclosure note (RED3-9, EPH-I0169) prints from this
     // record once the scan root settles.
     error_naming_from_path: ?[]const u8 = null,
+    // Directory of the last successfully loaded config file (owned;
+    // freed in deinit). The .ephor-ignore auto-load consults this dir
+    // beside the scan root (EPH-I0737): the operator's own tree keeps
+    // the ignore file next to the config that steered the scan.
+    config_dir: ?[]const u8 = null,
     // The cwd ephor.json parsed successfully (RED3-4, EPH-I0209). Its
     // trust note fires from the check handler, after the CLI path and the
     // target-config load settle the final scan root.
@@ -36097,6 +36333,7 @@ const Config = struct {
             self.error_naming_from_path,
             self.coverage_evidence_path,
             self.install_version,
+            self.config_dir,
         };
         for (owned_paths) |p| if (p) |v| allocator.free(v);
         for (self.known_issues.items) |k| allocator.free(k);
@@ -36314,6 +36551,10 @@ fn loadConfigFile(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     // unconditionally. Record the successful load so the check handler
     // discloses the decision once the scan root settles.
     cfg.cwd_config_loaded = true;
+    // The config dir feeds the .ephor-ignore lookup (EPH-I0737): the
+    // operator's own tree holds the ignore file next to this config.
+    if (cfg.config_dir) |old| allocator.free(old);
+    cfg.config_dir = try allocator.dupe(u8, ".");
 }
 
 /// Parse one candidate config file's content and emit its parse
@@ -36437,6 +36678,10 @@ fn commitLoadedConfig(c: LoadedConfigCommit) !void {
         .{ .path = c.config_path, .dropped = dropped_entries },
     );
     try noteLoadedConfigDisclosures(c);
+    // The loaded config's directory feeds the .ephor-ignore lookup
+    // (EPH-I0737). The dupe outlives the caller's dir_copy defer.
+    if (cfg.config_dir) |old| allocator.free(old);
+    cfg.config_dir = try allocator.dupe(u8, c.dir_copy);
     if (cfg.path_owned) allocator.free(cfg.path);
     cfg.path = c.saved_path;
     cfg.path_owned = true;
@@ -41849,16 +42094,38 @@ fn loadKnownIssuesOnce(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void
     }
 }
 
-/// Auto-detect `<cfg.path>/.ephor-ignore` and adopt it as the known-issues
-/// path. The file suppresses the scanned tree's own findings, so the
-/// adoption honors the ephor.json trust decision (EPH-I0222): an
-/// untrusted file is refused with one skip note and the path stays null.
+/// Auto-detect a `.ephor-ignore` and adopt it as the known-issues
+/// path. Two candidate dirs, in order (EPH-I0737): the loaded config's
+/// directory (the operator's own tree, where the steering config
+/// lives), then the scan root (the scanned tree). The first existing
+/// file wins, and its directory carries the trust decision: the same
+/// isConfigDirTrusted predicate the config loader applies to that
+/// directory, or the --trust-target-config declaration. An untrusted
+/// file is refused with one skip note and the path stays null.
 /// Returns null when no file exists or the file is untrusted.
 fn detectKnownIssuesPath(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !?[]const u8 {
-    const ignore_path = try std.fs.path.join(allocator, &.{ cfg.path, ".ephor-ignore" });
+    if (cfg.config_dir) |dir| {
+        if (try probeKnownIssuesDir(diag, allocator, cfg, dir)) |p| return p;
+    }
+    return probeKnownIssuesDir(diag, allocator, cfg, cfg.path);
+}
+
+/// Probe one directory for `<dir>/.ephor-ignore` and adopt it under
+/// that directory's trust decision (EPH-I0737). The file suppresses
+/// findings, so the adoption honors the ephor.json trust model
+/// (EPH-I0222): an untrusted file is refused with one skip note and
+/// the path stays null. Returns null when no file exists or the file
+/// is untrusted.
+fn probeKnownIssuesDir(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    cfg: *Config,
+    dir: []const u8,
+) !?[]const u8 {
+    const ignore_path = try std.fs.path.join(allocator, &.{ dir, ".ephor-ignore" });
     defer allocator.free(ignore_path);
     Fs.cwd(diag.io).access(ignore_path, .{}) catch return null; // No known issues file
-    const trusted = cfg.trust_target_config or isConfigDirTrusted(diag.io, cfg.path);
+    const trusted = cfg.trust_target_config or isConfigDirTrusted(diag.io, dir);
     if (!trusted) {
         // The scanned tree supplies the path bytes here: sanitize them.
         var safe_path = try types.sanitizeTerminal(allocator, ignore_path);
@@ -41881,19 +42148,34 @@ fn detectKnownIssuesPath(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !?[
 /// True when the issue's file:line matches a loaded known-issue key.
 /// Keys are "file:line" lines; the line number is the last
 /// colon-separated field, so a file path containing ':' still parses
-/// (the line part must be a number). No fixed-size key buffer: a file
-/// path longer than 512 bytes used to fail bufPrint and silently never
+/// (the line part must be a number). Both sides strip one leading
+/// "./" prefix before the compare (EPH-I0738): findings render relative
+/// to the invocation cwd, so `ephor check .` prints `./src/x.zig`
+/// while a hand-written key says `src/x.zig` — the pre-fix byte-exact
+/// compare silently un-matched from another CWD. Beyond the prefix the
+/// compare stays byte-exact. No fixed-size key buffer: a file path
+/// longer than 512 bytes used to fail bufPrint and silently never
 /// matched (B14-12). The linear scan is O(issues x keys); acceptable at
 /// current list sizes.
 fn isKnownIssue(issue: Issue, cfg: *const Config) bool {
     if (cfg.known_issues.items.len == 0) return false;
+    const issue_file = stripDotPrefix(issue.file);
 
     for (cfg.known_issues.items) |known| {
         const sep = mem.lastIndexOfScalar(u8, known, ':') orelse continue;
         const known_line = std.fmt.parseInt(usize, known[sep + 1 ..], 10) catch continue;
-        if (known_line == issue.line and mem.eql(u8, known[0..sep], issue.file)) return true;
+        const known_file = stripDotPrefix(known[0..sep]);
+        if (known_line == issue.line and mem.eql(u8, known_file, issue_file)) return true;
     }
     return false;
+}
+
+/// Strip one leading "./" path prefix (EPH-I0738): the invocation-cwd
+/// display artifact. `../` and deeper prefixes stay byte-exact — the
+/// normalization covers the rendering delta, not path identity.
+fn stripDotPrefix(path: []const u8) []const u8 {
+    if (path.len >= 2 and path[0] == '.' and path[1] == '/') return path[2..];
+    return path;
 }
 
 /// Path pair for one export run. base_path is the raw configured scan
@@ -44119,10 +44401,13 @@ fn printExportNotice(
 }
 
 /// --export=<file>: gather every printed finding into one list and write
-/// the export document. An export failure prints an error but does not
-/// fail the run (the pre-split behavior).
+/// the export document. An export failure prints an error and fails the
+/// run (EPH-I0741): a CI step that lost its export artifact must not
+/// pass. The error line crosses cliDiag, whose json_stream latch keeps
+/// it off the JSON machine stream; the exit flag carries the failure
+/// in both modes (the stashed diagnostic rides the JSON abort object).
 fn exportCheckIssues(
-    ctx: *const RunCtx,
+    ctx: *RunCtx,
     out: ReportOutCtx,
     findings: *const CheckFindings,
     filtered: *const FilteredMemIssues,
@@ -44138,6 +44423,7 @@ fn exportCheckIssues(
         printExportNotice(ctx.diag, ctx.alloc, exported_count, export_path);
     } else |err| {
         cliDiag(ctx.diag, "error: failed to export issues: {}\n", .{err});
+        ctx.should_exit_error = true;
     }
 }
 
@@ -47295,6 +47581,77 @@ test "isKnownIssue matches file paths beyond 512 bytes (EPH-I0532)" {
     try std.testing.expect(!isKnownIssue(rule_issue, &cfg));
 }
 
+test "known-issue keys match across the ./ display prefix (EPH-I0738)" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try cfg.known_issues.append(allocator, try allocator.dupe(u8, "src/bad.zig:8"));
+    // `ephor check .` prints `./src/bad.zig:8`: the hand-written key
+    // without the ./ prefix must match (the audit's silent-miss shape).
+    const dot_issue = Issue{
+        .file = "./src/bad.zig",
+        .line = 8,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA201",
+        .message = "m",
+        .help = null,
+    };
+    try std.testing.expect(isKnownIssue(dot_issue, &cfg));
+    // The reverse: a ./ prefixed key matches the plain rendered path.
+    try cfg.known_issues.append(allocator, try allocator.dupe(u8, "./lib/x.zig:3"));
+    const plain_issue = Issue{
+        .file = "lib/x.zig",
+        .line = 3,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA201",
+        .message = "m",
+        .help = null,
+    };
+    try std.testing.expect(isKnownIssue(plain_issue, &cfg));
+    // The line number still discriminates across the prefix strip.
+    const wrong_line = Issue{
+        .file = "./src/bad.zig",
+        .line = 9,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA201",
+        .message = "m",
+        .help = null,
+    };
+    try std.testing.expect(!isKnownIssue(wrong_line, &cfg));
+}
+
+test "known-issue keys stay byte-exact beyond the ./ prefix (EPH-I0738)" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try cfg.known_issues.append(allocator, try allocator.dupe(u8, "src/bad.zig:8"));
+    // A `../` prefix and a different dir are different paths: the strip
+    // covers the invocation-cwd rendering delta, never path identity.
+    const parent_issue = Issue{
+        .file = "../src/bad.zig",
+        .line = 8,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA201",
+        .message = "m",
+        .help = null,
+    };
+    try std.testing.expect(!isKnownIssue(parent_issue, &cfg));
+    const other_dir_issue = Issue{
+        .file = "other/src/bad.zig",
+        .line = 8,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA201",
+        .message = "m",
+        .help = null,
+    };
+    try std.testing.expect(!isKnownIssue(other_dir_issue, &cfg));
+}
+
 test "isValidZigImport keeps the .zig gate (EPH-I0527)" {
     // The std/builtin equality checks were unreachable: the suffix gate
     // already rejects both names, so the visible behavior is unchanged
@@ -47872,7 +48229,11 @@ test "handleMemoryLeak builds an owned message from the next line" {
     try std.testing.expectEqualStrings(RULE_RUNTIME_MEMORY_LEAK, issues.items[0].rule);
     try std.testing.expectEqualStrings("memory leak at /src/x.zig:42", issues.items[0].message);
     try std.testing.expect(issues.items[0].message_owned);
-    try std.testing.expectEqualStrings("runtime", issues.items[0].file);
+    // The located frame reaches the structured fields (EPH-I0736): the
+    // legacy permissive test ctx allows it, and the dupe is owned.
+    try std.testing.expectEqualStrings("/src/x.zig", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 42), issues.items[0].line);
+    try std.testing.expect(issues.items[0].file_owned);
 }
 
 test "handleMemoryLeak falls back to a static message without a location" {
@@ -47885,6 +48246,36 @@ test "handleMemoryLeak falls back to a static message without a location" {
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings("memory leak detected at runtime", issues.items[0].message);
     try std.testing.expect(!issues.items[0].message_owned);
+    // No located frame: the finding keeps the runtime anchor.
+    try std.testing.expectEqualStrings("runtime", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 1), issues.items[0].line);
+    try std.testing.expect(!issues.items[0].file_owned);
+}
+
+test "handleMemoryLeak keeps the runtime anchor for a forged location (EPH-I0736)" {
+    // The containment gate adjudicates the structured fields too: a
+    // forged absolute frame path with a resolved containment root
+    // leaves the finding at runtime:1:1 (EPH-I0171 + I0736).
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    var root_buf: [Fs.max_path_bytes]u8 = undefined;
+    const root_real = Fs.cwd(std.testing.io).realpath(".", &root_buf) catch
+        return error.SkipZigTest;
+    var iter = mem.splitScalar(u8, "/forged/proj/x.zig:7:5: 0xabc in foo", '\n');
+    const ctx = RuntimeEmitCtx{
+        .issues = &issues,
+        .allocator = allocator,
+        .io = std.testing.io,
+        .root_real = root_real,
+        .root_attempted = true,
+    };
+    try handleMemoryLeak(ctx, &iter, false, "0x1 leaked:");
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings("memory leak detected at runtime", issues.items[0].message);
+    try std.testing.expectEqualStrings("runtime", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 1), issues.items[0].line);
+    try std.testing.expect(!issues.items[0].file_owned);
 }
 
 test "emitLocatedIssue owns the location slice" {
@@ -48456,14 +48847,17 @@ test "runtime can't-run failure exits nonzero regardless of fail_on (EPH-I0734)"
 
 test "reportFmtFailure reports a missing zig as a command failure" {
     // EPH-I0232: the fmt band's spawn failure becomes a ZR104 finding
-    // (not ZA601). A missing zig is not a format finding.
+    // (not ZA601). A missing zig is not a format finding. The finding
+    // pins the real scanned path (EPH-I0735), never a fictional
+    // build.zig.
     const allocator = std.testing.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, allocator);
-    try reportFmtFailure(allocator, &issues, error.FileNotFound);
+    try reportFmtFailure(allocator, &issues, "target/src", error.FileNotFound);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
-    try std.testing.expectEqualStrings("build.zig", issues.items[0].file);
+    try std.testing.expectEqualStrings("target/src", issues.items[0].file);
+    try std.testing.expectEqual(@as(usize, 1), issues.items[0].line);
     try std.testing.expectEqual(Severity.err, issues.items[0].severity);
     try std.testing.expectEqualStrings("cannot run zig fmt: FileNotFound", issues.items[0].message);
     try std.testing.expect(issues.items[0].message_owned);
@@ -48474,7 +48868,7 @@ test "reportFmtFailure names the capture cap for StreamTooLong (EPH-I0501)" {
     const allocator = std.testing.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, allocator);
-    try reportFmtFailure(allocator, &issues, error.StreamTooLong);
+    try reportFmtFailure(allocator, &issues, "src", error.StreamTooLong);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
     try std.testing.expectEqualStrings(
@@ -49069,6 +49463,53 @@ test "runRuntimeAnalysis reports ZR104 for a nonzero exit with no diagnostics" {
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
     try std.testing.expectEqualStrings("command failed", issues.items[0].message);
+}
+
+test "runRuntimeAnalysis refuses a target without build.zig before the spawn (EPH-I0733)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const target = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(target);
+    // The pre-check must fire BEFORE the spawn: zig never runs, so the
+    // ancestor-walk cannot compile a foreign project, and a missing zig
+    // on PATH cannot mask the check (the FileNotFound shape the
+    // pre-check routes around). The default command is implied by
+    // custom_command = null.
+    var analysis_ran = true;
+    var issues = try runRuntimeAnalysis(
+        std.testing.io,
+        allocator,
+        target,
+        .{ .verbose = false, .custom_command = null, .analysis_ran = &analysis_ran },
+    );
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expect(!analysis_ran);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "no build.zig") != null);
+    try std.testing.expect(issues.items[0].message_owned);
+}
+
+test "runRuntimeAnalysis skips the build.zig pre-check for custom commands (EPH-I0733)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const target = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(target);
+    // --command runs anywhere: a fixture dir without build.zig stays
+    // runnable. The existing signal/cap tests all rely on this.
+    var analysis_ran = false;
+    var issues = try runRuntimeAnalysis(
+        std.testing.io,
+        allocator,
+        target,
+        .{ .verbose = false, .custom_command = "true", .analysis_ran = &analysis_ran },
+    );
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expect(analysis_ran);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
 test "runRuntimeAnalysis reports ZR105 for a stderr panic (EPH-I0489)" {
@@ -82058,6 +82499,171 @@ test "ZA204 fires when only a different longer var is assigned" {
     try std.testing.expect(found);
 }
 
+test "isPartialFill classifies element and slice writes (EPH-I0729)" {
+    try std.testing.expect(isPartialFill("buf[0] = 1;", "buf"));
+    try std.testing.expect(isPartialFill("buf[0..n] = src[0..n];", "buf"));
+    try std.testing.expect(isPartialFill("@memset(buf[0..n], 0);", "buf"));
+    try std.testing.expect(!isPartialFill("buf[0..] = src;", "buf"));
+    try std.testing.expect(!isPartialFill("@memset(buf[0..], 0);", "buf"));
+    try std.testing.expect(!isPartialFill("@memset(&buf, 0);", "buf"));
+    try std.testing.expect(!isPartialFill("buf = src;", "buf"));
+    try std.testing.expect(!isPartialFill("use(buf);", "buf"));
+    try std.testing.expect(!isPartialFill("buf[0];", "buf"));
+    // A field of ANOTHER var never fills the pending local.
+    try std.testing.expect(!isPartialFill("other.buf[0] = 1;", "buf"));
+    try std.testing.expect(!isPartialFill("buf.len = 1;", "buf"));
+    // Comment and string mentions stay inert.
+    try std.testing.expect(!isPartialFill("use(buf); // buf[0] = 1", "buf"));
+    try std.testing.expect(!isPartialFill("const s = \"buf[0] = 1\";", "buf"));
+}
+
+test "returnEscapeCol finds the escaping return occurrence (EPH-I0729)" {
+    try std.testing.expect(returnEscapeCol("return buf;", "buf") != null);
+    try std.testing.expect(returnEscapeCol("return buf[0..];", "buf") != null);
+    try std.testing.expect(returnEscapeCol("return buf[a..b];", "buf") != null);
+    try std.testing.expect(returnEscapeCol("if (c) return buf;", "buf") != null);
+    try std.testing.expect(returnEscapeCol("return buf[0];", "buf") == null);
+    try std.testing.expect(returnEscapeCol("return &buf;", "buf") == null);
+    try std.testing.expect(returnEscapeCol("return buf.len;", "buf") == null);
+    try std.testing.expect(returnEscapeCol("use(buf);", "buf") == null);
+    try std.testing.expect(returnEscapeCol("return other;", "buf") == null);
+    try std.testing.expect(returnEscapeCol("const s = \"return buf\";", "buf") == null);
+    try std.testing.expect(returnEscapeCol("return fmt(x, \"buf\");", "buf") == null);
+}
+
+test "ZA204 fires when a partially filled buffer escapes by return (EPH-I0729)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // `buf[0] = 1;` fills one byte; `return buf;` escapes the whole
+    // array with 31 undefined bytes. The pre-I0729 rule stayed silent
+    // (the element write dropped the var from the pending set).
+    const test_content =
+        \\const std = @import("std");
+        \\fn secret() [32]u8 {
+        \\    var buf: [32]u8 = undefined;
+        \\    buf[0] = 1;
+        \\    return buf;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za204_escape.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za204_escape.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var z204: usize = 0;
+    for (issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE)) continue;
+        z204 += 1;
+        try std.testing.expectEqual(@as(usize, 5), issue.line);
+    }
+    try std.testing.expectEqual(@as(usize, 1), z204);
+}
+
+test "ZA204 stays silent when the escaped element is the written one (EPH-I0729)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // `return buf[0];` escapes exactly the written byte: no undefined
+    // data leaves the scope.
+    const test_content =
+        \\const std = @import("std");
+        \\fn first() u8 {
+        \\    var buf: [32]u8 = undefined;
+        \\    buf[0] = 1;
+        \\    return buf[0];
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za204_element.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za204_element.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE));
+    }
+}
+
+test "ZA204 stays silent on a complete fill before return (EPH-I0729)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // A direct assignment covers the whole var, so the return escapes
+    // no undefined bytes.
+    const test_content =
+        \\const std = @import("std");
+        \\fn copy(src: [32]u8) [32]u8 {
+        \\    var buf: [32]u8 = undefined;
+        \\    buf = src;
+        \\    return buf;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za204_complete.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za204_complete.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE));
+    }
+}
+
+test "ZA204 stays silent when a partially filled buffer never escapes (EPH-I0729)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The partial fill feeds local use only; nothing escapes, so the
+    // scope end must not fire (dead data is not a leak).
+    const test_content =
+        \\const std = @import("std");
+        \\fn useLocal(src: [32]u8) u8 {
+        \\    var buf: [32]u8 = undefined;
+        \\    buf[0] = src[0];
+        \\    return src[0];
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za204_local.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za204_local.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE));
+    }
+}
+
 test "ZA204 no FP for memset after undefined" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -108808,6 +109414,130 @@ test "JSON mode makes verbose a no-op, text mode keeps it (EPH-I0213)" {
     try std.testing.expect(cfg_text.verbose);
 }
 
+test "a failed export fails the run (EPH-I0741)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    // A path under a directory that does not exist: createFile fails
+    // with FileNotFound (the F5 live shape).
+    const bad_path = try std.fmt.allocPrint(allocator, "{s}/no-such-dir/out.md", .{dir_path});
+    defer allocator.free(bad_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    _ = try setOptionalPath(allocator, &cfg.export_path, bad_path);
+    var ignore_cache = IgnoreCache.init(allocator);
+    defer ignore_cache.deinit();
+    var findings = CheckFindings{
+        .orphan_issues = .empty,
+        .cfg_mem_issues = .empty,
+        .err_issues = .empty,
+        .ignored_err_issues = .empty,
+        .unused_issues = .empty,
+        .cx_issues = .empty,
+        .fmt_issues = .empty,
+        .style_issues = .empty,
+        .naming_issues = .empty,
+        .test_issues = .empty,
+        .conc_issues = .empty,
+        .ast_stats = .{},
+    };
+    defer findings.deinit(allocator);
+    var filtered = FilteredMemIssues{
+        .mem_only = .empty,
+        .null_safety = .empty,
+        .panic = .empty,
+    };
+    defer filtered.deinit(allocator);
+    var ctx = RunCtx{
+        .alloc = allocator,
+        .cfg = &cfg,
+        .diag = &diag,
+        .base_path = ".",
+        .ignore_cache = &ignore_cache,
+    };
+    try exportCheckIssues(&ctx, ctx.reportOut(null), &findings, &filtered);
+    // The pre-fix run printed the error line and exited 0: a CI step
+    // that lost its export artifact still passed.
+    try std.testing.expect(ctx.should_exit_error);
+}
+
+test "a successful export leaves the exit flag clear (EPH-I0741)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    const good_path = try std.fmt.allocPrint(allocator, "{s}/out.md", .{dir_path});
+    defer allocator.free(good_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    _ = try setOptionalPath(allocator, &cfg.export_path, good_path);
+    var ignore_cache = IgnoreCache.init(allocator);
+    defer ignore_cache.deinit();
+    var findings = CheckFindings{
+        .orphan_issues = .empty,
+        .cfg_mem_issues = .empty,
+        .err_issues = .empty,
+        .ignored_err_issues = .empty,
+        .unused_issues = .empty,
+        .cx_issues = .empty,
+        .fmt_issues = .empty,
+        .style_issues = .empty,
+        .naming_issues = .empty,
+        .test_issues = .empty,
+        .conc_issues = .empty,
+        .ast_stats = .{},
+    };
+    defer findings.deinit(allocator);
+    var filtered = FilteredMemIssues{
+        .mem_only = .empty,
+        .null_safety = .empty,
+        .panic = .empty,
+    };
+    defer filtered.deinit(allocator);
+    var ctx = RunCtx{
+        .alloc = allocator,
+        .cfg = &cfg,
+        .diag = &diag,
+        .base_path = ".",
+        .ignore_cache = &ignore_cache,
+    };
+    try exportCheckIssues(&ctx, ctx.reportOut(null), &findings, &filtered);
+    try std.testing.expect(!ctx.should_exit_error);
+}
+
+test "file-level findings render with a position (EPH-I0739)" {
+    // The chosen I0739 contract: every finding line carries :line:col,
+    // file-level findings included, so the single documented VS Code
+    // problemMatcher regex matches all of them. The pre-fix drop branch
+    // printed `f.zig: warning[ZA501]: ...` — invisible to the matcher —
+    // and also de-positioned real findings at 1:1.
+    const issue = Issue{
+        .file = "f.zig",
+        .line = 1,
+        .col = 1,
+        .severity = .warning,
+        .rule = RULE_ORPHAN_FILE,
+        .message = "file not imported",
+        .help = null,
+    };
+    var out = types.OutBuf{ .allocator = std.testing.allocator };
+    defer out.deinit();
+    try issue.formatText("/repo", &out);
+    try std.testing.expectEqualStrings(
+        "f.zig:1:1: warning[ZA501]: file not imported\n",
+        out.buf.items,
+    );
+}
+
 test "CLI command-scoped flags under the wrong command error (EPH-I0525)" {
     var diag = testDiagCtx();
     // Regression: every command-scoped flag parsed under any command and
@@ -110925,6 +111655,125 @@ test "suppression: trust flag honors the .ephor-ignore auto-load (EPH-I0222)" {
     try std.testing.expectEqual(@as(usize, 0), diag.untrusted_ignore_skip_count);
 }
 
+test "detectKnownIssuesPath consults the config dir beside the scan root (EPH-I0737)" {
+    // The shipped-default shape: the default config (path_dir) steers the
+    // scan root into src/, while the operator's .ephor-ignore sits at
+    // the config dir (the project root). The pre-fix lookup probed only
+    // the scan root and silently never consulted the root file. Two
+    // sibling tmp dirs stand in for the config dir and the scan root.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp_a = std.testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    const cfg_dir = try tmpDirPath(allocator, &tmp_a);
+    defer allocator.free(cfg_dir);
+    const scan_root = try tmpDirPath(allocator, &tmp_b);
+    defer allocator.free(scan_root);
+    const ignore_path = try std.fmt.allocPrint(allocator, "{s}/.ephor-ignore", .{cfg_dir});
+    defer allocator.free(ignore_path);
+    try Fs.cwd(std.testing.io).writeFile(ignore_path, "src/a.zig:1\n", .{});
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.config_dir = try allocator.dupe(u8, cfg_dir);
+    try setOwnedPath(allocator, &cfg, scan_root);
+    // The tmp dirs sit outside the test cwd, so the flag is the trust
+    // vehicle for both candidate dirs in this fixture (the per-dir
+    // predicate is pinned by the untrusted tests).
+    cfg.trust_target_config = true;
+    diag.cli_diagnostics_enabled = false;
+
+    const adopted = try detectKnownIssuesPath(&diag, allocator, &cfg);
+    try std.testing.expectEqualStrings(ignore_path, adopted.?);
+}
+
+test "detectKnownIssuesPath falls back to the scan root without a config dir (EPH-I0737)" {
+    // Configless runs keep the pre-fix single-probe behavior: the scan
+    // root's file is the only candidate.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const scan_root = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(scan_root);
+    const ignore_path = try std.fmt.allocPrint(allocator, "{s}/.ephor-ignore", .{scan_root});
+    defer allocator.free(ignore_path);
+    try Fs.cwd(std.testing.io).writeFile(ignore_path, "src/a.zig:1\n", .{});
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, scan_root);
+    cfg.trust_target_config = true;
+    diag.cli_diagnostics_enabled = false;
+
+    const adopted = try detectKnownIssuesPath(&diag, allocator, &cfg);
+    try std.testing.expectEqualStrings(ignore_path, adopted.?);
+}
+
+test "detectKnownIssuesPath prefers the config dir file when both exist (EPH-I0737)" {
+    // Two placements, both trusted: the operator's own tree (the config
+    // dir) wins over the scanned tree's copy.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp_a = std.testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    const cfg_dir = try tmpDirPath(allocator, &tmp_a);
+    defer allocator.free(cfg_dir);
+    const scan_root = try tmpDirPath(allocator, &tmp_b);
+    defer allocator.free(scan_root);
+    const root_ignore = try std.fmt.allocPrint(allocator, "{s}/.ephor-ignore", .{cfg_dir});
+    defer allocator.free(root_ignore);
+    try Fs.cwd(std.testing.io).writeFile(root_ignore, "root/a.zig:1\n", .{});
+    const scan_ignore = try std.fmt.allocPrint(allocator, "{s}/.ephor-ignore", .{scan_root});
+    defer allocator.free(scan_ignore);
+    try Fs.cwd(std.testing.io).writeFile(scan_ignore, "scan/a.zig:1\n", .{});
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.config_dir = try allocator.dupe(u8, cfg_dir);
+    try setOwnedPath(allocator, &cfg, scan_root);
+    cfg.trust_target_config = true;
+    diag.cli_diagnostics_enabled = false;
+
+    const adopted = try detectKnownIssuesPath(&diag, allocator, &cfg);
+    try std.testing.expectEqualStrings(root_ignore, adopted.?);
+}
+
+test "detectKnownIssuesPath keeps the per-dir trust decision (EPH-I0737)" {
+    // The scan-root placement stays untrusted without the flag (the
+    // isConfigDirTrusted rule for a dir outside the test cwd), even
+    // when the config dir itself would be trusted.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp_a = std.testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    var tmp_b = std.testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+    const cfg_dir = try tmpDirPath(allocator, &tmp_a);
+    defer allocator.free(cfg_dir);
+    const scan_root = try tmpDirPath(allocator, &tmp_b);
+    defer allocator.free(scan_root);
+    const scan_ignore = try std.fmt.allocPrint(allocator, "{s}/.ephor-ignore", .{scan_root});
+    defer allocator.free(scan_ignore);
+    try Fs.cwd(std.testing.io).writeFile(scan_ignore, "src/a.zig:1\n", .{});
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.config_dir = try allocator.dupe(u8, cfg_dir);
+    try setOwnedPath(allocator, &cfg, scan_root);
+    diag.cli_diagnostics_enabled = false;
+
+    // No root file, no flag: the scan-root file is refused with one
+    // skip note and no adopted path.
+    const adopted = try detectKnownIssuesPath(&diag, allocator, &cfg);
+    try std.testing.expect(adopted == null);
+    try std.testing.expectEqual(@as(usize, 1), diag.untrusted_ignore_skip_count);
+}
+
 // ============================================================================
 // Output Sanitization Tests (RED5: EPH-I0146, I0147, I0148, I0149, I0162)
 // ============================================================================
@@ -111294,7 +112143,8 @@ test "parseFmtOutput findings own their file bytes after the source frees" {
     var out = types.OutBuf{ .allocator = allocator };
     defer out.deinit();
     for (issues.items) |issue| try issue.formatText(root, &out);
-    try std.testing.expect(mem.indexOf(u8, out.buf.items, "a.zig: warning[ZA601]") != null);
+    // The positioned form renders for the file-level ZA601 too (EPH-I0739).
+    try std.testing.expect(mem.indexOf(u8, out.buf.items, "a.zig:1:1: warning[ZA601]") != null);
     try std.testing.expectEqual(@as(usize, 0), diag.fmt_reject_count);
     // deinitIssues frees each owned name exactly once. The DebugAllocator
     // flags a borrow (invalid free) or a double free when this is wrong.

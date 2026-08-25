@@ -311,10 +311,47 @@ error: no build.zig found in current directory
         $EPHOR_TAG = Resolve-EphorTag
     }
 
-    if ($zigVersion) {
-        Write-Host "Installing ephor $EPHOR_TAG (Zig $zigVersion)..."
+    # Detect if this is an upgrade or a fresh install (install.sh
+    # EPH-I0641/I1106 parity, EPH-I0285 port). Both probes anchor to
+    # code lines, so a comment that mentions ephor cannot mislabel a
+    # fresh install as an upgrade. The build.zig probe shares its
+    # line-anchored idiom with the layout probe below. The zon probe
+    # matches the .ephor = dependency line that zig fetch writes.
+    # EPH-I1106 decision: a trailing inline comment on a code line
+    # still reaches the anchored probe, because the .* spans into the
+    # comment. Stripping trailing comments needs a Zig lexer, which
+    # the installer does not carry. The residual is accepted: it is
+    # label-only at this site, and the layout branch below shares the
+    # idiom and the limit.
+    $depProbe = '^\s*[^/.\s\\].*dependency\("ephor"'
+    $zonDepProbe = '^\s*\.ephor\s*='
+    $buildLines = Get-Content "build.zig" -Encoding UTF8
+    $hasDepLine = $false
+    foreach ($line in $buildLines) {
+        if ($line -cmatch $depProbe) {
+            $hasDepLine = $true
+            break
+        }
+    }
+    $hasZonDep = $false
+    if (Test-Path "build.zig.zon") {
+        foreach ($line in (Get-Content "build.zig.zon" -Encoding UTF8)) {
+            if ($line -cmatch $zonDepProbe) {
+                $hasZonDep = $true
+                break
+            }
+        }
+    }
+    if ($hasDepLine -or $hasZonDep) {
+        $ACTION = "Upgrading"
     } else {
-        Write-Host "Installing ephor $EPHOR_TAG..."
+        $ACTION = "Installing"
+    }
+
+    if ($zigVersion) {
+        Write-Host "$ACTION ephor $EPHOR_TAG (Zig $zigVersion)..."
+    } else {
+        Write-Host "$ACTION ephor $EPHOR_TAG..."
     }
     if (-not $EPHOR_URL) {
         # EPH-I0652: tests override the archive URL through
@@ -399,7 +436,12 @@ error: could not repair the fingerprint in build.zig.zon
         }
     }
 
-    # Canonical ephor block for build.zig
+    # Canonical ephor block for build.zig (install.sh parity, EPH-I0285
+    # port). The leading blank line of the here-string is the separator
+    # the block lands with. The TrimEnd call drops the trailing newline
+    # the here-string captures, so Set-Content writes exactly one line
+    # terminator after the block. install.sh parity: sh's EPHOR_BLOCK
+    # carries no trailing newline, and echo adds one.
     $EPHOR_BLOCK = @"
 
     // Ephor static analysis
@@ -418,45 +460,182 @@ error: could not repair the fingerprint in build.zig.zon
     const ephor_upgrade_step = b.step("ephor-upgrade", "Upgrade ephor to latest version");
     ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);
 "@
+    $EPHOR_BLOCK = $EPHOR_BLOCK.TrimEnd("`r", "`n")
 
-    $buildContent = Get-Content "build.zig" -Raw -Encoding UTF8
+    # Warn about a malformed ephor block and leave build.zig untouched.
+    # EPH-I0290 arm (a): the missing-marker case warns with manual
+    # instructions like the non-standard-layout branch, and the install
+    # exits 0. install.sh refuses that shape with exit 1; the warn
+    # shape is the ps1 behavior the issue sanctions.
+    function Warn-BlockLayout {
+        param([string]$Reason)
+        Write-Stderr "warning: $Reason"
+        Write-Stderr "Please update your ephor build steps manually (see README)."
+    }
 
-    if ($buildContent -match '// Ephor static analysis') {
-        # Ephor block exists - replace it with the canonical version
-        $lines = Get-Content "build.zig" -Encoding UTF8
-        $startLine = -1
-        $endLine = -1
+    # Refuse a splice and fail the install. The installer never guesses
+    # when the markers do not describe one unambiguous block
+    # (install.sh EPH-I0625/26/28 parity, EPH-I0285 port).
+    function Refuse-BlockSplice {
+        param([string]$Reason)
+        Write-Stderr "warning: $Reason"
+        Write-Stderr "The ephor build steps in build.zig were not updated."
+        Write-Stderr "Update them manually (see the ephor README)."
+    }
 
-        for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match '// Ephor static analysis' -and $startLine -eq -1) {
-                $startLine = $i
-            }
-            if ($lines[$i] -match 'ephor_upgrade_step\.dependOn') {
-                $endLine = $i
+    # The anchored marker patterns (install.sh parity, EPH-I0285 port).
+    # Each start marker requires the canonical four-space indent, and
+    # each end marker must sit at line start in code context: a line
+    # that begins with // cannot match. -cmatch keeps grep's
+    # case-sensitive anchoring.
+    $canonStart = '^\s*    // Ephor static analysis'
+    $canonEnd = '^\s*ephor_upgrade_step\.dependOn\(&ephor_upgrade_cmd\.step\);'
+    $legacyStart = '^\s*    // === Ephor Static Analysis ==='
+    $legacyEnd = '^\s*ephor_step\.dependOn\(&b\.addRunArtifact\(ephor_exe\)\.step\);'
+
+    # Find the first marker line of each kind and count every match, so
+    # the splice below replaces exactly one unambiguous span
+    # (install.sh EPH-I0625/26/28 parity). $buildLines comes from the
+    # upgrade/install probe above.
+    $startLine = -1
+    $endLine = -1
+    $startCount = 0
+    $endCount = 0
+    $legacyStartLine = -1
+    $legacyEndLine = -1
+    $legacyStartCount = 0
+    $legacyEndCount = 0
+    for ($i = 0; $i -lt $buildLines.Count; $i++) {
+        if ($buildLines[$i] -cmatch $canonStart) {
+            if ($startLine -eq -1) { $startLine = $i }
+            $startCount += 1
+        }
+        if ($buildLines[$i] -cmatch $canonEnd) {
+            if ($endLine -eq -1) { $endLine = $i }
+            $endCount += 1
+        }
+        if ($buildLines[$i] -cmatch $legacyStart) {
+            if ($legacyStartLine -eq -1) { $legacyStartLine = $i }
+            $legacyStartCount += 1
+        }
+        if ($buildLines[$i] -cmatch $legacyEnd) {
+            if ($legacyEndLine -eq -1) { $legacyEndLine = $i }
+            $legacyEndCount += 1
+        }
+    }
+
+    if ($startCount -gt 0 -or $endCount -gt 0) {
+        # The canonical block exists - replace it with the canonical
+        # version (EPH-I0290: a missing end marker warns instead of
+        # doing nothing; install.sh EPH-I0625 parity for the rest).
+        if ($startLine -eq -1 -or $endLine -eq -1) {
+            Warn-BlockLayout "the ephor block in build.zig is missing one of its markers."
+            return 0
+        }
+        if ($startCount -gt 1 -or $endCount -gt 1) {
+            Refuse-BlockSplice "build.zig has more than one ephor block marker."
+            return 1
+        }
+        if ($endLine -le $startLine) {
+            Refuse-BlockSplice "the ephor block markers in build.zig are out of order."
+            return 1
+        }
+        $spanHasDep = $false
+        for ($i = $startLine; $i -lt $endLine; $i++) {
+            if ($buildLines[$i] -cmatch 'dependency\("ephor"') {
+                $spanHasDep = $true
+                break
             }
         }
-
-        if ($startLine -ge 0 -and $endLine -ge 0) {
-            $newLines = @()
-            $newLines += $lines[0..($startLine - 1)]
-            $newLines += $EPHOR_BLOCK
-            if ($endLine + 1 -lt $lines.Count) {
-                $newLines += $lines[($endLine + 1)..($lines.Count - 1)]
-            }
-            Set-ContentNoFollow -Path "build.zig" -Value $newLines
-            Write-Host "Updated ephor build steps in build.zig"
+        if (-not $spanHasDep) {
+            Refuse-BlockSplice "the ephor block in build.zig has no dependency line."
+            return 1
         }
-    } elseif ($buildContent -match 'dependency\("ephor"') {
-        Write-Stderr "warning: ephor dependency found but build steps have non-standard layout"
-        Write-Stderr "Please update your ephor build steps manually (see README)"
+        # Absorb a pre-existing blank line above the block (install.sh
+        # parity, EPH-I0285 port): the block's leading newline
+        # re-creates exactly one, so keeping one here too would grow
+        # build.zig by one blank line per re-run.
+        if ($startLine -gt 0 -and $buildLines[$startLine - 1] -eq '') {
+            $startLine -= 1
+        }
+        $newLines = @()
+        if ($startLine -gt 0) {
+            # EPH-I0285 port: the line-0 edge guard. Without it,
+            # $lines[0..-1] evaluates as (0, -1) and duplicates the
+            # first and last lines (EPH-I0251 evidence).
+            $newLines += $buildLines[0..($startLine - 1)]
+        }
+        $newLines += $EPHOR_BLOCK
+        if ($endLine + 1 -lt $buildLines.Count) {
+            $newLines += $buildLines[($endLine + 1)..($buildLines.Count - 1)]
+        }
+        Set-ContentNoFollow -Path "build.zig" -Value $newLines
+        Write-Host "Updated ephor build steps in build.zig"
+    } elseif ($legacyStartCount -gt 0 -or $legacyEndCount -gt 0) {
+        # The old v0.11.x snippet migrates to the canonical block
+        # (install.sh parity, EPH-I0285 port). The markers validate the
+        # same way as the canonical branch.
+        if ($legacyStartLine -eq -1 -or $legacyEndLine -eq -1) {
+            Refuse-BlockSplice "the ephor block in build.zig is missing one of its markers."
+            return 1
+        }
+        if ($legacyStartCount -gt 1 -or $legacyEndCount -gt 1) {
+            Refuse-BlockSplice "build.zig has more than one ephor block marker."
+            return 1
+        }
+        if ($legacyEndLine -le $legacyStartLine) {
+            Refuse-BlockSplice "the ephor block markers in build.zig are out of order."
+            return 1
+        }
+        $spanHasDep = $false
+        for ($i = $legacyStartLine; $i -lt $legacyEndLine; $i++) {
+            if ($buildLines[$i] -cmatch 'dependency\("ephor"') {
+                $spanHasDep = $true
+                break
+            }
+        }
+        if (-not $spanHasDep) {
+            Refuse-BlockSplice "the ephor block in build.zig has no dependency line."
+            return 1
+        }
+        # Absorb a pre-existing blank line above the block (install.sh
+        # parity: the v0.11.x snippet was also inserted with a leading
+        # blank line).
+        if ($legacyStartLine -gt 0 -and $buildLines[$legacyStartLine - 1] -eq '') {
+            $legacyStartLine -= 1
+        }
+        $newLines = @()
+        if ($legacyStartLine -gt 0) {
+            $newLines += $buildLines[0..($legacyStartLine - 1)]
+        }
+        $newLines += $EPHOR_BLOCK
+        if ($legacyEndLine + 1 -lt $buildLines.Count) {
+            $newLines += $buildLines[($legacyEndLine + 1)..($buildLines.Count - 1)]
+        }
+        Set-ContentNoFollow -Path "build.zig" -Value $newLines
+        Write-Host "Updated ephor build steps in build.zig (migrated from v0.11.x snippet)"
+    } elseif ($hasDepLine) {
+        # EPH-I1144: the probe anchors to code lines exactly like the
+        # action probe above, so a comment that mentions the dependency
+        # no longer misroutes a fresh install into this branch. The
+        # trailing-inline-comment limit is shared and recorded at the
+        # action probe.
+        # Has a dependency but a non-standard block layout - leave it
+        # and warn the user (EPH-I1110: the warning pair prints to
+        # stderr).
+        Warn-BlockLayout "ephor dependency found but build steps have non-standard layout"
     } else {
+        # Fresh install - add the block after the last installArtifact
+        # line. install.sh parity note: sh anchors this probe to code
+        # lines and extends the insert to the statement terminator
+        # (EPH-I0626); the ps1 boundary is the last installArtifact
+        # line (EPH-I1158).
         Write-Host "Adding ephor build steps to build.zig..."
 
-        $lines = Get-Content "build.zig" -Encoding UTF8
         $lastInstallLine = -1
 
-        for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match "installArtifact") {
+        for ($i = 0; $i -lt $buildLines.Count; $i++) {
+            if ($buildLines[$i] -match "installArtifact") {
                 $lastInstallLine = $i
             }
         }
@@ -472,10 +651,10 @@ error: could not repair the fingerprint in build.zig.zon
         }
 
         $newLines = @()
-        $newLines += $lines[0..$lastInstallLine]
+        $newLines += $buildLines[0..$lastInstallLine]
         $newLines += $EPHOR_BLOCK
-        if ($lastInstallLine + 1 -lt $lines.Count) {
-            $newLines += $lines[($lastInstallLine + 1)..($lines.Count - 1)]
+        if ($lastInstallLine + 1 -lt $buildLines.Count) {
+            $newLines += $buildLines[($lastInstallLine + 1)..($buildLines.Count - 1)]
         }
         Set-ContentNoFollow -Path "build.zig" -Value $newLines
     }

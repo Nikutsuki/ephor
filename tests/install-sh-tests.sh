@@ -2,7 +2,7 @@
 # Regression suite for install.sh (batch B65: EPH-I0625 through EPH-I0630;
 # batch B66: EPH-I0631 through EPH-I0636; batch B67: EPH-I0637 through
 # EPH-I0642; batch B85: EPH-I0205; batch B86f: EPH-I1104/I1106/I1107/
-# I1110/I1111).
+# I1110/I1111; batch B93p: EPH-I0717/I0720).
 # Runs the real installer against planted fixtures in scratch dirs under
 # .tmp/install-sh-tests. Hermetic: the fake zig on PATH answers version
 # and fetch, and the tags API is a local file, so no network is touched.
@@ -980,6 +980,53 @@ assert_not_grep "$D/out.log" 'Done!' 'Done! printed after the refusal'
 [ ! -e "$D/build.zig.zon" ] || fail "the zon was created despite the refusal"
 assert_grep "$VICTIM" 'victim_secret' 'victim content lost'
 pass "t41 build.zig symlink refuses before read (EPH-I1111)"
+
+# --- t42 (EPH-I0717): a pre-existing zon with a real fingerprint takes
+# the single-fetch path, and the no-installArtifact refusal still fails
+# the install. This is the F6-audit proj-noart shape: the zon exists
+# before the run, the fetch succeeds, and the missing installArtifact
+# must still end the install nonzero.
+D="$TEST_ROOT/t42"
+mkdir -p "$D"
+cat > "$D/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) !void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+}
+EOF
+cat > "$D/build.zig.zon" <<'EOF'
+.{
+    .name = .t42,
+    .version = "0.0.0",
+    .fingerprint = 0x1234dead,
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
+EOF
+run_installer "$D"
+assert_rc 1
+assert_grep "$D/err.log" 'build steps were not' 'no partial-install message'
+assert_not_grep "$D/out.log" 'Done!' 'Done! printed after the refusal'
+assert_grep "$D/build.zig.zon" '.fingerprint = 0x1234dead,' 'the existing fingerprint changed'
+pass "t42 existing zon still fails the no-installArtifact install (EPH-I0717)"
+
+# --- t43 (EPH-I0720): the README manual-install block stays identical
+# to the canonical EPHOR_BUILD_BLOCK in src/main.zig. A user who copies
+# the README block is then visible to every block-migration path. The
+# extractions pin both surfaces as they ship: the README block spans
+# its start and end markers, and the main.zig block spans the const
+# lines with the Zig string-literal prefix stripped.
+D="$TEST_ROOT/t43"
+mkdir -p "$D"
+sed -n '/^    \/\/ Ephor static analysis$/,/^    ephor_upgrade_step\.dependOn(&ephor_upgrade_cmd\.step);$/p' \
+    "$REPO_ROOT/README.md" > "$D/readme-block.txt"
+sed -n '/^const EPHOR_BUILD_BLOCK =$/,/^;$/p' "$REPO_ROOT/src/main.zig" \
+    | sed '1d;$d' | sed 's/^    \\\\//' > "$D/main-block.txt"
+[ -s "$D/readme-block.txt" ] || fail "could not extract the README block"
+[ -s "$D/main-block.txt" ] || fail "could not extract EPHOR_BUILD_BLOCK from src/main.zig"
+cmp -s "$D/readme-block.txt" "$D/main-block.txt" \
+    || fail "the README manual block differs from EPHOR_BUILD_BLOCK"
+pass "t43 README block matches EPHOR_BUILD_BLOCK (EPH-I0720)"
 
 echo ""
 echo "install-sh tests: $PASS_COUNT passed"

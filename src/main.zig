@@ -7710,9 +7710,17 @@ fn markCaptureScopes(
 /// never name-alone: nested scopes each contribute their own extent, and the
 /// capture line counts as inside the scope so a fused body
 /// (`for (xs) |item| free(item);`) is covered. Accepted bounds, mirrored
-/// from the EPH-I0676 machinery: a while-continue tail or an
-/// unbalanced/fused-single-line brace group yields no extent (the lines stay
-/// unshadowed, fail-open toward reporting). A multi-line condition header
+/// from the EPH-I0676 machinery: an unbalanced or fused-single-line
+/// brace group yields no extent (the lines stay unshadowed, fail-open
+/// toward reporting). The while-continue tail (`: (expr)`) yields an
+/// extent on the same shapes the vote fires on (EPH-I0749, the end-line
+/// bound on loopBodyLineExtent): the CFG pass's `:` arm shadows a
+/// while-continue-with-capture body where BOTH passes previously yielded
+/// null (the textual captureBodyExtent still returns null on the tail).
+/// That widening is intended (B86j+B87 r2 F2): the payload shadow is
+/// real regardless of the tail, and the pre-change gap was over-report.
+/// It is pinned by "ZA106: while-continue capture payload free stays
+/// masked (EPH-I0749 shadow widening)". A multi-line condition header
 /// maps only from the capture line down. The mask is per line, not per
 /// binding, so a free of the root name inside an alias-capture scope (or of
 /// an alias inside a root-capture scope) is masked with the line. A
@@ -9918,13 +9926,21 @@ fn bracedBodyExtent(
 /// reviewer F1: the CFG merges that statement into the back-edge block).
 /// A while/for continue tail (`: (expr)`) is skipped and the scan resumes
 /// past its paren group, so the idiomatic while-continue loop keeps its
-/// body extent (EPH-I0749). The paren-group walk itself handles a
-/// multi-line continue expression, but the VOTE never reaches it: the
-/// header line the vote passes is the CFG header block's end_line, which
-/// is the condition's last line for a multi-line header, not the while
-/// keyword line — the `(` lookup misses and the extent is null, so the
-/// multi-line-tail shape stays silent end-to-end (EPH-I0749 bound,
-/// verified live on the wc_multi_paren/wc_multi2 probes). Accepted bound
+/// body extent (EPH-I0749). The tail's paren group can itself span lines
+/// (parenGroupEnd walks them). The effective coverage bound sits on the
+/// header block's END line (B86j+B87 r2 F2, live-verified on the wc_*
+/// probes): the vote passes header_line = the CFG header block's
+/// end_line, and the extent needs a `(` on that line resolving through
+/// its paren group (and any `:` tail group) to the body `{`. The silent
+/// class is the shape whose header end line carries no resolving `(`: a
+/// single-line condition whose CONTINUE TAIL wraps (the end line is the
+/// tail's close line — `1) {`, no `(`; the wc_multi_a probe stays
+/// silent), and the fused single-line body below. A wrapped CONDITION
+/// whose end line carries the `: (cont)` tail fires (the wc_multi_b and
+/// wc_multi_c probes — the tail's paren group resolves to the body
+/// brace), and an Allman body brace on its own line fires (wc_allman —
+/// the walk finds the `{` on the next line; adjudicated correct, the
+/// extent is well-defined and the defect real). Accepted bound
 /// (EPH-I0749): a fused
 /// single-line braced body (`while (c) { f(); }`) still yields null —
 /// the column-aware arm proved disproportionate (the CFG leaves same-line
@@ -9996,14 +10012,16 @@ fn loopBodyLineExtent(
 /// before free in a loop body stays silent (EPH-I0676)". The double-free
 /// direction stays loud through this vote (pinned by "ZA106: loop-body
 /// free double-frees on the next iteration (EPH-I0676)"). Since EPH-I0749
-/// the vote covers the while/for continue tail (`: (expr)`) on a
-/// single-line header; a multi-line header keeps the shape silent — the
-/// header_line here is the CFG header block's end_line (the condition's
-/// last line, not the keyword line), so the extent lookup misses the `(`
-/// and the vote never runs (EPH-I0749 bound, named on loopBodyLineExtent
-/// too). The fused single-line body stays silent — the documented bound
-/// of loopBodyLineExtent (EPH-I0749), pinned by "ZA106: fused single-line
-/// loop body stays silent (EPH-I0749)".
+/// the vote covers the while/for continue tail (`: (expr)`). The
+/// coverage bound sits on the header block's END line, not on
+/// "multi-line" itself (B86j+B87 r2 F2, named on loopBodyLineExtent with
+/// the live-verified shapes): the end line must carry a `(` resolving to
+/// the body brace. A wrapped continue TAIL stays silent (the end line
+/// carries none); a wrapped CONDITION whose end line carries the tail
+/// fires; an Allman body brace fires. The fused single-line body stays
+/// silent — the documented bound of loopBodyLineExtent (EPH-I0749),
+/// pinned by "ZA106: fused single-line loop body stays silent
+/// (EPH-I0749)".
 fn loopCarriedFreeVote(ctx: *const FreeScanCtx, bid: usize, actual_line: usize) !bool {
     for (ctx.cfg.edges.items) |edge| {
         if (edge.kind != .loop_back) continue;
@@ -21489,6 +21507,11 @@ const FnLockRecord = struct {
     }
 };
 
+/// LIFO capacity of the defer brace-kind stack (EPH-I0928): brace
+/// nesting inside one defer context. 64 matches the bit width of the
+/// kind word; an overflow fails loud (pushDeferBrace).
+const max_defer_stack_depth = 64;
+
 /// Mutable state for the per-file concurrency scan (ZC101).
 const ConcurrencyScanState = struct {
     allocator: Allocator,
@@ -21500,9 +21523,20 @@ const ConcurrencyScanState = struct {
     /// body, mirroring the ZT101 FnSpanState rule.
     sig_parens: usize = 0,
     fn_depth: usize = 0,
+    /// True exactly while a defer/errdefer block is open (EPH-I0928
+    /// invariant: in_defer ⟺ defer_depth > 0).
     in_defer: bool = false,
+    /// Open-DEFER-block count — never the mixed defer+context brace
+    /// count the B86j/B87 scalar walk carried (EPH-I0928).
     defer_depth: usize = 0,
     defer_stmt_depth: usize = 0,
+    /// LIFO brace-kind stack for the defer context (EPH-I0928): bit i is
+    /// 1 when the brace at stack depth i opened a defer block. Braces
+    /// outside the defer context stay untracked, so the stack is empty
+    /// exactly when in_defer is false — a context brace always sits
+    /// above a defer brace and pops first.
+    defer_kinds: u64 = 0,
+    defer_stack_len: usize = 0,
     /// Literal-blanking buffer for one file pass (16 KB): an over-cap
     /// line returns unblanked, so a literal brace on it still counts
     /// toward brace depth (documented bound, EPH-I0444 — rare,
@@ -21647,67 +21681,103 @@ fn isDiscardedAcquire(code: []const u8, call_start: usize) bool {
 /// attributed that depth, not their own — the defer registers at the
 /// opener's scope. The caller computes the keyword depth, so a
 /// `} defer {` continuation registers at the post-close depth (EPH-I0439).
-/// The brace walk covers the WHOLE line from the carried depth on every
-/// line, armed or not (EPH-I0928 F1): the pre-keyword segment keeps the
-/// carried open-defer count honest at the keyword — a leading `}` closing
-/// an enclosing defer block disarms it, a leading `{` (a bare block or an
-/// if open holding the defer) counts as part of the context. A
-/// single-statement defer opens no block: when the keyword segment
-/// carries no brace, in_defer never arms for the line.
+/// A single-statement defer opens no block: when no `{` sits at/after
+/// the keyword, in_defer never arms for the line.
+///
+/// State invariant (EPH-I0928): in_defer holds exactly while a defer
+/// block is open, and defer_depth is the open-DEFER count — never the
+/// mixed brace count the B86j/B87 scalar walk carried. The walk cannot
+/// textually distinguish a defer `}` from a context `}`, so the state
+/// carries a LIFO brace-KIND stack: the first `{` at/after an armed
+/// line's keyword is marked a defer opener (every deferred form —
+/// `defer {`, `defer if (c) {`, `defer while (c) {` — defers its first
+/// braced block), every other `{` opened inside the defer context is
+/// context, and each `}` pops the stack, so the kind of every close is
+/// exact. Braces outside the defer context stay untracked: a `}` on an
+/// empty stack closes an untracked context block (the if a `} defer {`
+/// continuation follows) and never disarms (EPH-I0926). The structural
+/// consequence is the invariant: a context brace always sits above a
+/// defer brace and pops first, so the stack is empty exactly when
+/// defer_depth reads zero. The mixed scalar broke the invariant twice
+/// (reviewer r2 F1): a `} defer {` continuation disarmed to zero
+/// mid-line and re-opened with in_defer stuck false, so the
+/// continuation body's acquires recorded plain (FP); a close-then-open
+/// line (`} if (c) {`) left a stale depth the next armed defer walked
+/// from, so its own close never reached zero and in_defer stayed true
+/// past the block (silent). A keyword line whose only `{` sits inside
+/// the defer call's own parens across lines (a multi-line argument
+/// struct literal) mis-marks that brace as the opener — the
+/// granularity bound of a paren-blind walk, unchanged from the scalar
+/// form. Residual (unchanged, disclosed): the statement depth
+/// attributed to lines after an inner defer close is the inner
+/// keyword's — a ZC102 depth-attribution residual on the nested-defer
+/// shape (EPH-I0928).
 fn trackConcurrencyDefer(
     blanked: []const u8,
     keyword_code_pos: ?usize,
     defer_stmt_depth: usize,
     state: *ConcurrencyScanState,
 ) void {
-    const armed = keyword_code_pos != null and
-        mem.indexOfScalar(u8, blanked, '{') != null;
-    if (armed) {
-        state.in_defer = true;
-        state.defer_stmt_depth = defer_stmt_depth;
-    }
-    if (!state.in_defer) return;
-    // The walk covers the WHOLE line from the carried depth — armed and
-    // non-armed lines share one walk (EPH-I0928 F1). The carried depth is
-    // the open-defer-block count at the line start; the pre-keyword
-    // segment must keep it honest at the keyword: a leading `}` closing
-    // an enclosing defer block drops the depth before the keyword's own
-    // block opens, and a leading `{` (a bare block or an if open holding
-    // the defer) counts as part of the context. A leading `}` at a zero
-    // carried depth closes a NON-defer block and stays clamped — it
-    // never disarms the fresh arm (EPH-I0926); disarming requires a real
-    // decrement to zero. The B86j form walked armed lines from the
-    // keyword and silently skipped that segment, so a `} defer {`
-    // continuation after a CLOSED defer block left in_defer armed — an
-    // acquire after it recorded deferred and a real lock-leak defect
-    // stayed silent (reviewer F1). The walk's own bookkeeping mixes
-    // defer braces with nested non-defer braces inside the defer
-    // context, which is exactly what the close detection needs: a defer
-    // block's `}` returns the depth to its pre-block level. Residual
-    // (unchanged, disclosed): the statement depth attributed to lines
-    // after an inner defer close is the inner keyword's — a ZC102
-    // depth-attribution residual on the nested-defer shape (EPH-I0928).
-    var walk_depth = state.defer_depth;
-    for (blanked) |c| {
-        if (c == '{') walk_depth += 1;
-        if (c == '}') {
-            // A `}` at depth 0 closes a non-defer block (the if the
-            // continuation follows) and must not disarm the fresh arm
-            // the keyword just armed (EPH-I0926); disarming requires a
-            // real decrement to zero — the close of a carried defer
-            // brace.
-            if (walk_depth == 0) continue;
-            walk_depth -= 1;
-            if (walk_depth == 0) state.in_defer = false;
+    const kw = keyword_code_pos orelse blanked.len;
+    var opener_seen = false;
+    for (blanked, 0..) |c, i| {
+        if (c == '{') {
+            // The first `{` at/after the keyword opens the deferred
+            // statement's block (EPH-I0928); a line with no keyword has
+            // no opener (kw sentinel past the line end).
+            const opener = !opener_seen and i >= kw;
+            opener_seen = opener_seen or opener;
+            pushDeferBrace(state, opener, defer_stmt_depth);
+            continue;
         }
+        if (c == '}') popDeferBrace(state);
     }
-    // A single-statement defer opens no block: the walk can end at
-    // depth 0 with no block opened (a brace outside the keyword
-    // segment armed the line) or with the block closed (the non-armed
-    // close line of an open defer block). Either way in_defer leaves
-    // this line false — it never leaks to the next line (EPH-I0926).
-    if (walk_depth == 0) state.in_defer = false;
-    state.defer_depth = walk_depth;
+}
+
+/// Push one `{` onto the defer brace-kind stack (EPH-I0928): `opener`
+/// marks the deferred statement's block opener on an armed line, which
+/// also captures the defer statement's depth and arms in_defer. A brace
+/// outside the defer context is untracked — the empty-stack `}` clamp
+/// (popDeferBrace) needs the stack to hold only defer-context braces.
+/// An overflow (nesting past max_defer_stack_depth — pathological)
+/// fails LOUD: the tracked context drops, so later acquires record
+/// plain, the over-report direction ZC101 documents as safe.
+fn pushDeferBrace(
+    state: *ConcurrencyScanState,
+    opener: bool,
+    defer_stmt_depth: usize,
+) void {
+    if (!opener and !state.in_defer) return;
+    if (state.defer_stack_len == max_defer_stack_depth) {
+        state.defer_stack_len = 0;
+        state.defer_kinds = 0;
+        state.defer_depth = 0;
+        state.in_defer = false;
+        return;
+    }
+    const bit = @as(u64, 1) << @intCast(state.defer_stack_len);
+    if (opener) {
+        state.defer_kinds |= bit;
+        state.defer_depth += 1;
+        state.defer_stmt_depth = defer_stmt_depth;
+        state.in_defer = true;
+    } else {
+        state.defer_kinds &= ~bit;
+    }
+    state.defer_stack_len += 1;
+}
+
+/// Pop one `}` off the defer brace-kind stack (EPH-I0928). A `}` on an
+/// empty stack closes an untracked context block (the if a `} defer {`
+/// continuation follows) and must not disarm (EPH-I0926): disarming
+/// requires popping a DEFER brace down to a zero open-defer count.
+fn popDeferBrace(state: *ConcurrencyScanState) void {
+    if (state.defer_stack_len == 0) return;
+    state.defer_stack_len -= 1;
+    const defer_bit = (state.defer_kinds >> @intCast(state.defer_stack_len)) & 1;
+    if (defer_bit == 0) return;
+    state.defer_depth -= 1;
+    if (state.defer_depth == 0) state.in_defer = false;
 }
 
 /// Open a fn record when a pending fn def gains its body `{` (ZC101).
@@ -52793,6 +52863,137 @@ test "ZA106: fused single-line loop body stays silent (EPH-I0749 documented boun
 
     try std.testing.expect(
         countRuleIssues(run.issues.items, "test_loop_fused.zig", RULE_DOUBLE_FREE) == 0,
+    );
+}
+
+test "ZA106: Allman while-continue loop body free fires the loop-carried vote (EPH-I0749)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The wc_allman probe shape: the body brace opens on its own line.
+    // The extent walk resumes past the continue tail's paren group,
+    // finds the `{` on the next line, and bounds the body — the
+    // loop-carried double-free fires. Firing is CORRECT (adjudicated
+    // B86j+B87 r2 F2): the Allman body is a well-defined braced extent
+    // and the defect is real; silence would be a false negative.
+    const content =
+        \\fn loop_allman(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    var i: usize = 0;
+        \\    while (i < 10) : (i += 1)
+        \\    {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_loop_allman.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(
+        countRuleIssues(run.issues.items, "test_loop_allman.zig", RULE_DOUBLE_FREE) == 1,
+    );
+}
+
+test "ZA106: wrapped continue tail keeps the while-continue vote silent (EPH-I0749 bound)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The wc_multi_a probe shape: a single-line condition whose
+    // CONTINUE TAIL wraps. The header block's end line is the tail's
+    // close line (`1) {`), which carries no `(` for the extent walk —
+    // the silent class of the end-line bound (B86j+B87 r2 F2: the bound
+    // sits on the header end line's resolving paren, not on
+    // "multi-line" itself). Fail open, the safe direction.
+    const content =
+        \\fn loop_wrapped_tail(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    var i: usize = 0;
+        \\    while (i < 10) : (i +=
+        \\        1) {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_loop_wrapped_tail.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(
+        countRuleIssues(run.issues.items, "test_loop_wrapped_tail.zig", RULE_DOUBLE_FREE) == 0,
+    );
+}
+
+test "ZA106: wrapped condition ending on the tail line fires the while-continue vote (EPH-I0749)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The wc_multi_b probe shape: a wrapped CONDITION whose last line
+    // carries the `: (i += 1)` tail. The header block's end line holds
+    // the tail's paren group, which resolves to the body brace — the
+    // firing class of the end-line bound (B86j+B87 r2 F2, live-pinned
+    // 0 → 1 on the wc_multi_b/wc_multi_c probes).
+    const content =
+        \\fn loop_wrapped_cond(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    var i: usize = 0;
+        \\    while (i < 10 and
+        \\        i > 0) : (i += 1) {
+        \\        allocator.free(buf);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_loop_wrapped_cond.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(
+        countRuleIssues(run.issues.items, "test_loop_wrapped_cond.zig", RULE_DOUBLE_FREE) == 1,
+    );
+}
+
+test "ZA106: while-continue capture payload free stays masked (EPH-I0749 shadow widening)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The computeCaptureShadowedLines widening: the CFG pass gains the
+    // loopBodyLineExtent `:` arm, so a while-continue-with-capture loop
+    // shadows its body where BOTH passes previously yielded null (the
+    // textual captureBodyExtent still returns null on the tail). The
+    // frees inside the body free the per-iteration payload, not the
+    // outer alloc: unmasked they read as the outer alloc's double-free
+    // (live-probe RED on the `:`-arm revert: the masked shape drew 1),
+    // the over-report gap the widening closes. The shadow is real
+    // regardless of the tail — recorded as intended in the pass doc
+    // (B86j+B87 r2 F2). The control fn proves the flag path ran.
+    const content =
+        \\fn loop_capture(allocator: std.mem.Allocator, it: anytype) !void {
+        \\    const item = try allocator.alloc(u8, 64);
+        \\    var i: usize = 0;
+        \\    while (it.next()) |item| : (i += 1) {
+        \\        allocator.free(item);
+        \\        allocator.free(item);
+        \\    }
+        \\    allocator.free(item);
+        \\}
+        \\fn loop_control(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_loop_capture.zig", content);
+    defer run.deinit(allocator);
+
+    // The masked capture shape draws nothing; the control's definite
+    // double-free is the one issue.
+    try std.testing.expect(
+        countRuleIssues(run.issues.items, "test_loop_capture.zig", RULE_DOUBLE_FREE) == 1,
     );
 }
 
@@ -98445,6 +98646,124 @@ test "ZC101: single-line nested defer keeps the whole-line defer context (EPH-I0
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 1, 0);
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: acquire inside a } defer { continuation body records deferred (EPH-I0928)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Reviewer r2 F1, manifestation B (the disarm-then-reopen break):
+    // the leading `}` pops the OUTER defer brace to a zero open-defer
+    // count, but the continuation `{` is itself a defer opener, so the
+    // context re-arms on the same line and the body stays deferred. The
+    // mixed-scalar walk left (in_defer=false, defer_depth=1) — the body
+    // acquire recorded plain and drew the FP warning. The brace-kind
+    // stack re-arms on the continuation opener (live-probe RED: the
+    // scalar form drew 2 warnings here).
+    const content =
+        \\fn foo() void {}
+        \\fn doWork() void {}
+        \\fn f(c: bool) void {
+        \\    defer {
+        \\        defer { foo(); }
+        \\    } defer {
+        \\        mu.lock();
+        \\    }
+        \\    doWork();
+        \\}
+        \\fn g(c: bool) void {
+        \\    mutex.lock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_acq_in_cont.zig", content);
+    defer run.deinit(allocator);
+
+    // f's acquire sits inside the continuation's defer block (dropped);
+    // only g's control warns.
+    try expectZC101Counts(run.issues.items, 1, 0);
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: close-then-open line drops the stale defer depth (EPH-I0928)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Reviewer r2 F1, manifestation A (the stale-depth break): the line
+    // closes a defer block and opens a non-defer block (`} if (c) {`).
+    // The scalar walk disarmed to zero on the close but counted the
+    // if's `{` back to one, leaving (in_defer=false, defer_depth=1) —
+    // the next armed defer walked from the stale one, its close never
+    // reached zero, and in_defer stayed true past the block: the
+    // post-block acquire recorded deferred and the real leak stayed
+    // silent. The brace-kind stack pops the defer brace and leaves the
+    // if untracked, so the depth is exact (live-probe RED: the scalar
+    // form drew 1 warning here).
+    const content =
+        \\fn foo() void {}
+        \\fn bar() void {}
+        \\fn baz() void {}
+        \\fn doWork() void {}
+        \\fn f(c: bool) void {
+        \\    defer { foo(); } if (c) {
+        \\        bar();
+        \\    }
+        \\    defer { baz(); }
+        \\    mu.lock();
+        \\    doWork();
+        \\}
+        \\fn g(c: bool) void {
+        \\    mutex.lock();
+        \\    doWork();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_stale_depth.zig", content);
+    defer run.deinit(allocator);
+
+    // f's uncovered post-block acquire fires, g's control fires — two
+    // warnings.
+    try expectZC101Counts(run.issues.items, 2, 0);
+    try expectZC102Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: single-statement defer after an if open arms no context (EPH-I0928)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The armed-without-opener sibling of the stale-depth break: the
+    // line carries a defer keyword and a `{`, but the brace sits BEFORE
+    // the keyword (the if open) and the defer is single-statement. The
+    // scalar walk armed on any-`{`-on-line, counted the if's brace to
+    // one, and left in_defer true past the line — the next line's
+    // acquire recorded deferred and the real leak stayed silent
+    // (live-probe RED: the 51cb1cf form drew 1 warning here, the
+    // control only). The opener rule arms only on a `{` at/after the
+    // keyword, so the if's brace stays untracked.
+    const content =
+        \\fn foo() void {}
+        \\fn f(c: bool) void {
+        \\    if (c) { defer foo();
+        \\        mu.lock();
+        \\    }
+        \\}
+        \\fn g() void {
+        \\    mutex.lock();
+        \\    foo();
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_armed_no_opener.zig", content);
+    defer run.deinit(allocator);
+
+    // f's acquire is not in a defer block (fires), g's control fires —
+    // two warnings.
+    try expectZC101Counts(run.issues.items, 2, 0);
     try expectZC102Counts(run.issues.items, 0, 0);
 }
 

@@ -55,25 +55,50 @@ fn hostileSeqLen(s: []const u8) usize {
 }
 
 /// Classify the byte at `s[0]` against the hostile bidi and invisible
-/// format set (EPH-I0579): U+061C Arabic Letter Mark, U+00AD soft hyphen,
-/// U+200B..U+200F zero-width and bidi marks, U+2028/U+2029 line and
-/// paragraph separators, U+202A..U+202E bidi embeddings and overrides,
-/// U+2060..U+206F invisible operators, bidi isolates, and deprecated
-/// shaping marks (the unassigned U+2065 included: filtering it is free
-/// and conservative), U+FEFF BOM, U+FFF9..U+FFFB interlinear
-/// annotation anchors, and the tag characters U+E0001 and
+/// format set (EPH-I0579, EPH-I0217): U+061C Arabic Letter Mark, U+00AD
+/// soft hyphen, U+0600..U+0605 Arabic number signs, U+06DD End of Ayah,
+/// U+070F Syriac Abbreviation Mark, U+0890..U+0891 Arabic pound and
+/// piastre marks, U+08E2 disputed End of Ayah, U+180E Mongolian Vowel
+/// Separator, U+200B..U+200F zero-width and bidi marks, U+2028/U+2029
+/// line and paragraph separators, U+202A..U+202E bidi embeddings and
+/// overrides, U+2060..U+206F invisible operators, bidi isolates, and
+/// deprecated shaping marks (the unassigned U+2065 included: filtering
+/// it is free and conservative), U+FE00..U+FE0F variation selectors
+/// (Mn class, invisible shaping marks — outside Cf but named by
+/// EPH-I0217's evidence), U+FEFF BOM, U+FFF9..U+FFFB interlinear
+/// annotation anchors, the Kaithi number signs U+110BD/U+110CD, the
+/// Egyptian hieroglyph format controls U+13430..U+1343F, the shorthand
+/// format letters U+1BCA0..U+1BCA3, the musical symbol controls
+/// U+1D173..U+1D17A, and the tag characters U+E0001 and
 /// U+E0020..U+E007F. A truncated lead consumes the rest (invalid UTF-8
 /// regardless) and reports U+FFFD. Shared by the terminal filter and the
 /// JSON escaper so both reject the same set.
+/// Hostile-unit classifiers indexed by lead byte. The comptime table keeps
+/// the dispatcher at one branch (the dogfood ratchet stays flat, and the
+/// EPH-I0217 extension doubles the hostile lead count without touching the
+/// dispatch complexity). The slots are `*const fn` pointers: a bare `fn`
+/// type is comptime-only, and the dispatcher indexes with a runtime byte.
+const hostile_leads = blk: {
+    var table = [_]?*const fn ([]const u8) HostileUnit{null} ** 256;
+    table[0xC2] = c2Unit;
+    table[0xD8] = d8Unit;
+    table[0xDB] = dbUnit;
+    table[0xDC] = dcUnit;
+    table[0xE0] = e0Unit;
+    table[0xE1] = e1Unit;
+    table[0xE2] = formatUnit;
+    table[0xEF] = efUnit;
+    table[0xF0] = f0Unit;
+    table[0xF3] = tagUnit;
+    break :blk table;
+};
+
+/// Classify the byte at `s[0]` against the hostile set (the classifier
+/// table above). A hostile sequence reports its length and codepoint; a
+/// clean byte reports len 0.
 fn hostileUnit(s: []const u8) HostileUnit {
-    switch (s[0]) {
-        0xC2 => return c2Unit(s),
-        0xD8 => return almUnit(s),
-        0xE2 => return formatUnit(s),
-        0xEF => return efUnit(s),
-        0xF3 => return tagUnit(s),
-        else => return .{ .len = 0, .cp = 0 },
-    }
+    const unit_fn = hostile_leads[s[0]] orelse return .{ .len = 0, .cp = 0 };
+    return unit_fn(s);
 }
 
 /// C1 controls (U+0080..U+009F) and U+00AD soft hyphen under the 0xC2
@@ -86,10 +111,44 @@ fn c2Unit(s: []const u8) HostileUnit {
     return .{ .len = 0, .cp = 0 };
 }
 
-/// U+061C Arabic Letter Mark (bidi) under the 0xD8 lead.
-fn almUnit(s: []const u8) HostileUnit {
+/// U+0600..U+0605 Arabic number signs and U+061C Arabic Letter Mark
+/// (bidi) under the 0xD8 lead.
+fn d8Unit(s: []const u8) HostileUnit {
     if (s.len < 2) return .{ .len = s.len, .cp = 0xFFFD };
+    if (s[1] >= 0x80 and s[1] <= 0x85)
+        return .{ .len = 2, .cp = 0x0600 + @as(u21, s[1] - 0x80) };
     if (s[1] == 0x9C) return .{ .len = 2, .cp = 0x061C };
+    return .{ .len = 0, .cp = 0 };
+}
+
+/// U+06DD Arabic End of Ayah under the 0xDB lead.
+fn dbUnit(s: []const u8) HostileUnit {
+    if (s.len < 2) return .{ .len = s.len, .cp = 0xFFFD };
+    if (s[1] == 0x9D) return .{ .len = 2, .cp = 0x06DD };
+    return .{ .len = 0, .cp = 0 };
+}
+
+/// U+070F Syriac Abbreviation Mark under the 0xDC lead.
+fn dcUnit(s: []const u8) HostileUnit {
+    if (s.len < 2) return .{ .len = s.len, .cp = 0xFFFD };
+    if (s[1] == 0x8F) return .{ .len = 2, .cp = 0x070F };
+    return .{ .len = 0, .cp = 0 };
+}
+
+/// U+0890..U+0891 Arabic pound and piastre marks and U+08E2 disputed End
+/// of Ayah under the 0xE0 lead.
+fn e0Unit(s: []const u8) HostileUnit {
+    if (s.len < 3) return .{ .len = s.len, .cp = 0xFFFD };
+    if (s[1] == 0xA2 and s[2] >= 0x90 and s[2] <= 0x91)
+        return .{ .len = 3, .cp = 0x0890 + @as(u21, s[2] - 0x90) };
+    if (s[1] == 0xA3 and s[2] == 0xA2) return .{ .len = 3, .cp = 0x08E2 };
+    return .{ .len = 0, .cp = 0 };
+}
+
+/// U+180E Mongolian Vowel Separator under the 0xE1 lead.
+fn e1Unit(s: []const u8) HostileUnit {
+    if (s.len < 3) return .{ .len = s.len, .cp = 0xFFFD };
+    if (s[1] == 0xA0 and s[2] == 0x8E) return .{ .len = 3, .cp = 0x180E };
     return .{ .len = 0, .cp = 0 };
 }
 
@@ -111,13 +170,35 @@ fn format80Unit(s: []const u8) HostileUnit {
     return .{ .len = 0, .cp = 0 };
 }
 
-/// U+FEFF BOM and U+FFF9..U+FFFB interlinear annotation anchors under the
-/// 0xEF lead.
+/// U+FE00..U+FE0F variation selectors (invisible shaping marks, Mn class
+/// but named by EPH-I0217's evidence), U+FEFF BOM, and U+FFF9..U+FFFB
+/// interlinear annotation anchors under the 0xEF lead.
 fn efUnit(s: []const u8) HostileUnit {
     if (s.len < 3) return .{ .len = s.len, .cp = 0xFFFD };
+    if (s[1] == 0xB8 and s[2] >= 0x80 and s[2] <= 0x8F)
+        return .{ .len = 3, .cp = 0xFE00 + @as(u21, s[2] - 0x80) };
     if (s[1] == 0xBB and s[2] == 0xBF) return .{ .len = 3, .cp = 0xFEFF };
     if (s[1] == 0xBF and s[2] >= 0xB9 and s[2] <= 0xBB)
         return .{ .len = 3, .cp = 0xFFF9 + @as(u21, s[2] - 0xB9) };
+    return .{ .len = 0, .cp = 0 };
+}
+
+/// The Kaithi number signs U+110BD/U+110CD, the Egyptian hieroglyph
+/// format controls U+13430..U+1343F, the shorthand format letters
+/// U+1BCA0..U+1BCA3, and the musical symbol controls U+1D173..U+1D17A
+/// under the 0xF0 lead.
+fn f0Unit(s: []const u8) HostileUnit {
+    if (s.len < 4) return .{ .len = s.len, .cp = 0xFFFD };
+    if (s[1] == 0x91 and s[2] == 0x82 and s[3] == 0xBD)
+        return .{ .len = 4, .cp = 0x110BD };
+    if (s[1] == 0x91 and s[2] == 0x83 and s[3] == 0x8D)
+        return .{ .len = 4, .cp = 0x110CD };
+    if (s[1] == 0x93 and s[2] == 0x90 and s[3] >= 0xB0 and s[3] <= 0xBF)
+        return .{ .len = 4, .cp = 0x13430 + @as(u21, s[3] - 0xB0) };
+    if (s[1] == 0x9B and s[2] == 0xB2 and s[3] >= 0xA0 and s[3] <= 0xA3)
+        return .{ .len = 4, .cp = 0x1BCA0 + @as(u21, s[3] - 0xA0) };
+    if (s[1] == 0x9D and s[2] == 0x85 and s[3] >= 0xB3 and s[3] <= 0xBA)
+        return .{ .len = 4, .cp = 0x1D173 + @as(u21, s[3] - 0xB3) };
     return .{ .len = 0, .cp = 0 };
 }
 
@@ -617,17 +698,32 @@ test "sanitizeSnippet keeps short backtick runs and filters controls" {
     try std.testing.expectEqualStrings("a `b` ``c`` ?d", result.slice);
 }
 
-/// The hostile-set battery (EPH-I0579): every codepoint the filter claims,
-/// expressed as inclusive ranges. The U+2060 range spans the unassigned
-/// U+2065, which the filter covers conservatively.
+/// The hostile-set battery (EPH-I0579, EPH-I0217): every codepoint the
+/// filter claims, expressed as inclusive ranges. The U+2060 range spans
+/// the unassigned U+2065, which the filter covers conservatively, and the
+/// U+FE00 range covers the Mn-class variation selectors named by the
+/// EPH-I0217 evidence. The set is the full Unicode Cf class (Unicode 16)
+/// plus the variation selectors.
 const hostile_ranges = [_]struct { from: u21, to: u21 }{
     .{ .from = 0x061C, .to = 0x061C },
     .{ .from = 0x00AD, .to = 0x00AD },
+    .{ .from = 0x0600, .to = 0x0605 },
+    .{ .from = 0x06DD, .to = 0x06DD },
+    .{ .from = 0x070F, .to = 0x070F },
+    .{ .from = 0x0890, .to = 0x0891 },
+    .{ .from = 0x08E2, .to = 0x08E2 },
+    .{ .from = 0x180E, .to = 0x180E },
     .{ .from = 0x200B, .to = 0x200F },
     .{ .from = 0x2028, .to = 0x202E },
     .{ .from = 0x2060, .to = 0x206F },
+    .{ .from = 0xFE00, .to = 0xFE0F },
     .{ .from = 0xFEFF, .to = 0xFEFF },
     .{ .from = 0xFFF9, .to = 0xFFFB },
+    .{ .from = 0x110BD, .to = 0x110BD },
+    .{ .from = 0x110CD, .to = 0x110CD },
+    .{ .from = 0x13430, .to = 0x1343F },
+    .{ .from = 0x1BCA0, .to = 0x1BCA3 },
+    .{ .from = 0x1D173, .to = 0x1D17A },
     .{ .from = 0xE0001, .to = 0xE0001 },
     .{ .from = 0xE0020, .to = 0xE007F },
 };
@@ -653,6 +749,30 @@ fn expectHostileSet(
 
 test "sanitizeTerminal filters the full hostile set (EPH-I0579)" {
     try expectHostileSet(sanitizeTerminal, "a?b", std.testing.allocator);
+}
+
+test "sanitizeTerminal filters the EPH-I0217 Cf members (spot pins)" {
+    // One spot pin per new lead the EPH-I0217 extension added, beside the
+    // battery that walks every range. Each invisible character collapses
+    // to one visible placeholder.
+    const cases = [_]struct { input: []const u8, want: []const u8 }{
+        .{ .input = "a\xD8\x80b", .want = "a?b" }, // U+0600 Arabic Number Sign
+        .{ .input = "a\xDB\x9Db", .want = "a?b" }, // U+06DD End of Ayah
+        .{ .input = "a\xDC\x8Fb", .want = "a?b" }, // U+070F Syriac Abbreviation Mark
+        .{ .input = "a\xE0\xA2\x90b", .want = "a?b" }, // U+0890 Arabic Pound Mark Above
+        .{ .input = "a\xE0\xA3\xA2b", .want = "a?b" }, // U+08E2 Disputed End of Ayah
+        .{ .input = "a\xE1\xA0\x8Eb", .want = "a?b" }, // U+180E Mongolian Vowel Separator
+        .{ .input = "a\xEF\xB8\x8Fb", .want = "a?b" }, // U+FE0F Variation Selector-16
+        .{ .input = "a\xF0\x91\x82\xBDb", .want = "a?b" }, // U+110BD Kaithi Number Sign
+        .{ .input = "a\xF0\x93\x90\xBFb", .want = "a?b" }, // U+1343F hieroglyph control
+        .{ .input = "a\xF0\x9B\xB2\xA0b", .want = "a?b" }, // U+1BCA0 Shorthand Format
+        .{ .input = "a\xF0\x9D\x85\xBAb", .want = "a?b" }, // U+1D17A Musical Symbol
+    };
+    for (cases) |case| {
+        var result = try sanitizeTerminal(std.testing.allocator, case.input);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(case.want, result.slice);
+    }
 }
 
 test "sanitizeMarkdown filters the full hostile set (EPH-I0579)" {
@@ -692,9 +812,10 @@ test "escapeJson escapes the full hostile set (EPH-I0579)" {
 
 test "escapeJson astral escapes re-parse to the original text (EPH-I0579)" {
     // The surrogate-pair escape must decode back to the original astral
-    // codepoint in a strict JSON consumer.
+    // codepoint in a strict JSON consumer. The I0217 members pin the new
+    // astral leads (Kaithi, musical symbols) on the same property.
     const allocator = std.testing.allocator;
-    for ([_]u21{ 0xE0001, 0xE0020, 0xE003F, 0xE0040, 0xE007F }) |cp| {
+    for ([_]u21{ 0xE0001, 0xE0020, 0xE003F, 0xE0040, 0xE007F, 0x110BD, 0x1D173 }) |cp| {
         const input = try std.fmt.allocPrint(allocator, "a{u}b", .{cp});
         defer allocator.free(input);
         var result = try escapeJson(allocator, input);
@@ -723,18 +844,21 @@ test "escapeJson replaces invalid lead bytes with U+FFFD (EPH-I0580)" {
         .{ .input = "\xED\xA0\x80", .want = "\\uFFFD\\uFFFD\\uFFFD" },
         .{ .input = "\xF0\x80\x80\x80", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
         .{ .input = "\xF4\x90\x80\x80", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
-        .{ .input = "\xE1\x80", .want = "\\uFFFD\\uFFFD" },
         // Tag-lead bytes with an out-of-range fourth byte are invalid
         // UTF-8: the lead falls to the validator and each byte becomes
         // U+FFFD (EPH-I1120).
         .{ .input = "\xF3\xA0\x80\xC5", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
         .{ .input = "\xF3\xA0\x81\xC5", .want = "\\uFFFD\\uFFFD\\uFFFD\\uFFFD" },
         // Truncated hostile tails consume the rest as one U+FFFD, the
-        // long-standing terminal-filter behavior on the JSON side.
+        // long-standing terminal-filter behavior on the JSON side. The
+        // EPH-I0217 leads join the same policy: a truncated 0xE1 lead is
+        // one U+FFFD like the pre-existing 0xE2/0xEF/0xF3 forms.
         .{ .input = "ab\xE2\x80", .want = "ab\\uFFFD" },
         .{ .input = "x\xC2", .want = "x\\uFFFD" },
         .{ .input = "\xEF\xBB", .want = "\\uFFFD" },
         .{ .input = "\xF3\xA0\x80", .want = "\\uFFFD" },
+        .{ .input = "\xE1\x80", .want = "\\uFFFD" },
+        .{ .input = "\xF0\x91\x82", .want = "\\uFFFD" },
     };
     for (cases) |case| {
         var result = try escapeJson(std.testing.allocator, case.input);

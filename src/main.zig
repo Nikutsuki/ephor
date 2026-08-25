@@ -2144,6 +2144,14 @@ const CFGBuildCtx = struct {
     /// pop/arm/return patterns (block_end, switch_arm, return_stmt)
     /// are unreachable here and route through their own walk handlers
     /// (EPH-I0999; also relieves EPH-I0059 branch pressure).
+    /// EPH-I0059 decision (recorded 2026-08-25): at 7 arms (7 ZA304
+    /// branches, 8 ZA305 CCN, flat-chain shaped) the lookup-table
+    /// refactor of the three handleBranch arms is not warranted — the
+    /// dead-arm removal above bought the headroom, and the budget holds
+    /// for several more control-opener arms. The pre-emptive trigger
+    /// stands: when the next CFPattern control-opener arm lands here,
+    /// group the three handleBranch arms (they differ only in BlockType)
+    /// into a lookup table before the count re-triggers ZA304.
     fn dispatchPattern(self: *CFGBuildCtx, pattern: CFPattern, t: []const u8, line: usize) !void {
         switch (pattern) {
             .if_start => try self.handleBranch(.if_block, t, line),
@@ -19700,6 +19708,98 @@ fn isSnapshotVerb(seg: []const u8) bool {
     return std.ascii.eqlIgnoreCase(seg[start..], "snap");
 }
 
+/// True when `w` is the assertion word `expect` or `assert`
+/// (case-insensitive).
+fn isExpectAssertWord(w: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(w, "expect") or std.ascii.eqlIgnoreCase(w, "assert");
+}
+
+/// True when `seg` carries `expect` or `assert` as a whole word (split on
+/// case transitions and underscores): `expectEqual`, `fxAssertFoo`,
+/// `assert_invariants`. Substring matching pulled in data-shaped names
+/// like `unexpectedError` (ghostty) and `unexpected_errno` (tigerbeetle)
+/// — error REPORTING fns, not assertions — and the transitive witness set
+/// then silenced tests that delegate to unrelated fns (EPH-I0048).
+fn hasAssertionWord(seg: []const u8) bool {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < seg.len) {
+        const word_end = seg[i] == '_' or std.ascii.isUpper(seg[i]);
+        if (!word_end) {
+            i += 1;
+            continue;
+        }
+        if (isExpectAssertWord(seg[start..i])) return true;
+        if (seg[i] == '_') {
+            start = i + 1;
+            i = start;
+        } else {
+            start = i;
+            i += 1;
+        }
+    }
+    return isExpectAssertWord(seg[start..]);
+}
+
+/// True when `seg` contains the verification verbs `verify` or `validate`
+/// as a whole word (split on case transitions and underscores), the same
+/// shape as isSnapshotVerb: `fastAggregateVerify`, `validateSealFields`,
+/// `pubkeyValidate`. Whole-word matching keeps noun shapes out
+/// (`verified_count`, `Verifier`).
+fn isVerificationVerb(seg: []const u8) bool {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < seg.len) {
+        const word_end = seg[i] == '_' or std.ascii.isUpper(seg[i]);
+        if (!word_end) {
+            i += 1;
+            continue;
+        }
+        const w = seg[start..i];
+        if (std.ascii.eqlIgnoreCase(w, "verify") or std.ascii.eqlIgnoreCase(w, "validate"))
+            return true;
+        if (seg[i] == '_') {
+            start = i + 1;
+            i = start;
+        } else {
+            start = i;
+            i += 1;
+        }
+    }
+    const w = seg[start..];
+    return std.ascii.eqlIgnoreCase(w, "verify") or std.ascii.eqlIgnoreCase(w, "validate");
+}
+
+/// True when the call at `code[start]` follows an identifier-bounded `try`
+/// on the same line: `try` is a reserved keyword, so a preceding
+/// identifier byte (the `s` in `stry`) rules it out. `try`-propagation is
+/// the mechanism that makes a validator call an assertion: the test fails
+/// on the validator's error, so absence of error IS the assertion
+/// (EPH-I0047).
+fn isTryPrefixed(code: []const u8, start: usize) bool {
+    var j = start;
+    while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t')) j -= 1;
+    if (j < 3) return false;
+    if (!mem.eql(u8, code[j - 3 .. j], "try")) return false;
+    if (j - 3 > 0 and isIdent(code[j - 4])) return false;
+    return true;
+}
+
+/// True when the call's only argument is an enum literal (`.foo`):
+/// `expect(.kwIf)` is a grammar token matcher (RhyOS shell parser), not
+/// an assertion — a real expect/assert call asserts a bool, so an enum
+/// literal can never be the asserted condition (EPH-I0048). A multi-line
+/// call accepts (conservative: the callArgs walk cannot see it).
+fn isSoleEnumLiteralArg(code: []const u8, open_paren: usize) bool {
+    const args = callArgs(code, open_paren) orelse return false;
+    const t = mem.trim(u8, args, " \t\r");
+    if (t.len < 2 or t[0] != '.') return false;
+    for (t[1..]) |c| {
+        if (!isIdent(c)) return false;
+    }
+    return true;
+}
+
 /// An assertion call's final segment names an expect/assert helper
 /// (expectEqual, std.debug.assert, custom assertFoo/fxAssertFoo helpers)
 /// or a snapshot-testing verb (whole-word `snap`, plus the dotted
@@ -19710,14 +19810,44 @@ fn isSnapshotVerb(seg: []const u8) bool {
 /// warnings — the safe direction.
 fn isAssertionTarget(target: []const u8) bool {
     const seg = lastSegment(target);
-    if (std.ascii.indexOfIgnoreCase(seg, "expect") != null or
-        std.ascii.indexOfIgnoreCase(seg, "assert") != null or
-        isSnapshotVerb(seg))
-    {
+    if (hasAssertionWord(seg) or isSnapshotVerb(seg)) {
         return true;
     }
     return mem.indexOfScalar(u8, target, '.') != null and
         mem.startsWith(u8, seg, "diff");
+}
+
+/// True when one call site counts as an assertion in a test body
+/// (ZT102): the expect/assert/snap/diff classes, a try-propagated
+/// verify/validate call (absence of error IS the assertion there,
+/// EPH-I0047), minus the enum token-matcher shape (EPH-I0048).
+fn countsAsAssertion(code: []const u8, site: CallSite) bool {
+    const target = code[site.start..site.name_end];
+    if (isAssertionTarget(target) and !isSoleEnumLiteralArg(code, site.open_paren)) return true;
+    if (isVerificationVerb(lastSegment(target))) return isTryPrefixed(code, site.start);
+    return false;
+}
+
+/// True when the call site at `code[start]` is a fn declaration's own
+/// name: `fn expect(self: ...) ...` reads as a call to `expect` but is a
+/// definition. `fn` only ever opens a declaration, so a target preceded
+/// by the `fn` keyword is never a call (EPH-I0048).
+fn isFnDeclSite(code: []const u8, start: usize) bool {
+    var j = start;
+    while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t')) j -= 1;
+    if (j < 2 or !mem.eql(u8, code[j - 2 .. j], "fn")) return false;
+    if (j - 2 > 0 and isIdent(code[j - 3])) return false;
+    return true;
+}
+
+/// True when the call marks its containing fn as an assertion witness
+/// (ZT102 helper-mediation): the assertion-shaped target minus the enum
+/// token-matcher shape. The transitive witness set stays tight (EPH-I0048):
+/// verify/validate verbs deliberately do not join it, so a test whose
+/// own body never propagates the validator error still fires.
+fn isAssertionWitnessCall(code: []const u8, site: CallSite) bool {
+    if (!isAssertionTarget(code[site.start..site.name_end])) return false;
+    return !isSoleEnumLiteralArg(code, site.open_paren);
 }
 
 /// Count assertion calls in one comment-stripped code slice (ZT102).
@@ -19725,7 +19855,7 @@ fn countAssertions(code: []const u8) usize {
     var count: usize = 0;
     var pos: usize = 0;
     while (nextCallSite(code, pos)) |site| {
-        if (isAssertionTarget(code[site.start..site.name_end])) count += 1;
+        if (countsAsAssertion(code, site)) count += 1;
         pos = site.open_paren + 1;
     }
     return count;
@@ -20253,8 +20383,10 @@ const FnCallFacts = struct {
 
     /// Record one line's direct call targets under fn `name`. A fn whose
     /// body contains an assertion call joins the `asserting` witness set
-    /// (ZT102 helper-mediation); nested-fn assertions roll up into the
-    /// outer fn, the same FP-safe precedent as the call edges.
+    /// (ZT102 helper-mediation, the EPH-I0048-tightened witness
+    /// predicate — word-boundary verbs minus the enum token-matcher
+    /// shape); nested-fn assertions roll up into the outer fn, the same
+    /// FP-safe precedent as the call edges.
     fn recordCallees(
         self: *FnCallFacts,
         allocator: Allocator,
@@ -20266,8 +20398,16 @@ const FnCallFacts = struct {
         var pos: usize = 0;
         while (nextCallSite(code, pos)) |site| {
             pos = site.open_paren + 1;
-            const target = code[site.start..site.name_end];
-            if (isAssertionTarget(target)) try self.asserting.put(allocator, name, {});
+            // A fn's OWN def line is a declaration, not a call:
+            // `fn expect(...) {` must not add a self-edge or mark the fn
+            // an assertion witness (EPH-I0048). A NESTED def line (a fn
+            // declared inside another fn's body, the type-factory shape)
+            // stays: its name differs from the recorded fn, and the
+            // documented ZT105 roll-up keeps it as a call edge of the
+            // outer fn.
+            if (isFnDeclSite(code, site.start) and
+                mem.eql(u8, callSiteName(code, site), name)) continue;
+            if (isAssertionWitnessCall(code, site)) try self.asserting.put(allocator, name, {});
             const seg = callSiteName(code, site);
             if (containsName(list.items, seg)) continue;
             try list.append(allocator, seg);
@@ -21720,6 +21860,7 @@ fn reportUntestedPubFns(
             .message_owned = true,
             .help = "call or reference it from a test; " ++
                 "indirect/integration coverage is statically invisible; " ++
+                "an uncalled pub fn is often never semantically analyzed by Zig, so it may not even compile (Fs.realpathAlloc class, EPH-I0218); " ++
                 "cross-file reachability merges same-named fns, so a " ++
                 "test-reachable same-named fn elsewhere can suppress this " ++
                 "note (tree_fuzz apply class, EPH-I0907); evidence is " ++
@@ -28799,6 +28940,23 @@ fn parensStayOpen(t: []const u8, from: usize, to: usize) bool {
     return depth > 0;
 }
 
+/// True when `line` carries an `@TypeOf(` or `@typeOf(` opener at a code
+/// position. The LiteralState walk masks string/char literals, `\\`
+/// multiline tails, and comments, so a string-carried opener is data and
+/// never satisfies the multi-line fallback gate (EPH-I1155, the I0929
+/// class on the fallback path).
+fn lineHasTypeOfOpenerInCode(line: []const u8) bool {
+    var lit = types.LiteralState.forLine(line) orelse return false;
+    var i: usize = 0;
+    while (i + 7 <= line.len) : (i += 1) {
+        _ = lit.updateForChar(line, i) orelse continue;
+        const is_upper = i + 8 <= line.len and mem.eql(u8, line[i .. i + 8], "@TypeOf(");
+        const is_lower = mem.eql(u8, line[i .. i + 7], "@typeOf(");
+        if (is_upper or is_lower) return true;
+    }
+    return false;
+}
+
 /// Check if `catch unreachable` is inside a @TypeOf() expression (compile-time only).
 /// Walks backwards through preceding lines accumulating paren depth. If a line
 /// contains `@TypeOf(` while cumulative depth shows we're still inside its parens,
@@ -28831,6 +28989,10 @@ fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u
     }
     // Multi-line: accumulate paren depth from current line backwards.
     // If we find @TypeOf( on a line where depth > 0, we're nested inside it.
+    // The opener match must sit at a code position (EPH-I1155): the pre-fix
+    // fallback accepted a string-carried `@TypeOf(` on an earlier line, and
+    // the depth + indexOf gate then suppressed a runtime catch (the I0929
+    // class on the fallback path).
     const prev = preceding_lines orelse return false;
     var depth: isize = parenBalance(t);
     var idx = prev.len;
@@ -28839,8 +29001,7 @@ fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u
         const pl = mem.trim(u8, prev[idx], " \t\r");
         if (isCommentOrMultilineString(pl)) continue;
         depth += parenBalance(pl);
-        if (depth > 0 and (mem.indexOf(u8, pl, "@TypeOf(") != null or
-            mem.indexOf(u8, pl, "@typeOf(") != null)) return true;
+        if (depth > 0 and lineHasTypeOfOpenerInCode(pl)) return true;
         // Stop at statement boundaries (no paren nesting left to resolve).
         // Judge the boundary on the comment-stripped code. A trailing
         // comment hides the terminator on the raw line. The walk then
@@ -43982,6 +44143,27 @@ fn mergeSkippedIssues(
     skipped_issues = .empty;
 }
 
+/// Render one sanitized verbose entry line for the orphans listing
+/// (EPH-I0216): entries may come from an untrusted config, so the bytes
+/// cross sanitizeTerminal before the print. The caller owns the result.
+fn renderOrphansEntryLine(allocator: Allocator, entry: []const u8) error{OutOfMemory}![]u8 {
+    var safe = try types.sanitizeTerminal(allocator, entry);
+    defer safe.deinit(allocator);
+    return std.fmt.allocPrint(allocator, "  - {s}\n", .{safe.slice});
+}
+
+/// Print the verbose orphans entry listing, one sanitized line per entry
+/// (EPH-I0216). Split out of handleOrphans so the listing loop keeps its
+/// own complexity off the handler's budget.
+fn printOrphansEntryList(allocator: Allocator, entries: []const []const u8) !void {
+    std.debug.print("Detected {d} entry points:\n", .{entries.len});
+    for (entries) |e| {
+        const line = try renderOrphansEntryLine(allocator, e);
+        defer allocator.free(line);
+        std.debug.print("{s}", .{line});
+    }
+}
+
 /// `orphans` command: report files no entry point can reach.
 fn handleOrphans(ctx: *RunCtx) !void {
     if (ctx.cfg.entries.items.len == 0) {
@@ -43989,10 +44171,7 @@ fn handleOrphans(ctx: *RunCtx) !void {
         ctx.should_exit_error = true;
         return;
     }
-    if (ctx.cfg.verbose) {
-        std.debug.print("Detected {d} entry points:\n", .{ctx.cfg.entries.items.len});
-        for (ctx.cfg.entries.items) |e| std.debug.print("  - {s}\n", .{e});
-    }
+    if (ctx.cfg.verbose) try printOrphansEntryList(ctx.alloc, ctx.cfg.entries.items);
     try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
     var g = ImportGraph.init(ctx.alloc, ctx.diag);
     defer g.deinit();
@@ -47604,6 +47783,15 @@ test "nested build module note sanitizes a hostile path (EPH-I1143)" {
         "note: could not parse nested build module a?[31mred?next\"q\n",
         note,
     );
+}
+
+test "orphans verbose entry line sanitizes an untrusted config entry (EPH-I0216)" {
+    // Entries an untrusted config may set (the RED3-10 honored surface)
+    // cross sanitizeTerminal before the verbose print: control bytes and
+    // the log-forging newline collapse to visible placeholders.
+    const line = try renderOrphansEntryLine(std.testing.allocator, "a\x1b[31mred\nnext\"q");
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings("  - a?[31mred?next\"q\n", line);
 }
 
 test "addEntryIfValid frees the duped entry on append failure (EPH-I1024)" {
@@ -86541,6 +86729,30 @@ test "isInsideTypeOf ignores a string-carried @TypeOf opener (EPH-I0929)" {
     try std.testing.expect(isInsideTypeOf(real, real_col, null));
 }
 
+test "isInsideTypeOf masks the multi-line fallback opener match (EPH-I1155)" {
+    // The I0929 class on the fallback path: line A opens a real paren
+    // group (depth carried forward), line B opens ANOTHER paren while
+    // carrying the opener text inside a STRING, line C holds a runtime
+    // catch. The pre-fix fallback accepted the string-carried opener on
+    // B (depth > 0 plus the raw indexOf) and suppressed the runtime
+    // catch. The fallback match must sit at a code position too.
+    const prev = [_][]const u8{
+        "const result = someFn(",
+        "    fmt(\"@TypeOf(x\",",
+    };
+    const line = "    y() catch unreachable,";
+    const col = mem.indexOf(u8, line, "catch unreachable").?;
+    try std.testing.expect(!isInsideTypeOf(line, col, &prev));
+    // Control: a code-position @TypeOf( opener on the preceding line
+    // still suppresses.
+    const prev_real = [_][]const u8{
+        "const T = @TypeOf(",
+    };
+    const line_real = "y() catch unreachable,";
+    const col_real = mem.indexOf(u8, line_real, "catch unreachable").?;
+    try std.testing.expect(isInsideTypeOf(line_real, col_real, &prev_real));
+}
+
 test "isInsideTypeOf detects multi-line @TypeOf with inner call spanning lines" {
     // Inner function call spans multiple lines, catch unreachable on the last
     const prev = [_][]const u8{
@@ -98232,6 +98444,9 @@ test "ZT102: lowercase cross-file name collisions do not suppress" {
     // RhyOS bzip2 shape: the block calls BitReader.init + a non-asserting
     // helper; an UNRELATED asserting `init` elsewhere in the project must
     // not cover the block — ubiquitous lowercase names collide project-wide.
+    // The helper is named `readStreamHeader` deliberately: a validate* verb
+    // would count as an assertion under the EPH-I0047 try-gate and break
+    // the collision premise.
     const specs = [_]TestQualityFile{
         .{ .path = "main.zig", .content =
         \\const BitReader = struct {
@@ -98239,12 +98454,12 @@ test "ZT102: lowercase cross-file name collisions do not suppress" {
         \\        return .{};
         \\    }
         \\};
-        \\fn validateStreamHeader(r: *BitReader) !void {
+        \\fn readStreamHeader(r: *BitReader) !void {
         \\    _ = r;
         \\}
         \\test "headers" {
         \\    var reader = BitReader.init();
-        \\    try validateStreamHeader(&reader);
+        \\    try readStreamHeader(&reader);
         \\}
         },
         .{ .path = "other.zig", .content =
@@ -98259,6 +98474,231 @@ test "ZT102: lowercase cross-file name collisions do not suppress" {
     try std.testing.expectEqual(
         @as(usize, 1),
         countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .note),
+    );
+}
+
+test "ZT102: try-propagated validator call counts as an assertion (EPH-I0047)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // zig-pulse crypto/bls.zig round-trip shape: the test body delegates to
+    // an error-returning validator with try — absence of error IS the
+    // assertion there.
+    const content =
+        \\fn fastAggregateVerify(keys: []const u8, msg: []const u8, sig: []const u8) !void {
+        \\    _ = keys;
+        \\    _ = msg;
+        \\    _ = sig;
+        \\}
+        \\test "round-trip" { try fastAggregateVerify("k", "m", "s"); }
+        \\test "discard" { _ = try fastAggregateVerify("k", "m", "s"); }
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_verify.zig", content);
+    defer run.deinit(allocator);
+
+    // Both shapes propagate the error, so both are silent. The `_ = try`
+    // form discards the value but never the error.
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt102_verify.zig", RULE_TEST_NO_ASSERTIONS),
+    );
+}
+
+test "ZT102: validator call without try still fires (EPH-I0047)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The try-gate is the whole mechanism: a validator whose error the test
+    // discards asserts nothing, so the warning must still fire.
+    const content =
+        \\fn validateConfig(cfg: u32) !void {
+        \\    _ = cfg;
+        \\}
+        \\test "config" { _ = validateConfig(1); }
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_verify_gate.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .warning),
+    );
+}
+
+test "ZT102: validator verbs stay out of the witness set (EPH-I0047)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The transitive witness set holds expect/assert/snap only: a helper
+    // whose body try-validates does NOT mark the delegating test silent.
+    // Requiring try at every hop would regress the landed expect/assert
+    // mediation classes, so the verb enable stays direct-only.
+    const content =
+        \\fn validateInner(x: u32) !void {
+        \\    _ = x;
+        \\}
+        \\fn checkWrapper(x: u32) !void {
+        \\    try validateInner(x);
+        \\}
+        \\test "x" { try checkWrapper(1); }
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_verify_chain.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .note),
+    );
+}
+
+test "ZT102: enum token-matcher expect does not join the witness set (EPH-I0048)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // RhyOS shell parser shape: `expect(.kw_if)` is a grammar token
+    // matcher, not an assertion — a real expect asserts a bool, so an
+    // enum literal can never be the asserted condition. The parser fn
+    // must not become a witness, and the delegating test still fires.
+    const content =
+        \\const Token = enum { kw_if };
+        \\const Parser = struct {
+        \\    fn expect(self: *Parser, tok: Token) !void {
+        \\        _ = self;
+        \\        _ = tok;
+        \\    }
+        \\};
+        \\fn parseToken(p: *Parser) !void {
+        \\    try p.expect(.kw_if);
+        \\}
+        \\test "parse" {
+        \\    var p = Parser{};
+        \\    try parseToken(&p);
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_expect_enum.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .note),
+    );
+}
+
+test "ZT102: bool-argument expect still joins the witness set (EPH-I0048)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Control for the enum gate: the same method shape with a bool
+    // argument is a real assertion and must still mediate.
+    const content =
+        \\const Parser = struct {
+        \\    fn expect(self: *Parser, ok: bool) !void {
+        \\        _ = self;
+        \\        _ = ok;
+        \\    }
+        \\};
+        \\fn parseToken(p: *Parser) !void {
+        \\    try p.expect(true);
+        \\}
+        \\test "parse" {
+        \\    var p = Parser{};
+        \\    try parseToken(&p);
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_expect_bool.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt102_expect_bool.zig", RULE_TEST_NO_ASSERTIONS),
+    );
+}
+
+test "ZT102: error-reporting fns do not join the witness set (EPH-I0048)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // ghostty `unexpectedError` / tigerbeetle `unexpected_errno` shapes:
+    // the substring matcher read "expect" inside "unexpected" and made
+    // error REPORTING fns assertion witnesses. Word-boundary matching
+    // must stop that, so the delegating test still fires.
+    const content =
+        \\fn unexpectedError(msg: []const u8) !void {
+        \\    _ = msg;
+        \\}
+        \\fn reportFailure(msg: []const u8) !void {
+        \\    try unexpectedError(msg);
+        \\}
+        \\test "report" { try reportFailure("x"); }
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_unexpected.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countBySeverity(run.issues.items, RULE_TEST_NO_ASSERTIONS, .note),
+    );
+}
+
+test "ZT102: assert word-boundary classes still join the witness set (EPH-I0048)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Controls for the word-boundary matcher: camelCase `fxAssert`,
+    // underscore `assert_invariants`, and the hardware `assertCs` method
+    // all carry `assert` as a whole word and keep mediating. assertCs is
+    // the documented residual: it is an error-returning hardware check
+    // (RhyOS `SpiError!void`), so the mediation direction matches the
+    // validator class — note severity only.
+    const content =
+        \\const Bus = struct {
+        \\    fn assertCs(self: *Bus, cs: u8) !void {
+        \\        _ = self;
+        \\        _ = cs;
+        \\    }
+        \\};
+        \\fn fxAssert(x: u32) !void {
+        \\    _ = x;
+        \\}
+        \\fn assert_invariants(x: u32) !void {
+        \\    _ = x;
+        \\}
+        \\fn spiTransfer(bus: *Bus, cs: u8) !void {
+        \\    try bus.assertCs(cs);
+        \\}
+        \\fn checkFx(x: u32) !void {
+        \\    try fxAssert(x);
+        \\}
+        \\fn checkBudget(x: u32) !void {
+        \\    try assert_invariants(x);
+        \\}
+        \\test "transfer" {
+        \\    var bus = Bus{};
+        \\    try spiTransfer(&bus, 3);
+        \\}
+        \\test "fx" { try checkFx(1); }
+        \\test "budget" { try checkBudget(1); }
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt102_assert_words.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt102_assert_words.zig", RULE_TEST_NO_ASSERTIONS),
     );
 }
 
@@ -99656,6 +100096,41 @@ test "ZT105: type-factory pub fns are not candidates" {
     try std.testing.expectEqual(
         @as(usize, 1),
         countUntestedFnNotes(run.issues.items, "plain_factory_user"),
+    );
+}
+
+test "ZT105: nested pub fn inside a type factory stays covered (EPH-I0048)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // tigerbeetle ResourcePool shape: a pub fn nested inside a type
+    // factory counts as covered when a test instantiates the factory —
+    // the nested declaration line rolls up as a call edge of the
+    // factory's span. The EPH-I0048 def-line skip must drop only the
+    // factory's own self-edge, never the nested roll-up edge.
+    const content =
+        \\pub fn ResourcePoolType(comptime Grid: type) type {
+        \\    _ = Grid;
+        \\    return struct {
+        \\        pub fn blocks_free(pool: *@This()) u32 {
+        \\            _ = pool;
+        \\            return 0;
+        \\        }
+        \\    };
+        \\}
+        \\test "pool" {
+        \\    const Pool = ResourcePoolType(u32);
+        \\    _ = Pool;
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt105_nested_factory.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "blocks_free"),
     );
 }
 

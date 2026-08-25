@@ -7237,7 +7237,8 @@ fn analyzeOneAllocSafety(
     propagateFreeState(ctx.cfg, &bstate);
     try detectUseAfterFree(&scan_ctx);
     try detectDoubleFree(&scan_ctx);
-    try detectDeferDoubleFree(ctx.allocator, &.{
+    // One pairing context serves both deferred-pair detectors (EPH-I0006).
+    const pair_ctx: DeferPairCtx = .{
         .lines = ctx.lines,
         .func_line = ctx.func_line,
         .file_path = ctx.file_path,
@@ -7246,7 +7247,9 @@ fn analyzeOneAllocSafety(
         .in_errdefer = ctx.in_errdefer,
         .capture_shadowed = capture_shadowed,
         .aliases = ctx.aliases,
-    }, issues);
+    };
+    try detectDeferDoubleFree(ctx.allocator, &pair_ctx, issues);
+    try detectErrdeferDirectFree(ctx.allocator, &pair_ctx, issues);
 }
 
 /// Source identity of one function body under analysis: its lines, the file
@@ -9533,11 +9536,11 @@ const DeferPairCtx = struct {
 
 /// Collect frees of var_name registered through `defer` statements (single-line
 /// `defer free(x);` and frees inside `defer { ... }` blocks). errdefer frees
-/// are deliberately excluded — conservatively: the pair errdefer-free +
-/// defer-free of the same variable is usually the canonical error/success
-/// cleanup split, but defer ALSO runs on error exits, so the pair can in fact
-/// double-free on the error path. Suppressing it here is an accepted FN,
-/// tracked in EPH-I0006.
+/// are deliberately excluded: the pair errdefer-free + defer-free of the same
+/// variable is the canonical error/success cleanup split. defer ALSO runs on
+/// error exits, so the pair CAN double-free on the error path — an accepted FN
+/// here. The errdefer + direct-free pairing has its own detector
+/// (detectErrdeferDirectFree, EPH-I0006).
 fn collectDeferFrees(
     allocator: Allocator,
     ctx: *const DeferPairCtx,
@@ -9560,11 +9563,11 @@ fn collectDeferFrees(
             ctx.var_name,
             ctx.aliases,
         )) continue;
-        // Conditional defer (`defer if (c) free(x);`): may or may not run, so
-        // a pairing is reported at warning severity. An `if` on a line INSIDE
-        // a defer block above the free is not seen here (documented limit).
-        const is_conditional = mem.indexOf(u8, t, "if ") != null or
-            mem.indexOf(u8, t, "if(") != null;
+        // Conditional defer (`defer if (c) free(x);`): may or may not run,
+        // so a pairing is reported at warning severity. The block form
+        // (`defer { if (c) { free(x); } }`) puts the guard on a line above
+        // the free — the walk in deferFreeIsConditional finds it (EPH-I0006).
+        const is_conditional = deferFreeIsConditional(ctx.lines, ctx.in_defer, idx, t);
         try frees.append(allocator, .{
             .line = ctx.func_line + idx,
             .indent = countIndent(line),
@@ -9572,6 +9575,57 @@ fn collectDeferFrees(
         });
     }
     return frees;
+}
+
+/// True when a code-position `if`/`if(` guard token opens on the line:
+/// identifier-bounded on both sides, outside strings and comments, with a
+/// `(` after the keyword (spacing tolerated). Mirrors hasRealKeyword's
+/// walk shape (EPH-I0006).
+fn hasGuardIfToken(t: []const u8) bool {
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
+    var s: usize = 0;
+    while (mem.indexOfPos(u8, t, s, "if")) |pos| {
+        s = pos + 2;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (pos + 2 < t.len and isIdent(t[pos + 2])) continue;
+        if (cls.isInsideString(pos)) continue;
+        if (comment_start != null and pos >= comment_start.?) continue;
+        var j = pos + 2;
+        while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+        if (j < t.len and t[j] == '(') return true;
+    }
+    return false;
+}
+
+/// Whether a defer-registered free at `idx` may be skipped at scope exit.
+/// The single-line form (`defer if (c) free(x);`) and the one-line block
+/// form (`defer { if (c) { free(x); } }`) carry the guard on the free's
+/// own line. The multi-line block form puts the guard on a line above the
+/// free: walk back to the defer opener and treat a shallower guard `if`
+/// as conditional (EPH-I0006). A guard at the free's own indent cannot
+/// contain it (a sibling statement, not a wrapper). Over-marking is FN-
+/// direction only — the severity softens, the pairing still reports.
+fn deferFreeIsConditional(
+    lines: []const []const u8,
+    in_defer: []const bool,
+    idx: usize,
+    t: []const u8,
+) bool {
+    if (hasGuardIfToken(t)) return true;
+    if (idx >= lines.len or !in_defer[idx]) return false;
+    const free_indent = countIndent(lines[idx]);
+    var i = idx;
+    while (i > 0) {
+        i -= 1;
+        const line = mem.trim(u8, lines[i], " \t\r");
+        const opens = mem.startsWith(u8, line, "defer {") or
+            mem.startsWith(u8, line, "defer{");
+        if (opens) return hasGuardIfToken(line);
+        if (!in_defer[i]) return false;
+        if (countIndent(lines[i]) < free_indent and hasGuardIfToken(line)) return true;
+    }
+    return false;
 }
 
 /// True when the var is reassigned anywhere after `from_line` (1-based,
@@ -9712,6 +9766,159 @@ fn detectDeferDoubleFree(
             .t = t,
         }, issues);
     }
+}
+
+/// Detect double-free between an errdefer-registered free and a direct
+/// free (EPH-I0006): errdefer fires on every error exit, so a direct free
+/// followed by a fallible statement double-frees on the error path.
+/// Suppressed when no fallible statement follows the pair (the canonical
+/// errdefer + success-path-free split), when the var is reassigned after
+/// the first executed free, or when the two sit on exclusive branches.
+/// Severity is always warning: the second free runs only on error paths.
+fn detectErrdeferDirectFree(
+    allocator: Allocator,
+    ctx: *const DeferPairCtx,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    var errdefer_frees = try collectErrdeferFrees(allocator, ctx);
+    defer errdefer_frees.deinit(allocator);
+    if (errdefer_frees.items.len == 0) return;
+
+    var join_buf: [max_join_bytes]u8 = undefined;
+    for (ctx.lines, 0..) |line, idx| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isDoubleFreeSkipLine(t)) continue;
+        if (ctx.in_defer[idx] or ctx.in_errdefer[idx]) continue;
+        if (ctx.capture_shadowed[idx]) continue;
+        if (!hasRealFreePattern(t)) continue;
+        if (!isDirectFreeOfVarOrAlias(
+            joinParenContinuation(ctx.lines, idx, &join_buf),
+            ctx.var_name,
+            ctx.aliases,
+        )) continue;
+        try pairDirectFreeWithErrdefers(allocator, ctx, .{
+            .frees = errdefer_frees.items,
+            .free_line = ctx.func_line + idx,
+            .free_indent = countIndent(line),
+            .t = t,
+        }, issues);
+    }
+}
+
+/// Collect frees registered through single-line `errdefer free(x);`
+/// statements. Frees inside `errdefer { ... }` blocks are excluded: the
+/// block closes (disarming the errdefer) before any later direct free can
+/// pair with it. A CONDITIONAL errdefer free (`errdefer if (flag)
+/// free(x);`) is excluded too: the guard flag couples the free to an
+/// ownership handoff the line model cannot track, and the unguarded shape
+/// is the issue's named class (EPH-I0006). Accepted FN: a guarded
+/// errdefer whose guard stays true past a direct free still double-frees.
+fn collectErrdeferFrees(
+    allocator: Allocator,
+    ctx: *const DeferPairCtx,
+) !std.ArrayListUnmanaged(DeferFree) {
+    var frees: std.ArrayListUnmanaged(DeferFree) = .empty;
+    var join_buf: [max_join_bytes]u8 = undefined;
+    for (ctx.lines, 0..) |line, idx| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        // Single-line form only: `errdefer {` opens a block (excluded), and
+        // block-body lines never carry the prefix.
+        if (!mem.startsWith(u8, t, "errdefer ")) continue;
+        if (mem.startsWith(u8, t, "errdefer {")) continue;
+        if (hasGuardIfToken(t)) continue;
+        if (ctx.capture_shadowed[idx]) continue;
+        if (!hasRealFreePattern(t)) continue;
+        if (!isDirectFreeOfVarOrAlias(
+            joinParenContinuation(ctx.lines, idx, &join_buf),
+            ctx.var_name,
+            ctx.aliases,
+        )) continue;
+        try frees.append(allocator, .{
+            .line = ctx.func_line + idx,
+            .indent = countIndent(line),
+            .is_conditional = true,
+        });
+    }
+    return frees;
+}
+
+/// Pair one direct free with every errdefer-registered free of the same
+/// var (EPH-I0006). The errdefer may register before or after the direct
+/// free: both orders double-free on an error exit past the later of the
+/// two. A fallible statement must follow the pair — without one the
+/// errdefer never fires after the free, the canonical success-path split.
+fn pairDirectFreeWithErrdefers(
+    allocator: Allocator,
+    ctx: *const DeferPairCtx,
+    site: DirectFreeSite,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    const sink: FreeIssueSink = .{
+        .allocator = allocator,
+        .issues = issues,
+        .file_path = ctx.file_path,
+        .var_name = ctx.var_name,
+    };
+    for (site.frees) |ef| {
+        const first = @min(ef.line, site.free_line);
+        if (hasReassignmentAfter(ctx.lines, ctx.func_line, first, ctx.var_name)) continue;
+        const second = @max(ef.line, site.free_line);
+        if (!hasFallibleStatementAfter(ctx.lines, second, site.free_line, ctx.func_line)) continue;
+        const span = FreeSpan{
+            .first = first,
+            .second = second,
+            .min_indent = @min(ef.indent, site.free_indent),
+        };
+        if (hasElseBranchBetween(ctx.lines, ctx.func_line, span)) continue;
+        if (hasSwitchArmBetween(ctx.lines, ctx.func_line, span)) continue;
+        try appendDoubleFreeIssue(&sink, .{
+            .t = site.t,
+            .line = site.free_line,
+            .freed_line = ef.line,
+            .severity = .warning,
+            .help = "errdefer frees on error exits — remove the duplicate free",
+        });
+    }
+}
+
+/// True when a fallible statement follows the pair's later member (the
+/// direct free) to the end of the function body: a code-position `try` or
+/// a `return error.`. The errdefer fires only on error exits, so without
+/// one the pairing is the canonical errdefer + success-path-free split.
+///
+/// Reachability guard (EPH-I0006 FP class): only a fallible statement
+/// inside the free's innermost block is credited. The first line at a
+/// shallower indent closes that block — past it, code runs either when
+/// the free did not run (an else arm) or after the free's branch
+/// terminated (`if (c) { free(x); return true; }`), so the errdefer is
+/// disarmed or single-firing there. Accepted FNs: a bare-block wrapper
+/// around the free and a brace-less branch body both stop the scan
+/// early, and a bare `return e;` / `catch |e| return e;` propagation is
+/// not a trigger at all (EPH-I0006).
+fn hasFallibleStatementAfter(
+    lines: []const []const u8,
+    from_line: usize,
+    free_line: usize,
+    func_line: usize,
+) bool {
+    if (from_line < func_line or free_line < func_line) return false;
+    const free_indent = countIndent(lines[free_line - func_line]);
+    for (from_line + 1..func_line + lines.len) |ln| {
+        const idx = ln - func_line;
+        if (idx >= lines.len) break;
+        if (countIndent(lines[idx]) < free_indent) return false;
+        const t = mem.trim(u8, lines[idx], " \t\r");
+        if (hasFallibleTrigger(t)) return true;
+    }
+    return false;
+}
+
+/// True when a code-position fallible trigger opens on the line: a `try`
+/// (spaced or parenthesized) or an error return.
+fn hasFallibleTrigger(t: []const u8) bool {
+    return hasRealKeyword(t, "try ") or hasRealKeyword(t, "try(") or
+        hasRealKeyword(t, "return error.");
 }
 
 /// One direct free plus the defer-registered frees to pair it with.
@@ -13726,7 +13933,10 @@ const ImportGraph = struct {
         }) {
             if (content[i] == '\n') {
                 line_num += 1;
-                col = 1;
+                // The loop's continue expression increments col before the
+                // first char of the new line, so reset to 0 here — the
+                // recorded column is the char's true column (EPH-I0013).
+                col = 0;
                 in_comment = false;
                 continue;
             }
@@ -17009,7 +17219,12 @@ fn findCatchSite(t: []const u8, start: usize) ?CatchSite {
         if (comment_start != null and pos >= comment_start.?) return null;
         var rest = after + skipLeadingWhitespace(t[after..]);
         if (rest < t.len and t[rest] == '|') {
-            const close = mem.indexOfScalarPos(u8, t, rest + 1, '|') orelse break;
+            // An unterminated payload pipe (`catch | y;` — invalid Zig) is
+            // skipped, not fatal: the scan resumes after this occurrence so
+            // a later REAL catch on the same line is still found
+            // (EPH-I0020). The break form aborted the per-line scan here, a
+            // fail-safe FN reachable only on non-compiling code.
+            const close = mem.indexOfScalarPos(u8, t, rest + 1, '|') orelse continue;
             rest = close + 1 + skipLeadingWhitespace(t[close + 1 ..]);
         }
         return .{ .col = pos, .rest = rest };
@@ -18369,9 +18584,12 @@ fn reportUnfilledField(
 // ============================================================================
 // ZA210: no-catch-return — `catch |e| return e` is a verbose `try`
 // ============================================================================
-// Single-line, same-payload form only. The multi-line block form
-// (`catch |e| { log(e); return e; }`) does real work between catch and
-// return and is deliberately out of scope (v1, documented).
+// v1: single-line, same-payload form. v2 (EPH-I0039): the block form
+// flags only when the body's sole statement is the payload return
+// (`catch |e| { return e; }`). Any other body content (logging, a
+// different return, a second statement) is real work between catch and
+// return and stays silent. The multi-line block (the close on a later
+// line) is out of scope: the per-line scan sees one line at a time.
 
 /// Index of the first `catch |` outside a string literal and outside a
 /// trailing comment, or null. Comment prose naming a payload is text, not
@@ -18399,6 +18617,8 @@ fn skipBlanks(t: []const u8, i: usize) usize {
 }
 
 /// ZA210: flag `expr catch |e| return e;` — identical payload both sides.
+/// The block form (`catch |e| { return e; }`) flags only when the body's
+/// sole statement is the payload return (v2, EPH-I0039).
 fn checkNoCatchReturn(t: []const u8, path: []const u8, ln: usize) ?Issue {
     const catch_pos = findCatchPayloadStart(t) orelse return null;
     var i = catch_pos + "catch |".len;
@@ -18409,14 +18629,11 @@ fn checkNoCatchReturn(t: []const u8, path: []const u8, ln: usize) ?Issue {
     i = skipBlanks(t, i);
     if (i >= t.len or t[i] != '|') return null;
     i = skipBlanks(t, i + 1);
-    if (!mem.startsWith(u8, t[i..], "return ")) return null;
-    i += "return ".len;
-    const rstart = i;
-    while (i < t.len and isIdent(t[i])) i += 1;
-    if (i == rstart) return null;
-    if (!mem.eql(u8, t[rstart..i], payload)) return null;
-    i = skipBlanks(t, i);
-    if (i < t.len and t[i] != ';') return null;
+    const matches = if (i < t.len and t[i] == '{')
+        isSoleReturnBlock(t, i, payload)
+    else
+        isSoleReturnTail(t, i, payload);
+    if (!matches) return null;
     return .{
         .file = path,
         .line = ln,
@@ -18426,6 +18643,41 @@ fn checkNoCatchReturn(t: []const u8, path: []const u8, ln: usize) ?Issue {
         .message = "catch |e| return e is a verbose try",
         .help = "use 'try' instead of catch |e| return e",
     };
+}
+
+/// After `return ` at `start`: an identifier run equal to `payload`.
+/// The index past the ident, or null when the shape differs.
+fn returnIdentEnd(t: []const u8, start: usize, payload: []const u8) ?usize {
+    var k = start;
+    while (k < t.len and isIdent(t[k])) k += 1;
+    if (k == start) return null;
+    if (!mem.eql(u8, t[start..k], payload)) return null;
+    return k;
+}
+
+/// v1 tail shape: `return payload;` with only a statement terminator or
+/// end of line after it.
+fn isSoleReturnTail(t: []const u8, i: usize, payload: []const u8) bool {
+    if (!mem.startsWith(u8, t[i..], "return ")) return false;
+    const k = returnIdentEnd(t, i + "return ".len, payload) orelse return false;
+    const tail = skipBlanks(t, k);
+    return tail >= t.len or t[tail] == ';';
+}
+
+/// v2 block body (EPH-I0039): exactly `{ return payload; }` — the body's
+/// sole statement is the payload return, with only a terminator or end of
+/// line after the close brace. Logging, a different return, or a second
+/// statement is real work and stays silent.
+fn isSoleReturnBlock(t: []const u8, open: usize, payload: []const u8) bool {
+    const body = skipBlanks(t, open + 1);
+    if (!mem.startsWith(u8, t[body..], "return ")) return false;
+    const k = returnIdentEnd(t, body + "return ".len, payload) orelse return false;
+    var j = skipBlanks(t, k);
+    if (j >= t.len or t[j] != ';') return false;
+    j = skipBlanks(t, j + 1);
+    if (j >= t.len or t[j] != '}') return false;
+    j = skipBlanks(t, j + 1);
+    return j >= t.len or t[j] == ';';
 }
 
 // ============================================================================
@@ -26503,6 +26755,19 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
 // aliases drop when the alias or its RHS reassigns after the declaration;
 // the sweep is conservative — a conditional rebind also drops, FN-only
 // (EPH-I1048).
+//
+// EPH-I0037 divergence, recorded: the pedantic by-value-container-return
+// audit (the pre-0.14.0 ZA110 candidate variant) is NOT implemented. The
+// ZA111 ID went to the returned-stack-reference rule (src/ast_tier_za111.zig),
+// a compiler-gap defect class. The pedantic variant would flag the plain
+// ownership-transfer idiom (`var x = .empty; populate; return x;`) — 39/39
+// hits on ephor itself were exactly that correct idiom, a 100% FP rate —
+// and a by-value container return is an objective non-defect, not a
+// defect signal, so the rule would be a codebase policy preference the
+// detection philosophy assigns to config tooling, not to ephor. No
+// unguarded TP class has appeared in the corpus A/B legs since the
+// deferral (every gate runs them). If a by-value-return audit is ever
+// wanted, it needs a NEW rule ID and an explicit user decision.
 
 const max_sig_join_lines = 16;
 const max_sig_bytes = 1024;
@@ -30322,6 +30587,7 @@ fn isDecrementGuarded(
     // verdict.
     if (hasBreakGuardOnPriorLines(ctx.lines, ctx.idx, var_name, decrement_amount)) return true;
     if (isSignedVarInContext(ctx.lines, ctx.idx, var_name)) return true;
+    if (isFloatVarInContext(ctx.lines, ctx.idx, var_name)) return true;
     if (hasPairedIncrementInLines(ctx.lines[0..ctx.idx], var_name)) return true;
     if (isInComptimeBlock(ctx.lines, ctx.idx)) return true;
     if (hasAssertGeGuard(ctx.lines, ctx.idx, var_name, decrement_amount)) return true;
@@ -30717,6 +30983,36 @@ fn lineDeclaresSignedVar(ctx: []const u8, var_name: []const u8) bool {
         const after_var = ctx[var_pos + var_name.len ..];
         for (signed_types) |stype| {
             if (mem.startsWith(u8, after_var, stype)) return true;
+        }
+    }
+    return false;
+}
+
+/// Heuristic: a variable declared with a float type is decremented on
+/// fractional values, not integer counters — the ZA901 overflow model does
+/// not apply (a float decrement cannot wrap an unsigned integer into the
+/// sentinel the rule guards against). Mirrors isSignedVarInContext's
+/// 10-line window and boundary-ident walk (EPH-I0018). An inferred float
+/// (`var score = 0.0;`) has no annotation and stays unflagged — accepted
+/// false positive, the annotation-only scope the issue names.
+fn isFloatVarInContext(lines: []const []const u8, current_idx: usize, var_name: []const u8) bool {
+    const check_start = if (current_idx > 10) current_idx - 10 else 0;
+    for (lines[check_start .. current_idx + 1]) |line| {
+        const ctx = mem.trim(u8, line, " \t\r");
+        if (lineDeclaresFloatVar(ctx, var_name)) return true;
+    }
+    return false;
+}
+
+/// True when any identifier-bounded occurrence of `var_name` on the line
+/// is followed by a float type annotation (`var x: f64 = 0` — EPH-I0018).
+fn lineDeclaresFloatVar(ctx: []const u8, var_name: []const u8) bool {
+    const float_types = [_][]const u8{ ": f16", ": f32", ": f64", ": comptime_float" };
+    var from: usize = 0;
+    while (nextBoundaryIdent(ctx, var_name, &from)) |var_pos| {
+        const after_var = ctx[var_pos + var_name.len ..];
+        for (float_types) |ftype| {
+            if (mem.startsWith(u8, after_var, ftype)) return true;
         }
     }
     return false;
@@ -33140,6 +33436,14 @@ fn hasIndexOperandBefore(inside: []const u8, pos: usize) bool {
 }
 
 /// Check if a real operand starts after `pos` in an index expression.
+/// Deliberate RHS-start exclusions (EPH-I0016, recorded): `@` (a `x -
+/// @sizeOf(T)` operand re-introduced the array-SIZE-expression FP class),
+/// `"` (a `n - "lit".len` operand fired on startsWith/endsWith-guarded
+/// suffix-stripping sites), and `-` (a `x - -1` operand is a unary
+/// negative). Those FP classes were judged worse than the resulting FN
+/// residuals (a real underflow behind an `@`-builtin or string-len RHS is
+/// rare; the corpus A/B runs on every gate and has shown no unguarded TP
+/// class since). Only ident, `(`, and `'` open a real RHS.
 fn hasIndexOperandAfter(inside: []const u8, pos: usize) bool {
     var j = pos + 1;
     while (j < inside.len and (inside[j] == ' ' or inside[j] == '\t')) j += 1;
@@ -45546,6 +45850,33 @@ test "analyzeFile keeps the first analysis of a duplicate path (EPH-I0693)" {
     try std.testing.expectEqual(@as(usize, 1), stored.imports.items.len);
 }
 
+test "extractImports records the true column of a const import (EPH-I0013)" {
+    // Pre-fix, the newline branch reset col=1 and the loop's continue
+    // expression immediately incremented it, so every import column was
+    // one past the import's true column (:N:2 for a column-1 import).
+    const allocator = std.testing.allocator;
+    var diag = testDiagCtx();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dep.zig", .data = "pub fn d() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dep2.zig", .data = "pub fn e() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "f.zig",
+        .data = "const dep = @import(\"dep.zig\");\n    const other = @import(\"dep2.zig\");\n",
+    });
+    const file_path = try tmpFilePath(allocator, &tmp, "f.zig");
+    defer allocator.free(file_path);
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    try graph.analyzeFile(file_path);
+    const stored = graph.files.get(file_path).?;
+    try std.testing.expectEqual(@as(usize, 2), stored.imports.items.len);
+    try std.testing.expectEqual(@as(usize, 1), stored.imports.items[0].col);
+    try std.testing.expectEqual(@as(usize, 2), stored.imports.items[1].line);
+    try std.testing.expectEqual(@as(usize, 5), stored.imports.items[1].col);
+}
+
 /// Test helper: build the ImportInfo for a chain node's import of the
 /// file `/chain/f<j>.zig`. The caller's FileAnalysis owns the result.
 fn makeChainImport(allocator: Allocator, j: usize) !ImportInfo {
@@ -56766,6 +57097,103 @@ test "ZA106: conditional defer plus direct free is a warning" {
         if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
         try std.testing.expect(issue.severity == .warning);
     }
+}
+
+test "ZA106: block-form conditional defer plus direct free is a warning (EPH-I0006)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The guard sits on a line above the free inside the defer block. The
+    // free may or may not run at scope exit, so the pairing grades warning
+    // — pre-fix the line-local `if` scan missed the block form and graded
+    // the conditional pair as a definite error (severity misclassification).
+    const content =
+        \\fn cond_block_defer(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    defer {
+        \\        if (c) {
+        \\            allocator.free(buf);
+        \\        }
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_cond_block_defer.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_cond_block_defer.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .warning);
+    }
+}
+
+test "ZA106: errdefer free plus direct free with a later try is a warning (EPH-I0006)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The direct free runs on the success path; the later `try` can error,
+    // so the errdefer fires and frees the same buffer again — a real
+    // double-free on the error path, not detected before EPH-I0006.
+    const content =
+        \\fn errdefer_direct(allocator: std.mem.Allocator, log: []const u8) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer allocator.free(buf);
+        \\    use(buf);
+        \\    allocator.free(buf);
+        \\    try write(log);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+        \\fn write(l: []const u8) !void {
+        \\    _ = l;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_direct.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_errdefer_direct.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .warning);
+    }
+}
+
+test "ZA106: errdefer free plus last-statement direct free stays silent (EPH-I0006)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // No fallible statement follows the direct free: the errdefer cannot
+    // fire after it, so this is the canonical errdefer + success-path-free
+    // cleanup split and must stay silent (the I0006 FP guard).
+    const content =
+        \\fn errdefer_split(allocator: std.mem.Allocator) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer allocator.free(buf);
+        \\    use(buf);
+        \\    allocator.free(buf);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_split.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_errdefer_split.zig",
+        RULE_DOUBLE_FREE,
+    ) == 0);
 }
 
 test "ZA106: defer free and direct free in different switch arms stay silent" {
@@ -84079,6 +84507,21 @@ test "ZA201 NOT suppressed in regular function" {
     try std.testing.expect(issue != null);
 }
 
+test "findCatchSite: an unterminated payload pipe does not hide a later catch (EPH-I0020)" {
+    // `catch | y;` is invalid Zig: the payload pipe never closes. Pre-fix,
+    // the orelse break aborted the per-line scan, so the later real catch
+    // on the same line was never found — a fail-safe FN reachable only on
+    // non-compiling code. The scan must skip the malformed occurrence and
+    // still report the real one.
+    const t = "foo() catch | y; bar() catch {}";
+    const later = findSilentCatchCol(t, &.{});
+    try std.testing.expect(later != null);
+    // The reported column is the catch keyword: the later real catch.
+    try std.testing.expectEqual(t.len - "catch {}".len, later.?.col);
+    // A lone unterminated pipe stays silent (no crash, no site).
+    try std.testing.expect(findSilentCatchCol("foo() catch | y;", &.{}) == null);
+}
+
 // ============================================================================
 // EPH-I0151: ZA201 multi-line empty-catch evasion forms
 // ============================================================================
@@ -87878,6 +88321,43 @@ test "ZA901: guarded unspaced decrement stays silent" {
     ) == 0);
 }
 
+test "ZA901: float decrement with a float annotation stays silent (EPH-I0018)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Float decrements (score -= 0.2) are not integer-counter underflows:
+    // the ZA901 model does not apply, so an annotated float var must stay
+    // silent while the unannotated integer twin still fires (the both-
+    // directions pin, EPH-I0018).
+    const content =
+        \\fn dec_score(x: u32) void {
+        \\    var score: f64 = 0.0;
+        \\    score -= 0.2;
+        \\    sink_float(score);
+        \\    var counter = x;
+        \\    counter -= 1;
+        \\    sink(counter);
+        \\}
+        \\fn sink_float(v: f64) void {
+        \\    _ = v;
+        \\}
+        \\fn sink(v: u32) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za901_float.zig", content);
+    defer run.deinit(allocator);
+
+    // Exactly one: the integer counter decrement, never the float one.
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_za901_float.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 1);
+}
+
 test "ZA901: zero-check same-line exits judged at the guard's depth (EPH-I0865)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -89201,6 +89681,15 @@ test "ZA903 matcher: unspaced bracket subtraction forms" {
     // A dereferenced index is a real operand; a bare `* -` is multiplication.
     try std.testing.expect(hasArrayIndexSubtraction("const y = a[ptr.* - 1];") != null);
     try std.testing.expect(hasArrayIndexSubtraction("const y = a[x * -1];") == null);
+}
+
+test "ZA903 matcher: RHS-start exclusion classes stay silent (EPH-I0016)" {
+    // The three deliberate RHS-start exclusions pin the recorded decision:
+    // accepting `@` re-introduced the array-size FP class, `"` fired on
+    // suffix-stripping sites, and `-` read a unary negative as an operand.
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[x - @sizeOf(T)];") == null);
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[n - \"lit\".len];") == null);
+    try std.testing.expect(hasArrayIndexSubtraction("const y = a[x - -1];") == null);
 }
 
 test "hasRangeEndInitGuard requires a literal init witness (EPH-I0499)" {
@@ -105395,9 +105884,25 @@ test "ZA210: catch |err| return different is silent" {
     try std.testing.expect(issue == null);
 }
 
-test "ZA210: multi-line catch block form is silent (v1 scope)" {
+test "ZA210: catch block with logging stays silent (v2 boundary, EPH-I0039)" {
+    // Logging between catch and return is real work — the block form fires
+    // only when the body's sole statement is the payload return.
     const issue = checkNoCatchReturn("foo() catch |err| { log(err); return err; }", "t.zig", 1);
     try std.testing.expect(issue == null);
+}
+
+test "ZA210: catch block whose sole statement is the payload return fires (EPH-I0039)" {
+    const issue = checkNoCatchReturn("foo() catch |err| { return err; }", "t.zig", 1);
+    try std.testing.expect(issue != null);
+    try std.testing.expectEqualStrings(RULE_NO_CATCH_RETURN, issue.?.rule);
+    try std.testing.expect(issue.?.severity == .note);
+}
+
+test "ZA210: catch block with a second statement stays silent (EPH-I0039)" {
+    // A second statement after the payload return is real work.
+    try std.testing.expect(checkNoCatchReturn("foo() catch |err| { return err; return; }", "t.zig", 1) == null);
+    // A different return payload is not the verbose-try shape.
+    try std.testing.expect(checkNoCatchReturn("foo() catch |err| { return other; }", "t.zig", 1) == null);
 }
 
 test "ZA210: try form produces no issue" {

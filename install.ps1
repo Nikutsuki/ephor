@@ -282,6 +282,22 @@ error: no build.zig found in current directory
         Write-Host "Created build.zig.zon for project '$projectName'"
     }
 
+    # EPH-I0284: refuse a symlink at build.zig.zon before the fetch. zig
+    # fetch --save rewrites the zon through zig's own write path, which
+    # follows a planted reparse point, so no installer-side no-follow
+    # writer (EPH-I0280) can close it. Get-Item -Force returns the link
+    # itself, where the reparse-point attribute is visible; Test-Path
+    # follows the link and cannot see it. The fresh-zon write above
+    # already replaced the name through Set-ContentNoFollow's rename, so
+    # a link that survives to here existed before the install.
+    $zonItem = Get-Item "build.zig.zon" -Force -ErrorAction SilentlyContinue
+    if ($zonItem -and
+        ($zonItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        Write-Stderr "error: build.zig.zon is a symlink."
+        Write-Stderr "Replace it with a regular file before installing ephor."
+        return 1
+    }
+
     # Detect the Zig version and pick a compatible ephor version.
     # EPH-I0187: no remote tag builds on Zig 0.15.x, so Zig below 0.16
     # pins the 0.15-era release by commit hash (see $EPHOR_0_15_COMMIT
@@ -551,11 +567,11 @@ error: could not repair the fingerprint in build.zig.zon
             Refuse-BlockSplice "the ephor block in build.zig has no dependency line."
             return 1
         }
-        # Absorb a pre-existing blank line above the block (install.sh
-        # parity, EPH-I0285 port): the block's leading newline
-        # re-creates exactly one, so keeping one here too would grow
-        # build.zig by one blank line per re-run.
-        if ($startLine -gt 0 -and $buildLines[$startLine - 1] -eq '') {
+        # Absorb every consecutive blank line above the block (EPH-I0060,
+        # install.sh parity): the block's leading newline re-creates
+        # exactly one, so the loop converges any run of N>=1 blanks to
+        # the canonical single blank on the next re-run.
+        while ($startLine -gt 0 -and $buildLines[$startLine - 1] -eq '') {
             $startLine -= 1
         }
         $newLines = @()
@@ -598,10 +614,10 @@ error: could not repair the fingerprint in build.zig.zon
             Refuse-BlockSplice "the ephor block in build.zig has no dependency line."
             return 1
         }
-        # Absorb a pre-existing blank line above the block (install.sh
-        # parity: the v0.11.x snippet was also inserted with a leading
-        # blank line).
-        if ($legacyStartLine -gt 0 -and $buildLines[$legacyStartLine - 1] -eq '') {
+        # Absorb every consecutive blank line above the block (EPH-I0060,
+        # same convergence as the canonical branch: the v0.11.x snippet
+        # was also inserted with a leading blank line).
+        while ($legacyStartLine -gt 0 -and $buildLines[$legacyStartLine - 1] -eq '') {
             $legacyStartLine -= 1
         }
         $newLines = @()

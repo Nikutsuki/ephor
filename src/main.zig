@@ -34868,6 +34868,11 @@ const RuntimeEmitCtx = struct {
     /// Dedup/cap state (EPH-I0211). Null disables both (legacy test
     /// callers); production passes the run-scoped state.
     state: ?*RuntimeParseState = null,
+    /// Writer seam for the verbose band (EPH-I0288). Tests pass a
+    /// capture writer so hostile fixture bytes stay off the green-run
+    /// log; production passes null for the raw stderr path,
+    /// byte-identical with the pre-seam output.
+    writer: ?*std.Io.Writer = null,
 };
 
 /// Static rule content of a runtime-diagnostic issue
@@ -34894,11 +34899,22 @@ const RuntimeParseState = struct {
 };
 
 /// Print one verbose-mode raw child line (EPH-I0171): the bytes are child
-/// output, so they cross the terminal sanitizer before the render.
-fn printVerboseRuntimeLine(allocator: Allocator, label: []const u8, t: []const u8) !void {
-    var safe = try types.sanitizeTerminal(allocator, t);
-    defer safe.deinit(allocator);
-    std.debug.print("{s}: {s}\n", .{ label, safe.slice });
+/// output, so they cross the terminal sanitizer before the render. The
+/// writer seam (EPH-I0288): the capture writer when the caller set one,
+/// raw stderr otherwise (the production default, byte-identical with
+/// std.debug.print). A full capture buffer fails the write and the
+/// content assertion, so the WriteFailed swallow is a truncation policy,
+/// not a silent error path (the types.printWriteFallback contract).
+fn printVerboseRuntimeLine(ctx: RuntimeEmitCtx, label: []const u8, t: []const u8) !void {
+    var safe = try types.sanitizeTerminal(ctx.allocator, t);
+    defer safe.deinit(ctx.allocator);
+    if (ctx.writer) |w| {
+        w.print("{s}: {s}\n", .{ label, safe.slice }) catch |err| switch (err) {
+            error.WriteFailed => {},
+        };
+    } else {
+        std.debug.print("{s}: {s}\n", .{ label, safe.slice });
+    }
 }
 
 /// Total cap on kept runtime findings (EPH-I0211). A real failing suite
@@ -35045,7 +35061,7 @@ fn handleMemoryLeak(
     verbose: bool,
     t: []const u8,
 ) !void {
-    if (verbose) try printVerboseRuntimeLine(ctx.allocator, "GPA", t);
+    if (verbose) try printVerboseRuntimeLine(ctx, "GPA", t);
     const loc = if (line_iter.next()) |next_line|
         extractFileLocation(mem.trim(u8, next_line, " \t\r"))
     else
@@ -35160,7 +35176,7 @@ fn classifyGPALine(
 fn classifyGPATable(ctx: RuntimeEmitCtx, verbose: bool, t: []const u8) !void {
     for (gpa_classifications) |cls| {
         if (!matchesAnyPattern(t, cls.patterns)) continue;
-        if (verbose) try printVerboseRuntimeLine(ctx.allocator, "GPA", t);
+        if (verbose) try printVerboseRuntimeLine(ctx, "GPA", t);
         const spec = RuntimeIssueSpec{
             .rule = cls.rule,
             .message = cls.message,
@@ -35350,7 +35366,7 @@ fn handleRunnerBlock(
     verbose: bool,
     t: []const u8,
 ) !void {
-    if (verbose) try printVerboseRuntimeLine(ctx.allocator, "GPA", t);
+    if (verbose) try printVerboseRuntimeLine(ctx, "GPA", t);
     var buf: [max_runner_block_lines][]const u8 = undefined;
     const n = collectRunnerBlock(line_iter, &buf);
     const lines = buf[0..n];
@@ -35374,7 +35390,7 @@ const panic_issue_spec = RuntimeIssueSpec{
 };
 
 fn handlePanicLine(ctx: RuntimeEmitCtx, t: []const u8, verbose: bool) !void {
-    if (verbose) try printVerboseRuntimeLine(ctx.allocator, "PANIC", t);
+    if (verbose) try printVerboseRuntimeLine(ctx, "PANIC", t);
     try emitLocatedIssue(ctx, panic_issue_spec, t);
 }
 
@@ -35385,7 +35401,7 @@ const fail_issue_spec = RuntimeIssueSpec{
 };
 
 fn handleFailLine(ctx: RuntimeEmitCtx, t: []const u8, verbose: bool) !void {
-    if (verbose) try printVerboseRuntimeLine(ctx.allocator, "TEST FAIL", t);
+    if (verbose) try printVerboseRuntimeLine(ctx, "TEST FAIL", t);
     try emitLocatedIssue(ctx, fail_issue_spec, t);
 }
 
@@ -38111,7 +38127,42 @@ fn createInstallConfig(diag: *DiagCtx, allocator: Allocator, ver: []const u8) !v
     defer safe_root.deinit(allocator);
 
     // Write config with version field
-    const config_content = try std.fmt.allocPrint(allocator,
+    const config_content = try buildInstallConfigContent(
+        allocator,
+        ver,
+        safe_root.slice,
+        entries_json.items,
+    );
+    defer allocator.free(config_content);
+
+    try writeFileAtomic(diag.io, std.Io.Dir.cwd(), CONFIG_FILENAME, config_content);
+
+    if (types.sanitizeTerminal(allocator, root_dir)) |safe_val| {
+        var safe_echo = safe_val;
+        defer safe_echo.deinit(allocator);
+        std.debug.print("Created {s} (version: {s}, path_dir: {s})\n", .{
+            CONFIG_FILENAME, ver, safe_echo.slice,
+        });
+    } else |_| {
+        // Sanitize OOM: drop the path rather than print it raw (the
+        // unresolvedScanRootExit policy).
+        std.debug.print("Created {s} (version: {s})\n", .{ CONFIG_FILENAME, ver });
+    }
+}
+
+/// Render the install-time ephor.json (EPH-I1146). The shape is the
+/// I1126 standard posture: enable ZA305/ZA306, fail_on warning, no
+/// verbatim thresholds block — the built-in defaults apply — and the
+/// current version. The pre-fix writer emitted the stale
+/// disable+thresholds family the I1126 init fix removed, so an
+/// install-only project re-created the deleted shape.
+fn buildInstallConfigContent(
+    allocator: Allocator,
+    ver: []const u8,
+    safe_root: []const u8,
+    entries_json: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator,
         \\{{
         \\  // Installed ephor version
         \\  "version": "{s}",
@@ -38129,40 +38180,21 @@ fn createInstallConfig(diag: *DiagCtx, allocator: Allocator, ver: []const u8) !v
         \\  // Patterns to exclude from orphan detection only
         \\  "orphan_exclude": ["_test.zig", "/test/", "/tests/"],
         \\
-        \\  // Rules to disable (by ID or category prefix)
-        \\  "disable": ["ZA305", "ZA306"],
+        \\  // Complexity rules to enable: cyclomatic (ZA305) and cognitive
+        \\  // (ZA306). Both are off unless enabled here — the standard
+        \\  // project posture turns them on (EPH-I1126).
+        \\  "enable": ["ZA305", "ZA306"],
         \\
-        \\  // Rules to explicitly enable (overrides disable)
-        \\  "enable": [],
+        \\  // CI gating: exit 1 when findings reach this level.
+        \\  // Values: error, warning, note, never.
+        \\  "fail_on": "warning",
         \\
-        \\  // Configurable thresholds
-        \\  "thresholds": {{
-        \\    "max_lines": 50,
-        \\    "max_nesting": 3,
-        \\    "max_params": 4,
-        \\    "max_branches": 12,
-        \\    "max_line_length": 100,
-        \\    "max_cyclomatic": 10,
-        \\    "max_cognitive": 15
-        \\  }}
+        \\  // Error naming convention for ZA703 (default: TitleCase, the
+        \\  // community standard — error.FileNotFound; "PascalCase" is an alias)
+        \\  // "error_naming": "snake_case"  — pre-flip behavior (error.file_not_found)
         \\}}
         \\
-    , .{ ver, safe_root.slice, entries_json.items });
-    defer allocator.free(config_content);
-
-    try writeFileAtomic(diag.io, std.Io.Dir.cwd(), CONFIG_FILENAME, config_content);
-
-    if (types.sanitizeTerminal(allocator, root_dir)) |safe_val| {
-        var safe_echo = safe_val;
-        defer safe_echo.deinit(allocator);
-        std.debug.print("Created {s} (version: {s}, path_dir: {s})\n", .{
-            CONFIG_FILENAME, ver, safe_echo.slice,
-        });
-    } else |_| {
-        // Sanitize OOM: drop the path rather than print it raw (the
-        // unresolvedScanRootExit policy).
-        std.debug.print("Created {s} (version: {s})\n", .{ CONFIG_FILENAME, ver });
-    }
+    , .{ ver, safe_root, entries_json });
 }
 
 /// Render the install config's entries array (EPH-I1139). Every entry is
@@ -39760,6 +39792,27 @@ fn extractTagName(json: []const u8, after_marker: usize) ?[]const u8 {
     return json[pos..end];
 }
 
+/// True when json[idx] starts a JSON key: the quote byte sits outside
+/// every string value (EPH-I0281). JSON has no comment grammar, so the
+/// context scan only tracks string values, with backslash escapes. A
+/// "name" inside a free-text message field is string data and fails the
+/// gate; only key positions mint candidates. A future API shape whose
+/// nested object carries its own "name" key stays an accepted residual:
+/// the value is still tag-shaped and the semver-max plus the I0193 floor
+/// bound it.
+fn isJsonKeyPosition(json: []const u8, idx: usize) bool {
+    var in_string = false;
+    var i: usize = 0;
+    while (i < idx) : (i += 1) {
+        if (in_string and json[i] == '\\' and i + 1 < idx) {
+            i += 1; // The escaped byte is string data.
+            continue;
+        }
+        if (json[i] == '"') in_string = !in_string;
+    }
+    return !in_string;
+}
+
 /// True when ver is strict "X.Y.Z": ASCII digits and exactly two dots, no
 /// empty component, no suffix. Prerelease tags ("0.15.0-beta.1") fail.
 fn isStrictSemverTag(ver: []const u8) bool {
@@ -39815,6 +39868,11 @@ fn parseVersionFromTagsApi(allocator: Allocator, json: []const u8) ?[]const u8 {
     while (mem.indexOfPos(u8, json, search_pos, name_marker)) |idx| {
         const after_marker = idx + name_marker.len;
         search_pos = after_marker;
+        // Structure-aware gate (EPH-I0281): a "name": sequence inside a
+        // string value (a tag message that mentions it) is text, not a
+        // key. Only key positions mint candidates; a spoofed version in
+        // a message can no longer steer the semver-max.
+        if (!isJsonKeyPosition(json, idx)) continue;
         const tag = extractTagName(json, after_marker) orelse continue;
         const ver = if (tag.len > 0 and tag[0] == 'v') tag[1..] else tag;
         if (!isStrictSemverTag(ver)) continue;
@@ -41450,7 +41508,8 @@ fn printHelp() void {
         \\  --fail-on=<level>    Exit 1 on findings at level: error, warning,
         \\                       note, never (warning == --strict; overrides config)
         \\  --trust-target-config  Honor every key from a scanned target's
-        \\                       ephor.json. Without it, a config outside the
+        \\                       ephor.json and its .ephor-ignore
+        \\                       auto-load. Without it, a config outside the
         \\                       working directory and its ancestors sets only
         \\                       "entries". The rest is ignored with a note.
         \\  --no-suppression     Audit mode: inline directives and the
@@ -41518,8 +41577,7 @@ fn printHelp() void {
         \\    "path_dir": "src",
         \\    "entries": ["src/main.zig", "build.zig"],
         \\    "exclude": ["test", "vendor"],
-        \\    "disable": ["ZA305", "ZA306"],
-        \\    "enable": ["ZA702"],
+        \\    "enable": ["ZA305", "ZA306"],
         \\    "strict": true,
         \\    "fail_on": "warning",
         \\    "error_naming": "TitleCase",
@@ -41534,6 +41592,14 @@ fn printHelp() void {
         \\      "max_file_bytes": 50000
         \\    }
         \\  }
+        \\
+        \\  The init and install writers emit the standard shape
+        \\  (EPH-I1146): version, path_dir, entries, exclude,
+        \\  orphan_exclude, enable (ZA305/ZA306), and fail_on. The
+        \\  example shows strict, error_naming, and thresholds as schema
+        \\  reference: each stays an optional manual override, and the
+        \\  built-in threshold defaults apply when the thresholds block
+        \\  is absent.
         \\
         \\  Keys parse in file order. A repeated scalar key (path_dir,
         \\  strict, fail_on, error_naming) resolves last-wins. A repeated
@@ -44885,6 +44951,24 @@ test "install entries JSON escapes hostile repo-derived bytes (EPH-I1139)" {
     );
 }
 
+test "install config template carries the standard posture (EPH-I1146)" {
+    // The I1126 init shape: enable ZA305/ZA306, fail_on warning, no
+    // verbatim thresholds block (built-in defaults apply), and the
+    // current version spliced verbatim. The pre-fix writer emitted the
+    // stale disable+thresholds family a fresh install-only project must
+    // never recreate.
+    const allocator = std.testing.allocator;
+    const content = try buildInstallConfigContent(allocator, "0.14.3", "src", "[\"src/main.zig\"]");
+    defer allocator.free(content);
+    try std.testing.expect(mem.indexOf(u8, content, "\"enable\": [\"ZA305\", \"ZA306\"]") != null);
+    try std.testing.expect(mem.indexOf(u8, content, "\"disable\"") == null);
+    try std.testing.expect(mem.indexOf(u8, content, "\"thresholds\"") == null);
+    try std.testing.expect(mem.indexOf(u8, content, "\"fail_on\": \"warning\"") != null);
+    try std.testing.expect(mem.indexOf(u8, content, "\"version\": \"0.14.3\"") != null);
+    try std.testing.expect(mem.indexOf(u8, content, "\"path_dir\": \"src\"") != null);
+    try std.testing.expect(mem.indexOf(u8, content, "\"entries\": [\"src/main.zig\"]") != null);
+}
+
 test "ImportGraph.deinit frees reachable keys when the key list append fails (EPH-I0375)" {
     // deinit collects owned map keys into a list before freeing them.
     // A failed append must free the key on the spot: the table deinit
@@ -47743,15 +47827,38 @@ test "declined runtime prompt carries a nonzero exit code (EPH-I0261)" {
     try std.testing.expectEqual(@as(u8, 1), declinedRuntimeExitCode());
 }
 
-test "printVerboseRuntimeLine sanitizes child bytes before the render (EPH-I0171)" {
+test "printVerboseRuntimeLine sanitizes child bytes before the render (EPH-I0171, EPH-I0288)" {
     // The verbose band prints raw child lines; this seam must strip
-    // control bytes. The sanitized output lands in the test log, where
-    // the '?' placeholder keeps it inert.
+    // control bytes. The writer seam routes the output to a capture
+    // buffer (EPH-I0288): zig 0.16's build_runner frames any supervised
+    // stderr on a GREEN run, so the hostile fixture bytes must never
+    // reach real stderr. The assertion pins the sanitizer's replacement
+    // too: the ESC byte renders as '?'.
     const allocator = std.testing.allocator;
-    try printVerboseRuntimeLine(allocator, "GPA", "boom \x1b[2J leaked");
-    // The sanitize path borrows clean input without allocation; the
-    // hostile path owns a copy. Both must stay byte-balanced.
-    try printVerboseRuntimeLine(allocator, "GPA", "clean line");
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    {
+        var buf: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try printVerboseRuntimeLine(
+            .{ .issues = &issues, .allocator = allocator, .writer = &w },
+            "GPA",
+            "boom \x1b[2J leaked",
+        );
+        try std.testing.expectEqualStrings("GPA: boom ?[2J leaked\n", w.buffered());
+    }
+    {
+        // The sanitize path borrows clean input without allocation; the
+        // hostile path owns a copy. Both must stay byte-balanced.
+        var buf: [64]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        try printVerboseRuntimeLine(
+            .{ .issues = &issues, .allocator = allocator, .writer = &w },
+            "GPA",
+            "clean line",
+        );
+        try std.testing.expectEqualStrings("GPA: clean line\n", w.buffered());
+    }
 }
 
 test "handleMemoryLeak builds an owned message from the next line" {
@@ -75749,6 +75856,39 @@ test "parseVersionFromTagsApi accepts a bare X.Y.Z tag" {
         return error.TestUnexpectedResult;
     defer allocator.free(ver);
     try std.testing.expectEqualStrings("0.14.3", ver);
+}
+
+test "parseVersionFromTagsApi ignores a \"name\" mention inside a message field (EPH-I0281)" {
+    const allocator = std.testing.allocator;
+    // A release note that quotes "name": "v9.9.9" is message text, not a
+    // tag key. The valid-JSON wire form escapes the embedded quotes
+    // (\"name\"); the string-context gate rejects the raw match and the
+    // semver-max comes from the real element keys only.
+    const json =
+        \\[{"name": "v0.14.2", "message": "see \"name\": \"v9.9.9\" for the pin"},
+        \\ {"name": "v0.14.3"}]
+    ;
+    const ver = parseVersionFromTagsApi(allocator, json) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(ver);
+    try std.testing.expectEqualStrings("0.14.3", ver);
+}
+
+test "parseVersionFromTagsApi rejects a name match inside a raw string value (EPH-I0281)" {
+    const allocator = std.testing.allocator;
+    // The discriminating shape: a malformed body whose message value
+    // carries UNESCAPED quotes, so the raw "name": "v9.9.9" sequence
+    // appears at a non-key position. This is the only shape the pre-fix
+    // scan minted a message candidate from — on valid JSON the
+    // serializer's escapes already failed extractTagName. The gate is the
+    // explicit structure contract, so the spoofed 9.9.9 must not win.
+    const json =
+        \\[{"name": "v0.14.2", "message": "x "name": "v9.9.9" y"}]
+    ;
+    const ver = parseVersionFromTagsApi(allocator, json) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(ver);
+    try std.testing.expectEqualStrings("0.14.2", ver);
 }
 
 test "parseVersionFromTagsApi returns null for garbage input" {
@@ -106299,6 +106439,19 @@ test "findPathDirInContent masks trailing comments and string bodies (EPH-I0144)
         \\}
     ;
     try std.testing.expectEqualStrings("src", findPathDirInContent(string_body).?);
+
+    // A multiline string that opens MID-LINE swallows the rest of its
+    // line as string data (EPH-I0283): the quoted path inside the tail
+    // must not win over a later real match. stripLineComment cuts at the
+    // opener (EPH-I0671); this pins the exact shape the I0283 probe
+    // used to steer.
+    const mid_line_tail =
+        \\pub fn build(b: *std.Build) void {
+        \\    const note = \\\\root_source_file = "evil/x.zig"
+        \\    const exe = b.addExecutable(.{ .root_source_file = b.path("src/main.zig") });
+        \\}
+    ;
+    try std.testing.expectEqualStrings("src", findPathDirInContent(mid_line_tail).?);
 }
 
 test "findPathDirInContent returns null when nothing matches" {

@@ -342,6 +342,20 @@ ZONEOF
     echo "Created build.zig.zon for project '${PROJECT_NAME}'"
 fi
 
+# EPH-I0284: refuse a symlink at build.zig.zon before the fetch. zig
+# fetch --save rewrites the zon through zig's own write path, which
+# follows a planted link, so no installer-side no-follow writer can
+# close it (the EPH-I0194 mktemp+mv discipline covers only the files
+# this script writes itself). The -L test does not follow the link
+# (lstat), so it sees the link itself. A fresh-zon mv above already
+# replaces the name, so a link that survives to here existed before
+# the install. The symlink-to-a-directory shape refused earlier.
+if [ -L "build.zig.zon" ]; then
+    echo "error: build.zig.zon is a symlink." >&2
+    echo "Replace it with a regular file before installing ephor." >&2
+    exit 1
+fi
+
 # Detect Zig version and pick compatible ephor version
 ZIG_VERSION=$(zig version 2>/dev/null || echo "")
 EPHOR_URL=""
@@ -555,12 +569,15 @@ if grep -qE "$CANON_START" build.zig; then
     if ! span_has_dependency_line "$START_LINE" "$END_LINE"; then
         refuse_block_splice "the ephor block in build.zig has no dependency line."
     fi
-    # Absorb a pre-existing blank line above the block: EPHOR_BLOCK's
-    # leading newline re-creates exactly one, so keeping one here too
-    # would grow build.zig by one blank line per re-run.
-    if [ "$START_LINE" -gt 1 ] && [ -z "$(sed -n "$((START_LINE - 1))p" build.zig)" ]; then
+    # Absorb every consecutive blank line above the block (EPH-I0060):
+    # EPHOR_BLOCK's leading newline re-creates exactly one, so the loop
+    # converges any run of N>=1 blanks to the canonical single blank on
+    # the next re-run. The pre-fix single-step absorb left files already
+    # damaged by the buggy installer at their N>=2 count forever (absorb
+    # one, re-add one, fixed point).
+    while [ "$START_LINE" -gt 1 ] && [ -z "$(sed -n "$((START_LINE - 1))p" build.zig)" ]; do
         START_LINE=$((START_LINE - 1))
-    fi
+    done
     # head -n 0 is fatal on BSD ("illegal line count") — a line-1 block
     # has nothing above it to keep.
     make_install_tmp ./build.zig.tmp.XXXXXXXX
@@ -585,12 +602,12 @@ elif grep -qE "$LEGACY_START" build.zig; then
     if ! span_has_dependency_line "$START_LINE" "$END_LINE"; then
         refuse_block_splice "the ephor block in build.zig has no dependency line."
     fi
-    # Absorb a pre-existing blank line above the block (same leak as the
-    # canonical branch: the v0.11.x snippet was also inserted with a
-    # leading blank line).
-    if [ "$START_LINE" -gt 1 ] && [ -z "$(sed -n "$((START_LINE - 1))p" build.zig)" ]; then
+    # Absorb every consecutive blank line above the block (EPH-I0060,
+    # same convergence as the canonical branch: the v0.11.x snippet was
+    # also inserted with a leading blank line).
+    while [ "$START_LINE" -gt 1 ] && [ -z "$(sed -n "$((START_LINE - 1))p" build.zig)" ]; do
         START_LINE=$((START_LINE - 1))
-    fi
+    done
     # head -n 0 is fatal on BSD ("illegal line count") — a line-1 block
     # has nothing above it to keep.
     make_install_tmp ./build.zig.tmp.XXXXXXXX

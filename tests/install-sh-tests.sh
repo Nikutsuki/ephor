@@ -2,7 +2,7 @@
 # Regression suite for install.sh (batch B65: EPH-I0625 through EPH-I0630;
 # batch B66: EPH-I0631 through EPH-I0636; batch B67: EPH-I0637 through
 # EPH-I0642; batch B85: EPH-I0205; batch B86f: EPH-I1104/I1106/I1107/
-# I1110/I1111; batch B93p: EPH-I0717/I0720).
+# I1110/I1111; batch B93p: EPH-I0717/I0720; batch B94: EPH-I0060/I0284).
 # Runs the real installer against planted fixtures in scratch dirs under
 # .tmp/install-sh-tests. Hermetic: the fake zig on PATH answers version
 # and fetch, and the tags API is a local file, so no network is touched.
@@ -1027,6 +1027,66 @@ sed -n '/^const EPHOR_BUILD_BLOCK =$/,/^;$/p' "$REPO_ROOT/src/main.zig" \
 cmp -s "$D/readme-block.txt" "$D/main-block.txt" \
     || fail "the README manual block differs from EPHOR_BUILD_BLOCK"
 pass "t43 README block matches EPHOR_BUILD_BLOCK (EPH-I0720)"
+
+# --- t44 (EPH-I0284): a build.zig.zon symlink to a regular file must be
+# refused before the fetch. zig fetch --save rewrites the zon through
+# zig's own write path, which follows the link, so the refusal is the
+# only installer-side closure. The victim file must keep its bytes and
+# the link must survive the refusal.
+D="$TEST_ROOT/t44"
+VICTIM="$TEST_ROOT/t44-victim"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+printf '%s\n' '.{ .name = .victim, .version = "1.2.3", .fingerprint = 0x0, .paths = .{} }' > "$VICTIM"
+ln -s "$VICTIM" "$D/build.zig.zon"
+run_installer "$D"
+assert_rc 1
+assert_grep "$D/err.log" 'build.zig.zon is a symlink' 'no refusal error'
+assert_not_grep "$D/out.log" 'Done!' 'Done! printed after the refusal'
+[ -L "$D/build.zig.zon" ] || fail "the installer replaced the zon symlink"
+assert_grep "$VICTIM" '.name = .victim' 'victim zon content lost'
+pass "t44 zon symlink to a file refuses before the fetch (EPH-I0284)"
+
+# --- t45 (EPH-I0060): every consecutive blank line above the canonical
+# block converges to exactly one on re-run. The pre-fix single-step
+# absorb left an N>=2 run at N-1+1 = N forever; the loop must heal the
+# damaged state to the canonical single blank after two runs.
+D="$TEST_ROOT/t45"
+mkdir -p "$D"
+{
+    echo 'const std = @import("std");'
+    echo 'pub fn build(b: *std.Build) !void {'
+    echo '    const target = b.standardTargetOptions(.{});'
+    echo '    const optimize = b.standardOptimizeOption(.{});'
+    echo ''
+    echo ''
+    echo ''
+    write_canonical_block
+    echo '}'
+} > "$D/build.zig"
+run_installer "$D"
+assert_rc 0
+# One blank line separates the block from the code above it after the
+# first run (three blanks absorbed, one re-added).
+BLOCK_LINE=$(line_of "$D/build.zig" '    // Ephor static analysis')
+ABOVE_BLANKS=0
+L=$((BLOCK_LINE - 1))
+while [ "$L" -ge 1 ] && [ -z "$(sed -n "${L}p" "$D/build.zig")" ]; do
+    ABOVE_BLANKS=$((ABOVE_BLANKS + 1))
+    L=$((L - 1))
+done
+assert_eq 1 "$ABOVE_BLANKS" 'blank run above the block is not the canonical one'
+run_installer "$D"
+assert_rc 0
+BLOCK_LINE=$(line_of "$D/build.zig" '    // Ephor static analysis')
+ABOVE_BLANKS=0
+L=$((BLOCK_LINE - 1))
+while [ "$L" -ge 1 ] && [ -z "$(sed -n "${L}p" "$D/build.zig")" ]; do
+    ABOVE_BLANKS=$((ABOVE_BLANKS + 1))
+    L=$((L - 1))
+done
+assert_eq 1 "$ABOVE_BLANKS" 'second run did not stay at the canonical single blank'
+pass "t45 blank run above the block converges on re-run (EPH-I0060)"
 
 echo ""
 echo "install-sh tests: $PASS_COUNT passed"

@@ -1143,9 +1143,16 @@ fn peekElseBody(code: []const u8, i: usize) BodyStart {
     if (isLabelBlockAhead(code, j)) return .label_block;
     // A payload-else body is a statement: a post-payload `if` is a
     // statement body, not an else-if chain header, and `=>` cannot
-    // follow a payload. The chain and `=>` rejections apply to the
-    // bare keyword only (EPH-I0119, EPH-I0096).
-    if (payload_skipped) return .statement;
+    // follow a payload. The one exception: a post-payload if whose
+    // condition closes into a braced body on this line models as a
+    // chain-shaped arm, so the scan keeps the chain machinery — no
+    // virtual else, the `{` claims the arm (EPH-I0120). The chain and
+    // `=>` rejections apply to the bare keyword only (EPH-I0119,
+    // EPH-I0096).
+    if (payload_skipped) {
+        if (postPayloadIfChains(code, j)) return .none;
+        return .statement;
+    }
     if (j + 2 <= code.len and mem.eql(u8, code[j .. j + 2], "if") and
         (j + 2 == code.len or !isIdent(code[j + 2]))) return .none;
     if (j + 1 < code.len and code[j] == '=' and code[j + 1] == '>') return .none;
@@ -1842,7 +1849,7 @@ const CFGBuildCtx = struct {
         return self.block_stack.pop();
     }
 
-    fn handleElse(self: *CFGBuildCtx, t: []const u8, line: usize) !void {
+    fn handleElse(self: *CFGBuildCtx, t: []const u8, line: usize, else_pos: usize) !void {
         const claimed_pending = self.pending_else != null;
         const entry = self.takeElseEntry() orelse return;
         // An else-if entry carries the chain merge in merge_block and the
@@ -1886,7 +1893,7 @@ const CFGBuildCtx = struct {
             try self.addExitBlock(else_body);
             self.current_block = merge_block;
             self.cfg.blocks.items[self.current_block].start_line = line + 1;
-        } else if (elseChainsIntoIf(t)) {
+        } else if (elseChainsIntoIf(t, else_pos)) {
             try self.openElseIfBranch(else_body, merge_block, line);
         } else {
             try self.block_stack.append(self.allocator, .{
@@ -2093,7 +2100,7 @@ const CFGBuildCtx = struct {
         if (self.pending_else != null and code.len > 0 and !virtual_else and
             !scanClaimsElse(pattern, scan.events))
             try self.finishPendingElse(line);
-        if (virtual_else) try self.handleElse(code, line);
+        if (virtual_else) try self.handleElse(code, line, 0);
         self.attributeLineSpan(line, paren_at_start, claims_deferred);
         if (self.paren_depth == 0) self.cond_origin = null;
         try self.walkLineEvents(pattern, code, line);
@@ -2158,7 +2165,15 @@ const CFGBuildCtx = struct {
             .while_start => try self.handleBranch(.while_block, t, line),
             .for_start => try self.handleBranch(.for_block, t, line),
             .switch_start => try self.handleSwitchStart(),
-            .else_start, .else_if => try self.handleElse(t, line),
+            // The dispatch-path else sits at the line's pattern position
+            // (after leading `}`s for the mid-line forms, at 0 for the
+            // line-start forms); the walk's else_keyword events carry the
+            // exact col instead (EPH-I0113).
+            .else_start, .else_if => try self.handleElse(
+                t,
+                line,
+                mem.indexOf(u8, t, "else") orelse 0,
+            ),
             .catch_start => try self.handleCatchStart(line),
             else => {},
         }
@@ -2212,9 +2227,14 @@ const CFGBuildCtx = struct {
     /// Capture the open of a same-line braced arm: the dispatched
     /// opener's block owns the arm's span; a non-opener line (Allman `{`
     /// claiming a pending entry) has no arm block of its own
-    /// (EPH-I0846/49).
+    /// (EPH-I0846/49). On an else-carrying line only an arm opened after
+    /// the line's first else keyword records: the chain arms and the
+    /// final bare-else arm are the attribution targets, while the
+    /// pre-else if-arm keeps the whole-line fallback that the EPH-I0872
+    /// residual pins (EPH-I0113).
     fn captureArmOpen(self: *CFGBuildCtx, walk: *EventWalkCtx, event: ControlEvent) void {
         if (!walk.record_arms) return;
+        if (walk.has_else and !walk.saw_else) return;
         walk.arm_open_col = event.col;
         walk.arm_block = if (isControlOpener(walk.pattern))
             self.current_block
@@ -2223,19 +2243,21 @@ const CFGBuildCtx = struct {
     }
 
     /// Outcome of the span prelude for one line: whether the walk records
-    /// column spans for it, whether it records same-line arm spans, and
-    /// the col_spans length to roll back to when the else claims a
-    /// non-if entry.
+    /// column spans for it, whether it records same-line arm spans, the
+    /// col_spans length to roll back to when the else claims a non-if
+    /// entry, and whether the line carries an else keyword.
     const SpanPrelude = struct {
         record_spans: bool,
         record_arms: bool,
         span_mark: usize,
+        has_else: bool,
     };
 
     /// Per-line event-walk state: the span prelude's recording flags and
-    /// rollback mark, the advancing span column, the opener latch, and
-    /// the same-line arm span's open column and arm block. Bundled so one
-    /// event step stays inside the param limit (EPH-I0761).
+    /// rollback mark, the advancing span column, the opener latch, the
+    /// same-line arm span's open column and arm block, and the two else
+    /// markers that scope arm spans on chain lines (EPH-I0113). Bundled
+    /// so one event step stays inside the param limit (EPH-I0761).
     const EventWalkCtx = struct {
         pattern: CFPattern,
         code: []const u8,
@@ -2243,6 +2265,8 @@ const CFGBuildCtx = struct {
         record_spans: bool,
         record_arms: bool,
         span_mark: usize,
+        has_else: bool = false,
+        saw_else: bool = false,
         span_col: usize = 0,
         opener_dispatched: bool = false,
         arm_open_col: ?usize = null,
@@ -2252,11 +2276,15 @@ const CFGBuildCtx = struct {
     /// Decide and start span recording for the line. A plain-else line
     /// (`else {`, not an else-if chain, not `else return`) records the
     /// column spans that split the line's ownership across the branch,
-    /// the arms, and the merge. A line without an else records same-line
-    /// braced arm spans during the event walk instead — except a switch,
-    /// whose prong braces are expression braces: exhaustiveness has no
-    /// unguarded path, so the switch's own braces must not become a
-    /// conditional arm (EPH-I0111).
+    /// the arms, and the merge. A chain line records same-line braced
+    /// arm spans instead: the condition-side text keeps the whole-line
+    /// fallback (the first block covering the line is the condition
+    /// block), while a same-line arm's fill lands on the arm's own block
+    /// instead of leaking onto the fallthrough path (EPH-I0113). A line
+    /// without an else records same-line braced arm spans too — except a
+    /// switch, whose prong braces are expression braces: exhaustiveness
+    /// has no unguarded path, so the switch's own braces must not become
+    /// a conditional arm (EPH-I0111).
     fn beginLineSpans(
         self: *CFGBuildCtx,
         pattern: CFPattern,
@@ -2264,14 +2292,19 @@ const CFGBuildCtx = struct {
     ) SpanPrelude {
         const events = self.event_scratch.items;
         var has_else = false;
+        var first_else_col: usize = 0;
         for (events) |event| {
-            if (event.kind == .else_keyword) has_else = true;
+            if (event.kind == .else_keyword) {
+                if (!has_else) first_else_col = event.col;
+                has_else = true;
+            }
         }
+        const chain = has_else and elseChainsIntoIf(code, first_else_col);
         return .{
-            .record_spans = has_else and !elseChainsIntoIf(code) and
-                !hasInlineElseReturn(code),
-            .record_arms = !has_else and pattern != .switch_start,
+            .record_spans = has_else and !chain and !hasInlineElseReturn(code),
+            .record_arms = pattern != .switch_start and (!has_else or chain),
             .span_mark = self.cfg.col_spans.items.len,
+            .has_else = has_else,
         };
     }
 
@@ -2326,6 +2359,7 @@ const CFGBuildCtx = struct {
             .record_spans = prelude.record_spans,
             .record_arms = prelude.record_arms,
             .span_mark = prelude.span_mark,
+            .has_else = prelude.has_else,
         };
         for (events, 0..) |event, idx| {
             const next_is_else = idx + 1 < events.len and
@@ -2351,19 +2385,25 @@ const CFGBuildCtx = struct {
         if (walk.record_spans) try self.advanceSpan(walk.line, &walk.span_col, event);
         switch (event.kind) {
             .open_control => {
-                if (walk.opener_dispatched) return;
-                walk.opener_dispatched = true;
-                if (isControlOpener(walk.pattern))
-                    try self.dispatchPattern(walk.pattern, walk.code, walk.line);
+                if (!walk.opener_dispatched) {
+                    walk.opener_dispatched = true;
+                    if (isControlOpener(walk.pattern))
+                        try self.dispatchPattern(walk.pattern, walk.code, walk.line);
+                }
+                // A chain arm's open follows the else_keyword that already
+                // dispatched, so the capture runs regardless of the latch
+                // (EPH-I0113); the capture's own gates scope which arms
+                // record.
                 self.captureArmOpen(walk, event);
             },
             .else_keyword => {
+                walk.saw_else = true;
                 if (walk.record_spans and !self.elseClaimsIfEntry()) {
                     self.cfg.col_spans.shrinkRetainingCapacity(walk.span_mark);
                     walk.record_spans = false;
                 }
                 walk.opener_dispatched = true;
-                try self.handleElse(walk.code, walk.line);
+                try self.handleElse(walk.code, walk.line, event.col);
             },
             .close_control, .close_virtual => {
                 try self.closeBodyMarkers(event);
@@ -2430,16 +2470,55 @@ fn hasInlineElseReturn(t: []const u8) bool {
         mem.startsWith(u8, after_else, "return;");
 }
 
-/// True when the else on this line chains into another condition
-/// (`else if (d) {`): the else body is a new branch header, not the plain
-/// final-else block (EPH-I0087). An `else` word inside a leading string
-/// literal can hide the keyword; the line then degrades to the plain-else
-/// model, which is the safe (FN-never-FP) direction.
-fn elseChainsIntoIf(t: []const u8) bool {
-    const else_pos = mem.indexOf(u8, t, "else") orelse return false;
-    const after_else = mem.trimStart(u8, t[else_pos + 4 ..], " \t");
-    if (!mem.startsWith(u8, after_else, "if")) return false;
-    return after_else.len == 2 or !isIdent(after_else[2]);
+/// True when the else at `else_pos` chains into another condition: the
+/// keyword is followed (past an optional `|payload|` capture, which
+/// belongs to the else header — EPH-I0120) by a whole-word `if`. A bare
+/// else on the same line as an earlier chain link is never a chain link
+/// itself — the scan starts at THIS else, not the line's first, so the
+/// second handleElse of a one-line `} else if (d) { ... } else {` reads
+/// the bare else correctly (EPH-I0113). A post-payload `if` chains only
+/// when its condition closes on this line into a braced body
+/// (`else |_| if (cond) {`): a braceless post-payload if is a statement
+/// body, not a chain header (EPH-I0119). An unclosed payload or a
+/// payload-else without an `if` degrades to the plain-else model, the
+/// FN-safe direction. An `else` word inside a leading string literal can
+/// hide the keyword; the callers' whole-word event scan keeps that out
+/// of the mid-line path, and the dispatch path's else sits at the
+/// line's pattern position.
+fn elseChainsIntoIf(t: []const u8, else_pos: usize) bool {
+    var j = else_pos + 4;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    if (j < t.len and t[j] == '|') {
+        const close = mem.indexOfScalarPos(u8, t, j + 1, '|') orelse return false;
+        j = close + 1;
+        while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+        return postPayloadIfChains(t, j);
+    }
+    if (j + 2 > t.len or !mem.eql(u8, t[j .. j + 2], "if")) return false;
+    return j + 2 == t.len or !isIdent(t[j + 2]);
+}
+
+/// True when the post-payload `if` at `j` opens a chain-shaped arm: a
+/// whole-word `if` whose condition closes on this line and whose body is
+/// braced (EPH-I0120). The braceless form stays a statement body, the
+/// EPH-I0119 model. A condition that does not close here degrades to the
+/// plain-else model, the FN-safe direction.
+fn postPayloadIfChains(t: []const u8, j: usize) bool {
+    if (j + 2 > t.len or !mem.eql(u8, t[j .. j + 2], "if")) return false;
+    if (j + 2 < t.len and isIdent(t[j + 2])) return false;
+    const open = mem.indexOfScalarPos(u8, t, j + 2, '(') orelse return false;
+    var depth: usize = 0;
+    for (t[open..], 0..) |c, rel| {
+        if (c == '(') depth += 1;
+        if (c != ')') continue;
+        depth -= 1;
+        if (depth != 0) continue;
+        const after = open + rel + 1;
+        var k = after;
+        while (k < t.len and (t[k] == ' ' or t[k] == '\t')) k += 1;
+        return k < t.len and t[k] == '{';
+    }
+    return false;
 }
 
 /// Build the control-flow graph for one function body; the caller owns
@@ -3385,7 +3464,17 @@ fn classifyFillLine(check_line: []const u8, name: []const u8) FillVerdict {
     if (is_self_read) return .self_read_use;
     if (findFillCallOccurrence(check_line, name)) |fill_col| {
         const read_col = firstVarReadPos(check_line, name) orelse return .fill;
-        if (read_col < fill_col) return .self_read_use;
+        // The read must precede the call's closing `)` to observe the
+        // pre-fill value: an in-args read (`fill(&x, x)`, `foo(use(x),
+        // &x)`) runs before the call completes and takes effect
+        // (EPH-I0122). A call whose `)` is not on this line cannot
+        // complete before any read here — the multi-line form resolves
+        // through the FillScan pending path instead (EPH-I0103).
+        var depth: usize = 1;
+        var mode: QuoteMode = .none;
+        const close_col = scanLineForParenClose(check_line, fill_col + 1, &depth, &mode) orelse
+            return .self_read_use;
+        if (read_col < close_col) return .self_read_use;
     }
     return .fill;
 }
@@ -5289,6 +5378,20 @@ fn checkVarDefiniteAssignment(
 /// — accepted false negatives. A read on its own guard-if's opener line
 /// (the one-line body form) reaches the guard-if through the read column
 /// (EPH-I0846/49).
+///
+/// Documented residual (EPH-I0826): a LOOP-carried guard — a write loop
+/// gated by one counter and a read loop gated by the same counter —
+/// stays invisible to this suppressor. The RhyOS
+/// net/dns_recursive.zig:2034 shape (`var tmp: [20]u8 = undefined`; the
+/// digit loop writes tmp[tmp_len] and bumps tmp_len; the reverse loop
+/// reads tmp[tmp_len - 1 - ri] under `ri < tmp_len`) has no unassigned
+/// read at runtime: tmp_len counts the writes, so the read loop's
+/// counter bounds the read to written elements. Correlating the two
+/// loops needs an invariant proof (the write loop increments tmp_len
+/// exactly once per element write) that the line-based guard model
+/// cannot carry soundly. The verdict is the fail-safe over-warn; the
+/// site is the regression pin (test "ZA607: loop-carried counter guard
+/// over-warns (EPH-I0826, documented residual)").
 fn isCorrelatedGuardRead(
     lines: []const []const u8,
     read_idx: usize,
@@ -6631,10 +6734,17 @@ fn skipCommentLines(lines: []const []const u8, start: usize, limit: usize) usize
     return idx;
 }
 
-/// Check if a branch (lines[start..end]) assigns the variable. String and
-/// comment content never counts: `const s = "{ x = 5; }";` inside a branch
-/// must not fake an assignment that arms the early-return suppressor and
-/// hides a genuine uninit read (EPH-I0870).
+/// Check if a branch (lines[start..end]) assigns the variable on every
+/// path to its exit. String and comment content never counts: `const s =
+/// "{ x = 5; }";` inside a branch must not fake an assignment that arms
+/// the early-return suppressor and hides a genuine uninit read
+/// (EPH-I0870). The assignment must sit at the branch-body top level
+/// (relative brace depth 0 or 1): a nested conditional's assignment may
+/// never run, so it does not dominate the branch exit and must not arm
+/// the suppressor (EPH-I0117). A braceless nested `if (d) x = 1;` inside
+/// the branch is invisible to the depth gate — its assignment reads as
+/// top-level and stays an accepted false negative, the same blindness
+/// the guard scan carries (hasTopLevelAssign).
 fn branchAssignsVar(
     lines: []const []const u8,
     start: usize,
@@ -6644,6 +6754,7 @@ fn branchAssignsVar(
     // Saturating end cap: an empty slice yields an empty scan instead
     // of underflowing (EPH-I0341, band-B01b F-15).
     const actual_end = @min(end, lines.len -| 1);
+    var depth: usize = 0;
     for (@min(start, lines.len)..@min(actual_end + 1, lines.len)) |i| {
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
@@ -6659,8 +6770,13 @@ fn branchAssignsVar(
             if (vpos + var_name.len < t.len and isIdent(t[vpos + var_name.len])) continue;
             if (cls.isInsideString(vpos)) continue;
             if (comment_start != null and vpos >= comment_start.?) break;
-            if (isAssignmentTarget(t, var_name, vpos)) return true;
+            if (!isAssignmentTarget(t, var_name, vpos)) continue;
+            // The branch-body top level only (EPH-I0117): the branch's own
+            // brace puts its statements at depth 1, a nested braced
+            // conditional at 2+; a braceless branch body sits at depth 0.
+            if (braceDepthAt(t, vpos, depth) <= 1) return true;
         }
+        depth = computeBraceDepth(t, depth);
     }
     return false;
 }
@@ -6706,7 +6822,7 @@ fn oneLineElseArmTailExits(t: []const u8) bool {
         rest = mem.trimStart(u8, rest[1..], " \t");
     }
     if (!isElseBodyStart(rest)) return false;
-    if (elseChainsIntoIf(rest)) return false;
+    if (elseChainsIntoIf(rest, 0)) return false;
     const else_abs = t.len - rest.len;
     const open_rel = mem.indexOf(u8, rest["else".len..], "{") orelse return false;
     const open = else_abs + "else".len + open_rel;
@@ -26604,25 +26720,51 @@ fn isErrorSetOpen(t: []const u8, i: usize) bool {
     return mem.eql(u8, t[j - error_keyword_len .. j], "error");
 }
 
-/// Convert definite assignment issues to ZA607 warnings
+/// One ZA607 finding staged for source-ordered emission (EPH-I0243).
+const DefIssueEntry = struct {
+    name: []const u8,
+    line: usize,
+};
+
+/// Convert definite assignment issues to ZA607 warnings. Emission is
+/// source-ordered: the map iteration is hash order, so same-function
+/// variables with adjacent lines used to print out of source order
+/// (tigerbeetle lsm/tree.zig:381-384). Every issue here carries col 1
+/// and the fixed ZA607 rule, so (line, name) is the full
+/// (file, line, col, rule) sort key (EPH-I0243).
 fn emitDefiniteAssignmentIssues(
     allocator: Allocator,
     issues: *std.ArrayListUnmanaged(Issue),
     def_issues: *std.StringHashMap(usize),
     file_path: []const u8,
 ) !void {
+    var staged = std.ArrayListUnmanaged(DefIssueEntry).empty;
+    defer staged.deinit(allocator);
+    try staged.ensureTotalCapacity(allocator, def_issues.count());
     var def_iter = def_issues.iterator();
     while (def_iter.next()) |entry| {
+        staged.appendAssumeCapacity(.{
+            .name = entry.key_ptr.*,
+            .line = entry.value_ptr.*,
+        });
+    }
+    mem.sort(DefIssueEntry, staged.items, {}, struct {
+        fn lessThan(_: void, a: DefIssueEntry, b: DefIssueEntry) bool {
+            if (a.line != b.line) return a.line < b.line;
+            return mem.order(u8, a.name, b.name) == .lt;
+        }
+    }.lessThan);
+    for (staged.items) |entry| {
         const msg = try std.fmt.allocPrint(
             allocator,
             "variable '{s}' potentially read " ++
                 "before assignment",
-            .{entry.key_ptr.*},
+            .{entry.name},
         );
         errdefer allocator.free(msg);
         try issues.append(allocator, .{
             .file = file_path,
-            .line = entry.value_ptr.*,
+            .line = entry.line,
             .col = 1,
             .severity = .warning,
             .rule = RULE_DEFINITE_ASSIGNMENT,
@@ -65622,6 +65764,43 @@ test "definite-assignment converges on a 10k-line adversarial function (EPH-I033
     try std.testing.expectEqual(@as(usize, 1000), def_issues.count());
 }
 
+test "ZA607: same-function issues emit in source line order (EPH-I0243)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I0243: one function with three undefined vars, each read on a
+    // distinct line. The map iteration is hash order — the tigerbeetle
+    // lsm/tree.zig capture shows it diverges from source order — so the
+    // emission must stage and sort by (line, name) before appending.
+    // Every ZA607 issue carries col 1 and the fixed rule, so line order
+    // IS the full (file, line, col, rule) order here.
+    const content =
+        \\fn threeVars(a: bool, b: bool) u32 {
+        \\    var zz: u32 = undefined;
+        \\    var mm: u32 = undefined;
+        \\    var aa: u32 = undefined;
+        \\    if (a) return zz;
+        \\    if (b) return mm;
+        \\    return aa;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0243_order.zig", content);
+    defer run.deinit(allocator);
+
+    var lines_seen = std.ArrayListUnmanaged(usize).empty;
+    defer lines_seen.deinit(allocator);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DEFINITE_ASSIGNMENT)) continue;
+        try lines_seen.append(allocator, issue.line);
+    }
+    try std.testing.expectEqual(@as(usize, 3), lines_seen.items.len);
+    try std.testing.expectEqual(@as(usize, 5), lines_seen.items[0]);
+    try std.testing.expectEqual(@as(usize, 6), lines_seen.items[1]);
+    try std.testing.expectEqual(@as(usize, 7), lines_seen.items[2]);
+}
+
 test "analyzeDefiniteAssignment: OOM mid-run unwinds both maps (EPH-I0337)" {
     const allocator = std.testing.allocator;
     const lines = [_][]const u8{
@@ -67911,6 +68090,42 @@ test "ZA607: while-else with fills on both arms stays silent" {
     );
 }
 
+test "ZA607: one-line while-else break arm still flags the read (EPH-I0112)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I0112 repro: `while (c) { break; } else { x = 2; } use(x);`.
+    // The break path skips the else arm, so x is maybe-undefined at the
+    // read. The else-arm fill on the loop line must not drop the var in
+    // the fill-before-use filter, and the CFG break model must keep the
+    // post-else merge uncovered. The zero-trip twin (while-body fill
+    // alone) is pinned by "ZA607: while-body fill alone does not cover
+    // the zero-trip path" (EPH-I0110).
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn whileElseBreakOneLine(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    while (c) {
+        \\        break;
+        \\    } else {
+        \\        x = 2;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_we_oneline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_we_oneline.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "ZA607: for-body fill alone does not cover the zero-trip path" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -69590,6 +69805,81 @@ test "ZA607: payload-else with both arms filling stays silent (EPH-I0119)" {
     );
 }
 
+test "ZA607: braced payload-else-if condition fill covers the arm (EPH-I0120)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The issue's p16 repro: `} else |_| if (extract(&file_name)) {`.
+    // The payload sits between the else and the if, so the pre-fix
+    // pattern match treated the line as a plain else and the condition
+    // fill never genned the arm block — the arm read fired though the
+    // extract call covers it on exactly the paths that enter the arm.
+    // The payload-aware chain model (elseChainsIntoIf skips the capture;
+    // peekElseBody keeps the braced if on the chain path) must make the
+    // arm read silent. The p12 plain twin keeps its pin at
+    // "ZA607: fill-call in else-if condition covers the arm body".
+    const content =
+        \\fn extract(p: *[]const u8) bool {
+        \\    p.* = "x";
+        \\    return true;
+        \\}
+        \\fn simpleElsePayload(c: bool) []const u8 {
+        \\    var file_name: []const u8 = undefined;
+        \\    if (c) {
+        \\        return "lit";
+        \\    } else |_| if (extract(&file_name)) {
+        \\        return file_name;
+        \\    } else {
+        \\        return "other";
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0120_payload.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0120_payload.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braced payload-else-if with non-filling condition still fires (EPH-I0120)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The negative control for the payload chain: the post-payload if's
+    // condition does NOT fill x, so the arm read is genuinely
+    // unassigned. The chain model must keep the arm's entry unfilled —
+    // crediting the condition block to every path would hide the read.
+    const content =
+        \\fn plain(c: bool) bool {
+        \\    _ = c;
+        \\    return true;
+        \\}
+        \\fn payloadNeg(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        return 1;
+        \\    } else |_| if (plain(c)) {
+        \\        return x;
+        \\    } else {
+        \\        return 2;
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0120_nofill.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0120_nofill.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "buildCFG: payload-else next-line body lands in the else arm (EPH-I0119)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
@@ -69707,6 +69997,77 @@ test "ZA607: early return on unassigned paths is silent" {
     );
 }
 
+test "ZA607: nested non-dominating branch assignment does not arm the suppressor (EPH-I0117)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I0117 shape-Q negative control: the if-arm's assignment sits
+    // inside a nested if, so it does not dominate the arm exit. The
+    // textual branch scan must not credit it — the c=true,d=false path
+    // reaches the read unassigned and must fire. Pre-fix the branch scan
+    // counted the nested assignment, the chain looked fully covered
+    // (assign-or-exit on every arm), and the read stayed silent.
+    const content =
+        \\fn use(v: u32) u32 {
+        \\    return v;
+        \\}
+        \\fn nestedAssign(c: bool, d: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        if (d) {
+        \\            x = 1;
+        \\        }
+        \\    } else {
+        \\        return 0;
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0117_nested.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0117_nested.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: branch-exit dominating assignment still arms the suppressor (EPH-I0117)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The guard against over-tightening: the assignment sits at the
+    // branch-body top level, so it dominates the arm exit (every path
+    // either returns or assigns). The depth gate must keep crediting it,
+    // or the suppressor over-fires on the canonical assign-or-exit shape.
+    const content =
+        \\fn use(v: u32) u32 {
+        \\    return v;
+        \\}
+        \\fn dominatingAssign(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        x = 1;
+        \\        if (!c) return 0;
+        \\    } else {
+        \\        return 0;
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0117_dom.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0117_dom.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "ZA607: correlated guard read is silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -69733,6 +70094,56 @@ test "ZA607: correlated guard read is silent" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_corr.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: loop-carried counter guard over-warns (EPH-I0826, documented residual)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The RhyOS net/dns_recursive.zig:2034 shape (RG-1 first capture):
+    // the digit loop writes tmp[tmp_len] and bumps tmp_len; the reverse
+    // loop reads tmp[tmp_len - 1 - ri] under `ri < tmp_len`. No
+    // unassigned read exists at runtime — tmp_len counts the writes, so
+    // the read loop's counter bounds the read to written elements. The
+    // guard correlation needs an invariant proof the line-based model
+    // cannot carry soundly, so the verdict is the accepted fail-safe
+    // over-warn (documented at isCorrelatedGuardRead, EPH-I0826). This
+    // pin locks the over-warn: a change that silences it must come with
+    // the guard-correlation model, and a change that keeps the warning
+    // keeps the site honest on every RG-1 re-run.
+    const content =
+        \\fn formatIdx(buf: []u8, idx: usize) usize {
+        \\    var pos: usize = 0;
+        \\    if (idx == 0) {
+        \\        buf[pos] = '0';
+        \\        pos += 1;
+        \\    } else {
+        \\        var tmp: [20]u8 = undefined;
+        \\        var tmp_len: usize = 0;
+        \\        var val = idx;
+        \\        while (val > 0) {
+        \\            tmp[tmp_len] = @intCast('0' + (val % 10));
+        \\            tmp_len += 1;
+        \\            val /= 10;
+        \\        }
+        \\        var ri: usize = 0;
+        \\        while (ri < tmp_len) : (ri += 1) {
+        \\            buf[pos] = tmp[tmp_len - 1 - ri];
+        \\            pos += 1;
+        \\        }
+        \\    }
+        \\    return pos;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0826_rh.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0826_rh.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 
@@ -70571,6 +70982,75 @@ test "ZA607: multi-line else-if chain split fires on the unassigned path (EPH-I0
         try std.testing.expect(issue.line == 7);
         try std.testing.expect(issue.severity == .warning);
     }
+}
+
+test "ZA607: one-line chain with all arms filling stays silent (EPH-I0113)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The issue's exact repro: the chain link and the final bare else
+    // share one line (`} else if (d) { x = 2; } else {`) and every arm
+    // fills x. Pre-fix the second handleElse read the bare else as a
+    // chain link (elseChainsIntoIf scanned the whole line's first else)
+    // and opened a phantom arm, so the fill attribution leaked across
+    // the fallthrough path. The position-aware chain test plus the
+    // post-else arm spans must keep the read silent — every path fills.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn f(c: bool, d: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        x = 1;
+        \\    } else if (d) { x = 2; } else {
+        \\        x = 3;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0113_allfill.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i0113_allfill.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line chain arm fill does not cover the bare else path (EPH-I0113)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The discriminating negative control: the one-line d-arm fills x,
+    // the final bare else does not. Pre-fix the same-line arm fill
+    // attributed to the chain condition block and credited the d=false
+    // fallthrough path, so the genuinely unassigned read stayed silent.
+    // The post-else arm span must move the fill onto the arm's own
+    // block, leaving the fallthrough uncovered.
+    const content =
+        \\fn sink() void {}
+        \\fn f(c: bool, d: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        x = 1;
+        \\    } else if (d) { x = 2; } else {
+        \\        sink();
+        \\    }
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0113_gap.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0113_gap.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
 }
 
 test "ZA607: braceless while body keeps pre-B2 verdict" {
@@ -74969,6 +75449,69 @@ test "ZA607: same-line read before bare @memset slice dest is detected" {
     );
 }
 
+test "ZA607: in-args self read of the fill destination is detected (EPH-I0122)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The issue's p17 repro: `fill(&x, x)` reads x as the second
+    // argument before the call completes. Pre-fix classifyFillLine
+    // compared the read column against the call's OPEN paren, so the
+    // in-args read classified as a fill and the entry filter dropped the
+    // var. The read must compare against the call's closing `)`, keep
+    // the var, and fire.
+    const content =
+        \\fn fill(p: *u32, v: u32) void {
+        \\    p.* = v;
+        \\}
+        \\fn fillSelfArg() void {
+        \\    var x: u32 = undefined;
+        \\    fill(&x, x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0122_selfarg.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0122_selfarg.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: read in an earlier argument than the fill destination is detected (EPH-I0122)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The issue's p22 repro: `foo(use(x), &x)` reads x in the first
+    // argument while the fill destination sits in the second. The read
+    // precedes the call's closing `)` and observes the undefined value.
+    // Same open-paren comparison class as p17; pinned separately because
+    // the first occurrence is the read, not the destination.
+    const content =
+        \\fn use(v: u32) u32 {
+        \\    return v;
+        \\}
+        \\fn foo(a: u32, p: *u32) void {
+        \\    _ = a;
+        \\    _ = p;
+        \\}
+        \\fn readEarlierArg() void {
+        \\    var x: u32 = undefined;
+        \\    foo(use(x), &x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i0122_earlier.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i0122_earlier.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "ZA607: init-call vars keep their dropped verdict" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -74980,8 +75523,8 @@ test "ZA607: init-call vars keep their dropped verdict" {
     // may initialize x. Statement-precise `x.init()` would require narrowing
     // that filter to known fill methods, which trades these FNs for FPs on
     // genuine init methods the analyzer cannot know. The FN remainder is
-    // tracked in EPH-I1101 (band-T03 F3, remainder: statement-precise
-    // init narrowing).
+    // tracked in EPH-I1173 (band-T03 F3, EPH-I1101 split remainder:
+    // statement-precise init narrowing).
     const content =
         \\const Box = struct {
         \\    fn init() Box {
@@ -75145,8 +75688,8 @@ test "ZA607: address-escape var stays dropped" {
     // Pinned (EPH-I0102): `const p = &x;` lets the pointer escape — writes
     // through p are untrackable, so removeAddressOfVars still drops the
     // var. Only `&x` call arguments (the fill-call heuristic) stay
-    // trackable. The pre-escape read FN is tracked in EPH-I1101
-    // (band-T03 F3, remainder: pre-escape reads).
+    // trackable. The pre-escape read FN is tracked in EPH-I1174
+    // (band-T03 F3, EPH-I1101 split remainder: pre-escape reads).
     const content =
         \\fn addrEscapeDrops() u32 {
         \\    var x: u32 = undefined;
@@ -75443,8 +75986,8 @@ test "ZA607: payload-shadow drop trades pre-payload reads for silence" {
     // whole function, and the read is missed. The drop is deliberate: a
     // payload binding anywhere makes every same-name occurrence suspect,
     // and a wrong-fire is worse than a miss. A scope-aware payload model
-    // would recover this read. Tracked in EPH-I1101 (band-T03 F3,
-    // remainder: scope-aware payload model).
+    // would recover this read. Tracked in EPH-I1175 (band-T03 F3,
+    // EPH-I1101 split remainder: scope-aware payload model).
     const content =
         \\fn overDrop(items: []const u32) void {
         \\    var x: u32 = undefined;

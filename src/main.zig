@@ -17414,7 +17414,8 @@ fn returnKwCol(code: []const u8) ?usize {
 
 /// Column of the first escaping occurrence of `var_name` at or after
 /// `from` on a return line, or null. The classification lives in
-/// isEscapingOccurrence; this walk adds the string mask.
+/// isEscapingOccurrence (slice-field reads and comparisons stay
+/// non-escaping, EPH-I1170); this walk adds the string mask.
 fn escapingOccurrenceCol(code: []const u8, var_name: []const u8, from: usize) ?usize {
     var cls = LineClassifier.init(code);
     var iter = VarOccurrenceIter{ .t = code, .name = var_name, .from = from };
@@ -17425,19 +17426,54 @@ fn escapingOccurrenceCol(code: []const u8, var_name: []const u8, from: usize) ?u
     return null;
 }
 
-/// True when the occurrence escapes the pending var's value (EPH-I0729).
-/// Escaping forms: the whole var (`return buf;`) and slices
-/// (`return buf[0..n];`). Non-escaping forms: element reads
-/// (`return buf[0];`), field reads (`return buf.len;`), and
-/// address-of returns (`return &buf;`, a Zig compile error anyway).
+/// True when the occurrence escapes the pending var's value (EPH-I0729,
+/// EPH-I1170). Escaping forms: the bare value (`return buf;`), slices
+/// (`return buf[0..n];`), an index into a slice
+/// (`return buf[0..4][0];` — the fill state tracks none/partial, not
+/// which indices were written, so the read byte cannot be proven
+/// written; conservative fire), and value-propagating expressions
+/// (`return buf + 1;`). Non-escaping forms: element reads
+/// (`return buf[0];`), field reads on the var or on a slice
+/// (`return buf.len;`, `return buf[0..4].len;` — metadata carries no
+/// buffer bytes), comparisons (`return buf == want;` — the result is a
+/// bool), and address-of returns (`return &buf;`, a Zig compile error
+/// anyway).
 fn isEscapingOccurrence(code: []const u8, var_name: []const u8, pos: usize) bool {
     if (pos > 0 and code[pos - 1] == '&') return false;
-    const after = pos + var_name.len;
+    var after = pos + var_name.len;
     if (after >= code.len) return true;
-    if (code[after] == '.') return false;
-    if (code[after] != '[') return true;
-    const close = skipBracketed(code, after) orelse return false;
-    return hasTopLevelRange(code[after + 1 .. close - 1]);
+    var rest = mem.trimStart(u8, code[after..], " \t");
+    // A bracket group: element reads stay silent; slices keep tracking
+    // their suffix (a `.` after the `]` is a field read, a second
+    // bracket is an element access into the slice).
+    if (rest.len > 0 and rest[0] == '[') {
+        const open = code.len - rest.len;
+        const close = skipBracketed(code, open) orelse return false;
+        if (!hasTopLevelRange(code[open + 1 .. close - 1])) return false;
+        after = close;
+        rest = mem.trimStart(u8, code[after..], " \t");
+    }
+    if (rest.len == 0) return true;
+    if (rest[0] == '.') return false;
+    if (isComparisonOp(rest)) return false;
+    return true;
+}
+
+/// True when the token at `rest` starts a comparison operator: `==`,
+/// `!=`, `<=`, `>=`, `<`, `>`. A comparison reads the buffer but
+/// escapes only a bool — none of the undefined bytes flow into the
+/// result, so the read does not leak them (EPH-I1170). The two-byte
+/// forms check first so the shifts (`<<`, `>>`) stay value-propagating
+/// escapes.
+fn isComparisonOp(rest: []const u8) bool {
+    if (rest.len >= 2) {
+        const two = rest[0..2];
+        if (mem.eql(u8, two, "==") or mem.eql(u8, two, "!=") or
+            mem.eql(u8, two, "<=") or mem.eql(u8, two, ">=")) return true;
+        if (rest[0] == '<' and rest[1] != '<') return true;
+        if (rest[0] == '>' and rest[1] != '>') return true;
+    }
+    return false;
 }
 
 /// Pending undefined variable to check within function scope
@@ -82531,6 +82567,27 @@ test "returnEscapeCol finds the escaping return occurrence (EPH-I0729)" {
     try std.testing.expect(returnEscapeCol("return fmt(x, \"buf\");", "buf") == null);
 }
 
+test "returnEscapeCol stays silent on slice field reads and comparisons (EPH-I1170)" {
+    // A field read on a slice escapes metadata only: `buf[0..4].len`
+    // carries none of the buffer bytes, so a partial fill feeding it
+    // leaks nothing (the pre-fix classifier fired here).
+    try std.testing.expect(returnEscapeCol("return buf[0..4].len;", "buf") == null);
+    try std.testing.expect(returnEscapeCol("return buf[0..n].len;", "buf") == null);
+    // Comparisons escape only a bool: the undefined bytes stay in the
+    // buffer. The two-byte forms check first, so the shifts keep the
+    // value-propagating verdict.
+    try std.testing.expect(returnEscapeCol("return buf == want;", "buf") == null);
+    try std.testing.expect(returnEscapeCol("return buf != want;", "buf") == null);
+    try std.testing.expect(returnEscapeCol("return buf < want;", "buf") == null);
+    try std.testing.expect(returnEscapeCol("return buf >= want;", "buf") == null);
+    try std.testing.expect(returnEscapeCol("return buf[0..4] == want;", "buf") == null);
+    try std.testing.expect(returnEscapeCol("return buf + 1;", "buf") != null);
+    try std.testing.expect(returnEscapeCol("return buf << 1;", "buf") != null);
+    // The documented conservative verdict: an index into a slice stays
+    // escaping (the fill state cannot prove the read index was written).
+    try std.testing.expect(returnEscapeCol("return buf[0..4][0];", "buf") != null);
+}
+
 test "ZA204 fires when a partially filled buffer escapes by return (EPH-I0729)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -82655,6 +82712,44 @@ test "ZA204 stays silent when a partially filled buffer never escapes (EPH-I0729
     const analysis = try createTestFileAnalysis(allocator, "test_za204_local.zig", test_content);
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_za204_local.zig"), {});
+
+    var issues = try analyzeErrors(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_UNDEFINED_USAGE));
+    }
+}
+
+test "ZA204 stays silent on slice field reads and comparisons after a partial fill (EPH-I1170)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // `buf[0..4].len` reads slice metadata and `buf == other` escapes
+    // only a bool: neither carries undefined buffer bytes, so the
+    // pre-I1170 classifier fired ZA204 on both (verified live).
+    const test_content =
+        \\const std = @import("std");
+        \\fn sliceLen() usize {
+        \\    var buf: [32]u8 = undefined;
+        \\    buf[0] = 1;
+        \\    return buf[0..4].len;
+        \\}
+        \\fn compare(other: [32]u8) bool {
+        \\    var buf: [32]u8 = undefined;
+        \\    buf[0] = 1;
+        \\    return buf == other;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_za204_suffix.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_za204_suffix.zig"), {});
 
     var issues = try analyzeErrors(allocator, &graph);
     defer deinitIssues(&issues, allocator);

@@ -86,7 +86,7 @@ No separate modes. All checks available. Configure what you want via `ephor.json
 | **ZA204** = undefined | Error Handling | - | May leak sensitive data |
 | **ZA205** ignored error union | Error Handling | - | Error result discarded |
 | **ZA301** function too long | Complexity | 50 lines | Complexity indicator |
-| **ZA302** nesting too deep | Complexity | 4 levels | Complexity indicator |
+| **ZA302** nesting too deep | Complexity | 3 levels | Complexity indicator |
 | **ZA303** too many params | Complexity | 5 params | API smell indicator |
 | **ZA304** too many branches | Complexity | 10 branches | Complexity indicator |
 | **ZA401** unused import | Unused Code | - | Dead code indicator |
@@ -179,7 +179,7 @@ All checks are fast enough for regular development. No need for separate modes.
 
 **Threshold Rationale**:
 - 50 lines: Fits on one screen, comprehensible at a glance
-- 4 nesting: Beyond this, extract helper functions
+- 3 nesting: Beyond this, extract helper functions
 - 5 params: Consider a config struct
 - 10 branches: Consider lookup tables or state machines
 
@@ -284,7 +284,7 @@ This helps developers decide if upgrading is a quick task or a major undertaking
 
   "thresholds": {
     "max_function_lines": 50,
-    "max_nesting_depth": 4,
+    "max_nesting_depth": 3,
     "max_params": 5,
     "max_branches": 10,
     "max_line_length": 80,

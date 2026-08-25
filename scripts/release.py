@@ -20,8 +20,11 @@ Files updated:
 Not rewritten by this script:
     - install.sh and install.ps1 keep EPHOR_FALLBACK_TAG at the previous
       release until the first post-tag commit (EPH-I0702, check-version.sh
-      sections 5 and 5b). The EPHOR_TAG rewrite in install.sh is dead code,
-      tracked by EPH-I0253.
+      sections 5 and 5b). verify_bumped asserts the fallback never names
+      an untagged version (EPH-I0253): at bump time it must be at or
+      below the release being left behind. The freshness direction (the
+      fallback equals the newest remote tag) is check-version.sh section
+      5's check at tag-push time.
 
 Guards (EPH-I0663, EPH-I0656):
     - A new version equal to or below the current version is refused.
@@ -96,13 +99,6 @@ def prepare_bumps(old: str, new: str) -> list[tuple[Path, str, bool]]:
             # "version": "X.Y.Z" in JSON example
             (rf'("version": "){old_re}(")', rf'\g<1>{new}\g<2>'),
         ]),
-        # EPH-I0253: this rewrite is dead. install.sh computes EPHOR_TAG at
-        # runtime, so the pattern never matches. EPHOR_FALLBACK_TAG in
-        # install.sh and install.ps1 bumps manually in the first post-tag
-        # commit (mega-audit file-scripts.md finding 3).
-        bump(REPO_ROOT / "install.sh", [
-            (rf'(EPHOR_TAG="v){old_re}(")', rf'\g<1>{new}\g<2>'),
-        ]),
         # The JSON example only. Never rewrite the install URL: it tracks the
         # latest remote tag (check-version.sh section 3), not the zon version
         # (EPH-I0702, EPH-I0188).
@@ -114,8 +110,9 @@ def prepare_bumps(old: str, new: str) -> list[tuple[Path, str, bool]]:
 
 # Surfaces whose bump must change something (EPH-I0656). A no-op bump here
 # means the old version string was not found where the release model
-# requires it. install.sh is exempt: its EPHOR_TAG rewrite is dead code
-# (EPH-I0253), and a release that fails on dead code could never land.
+# requires it. install.sh and install.ps1 are not bumped: their
+# EPHOR_FALLBACK_TAG moves in the first post-tag commit (EPH-I0702), and
+# verify_bumped asserts it never names an untagged version (EPH-I0253).
 REQUIRED_SURFACES = {
     REPO_ROOT / "build.zig.zon",
     REPO_ROOT / "src" / "main.zig",
@@ -156,32 +153,39 @@ def verify_bumped(old: str, new: str, contents: dict[Path, str]) -> None:
         if not re.search(new_re, text, re.MULTILINE):
             missing.append(f"  {path.name}: no line matches {template.format(new)!r}")
 
-    # EPH-I0656: the installer fallbacks join the checked surfaces. Each
-    # fallback keeps the previous release until the first post-tag commit
-    # (EPH-I0702), but it must never name the untagged version under
-    # development: installs would fetch a 404 archive during an API
-    # outage. The premature pin is the defect this guard catches.
-    fallback_new = re.compile(rf'\$?EPHOR_FALLBACK_TAG\s*=\s*"v{re.escape(new)}"')
-    premature: list[str] = []
+    # EPH-I0253: this check is the meaningful successor of the vacuous
+    # install.sh stale scan. The fallback names the newest remote tag,
+    # so at bump time it must name a version at or below the release
+    # being left behind: anything above it is an untagged version, and
+    # installs would fetch a 404 archive during an API outage. The
+    # premature pin (fallback equals new) is the instance of record;
+    # the same bound also catches a dev version between old and new.
+    # The freshness direction (fallback equals the newest remote tag)
+    # is check-version.sh section 5's check at tag-push time: release.py
+    # runs offline and cannot compare remote tags.
+    fallback_re = re.compile(r'\$?EPHOR_FALLBACK_TAG\s*=\s*"v(\d+\.\d+\.\d+)"')
+    ahead: list[str] = []
     for path in (REPO_ROOT / "install.sh", REPO_ROOT / "install.ps1"):
         for i, line in enumerate(contents[path].splitlines(), 1):
-            if fallback_new.search(line):
-                premature.append(f"  {path.name}:{i}: {line.strip()}")
+            m = fallback_re.search(line)
+            if m and version_tuple(m.group(1)) > version_tuple(old):
+                ahead.append(f"  {path.name}:{i}: {line.strip()}")
 
     if stale:
         print(f"\nerror: stale references to {old} found:")
         for line in stale:
             print(line)
-    if premature:
-        print(f"\nerror: an installer fallback names the untagged version {new}:")
-        for line in premature:
+    if ahead:
+        print(f"\nerror: an installer fallback names an untagged version "
+              f"(above v{old}):")
+        for line in ahead:
             print(line)
-        print("The fallbacks move to the new tag in the first post-tag commit.")
+        print(f"The fallback moves to v{new} in the first post-tag commit.")
     if missing:
         print(f"\nerror: version {new} missing from a production location:")
         for line in missing:
             print(line)
-    if stale or missing or premature:
+    if stale or missing or ahead:
         print("Fix the files above, then run the bump again.")
         sys.exit(1)
 
@@ -235,9 +239,10 @@ def main() -> None:
         sys.exit(1)
 
     # Verify the new contents in memory, then write, then verify the
-    # written files (EPH-I0663). install.ps1 is read for the fallback
-    # guard even though this script never rewrites it.
+    # written files (EPH-I0663). install.sh and install.ps1 are read for
+    # the fallback guard even though this script never rewrites them.
     contents = {path: content for path, content, _ in pending}
+    contents[REPO_ROOT / "install.sh"] = (REPO_ROOT / "install.sh").read_text()
     contents[REPO_ROOT / "install.ps1"] = (REPO_ROOT / "install.ps1").read_text()
     verify_bumped(old_version, new_version, contents)
 

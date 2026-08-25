@@ -402,6 +402,11 @@ An override that is not absolute or does not resolve prints a warning and falls 
 | **ZA110** | warning | ON | Managed container local returned by value while a `defer x.deinit()` is still armed — the returned copy's backing is freed (the plain `var x = ...; return x;` ownership-transfer idiom is correct and stays silent) |
 | **ZA111** | error | ON | Returned-stack-reference (AST tier): returned pointer/slice provably refers to a stack local or by-value parameter (`return &s.field;`, `return &param;`, `const p = &x; return p;`, `return arr[0..n];`). Covers the forms Zig's Sema misses; the bare `return &var;` form is a hard compile error and is never echoed. Chains through pointer/slice bindings or fields are safe and stay silent, as do `comptime var`s and unresolvable types |
 
+**Memory family caveats.** Two limits bound what the memory family sees. Both are false-negative-safe.
+
+- **ZA101 use-suppression.** The no-defer analysis reads an allocation that later code consumes as ownership-transferred, so a used allocation with no free goes silent. The class was narrowed twice: a bare loop read over the allocation now warns (EPH-I0327), and only ownership-capable targets count as transfers (EPH-I0346). An indexed fill (`buf[i] = v`) still masks ZA101: the fill shapes are documented load-bearing (EPH-I0102), and the acceptance gate stays tracked (EPH-I0752). ZA102 does not share the mask. A used `create` still warns.
+- **ZA105/ZA106 cross-block dataflow.** A forward fixpoint over per-block free operations propagates a free through nested blocks (EPH-I0676), so a use after a conditionally-executed free fires as a conditional warning at any nesting depth, and a provable same-block use-after-free is an error. Two limits remain: a free behind a return-else shape stays silent (EPH-I0677), and defer-depth double-counting marks a function tail as in-defer and can hide a real defect (EPH-I0680).
+
 ### Error Handling Patterns (ZA2xx)
 
 | Rule | Severity | Default | Description |
@@ -562,7 +567,7 @@ path-class heuristic is grounded for them.
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
 | **ZA901** | warning | OFF | Decrement without overflow guard may panic (use `--enable=ZA9`) |
-| **ZA903** | warning | OFF | Arithmetic in array index may overflow (use `--enable=ZA9`) |
+| **ZA903** | warning | OFF | Subtraction in an array index may underflow (use `--enable=ZA9`) |
 | **ZA904** | note | OFF | `@intCast`/`@truncate` without a bounds proof in the preceding lines (use `--enable=ZA904`) |
 
 **ZA904 guard classes** (any one suppresses the note, scanning the same-line
@@ -1047,7 +1052,10 @@ Issues:
   Panic:      0
   Tests:      0
   Concurrency: 0
+  Notes:      0
   TOTAL:      754
+
+Quality: NotImplemented=497 TODO/FIXME=268
 
 STATUS: ISSUES FOUND
 ```

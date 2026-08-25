@@ -212,7 +212,7 @@ pub fn wayTooLongFunction() void {
 }
 
 // =============================================================================
-// ZA302: Function exceeds max nesting depth (4)
+// ZA302: Function exceeds max nesting depth (3)
 // =============================================================================
 
 /// BAD: Too deeply nested
@@ -220,8 +220,8 @@ pub fn deeplyNested(a: bool, b: bool, c: bool, d: bool, e: bool) void {
     if (a) { // depth 1
         if (b) { // depth 2
             if (c) { // depth 3
-                if (d) { // depth 4
-                    if (e) { // depth 5 - exceeds 4 - ZA302 should fire
+                if (d) { // depth 4 - exceeds 3 - ZA302 should fire
+                    if (e) { // depth 5
                         std.debug.print("Too deep!\n", .{});
                     }
                 }

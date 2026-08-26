@@ -649,6 +649,13 @@ const BasicBlock = struct {
     }
 };
 
+/// True when the block wired its own exit — a return or a break/continue
+/// jump — so no close wiring may add a fall-through edge from it
+/// (EPH-I0094, EPH-I1188).
+fn isExitTerminal(block: *const BasicBlock) bool {
+    return block.is_return or block.is_jump_terminal;
+}
+
 /// Edge types in CFG
 const EdgeKind = enum {
     sequential, // Normal flow to next block
@@ -1958,9 +1965,12 @@ const CFGBuildCtx = struct {
         else
             entry.merge_block;
         const merge_block = if (chained) entry.merge_block else try self.cfg.addBlock();
-        // A jump-terminal body (break/continue) already wired its exit, so
-        // the close-time edge from it is skipped (EPH-I0094).
-        const terminal = self.cfg.blocks.items[self.current_block].is_jump_terminal;
+        // A jump-terminal or return-terminal body already wired its
+        // exit, so the close-time edge from it is skipped (EPH-I0094,
+        // EPH-I1188: the return check mirrors handleBlockEnd — the
+        // missing check let a return-terminal arm fall through to the
+        // merge and fire the post-chain read on the returned path).
+        const block = &self.cfg.blocks.items[self.current_block];
         if (isLoopBlock(entry.block_type)) {
             // A loop's else runs when the condition goes false, so the else
             // body IS the loop's false exit and the body loops back — it
@@ -1969,10 +1979,10 @@ const CFGBuildCtx = struct {
             // (EPH-I0086). Breaks wired to the false exit before the else
             // arrived bypass the else arm and move to the post-else merge
             // (EPH-I0094).
-            if (!terminal) try self.wireLoopBack(entry);
+            if (!isExitTerminal(block)) try self.wireLoopBack(entry);
             self.rewireBreakJumps(else_body, merge_block);
         } else {
-            if (!terminal)
+            if (!isExitTerminal(block))
                 try self.cfg.addEdge(self.current_block, merge_block, .sequential);
         }
         if (hasInlineElseReturn(t)) {
@@ -2116,29 +2126,19 @@ const CFGBuildCtx = struct {
     /// branch; a loop close mirrors its loop branch (EPH-I0086). An else-if
     /// close also wires the chain fallthrough: the condition-false path
     /// reaches the merge without touching the arm (EPH-I0087). A
-    /// jump-terminal body already wired its exit, so no fall-through edge
-    /// leaves it (EPH-I0094).
-    ///
-    /// Documented residual (EPH-I1176, the EPH-I0826 pattern): the
-    /// terminal check reads is_jump_terminal but not is_return, so a
-    /// return-terminal deferred block gets a spurious sequential edge to
-    /// the merge (handleBlockEnd carries the is_return check at its own
-    /// close wiring). Under the AND-meet definite-assignment flow the
-    /// spurious edge is benign in the observed shapes — the false-path
-    /// pred's undefined state keeps the meet uncovered — but the edge
-    /// defeats the has_succ-based neighbor filter for the return block
-    /// and remains an approximation hazard in the line-based CFG model.
-    /// The pin locks the current verdicts (test "ZA607: return-terminal
-    /// deferred close keeps the spurious merge edge (EPH-I1176,
-    /// documented residual)").
+    /// jump-terminal or return-terminal body already wired its exit, so
+    /// no fall-through edge leaves it (EPH-I0094, EPH-I1188 — the return
+    /// check landed under the I1188 kick-back: the former is_jump_terminal
+    /// -only check let a return-terminal deferred block fall through to
+    /// the merge, the FP the else-boundary probe exposed).
     fn finishPendingElse(self: *CFGBuildCtx, line: usize) !void {
         const entry = self.pending_else orelse return;
         self.pending_else = null;
-        const terminal = self.cfg.blocks.items[self.current_block].is_jump_terminal;
+        const block = &self.cfg.blocks.items[self.current_block];
         if (isLoopBlock(entry.block_type)) {
-            if (!terminal) try self.wireLoopBack(entry);
+            if (!isExitTerminal(block)) try self.wireLoopBack(entry);
         } else {
-            if (!terminal)
+            if (!isExitTerminal(block))
                 try self.cfg.addEdge(self.current_block, entry.merge_block, .sequential);
             // An else-if entry always carries its condition-false block
             // (openElseIfBranch sets it), so the optional unwraps by
@@ -4914,15 +4914,6 @@ fn hasAddressOfVar(t: []const u8, var_name: []const u8) bool {
     return false;
 }
 
-/// True when a `&var_name` occurrence is untrackable: taking the address
-/// without passing it to a call (`const p = &x;`, `return &x;`) lets the
-/// pointer escape, and writes through it are invisible to the fill
-/// analysis. A `&var` call argument stays trackable — the call-fill
-/// heuristic covers it at statement precision (EPH-I0102).
-fn hasUntrackableAddressOf(t: []const u8, var_name: []const u8) bool {
-    return firstUntrackableAddressOfCol(t, var_name) != null;
-}
-
 /// Column of the first untrackable `&var_name` occurrence in `t`, or
 /// null: the address escapes without passing through a call argument
 /// (EPH-I1174). The column lets the read scan split a same-line read
@@ -5409,17 +5400,12 @@ fn removeIndirectlyInitVars(
     for (remove.items) |vn| _ = undef_vars.remove(vn);
 }
 
-/// True when the line holds a payload binding of var_name: `|x|` or
-/// `|x, ...|` — adjacent pipe before the name, a payload delimiter after.
-/// Canonical (zig fmt) spacing puts spaces around bitwise-or operands, so
-/// the adjacent-pipe form is a binding, not `a | x | z`.
-fn hasPayloadBinding(t: []const u8, var_name: []const u8) bool {
-    return payloadBindingCol(t, var_name) != null;
-}
-
 /// Column of the first payload binding of var_name in `t`, or null
-/// (EPH-I1175). The binding shadows the tracked var only inside its own
-/// body scope.
+/// (EPH-I1175): `|x|` or `|x, ...|` — adjacent pipe before the name, a
+/// payload delimiter after. Canonical (zig fmt) spacing puts spaces
+/// around bitwise-or operands, so the adjacent-pipe form is a binding,
+/// not `a | x | z`. The binding shadows the tracked var only inside its
+/// own body scope.
 fn payloadBindingCol(t: []const u8, var_name: []const u8) ?usize {
     // One classifier walk per line (EPH-I0153): candidates ascend.
     var cls = LineClassifier.init(t);
@@ -5473,7 +5459,11 @@ fn payloadShadowEnd(lines: []const []const u8, bind_idx: usize) ?usize {
 }
 
 /// Line of the `}` that brings the walk depth to zero, or null when the
-/// braces never balance (EPH-I1175).
+/// braces never balance (EPH-I1175). A line whose first code token is
+/// `}` closes the primary body before it re-opens: `} else {` starts the
+/// non-shadowed else arm, so the span ends on that line even though the
+/// brace count nets to zero (EPH-I1188). A mid-line struct-literal
+/// close never leads the line and keeps the counting walk.
 fn braceCloseLine(
     lines: []const []const u8,
     from_idx: usize,
@@ -5485,11 +5475,27 @@ fn braceCloseLine(
         const body = mem.trim(u8, lines[j], " \t\r");
         if (isCommentOrMultilineString(body)) continue;
         const bc = braceCountOnLine(body);
+        if (body.len > 0 and body[0] == '}') {
+            if (closeFirstLineEnds(bc, &depth)) return j;
+            continue;
+        }
         if (bc.opens >= bc.closes) depth += bc.opens;
         if (bc.closes >= bc.opens) depth -|= bc.closes;
         if (depth == 0) return j;
     }
     return null;
+}
+
+/// Handle a close-first walk line (`} else {`, `} else if (d) {`,
+/// `} } else {`): the closes run before the re-open, so the span ends
+/// when they reach the walk depth — the trailing arm is NOT shadowed
+/// (EPH-I1188). A nested block's close (depth > 1 entering) updates the
+/// depth and the walk continues inside the shadowed body.
+fn closeFirstLineEnds(bc: BraceLineCount, depth: *usize) bool {
+    if (bc.closes >= depth.*) return true;
+    depth.* -= bc.closes;
+    if (bc.opens >= bc.closes) depth.* += bc.opens;
+    return depth.* == 0;
 }
 
 /// End line of a brace-less payload body: the statement on the first
@@ -5922,7 +5928,8 @@ fn scanVarReads(
         const wv = windowVerdict(win, ctx, idx);
         if (wv == .stop) break;
         if (wv == .skip) continue;
-        if (!readIsUncovered(sc, win.name, idx)) continue;
+        const uncovered = readIsUncovered(sc, win.name, idx);
+        if (!uncovered) continue;
         try issues.put(win.name, al);
         break;
     }
@@ -6128,9 +6135,13 @@ fn loopIncrementSpan(
         // The former walk ran past it to the next standalone `}` — an
         // enclosing block's close — and swallowed the post-loop lines
         // into the span (EPH-I1177). hasOnelineLoopClose carries the
-        // quote-masked whole-line close walk (EPH-I0789).
-        if (hasOnelineLoopClose(t))
+        // quote-masked whole-line close walk (EPH-I0789). A tail write
+        // after the same-line body sits on this line too and breaks the
+        // correlation (EPH-I1187).
+        if (hasOnelineLoopClose(t)) {
+            if (lineHasOtherCounterWrite(t, counter)) return null;
             return endOrNull(found_inc, loop_idx + 1);
+        }
         return bracedLoopBodyEnd(ctx, loop_idx, &found_inc);
     }
     return bracelessLoopBodyEnd(ctx, loop_idx, &found_inc);
@@ -6179,8 +6190,12 @@ fn bracelessLoopBodyEnd(
     loop_idx: usize,
     found_inc: *bool,
 ) ?usize {
-    if (ctx.body_start < ctx.t.len and statementEndsOnLine(ctx.t, ctx.body_start))
+    if (ctx.body_start < ctx.t.len and statementEndsOnLine(ctx.t, ctx.body_start)) {
+        // A tail write after the same-line body sits on the opener line
+        // and breaks the correlation (EPH-I1187).
+        if (lineHasOtherCounterWrite(ctx.t, ctx.counter)) return null;
         return endOrNull(found_inc.*, loop_idx + 1);
+    }
     var depth: usize = 0;
     var mode: QuoteMode = .none;
     var j = loop_idx + 1;
@@ -6189,7 +6204,12 @@ fn bracelessLoopBodyEnd(
         if (isCommentOrMultilineString(body)) continue;
         if (mem.startsWith(u8, body, "{")) return null;
         if (lineHasIncrement(body, ctx.counter)) found_inc.* = true;
-        _ = scanLineForStatementEnd(body, 0, &depth, &mode) orelse continue;
+        const stmt_end = scanLineForStatementEnd(body, 0, &depth, &mode) orelse
+            continue;
+        // A counter write in the statement line's tail (after the `;`)
+        // breaks the correlation: the body ends at the statement, so
+        // the tail is outside the loop (EPH-I1187).
+        if (lineWritesName(body[stmt_end..], ctx.counter)) return null;
         return endOrNull(found_inc.*, j + 1);
     }
     return null;
@@ -6212,6 +6232,29 @@ fn lineHasIncrement(t: []const u8, name: []const u8) bool {
         if (!mem.startsWith(u8, after, "+=") and !mem.startsWith(u8, after, "+%=")) continue;
         const rhs = mem.trim(u8, after[2..], " \t");
         if (rhs.len > 0 and rhs[0] == '1' and (rhs.len == 1 or !isIdent(rhs[1]))) return true;
+    }
+    return false;
+}
+
+/// True when the line carries a counter write that is not the one-step
+/// increment the trip model assumes. A one-line loop body shares its
+/// line with the header, so a tail write after the body (`{ x = 1; }
+/// count = 7;` — the B100 r1 F1 hole in same-line form) sits on the
+/// opener line; admitting the span with it would hide the write and
+/// silence a read the zero-trip path reaches unfilled (EPH-I1187).
+fn lineHasOtherCounterWrite(t: []const u8, name: []const u8) bool {
+    var iter = VarOccurrenceIter{ .t = t, .name = name };
+    while (iter.next()) |pos| {
+        const after = mem.trimStart(u8, t[pos + name.len ..], " \t");
+        const compound = mem.startsWith(u8, after, "+=") or
+            mem.startsWith(u8, after, "+%=");
+        if (compound) {
+            const rhs = mem.trim(u8, after[2..], " \t");
+            const is_one = rhs.len > 0 and rhs[0] == '1' and
+                (rhs.len == 1 or !isIdent(rhs[1]));
+            if (is_one) continue;
+        }
+        if (lineWritesName(t[pos..], name)) return true;
     }
     return false;
 }
@@ -70901,6 +70944,105 @@ test "ZA607: Allman loop opener keeps the missed suppression (EPH-I1177, documen
     );
 }
 
+test "ZA607: one-line braced body tail write breaks the correlation (EPH-I1187)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The B100 r1 F1 hole in same-line form: the one-line braced
+    // admission ended the span at the opener's next line, so the tail
+    // write on the SAME line (`} count = 7;`) escaped the outside-write
+    // scan and the suppressor silenced a read the zero-trip path reaches
+    // unfilled. The admission now fails closed on a non-increment
+    // counter write on the opener line (EPH-I1187).
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn onelineBracedTail(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    while (c) : (count += 1) { x = 1; } count = 7;
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_oneline_tail.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_zt_oneline_tail.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braceless one-line body tail write breaks the correlation (EPH-I1187)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The brace-less one-line twin: the statement ends on the opener
+    // line, and the tail write after its `;` sits on the same line
+    // (EPH-I1187).
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn bracelessOnelineTail(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    {
+        \\        while (c) : (count += 1) x = 1; count = 7;
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_bl_oneline_tail.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_zt_bl_oneline_tail.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braceless body statement tail write breaks the correlation (EPH-I1187)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The next-line body's statement line carries the tail after its
+    // own `;` (`x = 1; count = 7;`): the body ends at the statement, so
+    // the tail write is outside the loop and must break the correlation
+    // (EPH-I1187).
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn nextlineTail(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    {
+        \\        while (c) : (count += 1)
+        \\            x = 1; count = 7;
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_nextline_tail.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_zt_nextline_tail.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "ZA607: Allman switch prong fill keeps the conditional verdict (EPH-I0128)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -78907,21 +79049,20 @@ test "ZA607: multi-else line classifies by the chain link else (EPH-I1176, docum
     );
 }
 
-test "ZA607: return-terminal deferred close keeps the spurious merge edge (EPH-I1176, documented residual)" {
+test "ZA607: return-terminal deferred close wires no merge edge (EPH-I1176/EPH-I1188)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Documented residual (EPH-I1176, the EPH-I0826 pattern):
-    // finishPendingElse checks is_jump_terminal but not is_return when
-    // wiring the deferred close, so a return-terminal body gets a
-    // spurious sequential edge to the merge (handleBlockEnd carries the
-    // is_return check at its own close wiring). Under the AND-meet
-    // definite-assignment flow the edge is benign here — the false-path
-    // pred's undefined state keeps the meet uncovered and the read
-    // fires correctly — so the pin locks the current verdict and the
-    // mechanism comment at finishPendingElse documents the hazard.
+    // finishPendingElse now carries the is_return check its sibling
+    // handleBlockEnd always had (fixed under the I1188 kick-back; the
+    // I1176 record carried the gap as a documented residual): a
+    // return-terminal deferred body wires no fall-through edge, so the
+    // merge's only pred is the false branch and the read fires on the
+    // path that reaches it unfilled. The pre-fix shape fired too (the
+    // AND-meet kept the meet uncovered), so the verdict is the pin: a
+    // change that silences it must prove the return path fills x.
     const content =
         \\fn spuriousEdgeShape(c: bool) u32 {
         \\    var x: u32 = undefined;
@@ -79081,6 +79222,69 @@ test "ZA607: payload-body reads and post-body reads stay split (EPH-I1175)" {
     try std.testing.expectEqual(
         1,
         countRuleIssues(run.issues.items, "da_fc_shadow_scope.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: payload-shadow span ends at the else boundary (EPH-I1188)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The shadow ends where the payload body closes: `} else {` re-opens
+    // into the NON-shadowed else arm, so an else-body read of the
+    // tracked var fires (EPH-I1188). The former net-zero brace count
+    // dragged the span into the else body and suppressed the read.
+    const content =
+        \\fn elseBodyRead(opt: ?u32) void {
+        \\    var x: u32 = undefined;
+        \\    if (opt) |x| {
+        \\        use(x);
+        \\    } else {
+        \\        use(x);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_shadow_else_fn.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fc_shadow_else_fn.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: else-arm fill covers the read past the payload-shadow span (EPH-I1188)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The payload path returns and the else path fills: the post-chain
+    // read is covered, so it must stay silent. The overextended span
+    // gen-skipped the else fill and the read over-warned (EPH-I1188).
+    const content =
+        \\fn init(p: *u32) void {
+        \\    p.* = 1;
+        \\}
+        \\fn payloadReturns(opt: ?u32) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (opt) |x| {
+        \\        use(x);
+        \\        return 1;
+        \\    } else {
+        \\        init(&x);
+        \\    }
+        \\    use(x);
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_shadow_else_fp.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_shadow_else_fp.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 
@@ -90846,13 +91050,13 @@ test "quote-aware comment guards across the occurrence scans (EPH-I0003)" {
     // is data, not a comment start. The five mid-line `//` guards route
     // through findCommentStart, which is quote-aware.
     try std.testing.expect(hasAddressOfVar("const u = \"http://a\"; f(&x)", "x"));
-    try std.testing.expect(hasUntrackableAddressOf("const u = \"http://a\"; const p = &x;", "x"));
+    try std.testing.expect(firstUntrackableAddressOfCol("const u = \"http://a\"; const p = &x;", "x") != null);
     try std.testing.expect(hasMethodCallOnVar("const u = \"http://a\"; x.clear();", "x"));
-    try std.testing.expect(hasPayloadBinding("const u = \"http://a\"; for (xs) |x|", "x"));
+    try std.testing.expect(payloadBindingCol("const u = \"http://a\"; for (xs) |x|", "x") != null);
     try std.testing.expect(hasSlicePassToFunction("const u = \"http://a\"; send(buf[0..])", "buf"));
     // An occurrence after a real trailing comment stays invisible.
     try std.testing.expect(!hasAddressOfVar("f(&y); // &x", "x"));
-    try std.testing.expect(!hasPayloadBinding("for (xs) |y| // |x|", "x"));
+    try std.testing.expect(payloadBindingCol("for (xs) |y| // |x|", "x") == null);
 }
 
 test "a mid-line multiline opener tail never fills (EPH-I0003)" {

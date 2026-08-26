@@ -402,6 +402,18 @@ fn latchErrorDiag(diag: *DiagCtx, comptime fmt: []const u8) void {
     if (comptime mem.startsWith(u8, fmt, "error: ")) diag.error_diag_printed = true;
 }
 
+/// Unarm the printed-error latch after an error line the run survives
+/// (EPH-I1161). errorExitCode skips the runtime's bare error line only
+/// when the latch names the failure it is about to return, so a line
+/// printed for a failure the run survives (the fmt band's cannot-run
+/// line, the export failure line) must not keep the latch armed: a
+/// later unrelated failure would then exit silently with the surviving
+/// line naming the wrong one. The helper lives beside latchErrorDiag so
+/// the pair's contract stays visible.
+fn unlatchErrorDiag(diag: *DiagCtx) void {
+    diag.error_diag_printed = false;
+}
+
 /// Print a CLI/config diagnostic unless the run has muted the channel or
 /// the output stream is the JSON machine contract (EPH-I0213). With a
 /// sink installed (EPH-I1051) the message formats once into a fixed
@@ -21260,6 +21272,17 @@ fn isExpectAssertWord(w: []const u8) bool {
 /// like `unexpectedError` (ghostty) and `unexpected_errno` (tigerbeetle)
 /// — error REPORTING fns, not assertions — and the transitive witness set
 /// then silenced tests that delegate to unrelated fns (EPH-I0048).
+///
+/// Accepted residual (EPH-I1172): ALL-CAPS names (`EXPECT`, `ASSERT_EQ`)
+/// split into single letters, and derivative-prefix forms
+/// (`assertionHolds`, `expectationFailed`, `expectsBool`) carry no word
+/// break after the verb, so neither class counts. A corpus sweep on
+/// 2026-08-26 found zero genuine instances of either class called from a
+/// test block: the only ALL-CAPS calls are C-translation artifacts whose
+/// ASSERT is a @compileError const, and the assertionFailure fns are the
+/// error REPORTING class EPH-I0048 exists to exclude. A missed witness
+/// is a false-positive ZT102 note — the safe direction. One genuine
+/// project instance is the signal to extend the matcher.
 fn hasAssertionWord(seg: []const u8) bool {
     var start: usize = 0;
     var i: usize = 0;
@@ -32559,7 +32582,7 @@ fn isArrayLenCFGGuarded(ctx: GuardLineCtx) bool {
     return isGuardedAtLine(ctx, buf[0 .. base.len + 4], null);
 }
 
-/// Check if array index arithmetic is guarded by various patterns.
+/// Check if array index subtraction is guarded by various patterns.
 /// The line-level guards (steps 1-8) short-circuit before the witness
 /// pass (steps 9-11): a line-level guard that matches ANY bracket
 /// silences the whole line, so an unwitnessed range end can stay silent
@@ -32702,7 +32725,7 @@ fn checkDecrementOverflow(
     if (any_fire) try ctx.reported.put(line_num, {});
 }
 
-/// ZA903: Check for unguarded array index arithmetic
+/// ZA903: Check for unguarded array index subtraction
 fn checkArrayIndexOverflow(
     ctx: CFGPanicCtx,
     t: []const u8,
@@ -32727,8 +32750,8 @@ fn checkArrayIndexOverflow(
         .col = col + 1,
         .severity = .warning,
         .rule = RULE_INDEX_ARITHMETIC,
-        .message = "arithmetic in array index may overflow",
-        .help = "ensure index arithmetic cannot underflow" ++
+        .message = "subtraction in an array index may underflow",
+        .help = "ensure the subtraction cannot underflow" ++
             ", or use saturating subtraction -|",
     });
     try ctx.reported.put(line_num, {});
@@ -33645,13 +33668,13 @@ fn hasLenGuardPattern(ctx: []const u8) bool {
     return false;
 }
 
-/// Check for early-return length guards that protect array index arithmetic
+/// Check for early-return length guards that protect array index subtraction
 fn isLenGuardLine(ctx: []const u8) bool {
     if (mem.indexOf(u8, ctx, ".len") == null) return false;
     return lineHasIf(ctx) and hasLenGuardPattern(ctx);
 }
 
-/// Check for early-return length guards that protect array index arithmetic.
+/// Check for early-return length guards that protect array index subtraction.
 /// The candidate line is parsed first: the indexed array's base binds the
 /// guard, so `if (a.len == 0) return;` cannot silence a `b[i - 1]`
 /// candidate (EPH-I0496, band-B12 F14). The 30-line window walk accepts
@@ -35474,7 +35497,7 @@ fn hasArrayIndexSubtraction(t: []const u8) ?usize {
     return null;
 }
 
-/// Extract array base variable from index arithmetic pattern
+/// Extract array base variable from the index subtraction pattern
 /// e.g., "x[x.len - 8]" -> "x", "in[in.len - 4 ..]" -> "in"
 fn extractArrayBaseFromIndexArithmetic(t: []const u8) ?[]const u8 {
     // Find pattern: identifier[identifier.len
@@ -35964,7 +35987,7 @@ fn hasIfElseExprGuard(t: []const u8, expr: IndexExprLoc) bool {
     return hasElseArmZeroExclusion(t, expr.var_name, else_pos);
 }
 
-/// Check if the same line carries a guard for its index arithmetic. A
+/// Check if the same line carries a guard for its index subtraction. A
 /// guard counts only when its lower-bound comparison relates to the
 /// index var and sits left of the index expression (band-B12 F17,
 /// EPH-I0506).
@@ -36778,6 +36801,10 @@ fn runFmtCheck(
         // The bare line stays off the JSON machine stream (EPH-I0213);
         // the ZR104 finding below carries the same fact as machine data.
         cliDiag(diag, "error: cannot run zig fmt: {}\n", .{err});
+        // The run survives this failure: the ZR104 finding below carries
+        // it, so the printed-error latch must not keep speaking for a
+        // later unrelated failure (EPH-I1161).
+        unlatchErrorDiag(diag);
         var issues: std.ArrayListUnmanaged(Issue) = .empty;
         // Accumulator discipline (EPH-I0692, F-4): every production
         // issue list carries an errdefer deinitIssues. reportFmtFailure
@@ -44373,7 +44400,7 @@ fn printHelp() void {
         \\  ZA8xx  NullSafety (ZA801: unsafe-optional-unwrap (off by default),
         \\                     ZA802: unsafe-deref (off by default))
         \\  ZA9xx  Panic      (ZA901: decrement-no-guard (off by default),
-        \\                     ZA903: index-arithmetic (off by default),
+        \\                     ZA903: index-subtraction (off by default),
         \\                     ZA904: intcast-no-bounds (note, off by default))
         \\  ZA3xx  Complexity (ZA301: func-too-long, ZA302: nesting-too-deep,
         \\                     ZA303: too-many-params, ZA304: too-many-branches,
@@ -44408,9 +44435,11 @@ fn printHelp() void {
         \\  prompt (n, or EOF on a non-interactive stdin) prints "Aborted."
         \\  and exits 1: a CI run without --yes fails instead of passing
         \\  silently. A run that cannot start — the child spawn fails, the
-        \\  target directory is missing, or the capture cap trips —
-        \\  reports a ZR104 finding and exits 1 the same way: the analysis
-        \\  did not run.
+        \\  target directory is missing, or the capture cap trips — exits 1
+        \\  the same way: the analysis did not run. A failed spawn and a
+        \\  capture-cap trip report a ZR104 finding. A missing directory
+        \\  usually aborts earlier with an error line naming the
+        \\  unresolved scan root (EPH-I1162).
         \\
         \\INTELLIJ IDEA SETUP:
         \\  1. Settings > Tools > External Tools > Add
@@ -46895,6 +46924,10 @@ fn exportCheckIssues(
         printExportNotice(ctx.diag, ctx.alloc, exported_count, export_path);
     } else |err| {
         cliDiag(ctx.diag, "error: failed to export issues: {}\n", .{err});
+        // The run survives this failure: the exit flag carries it, so
+        // the printed-error latch must not keep speaking for a later
+        // unrelated failure (EPH-I1161).
+        unlatchErrorDiag(ctx.diag);
         ctx.should_exit_error = true;
     }
 }
@@ -51482,6 +51515,25 @@ test "runFmtCheck JSON mode keeps the spawn-failure line off the stream (EPH-I02
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
     try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "FileNotFound") != null);
+}
+
+test "runFmtCheck spawn failure unarms the printed-error latch (EPH-I1161)" {
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const allocator = std.testing.allocator;
+    // Force the spawn failure with a nonexistent tool path; restore the
+    // global so the rest of the suite sees the real zig.
+    const saved_zig_path = tool_zig_path;
+    defer tool_zig_path = saved_zig_path;
+    tool_zig_path = "/nonexistent/ephor-jq-fmt";
+    var issues = try runFmtCheck(&diag, allocator, "src");
+    defer deinitIssues(&issues, allocator);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    // The run survives the fmt failure (the ZR104 finding carries it),
+    // so the printed-error latch must unarm: a later unrelated failure
+    // must not exit silently with this line naming the wrong one.
+    try std.testing.expect(!diag.error_diag_printed);
 }
 
 test "runFmtCheck accepts a dash-leading scan path (EPH-I1023)" {
@@ -93850,6 +93902,39 @@ test "ZA903: candidate outside an else arm still fires (EPH-I0487 lock)" {
     ) == 1);
 }
 
+test "ZA903 message and help name subtraction underflow (EPH-I1169)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    const content =
+        \\fn underflow(i: usize, arr: []usize) usize {
+        \\    return arr[i - 1];
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_za903_prose.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), countRuleIssues(
+        run.issues.items,
+        "test_za903_prose.zig",
+        RULE_INDEX_ARITHMETIC,
+    ));
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_INDEX_ARITHMETIC)) continue;
+        // The matcher is subtraction-only, so the message must not
+        // promise overflow coverage. The ZA903 producer always sets the
+        // help field; a null here is a test-fixture failure, not a shape
+        // the pin models.
+        const help = issue.help orelse return error.TestUnexpectedResult;
+        try std.testing.expect(mem.indexOf(u8, issue.message, "overflow") == null);
+        try std.testing.expect(mem.indexOf(u8, issue.message, "subtraction") != null);
+        try std.testing.expect(mem.indexOf(u8, issue.message, "underflow") != null);
+        try std.testing.expect(mem.indexOf(u8, help, "saturating subtraction") != null);
+    }
+}
+
 test "ZA901: literal, increment, comment, and string forms stay silent" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -101885,6 +101970,27 @@ test "ZT102: camelCase Assert helpers count as assertions" {
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "hasAssertionWord pins the whole-word classes and the accepted residuals (EPH-I1172)" {
+    // The supported whole-word classes (split on case transitions and
+    // underscores).
+    try std.testing.expect(hasAssertionWord("expectEqual"));
+    try std.testing.expect(hasAssertionWord("fxAssertFoo"));
+    try std.testing.expect(hasAssertionWord("assert_invariants"));
+    // The accepted residuals documented in hasAssertionWord's doc: ALL-CAPS
+    // names split into single letters, and derivative-prefix forms carry
+    // no word break after the verb. A corpus sweep found zero genuine
+    // instances of either class called from a test block.
+    try std.testing.expect(!hasAssertionWord("EXPECT"));
+    try std.testing.expect(!hasAssertionWord("ASSERT_EQ"));
+    try std.testing.expect(!hasAssertionWord("assertion"));
+    try std.testing.expect(!hasAssertionWord("assertionHolds"));
+    try std.testing.expect(!hasAssertionWord("expectation"));
+    try std.testing.expect(!hasAssertionWord("expectsBool"));
+    // The EPH-I0048 exclusion class stays excluded.
+    try std.testing.expect(!hasAssertionWord("unexpectedError"));
+    try std.testing.expect(!hasAssertionWord("assertionFailure"));
 }
 
 test "ZT102: multi-line vacuous test warns at the test line" {
@@ -114951,6 +115057,61 @@ test "a failed export fails the run (EPH-I0741)" {
     // The pre-fix run printed the error line and exited 0: a CI step
     // that lost its export artifact still passed.
     try std.testing.expect(ctx.should_exit_error);
+}
+
+test "a failed export unarms the printed-error latch (EPH-I1161)" {
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    // A path under a directory that does not exist: createFile fails
+    // with FileNotFound (the F5 live shape).
+    const bad_path = try std.fmt.allocPrint(allocator, "{s}/no-such-dir/out.md", .{dir_path});
+    defer allocator.free(bad_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    _ = try setOptionalPath(allocator, &cfg.export_path, bad_path);
+    var ignore_cache = IgnoreCache.init(allocator);
+    defer ignore_cache.deinit();
+    var findings = CheckFindings{
+        .orphan_issues = .empty,
+        .cfg_mem_issues = .empty,
+        .err_issues = .empty,
+        .ignored_err_issues = .empty,
+        .unused_issues = .empty,
+        .cx_issues = .empty,
+        .fmt_issues = .empty,
+        .style_issues = .empty,
+        .naming_issues = .empty,
+        .test_issues = .empty,
+        .conc_issues = .empty,
+        .ast_stats = .{},
+    };
+    defer findings.deinit(allocator);
+    var filtered = FilteredMemIssues{
+        .mem_only = .empty,
+        .null_safety = .empty,
+        .panic = .empty,
+    };
+    defer filtered.deinit(allocator);
+    var ctx = RunCtx{
+        .alloc = allocator,
+        .cfg = &cfg,
+        .diag = &diag,
+        .base_path = ".",
+        .ignore_cache = &ignore_cache,
+    };
+    try exportCheckIssues(&ctx, ctx.reportOut(null), &findings, &filtered);
+    try std.testing.expect(ctx.should_exit_error);
+    // The run survives the export failure (the exit flag carries it),
+    // so the printed-error latch must unarm: a later unrelated failure
+    // must not exit silently with this line naming the wrong one.
+    try std.testing.expect(!ctx.diag.error_diag_printed);
 }
 
 test "a successful export leaves the exit flag clear (EPH-I0741)" {

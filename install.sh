@@ -549,6 +549,60 @@ span_has_dependency_line() {
     sed -n "$1,$(( $2 - 1 ))p" build.zig | grep -q 'dependency("ephor"'
 }
 
+# Print the 1-based line number of the last code-position installArtifact
+# mention in build.zig, or nothing when none exists (EPH-I0715). The awk
+# walk tracks string and char literals and stops at // comments and \\
+# multiline tails, so a mention inside a string or a comment cannot win
+# the insertion anchor. The first non-space char gate keeps the
+# EPH-I0626 code-line idiom: a line that opens with // or \\, or a
+# `.`-led field line, is data, not a call. The trailing-inline comment
+# limit is shared with the DEP_PROBE idiom (EPH-I1106): the .* spans
+# into the comment, and stripping it needs a Zig lexer the installer
+# does not carry.
+find_install_artifact_line() {
+    awk -f - build.zig <<'AWKEOF'
+{
+    line = $0
+    n = length(line)
+    if (index(line, "installArtifact") == 0) next
+    i = 1
+    while (i <= n && substr(line, i, 1) == " ") i = i + 1
+    while (i <= n && substr(line, i, 1) == "\t") i = i + 1
+    if (i > n) next
+    first = substr(line, i, 1)
+    if (first == "/" || first == "\\" || first == ".") next
+    in_str = 0
+    in_char = 0
+    while (i <= n) {
+        c = substr(line, i, 1)
+        if (in_str) {
+            if (c == "\\") i = i + 1
+            else if (c == "\"") in_str = 0
+            i = i + 1
+            continue
+        }
+        if (in_char) {
+            if (c == "\\") i = i + 1
+            else if (c == "'") in_char = 0
+            i = i + 1
+            continue
+        }
+        if (c == "\"") { in_str = 1; i = i + 1; continue }
+        if (c == "'") { in_char = 1; i = i + 1; continue }
+        if (c == "/" && substr(line, i + 1, 1) == "/") break
+        if (c == "\\" && substr(line, i + 1, 1) == "\\") break
+        if (substr(line, i, 15) == "installArtifact") {
+            last_line = NR
+            i = i + 15
+            continue
+        }
+        i = i + 1
+    }
+}
+END { if (last_line != "") print last_line }
+AWKEOF
+}
+
 # The anchored marker patterns for the block splice (EPH-I0625). Each
 # start marker requires the canonical four-space indent (or deeper),
 # and each end marker must sit at line start in code context: a line
@@ -658,10 +712,16 @@ else
     # (b.installArtifact(exe); // note) masks the semicolon match: the
     # block then lands after the next semicolon line, which is still
     # valid Zig, or the install refuses when no semicolon line follows.
+    # EPH-I0715: the anchor scan is quote- and comment-aware
+    # (find_install_artifact_line), so a mention inside a string or a
+    # comment below the real call cannot win. The composed file must
+    # pass zig ast-check before it replaces the live one — the same
+    # gate the Zig side runs (EPH-I0512) — so any anchor shape that
+    # still corrupts the file fails the install instead of writing a
+    # broken build.zig.
     echo "Adding ephor build steps to build.zig..."
 
-    LINE=$(grep -nE '^[[:space:]]*[^/.\\[:space:]].*installArtifact' build.zig \
-        | tail -1 | cut -d: -f1)
+    LINE=$(find_install_artifact_line)
 
     if [ -z "$LINE" ]; then
         # EPH-I0635: the dependency landed but the build steps did not.
@@ -685,6 +745,17 @@ else
     head -n "$INSERT_AT" build.zig > "$INSTALL_TMP"
     echo "$EPHOR_BLOCK" >> "$INSTALL_TMP"
     tail -n +"$((INSERT_AT + 1))" build.zig >> "$INSTALL_TMP"
+    # EPH-I0715: the composed file must pass zig ast-check before it
+    # replaces the live one (the Zig-side EPH-I0512 gate). ast-check
+    # resolves names too, so the gate also proves the block's `target`
+    # name stays in scope. On failure the original stays untouched and
+    # the EXIT trap removes the temp file.
+    if ! zig ast-check "$INSTALL_TMP" >/dev/null 2>&1; then
+        echo "warning: the composed build.zig failed zig ast-check." >&2
+        echo "The ephor build steps were not added." >&2
+        echo "Add them manually (see README)." >&2
+        exit 1
+    fi
     preserve_mode build.zig
     mv "$INSTALL_TMP" build.zig
     INSTALL_TMP=""

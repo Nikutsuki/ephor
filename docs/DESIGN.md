@@ -18,15 +18,15 @@ In an era of AI-assisted coding, Ephor serves as a safety net that catches:
 - Code complexity that makes bugs harder to spot
 - Dead code and unused imports
 
-The tool doesn't judge code as "wrong" - it flags areas where a developer (human or AI) should double-check their work. Think of it as a code review checklist that runs automatically.
+The tool does not judge code as "wrong" - it flags areas where a developer (human or AI) should double-check their work. Think of it as a code review checklist that runs automatically.
 
-**Philosophy**: The linter highlights potential issues. The developer decides if they're actual problems.
+**Philosophy**: The linter highlights potential issues. The developer decides if they are actual problems.
 
 ## Design Principles
 
 ### 1. Enforce Community Standards, Not Personal Opinions
 
-Ephor enforces **established community conventions** - not arbitrary rules we invented. The Zig compiler intentionally doesn't enforce style, but the community has clear standards documented in the official style guide and demonstrated throughout the standard library.
+Ephor enforces **established community conventions** - not arbitrary rules we invented. The Zig compiler intentionally does not enforce style, but the community has clear standards documented in the official style guide and demonstrated throughout the standard library.
 
 **What we enforce by default**:
 - Memory safety patterns (defer after alloc, errdefer, undefined warnings)
@@ -35,21 +35,21 @@ Ephor enforces **established community conventions** - not arbitrary rules we in
 - Line length (100 columns - configurable)
 - Formatting consistency (zig fmt check)
 
-**What we DON'T enforce by default** (project-dependent):
+**What we DO NOT enforce by default** (project-dependent):
 - File size limits (set `max_file_bytes` to enable)
 - Naming conventions (ZA703 - not yet implemented)
 
-**What's configurable**:
+**What is configurable**:
 - All thresholds (line length, function size, nesting, params, branches)
 - Any rule can be disabled: `"disable": ["ZA301"]`
 
 **Everything is configurable**:
-- Don't like a rule? Disable it: `"disable": ["ZA703"]`
+- Do not like a rule? Disable it: `"disable": ["ZA703"]`
 - Want stricter checks? Enable them: `"enable": ["ZA204", "ZA701"]`
 - Different thresholds? Set them: `"thresholds": { "max_function_lines": 100 }`
 - Project-wide settings? Use profiles: `"profiles": ["security"]`
 
-### 2. Don't Duplicate Existing Tools
+### 2. Do Not Duplicate Existing Tools
 
 | Tool | Handles | Ephor Does NOT Duplicate |
 |------|---------|-------------------------------|
@@ -297,7 +297,7 @@ This helps developers decide if upgrading is a quick task or a major undertaking
 
 ### Enabling Expensive Checks (ZA9xx)
 
-The ZA9xx lifetime checks are OFF by default because they're slower. To enable:
+The ZA9xx lifetime checks are OFF by default because they are slower. To enable:
 
 ```json
 {
@@ -494,7 +494,7 @@ fn veryLongFunction() void {  // No warning on this line
 
 This section explains what CFG/DFA infrastructure means and how it enables advanced checks (ZA105-106, ZA205, ZA801-802, ZA901-903).
 
-### Why Pattern Matching Isn't Enough
+### Why Pattern Matching Is Not Enough
 
 Current linting uses pattern matching: scan text for `catch {}` or `.alloc(` without nearby `defer`. This works for simple cases but fails when:
 
@@ -513,7 +513,7 @@ fn example(allocator: Allocator) ![]u8 {
 }
 ```
 
-Pattern matching can't understand:
+Pattern matching cannot understand:
 - Which execution paths exist
 - Whether `defer` covers all paths
 - Whether ownership is transferred (returned, stored elsewhere)
@@ -653,22 +653,22 @@ Algorithm (worklist):
 
 All checks are fast enough to run on every lint. No need for separate modes.
 
-### Design Principle: Don't Duplicate Zig Tools
+### Design Principle: Do Not Duplicate Zig Tools
 
 | Zig Tool | What It Does | Ephor Does NOT Duplicate |
 |----------|--------------|-------------------------------|
-| `zig fmt` | Formatting | We wrap `zig fmt --check`, don't reimplement |
+| `zig fmt` | Formatting | We wrap `zig fmt --check`, do not reimplement |
 | `zig build` | Compilation, type checking | We use compiler output for type info if needed |
 | `zig build test` | Runtime behavior | We do static analysis only |
 
-**If the Zig compiler already does it, we leverage it - not rebuild it.**
+**If the Zig compiler already does it, we use it - do not rebuild it.**
 
 For advanced checks:
 - Need type info? → Parse `zig build` output or use AST hints
 - Need to know if code compiles? → Run `zig build` first
-- Complex type inference? → That's the compiler's job
+- Complex type inference? → That is the compiler's job
 
-The linter focuses on **single-function analysis** with simple state tracking. This catches common bugs (leaks, null derefs, ignored errors) that slip past the compiler but don't require rebuilding compiler internals.
+The linter focuses on **single-function analysis** with simple state tracking. This catches common bugs (leaks, null derefs, ignored errors) that slip past the compiler but do not require rebuilding compiler internals.
 
 ---
 
@@ -700,7 +700,7 @@ Or disable entirely:
 
 **Decision**: ON by default (when implemented)
 
-Zig's compiler doesn't enforce naming, but the community has clear documented standards. Ephor will enforce community conventions:
+Zig's compiler does not enforce naming, but the community has clear documented standards. Ephor will enforce community conventions:
 - Types (struct, enum, union): `TitleCase`
 - Enum fields: `snake_case`
 - Error set values: `TitleCase`
@@ -724,7 +724,7 @@ Profiles provide sensible defaults for a use case. Explicit config represents in
 Ephor is a linter, not a formatter. Use `zig fmt` for formatting fixes. The tool reports issues; the developer fixes them.
 
 Rationale:
-- `zig fmt` is the official formatting tool - don't duplicate
+- `zig fmt` is the official formatting tool - do not duplicate
 - Auto-fixing code changes can introduce bugs
 - Keep the tool simple and focused on detection
 
@@ -732,7 +732,7 @@ Rationale:
 
 **Decision**: Single mode, no `--deep` flag
 
-All checks run together. If a check is helpful, it's ON by default. If it's expensive, it's OFF by default but easily enabled via config.
+All checks run together. If a check is helpful, it is ON by default. If it is expensive, it is OFF by default but easily enabled via config.
 
 Rationale:
 - Simpler mental model for users

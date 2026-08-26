@@ -303,7 +303,7 @@ const DiagCtx = struct {
     /// the mute keeps that echoed stderr quiet.
     cli_diagnostics_enabled: bool = true,
     /// JSON output mode (--format=json): the shared stderr stream carries
-    /// the machine JSON contract, so human diagnostics must not reach it
+    /// the machine JSON guarantee, so human diagnostics must not reach it
     /// (EPH-I0213). A pre-scan of argv arms this before the config load;
     /// parseSimpleFlag sets it when the format flag parses. Once armed the
     /// latch stays on for the whole run, even when a later --format=text
@@ -314,7 +314,7 @@ const DiagCtx = struct {
     /// std.debug.print stderr path byte-identical (the fixed-buffer
     /// format runs only when a sink is installed). The json_stream and
     /// cli_diagnostics_enabled latches gate the sink exactly like the
-    /// default path, so the JSON machine contract stays pure.
+    /// default path, so the JSON machine guarantee stays pure.
     diag_sink: ?DiagSink = null,
     /// Errno-style detail for error.InvalidFailOnValue /
     /// error.InvalidStrictValue out of config parsing: the parse layer
@@ -381,7 +381,7 @@ const DiagCtx = struct {
     /// Threshold values clamped at the documented maxima.
     threshold_clamp_count: usize = 0,
     /// Config threshold values that do not parse as a positive integer
-    /// (B13-11, EPH-I0518): a typo'd huge value reverting to the default
+    /// (B13-11, EPH-I0518): a mistyped huge value reverting to the default
     /// silently was the pre-fix behavior.
     threshold_invalid_count: usize = 0,
     /// Suppression-accounting notes printed.
@@ -464,13 +464,13 @@ fn latchErrorDiag(diag: *DiagCtx, comptime fmt: []const u8) void {
 /// line, the export failure line) must not keep the latch armed: a
 /// later unrelated failure would then exit silently with the surviving
 /// line naming the wrong one. The helper lives beside latchErrorDiag so
-/// the pair's contract stays visible.
+/// the pair's guarantee stays visible.
 fn unlatchErrorDiag(diag: *DiagCtx) void {
     diag.error_diag_printed = false;
 }
 
 /// Print a CLI/config diagnostic unless the run has muted the channel or
-/// the output stream is the JSON machine contract (EPH-I0213). With a
+/// the output stream is the JSON machine guarantee (EPH-I0213). With a
 /// sink installed (EPH-I1051) the message formats once into a fixed
 /// buffer and goes through the sink; without one the call passes
 /// straight to std.debug.print, so production output is byte-identical
@@ -478,7 +478,7 @@ fn unlatchErrorDiag(diag: *DiagCtx) void {
 fn cliDiag(diag: *DiagCtx, comptime fmt: []const u8, args: anytype) void {
     if (!diag.cli_diagnostics_enabled) return;
     // An error-keyword message latches the printed-error flag for
-    // errorExitCode's one-line-per-failure contract (EPH-I0728). The
+    // errorExitCode's one-line-per-failure guarantee (EPH-I0728). The
     // branch lives in the helper so cliDiag keeps its complexity budget.
     latchErrorDiag(diag, fmt);
     if (diag.json_stream) {
@@ -545,8 +545,8 @@ test "cliDiag routes through the sink; the latches still gate it (EPH-I1051)" {
     diag.diag_sink = capture.sink();
     cliDiag(&diag, "note: {s} {d}\n", .{ "alpha", 3 });
     try std.testing.expectEqualStrings("note: alpha 3\n", capture.slice());
-    // json_stream: the machine contract stays pure — the latch gates the
-    // sink exactly like the default stderr path (B56 gate contract).
+    // json_stream: the machine guarantee stays pure — the latch gates the
+    // sink exactly like the default stderr path (B56 gate guarantee).
     diag.json_stream = true;
     cliDiag(&diag, "machine\n", .{});
     try std.testing.expectEqual(@as(usize, 14), capture.len);
@@ -1065,11 +1065,19 @@ fn matchesCFPatternEntry(trimmed: []const u8, p: CFPatternEntry) bool {
 /// shape is rare; zig fmt expands it to the multi-line form that scans
 /// correctly (the EPH-I0679 machinery). The pin lives in the buildCFG
 /// switch test family.
+/// EPH-I0115: a leading block label is stripped before the table match
+/// (`outer: while (c) {` opens a while entry), so bare break/continue
+/// inside the loop bind to it. The labeled jump itself
+/// (`break :outer;`) stays unclassified: line-based analysis cannot tell
+/// a labeled loop break from a labeled block break, and wiring block
+/// breaks to loop merges would be wrong (EPH-I0094 direction). The
+/// fallback tests (catch/prong) still see the original line.
 fn detectCFPattern(t: []const u8) CFPattern {
     const trimmed = mem.trim(u8, t, " \t\r");
+    const unlabeled = stripLabel(trimmed);
 
     for (cf_patterns) |p| {
-        if (matchesCFPatternEntry(trimmed, p)) return p.result;
+        if (matchesCFPatternEntry(unlabeled, p)) return p.result;
     }
 
     if (isUnbalancedCatchBlock(trimmed)) return .catch_start;
@@ -2652,15 +2660,20 @@ const CFGBuildCtx = struct {
 /// false here — the CFG builder defers the false edge to the condition's
 /// close line, where the accumulated text re-runs this check (EPH-I0130).
 fn isWhileLiteralTrue(t: []const u8) bool {
-    if (!mem.startsWith(u8, t, "while")) return false;
-    const open = mem.indexOfScalar(u8, t, '(') orelse return false;
+    // EPH-I0115: a labeled `outer: while (true) {` must keep its
+    // literal-true treatment. Without the strip the condition never
+    // matched, the false edge wired, and post-loop reads blamed the
+    // phantom zero-trip path (the EPH-I0110 direction).
+    const unlabeled = stripLabel(t);
+    if (!mem.startsWith(u8, unlabeled, "while")) return false;
+    const open = mem.indexOfScalar(u8, unlabeled, '(') orelse return false;
     var depth: usize = 0;
-    for (t[open..], 0..) |c, i| {
+    for (unlabeled[open..], 0..) |c, i| {
         if (c == '(') depth += 1;
         if (c != ')') continue;
         depth -= 1;
         if (depth != 0) continue;
-        const cond = mem.trim(u8, t[open + 1 .. open + i], " \t");
+        const cond = mem.trim(u8, unlabeled[open + 1 .. open + i], " \t");
         return mem.eql(u8, stripGroupingParens(cond), "true");
     }
     return false;
@@ -2842,7 +2855,7 @@ fn skipLeadingWhitespace(line: []const u8) usize {
     return lead;
 }
 
-/// Check if line has a free/destroy pattern that's NOT inside a string
+/// Check if line has a free/destroy pattern that is NOT inside a string
 fn hasRealFreePattern(t: []const u8) bool {
     // Check cleanup patterns from compat layer (excludes .deinit which is bulk cleanup)
     for (compat.getCleanupPatterns()) |pat| {
@@ -2892,7 +2905,7 @@ fn hasRealKeyword(t: []const u8, kw: []const u8) bool {
 /// Handles patterns like: Type.alloc(), module.Type.alloc(), Type(T).alloc()
 ///
 /// NOTE: This is CONVENTION-BASED, not language semantics. Zig style guide recommends
-/// TitleCase for types, but it's not enforced by the compiler. This heuristic works
+/// TitleCase for types, but it is not enforced by the compiler. This heuristic works
 /// for code following standard Zig naming conventions.
 fn isTypeAllocFactory(t: []const u8, alloc_pos: usize) bool {
     if (alloc_pos == 0) return false;
@@ -2938,7 +2951,7 @@ fn isTypeAllocFactory(t: []const u8, alloc_pos: usize) bool {
 ///   - @import or @Type builtins
 ///
 /// Non-types (runtime values) look like:
-///   - Lowercase identifiers that aren't primitives (object_ty_id, result, count)
+///   - Lowercase identifiers that are not primitives (object_ty_id, result, count)
 ///   - Null, numeric literals
 fn hasTypeFirstArg(t: []const u8, open_paren_end: usize) bool {
     if (open_paren_end >= t.len) return false;
@@ -2968,8 +2981,8 @@ fn hasTypeFirstArg(t: []const u8, open_paren_end: usize) bool {
 
     if (isPrimitiveTypeName(c, first_arg)) return true;
 
-    // If we got here with a lowercase identifier that's not a primitive,
-    // it's likely a runtime variable (e.g. object_ty_id, result, count)
+    // If we got here with a lowercase identifier that is not a primitive,
+    // it is likely a runtime variable (e.g. object_ty_id, result, count)
     return false;
 }
 
@@ -4994,7 +5007,7 @@ fn hasAddressOfVar(t: []const u8, var_name: []const u8) bool {
         const end = pos + 1 + var_name.len;
         if (end < t.len and isIdent(t[end])) continue;
 
-        // Make sure it's not inside a string or comment
+        // Make sure it is not inside a string or comment
         if (cls.isInsideString(pos)) continue;
         if (findCommentStart(t[0..pos]) != null) continue;
 
@@ -5024,7 +5037,7 @@ fn firstUntrackableAddressOfCol(t: []const u8, var_name: []const u8) ?usize {
         const end = pos + 1 + var_name.len;
         if (end < t.len and isIdent(t[end])) continue;
 
-        // Make sure it's not inside a string or comment
+        // Make sure it is not inside a string or comment
         if (cls.isInsideString(pos)) continue;
         if (findCommentStart(t[0..pos]) != null) continue;
 
@@ -5335,7 +5348,7 @@ fn collectUndefinedVars(
 /// Zig struct literals: `var x = .{ .field = undefined }` - x IS assigned, field is undefined
 /// Pattern: looks for `.identifier = undefined` indicating field, not top-level variable
 fn isStructFieldUndefined(t: []const u8, undefined_col: usize) bool {
-    // Look backwards from the `=` sign to find if there's a `.identifier` pattern
+    // Look backwards from the `=` sign to find if there is a `.identifier` pattern
     // The `= undefined` starts at undefined_col, so the `=` is at undefined_col
     if (undefined_col == 0) return false;
 
@@ -5919,7 +5932,7 @@ fn readIsUncovered(sc: *const ReadScanCtx, var_name: []const u8, idx: usize) boo
     // Check if the read is inside a null-guard on a variable that is only
     // set non-null in blocks that also assign the flagged variable.
     if (isNullGuardCorrelatedRead(sc.da.lines, idx, read_col, var_name)) return false;
-    // Check if all paths that don't assign the variable have early returns.
+    // Check if all paths that do not assign the variable have early returns.
     // e.g., if (A) { k = 1; } else if (B) { k = 2; } else { return; }
     if (earlyReturnSuppresses(sc.early_returns, idx)) return false;
     // Check if the read is on the RHS of an `or` short-circuit in a
@@ -8568,7 +8581,7 @@ fn collectAliasFromLine(
 ) !void {
     if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) return;
     const name = extractVarDeclName(t) orelse return;
-    // Don't track if this name is itself an allocation (not an alias)
+    // Do not track if this name is itself an allocation (not an alias)
     if (allocs.contains(name)) return;
     const rhs = extractSimpleIdentRhs(t) orelse return;
     const root = resolveAliasRoot(rhs, allocs, aliases) orelse return;
@@ -10412,7 +10425,7 @@ fn detectUseAfterFree(ctx: *const FreeScanCtx) !void {
 }
 
 /// Check uses of aliases after the original is freed.
-/// The free was on the ORIGINAL variable, not the alias. So we can't reuse
+/// The free was on the ORIGINAL variable, not the alias. So we cannot reuse
 /// checkLineForUAF (which scans for free of the passed var_name).
 /// Instead: if original was freed, any use of an alias after the free line is UAF.
 fn detectAliasUseAfterFree(ctx: *const FreeScanCtx) !void {
@@ -14312,7 +14325,7 @@ fn continueBlockCollection(
     try bs.content.append(allocator, ' ');
     // bs.start is fixed when the block opens and never mutates during
     // the char scan — hoist the invariant literal out of the loop so its
-    // braces don't count toward nesting depth (ZA302).
+    // braces do not count toward nesting depth (ZA302).
     const site: StmtSite = .{ .line = bs.start };
     for (masked) |c| {
         if (c == '{') bs.depth += 1;
@@ -15142,7 +15155,7 @@ const ImportGraph = struct {
 
     fn deinit(self: *ImportGraph) void {
         // resolved_to_key aliases entries owned by self.files — just
-        // drop the table, don't free the slices.
+        // drop the table, do not free the slices.
         self.resolved_to_key.deinit(self.allocator);
 
         self.walked_file_inodes.deinit(self.allocator);
@@ -15392,7 +15405,7 @@ const ImportGraph = struct {
         // deinit, leaking its content, path copies, and imports. The
         // walk gate (EPH-I0823) and the entry dedupe (EPH-I0812/I0817)
         // make a duplicate unreachable today; the guard keeps the
-        // ownership contract unconditional, so a future ingest path
+        // ownership guarantee unconditional, so a future ingest path
         // cannot silently reopen the leak.
         const gop = try self.files.getOrPut(analysis.path);
         if (gop.found_existing) {
@@ -15644,7 +15657,7 @@ const ImportGraph = struct {
         });
     }
 
-    /// Extract @import("...") patterns that aren't preceded by `const`
+    /// Extract @import("...") patterns that are not preceded by `const`
     /// Catches switch arms like `=> @import("x.zig")`, array inits, etc.
     /// Matches are masked to code positions (EPH-I0227): a `@import("...")`
     /// inside a string, comment, or `\\` multiline-string body is text, not
@@ -15852,7 +15865,7 @@ const ImportGraph = struct {
         self.tryMarkBuildPath(joined, build_root);
     }
 
-    /// Resolve a single b.path ref and mark it reachable if it's a .zig file.
+    /// Resolve a single b.path ref and mark it reachable if it is a .zig file.
     fn tryMarkBuildPath(
         self: *ImportGraph,
         ref_path: []const u8,
@@ -16146,7 +16159,7 @@ const ImportGraph = struct {
     }
 
     /// Mark all .zig files under a directory as reachable (for nested build.zig sub-projects
-    /// where we can't statically resolve b.path(variable) calls)
+    /// where we cannot statically resolve b.path(variable) calls)
     fn markAllZigFilesReachable(self: *ImportGraph, dir_path: []const u8) void {
         self.markZigFilesRecursive(dir_path, 0) catch return;
     }
@@ -16222,9 +16235,9 @@ const ImportGraph = struct {
             if (self.files.getPtr(key)) |entry| return entry.imports.items;
         }
         // Fallback: path may already be a files key (no realpath needed),
-        // or may be a path form we haven't indexed. A single pointer
+        // or may be a path form we have not indexed. A single pointer
         // lookup on the primary map handles the former; we deliberately
-        // do NOT call realpath on every file here — that's what blew up.
+        // do NOT call realpath on every file here — that is what blew up.
         if (self.files.getPtr(path)) |entry| return entry.imports.items;
         return null;
     }
@@ -16473,7 +16486,7 @@ fn collectNoFreeAllocatorNames(
         // Track local variables named "arena" as no-free allocators:
         // `const arena = session.arena;`, `const arena = b.allocator;` etc.
         // Naming a variable "arena" is a strong convention signal in Zig that
-        // it's backed by an arena allocator. False negative risk is near-zero.
+        // it is backed by an arena allocator. False negative risk is near-zero.
         const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
         var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
         if (mem.startsWith(u8, rhs, "try ")) rhs = rhs[4..];
@@ -17241,7 +17254,7 @@ fn resolveStandaloneReturn(ctx: *const TypeContext, t: []const u8) ReturnKind {
 /// is returnTypeAfter: error-set literal braces in the return type are
 /// balanced, never the boundary (EPH-I1042).
 fn extractFnReturnType(t: []const u8) ?[]const u8 {
-    // Find the fn keyword to ensure we're looking at a function. The
+    // Find the fn keyword to ensure we are looking at a function. The
     // probe is code-position-masked: a string like `const pat = "fn (";`
     // and an identifier like `my_fn (` are not functions (EPH-I0949
     // residual class, EPH-I0975).
@@ -17740,7 +17753,7 @@ fn registerFnSignature(
 /// The declared name of a var/const decl line, starting at its decl
 /// keyword end (varDeclPrefixLen), or null when no identifier follows.
 /// Pub-prefixed decls need this pub-aware extraction: the shared
-/// extractVarDeclName keeps its var/const-only contract (EPH-I1044).
+/// extractVarDeclName keeps its var/const-only guarantee (EPH-I1044).
 fn extractVarDeclNameAfter(t: []const u8, prefix_len: usize) ?[]const u8 {
     var name_end = prefix_len;
     while (name_end < t.len and isIdent(t[name_end])) name_end += 1;
@@ -17851,7 +17864,7 @@ fn extractMethodTarget(t: []const u8, dot_pos: usize) ?[]const u8 {
 }
 
 /// Type-aware method pattern matching.
-/// - Universal patterns (don't start with '.') always apply: "debug.print", "assert("
+/// - Universal patterns (do not start with '.') always apply: "debug.print", "assert("
 /// - Method patterns (start with '.') only match when the receiver variable is a
 ///   confirmed stdlib type tracked in stdlib_vars.
 /// When stdlib_vars is null, falls back to legacy substring matching (current behavior).
@@ -17975,7 +17988,7 @@ fn ownershipTransferPos(t: []const u8, alloc_name: []const u8) ?usize {
     for (ownership_lang_patterns) |pattern| {
         const pos = mem.indexOf(u8, t, pattern) orelse continue;
         // ".* = " is only an ownership transfer when alloc_name is on the RHS.
-        // When alloc_name is on the LHS (e.g., node.* = .{...}), it's
+        // When alloc_name is on the LHS (e.g., node.* = .{...}), it is
         // initialization of allocated memory, not a transfer.
         if (mem.eql(u8, pattern, ".* = ")) {
             if (isAllocOnRhs(t, alloc_name)) return pos;
@@ -17991,7 +18004,7 @@ fn ownershipTransferPos(t: []const u8, alloc_name: []const u8) ?usize {
 }
 
 /// ".* = " is only an ownership transfer when alloc_name is on the RHS.
-/// When alloc_name is on the LHS (e.g., node.* = .{...}), it's
+/// When alloc_name is on the LHS (e.g., node.* = .{...}), it is
 /// initialization of allocated memory, not a transfer.
 fn isAllocOnRhs(t: []const u8, alloc_name: []const u8) bool {
     const eq_pos = mem.indexOf(u8, t, " = ") orelse return false;
@@ -18412,7 +18425,7 @@ fn extractFirstArgDotted(t: []const u8, start: usize) ?[]const u8 {
     const ident_start = s;
     while (s < t.len and (isIdent(t[s]) or t[s] == '.')) s += 1;
     if (s == ident_start) return null;
-    // Don't end with a dot
+    // Do not end with a dot
     if (t[s - 1] == '.') s -= 1;
     if (s == ident_start) return null;
     return t[ident_start..s];
@@ -18862,7 +18875,7 @@ fn isCleanupMethodCall(t: []const u8) bool {
 
 /// Case-insensitive keyword check with camelCase/snake_case segment
 /// boundaries (EPH-I0409, EPH-I0875): the keyword must start at the name's
-/// start, at an uppercase letter, or after an underscore — `close` matches
+/// start, at an uppercase letter, or after an underline — `close` matches
 /// close/onClose but never enclose/disclose, and `teardown` matches
 /// peer_teardown, so unrelated methods keep the ZA201 verdict.
 fn containsCleanupKeyword(name: []const u8, keywords: []const []const u8) bool {
@@ -18879,7 +18892,7 @@ fn containsCleanupKeyword(name: []const u8, keywords: []const []const u8) bool {
             from = pos + kw.len;
             // Segment boundary: the match starts the name, a camelCase
             // segment (uppercase in the ORIGINAL name — case is the
-            // boundary marker), or a snake_case segment (underscore before
+            // boundary marker), or a snake_case segment (underline before
             // the match) (EPH-I0875).
             if (pos == 0 or std.ascii.isUpper(name[pos]) or
                 (pos > 0 and name[pos - 1] == '_')) return true;
@@ -19137,7 +19150,7 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
     var i: usize = 0;
     while (i + var_name.len <= t.len) : (i += 1) {
         if (!mem.eql(u8, t[i .. i + var_name.len], var_name)) continue;
-        // Check it's a word boundary (not middle of identifier)
+        // Check it is a word boundary (not middle of identifier)
         const end_i = i + var_name.len;
         const after_ok = end_i >= t.len or !isIdent(t[end_i]);
         if (!after_ok) continue;
@@ -19929,7 +19942,7 @@ fn isStaticStorageStruct(t: []const u8) bool {
     // Pattern: const X = struct { (used for thread-local static storage)
     if (mem.indexOf(u8, t, "const ") == null) return false;
     if (mem.indexOf(u8, t, "= struct")) |pos| {
-        // Make sure there's an identifier between const and = struct
+        // Make sure there is an identifier between const and = struct
         const before = t[6..pos]; // after "const "
         return mem.trim(u8, before, " \t").len > 0;
     }
@@ -21373,7 +21386,7 @@ fn isSnapshotVerb(seg: []const u8) bool {
             continue;
         }
         if (std.ascii.eqlIgnoreCase(seg[start..i], "snap")) return true;
-        // An uppercase letter opens the next word; an underscore is consumed.
+        // An uppercase letter opens the next word; an underline is consumed.
         if (seg[i] == '_') {
             start = i + 1;
             i = start;
@@ -22237,7 +22250,7 @@ fn collectFnCallFacts(allocator: Allocator, content: []const u8) !FnCallFacts {
 }
 
 /// True when a string-form test-name word looks like a deliberate code
-/// reference (contains an uppercase, a digit, or an underscore) rather
+/// reference (contains an uppercase, a digit, or an underline) rather
 /// than an English prose word. Single lowercase words like "access" or
 /// "deinit" collide with common method names while appearing constantly
 /// as prose — admitting them as candidates floods ZT101 with FPs.
@@ -25537,7 +25550,7 @@ const UnusedFileCtx = struct {
 /// Check a single import for usage (ZA401)
 fn checkUnusedImport(ctx: UnusedFileCtx, imp: ImportInfo) !void {
     if (imp.name.len > 0 and imp.name[0] == '_') return;
-    // Skip public re-exports - they're intentional library API
+    // Skip public re-exports - they are intentional library API
     if (imp.is_pub) return;
     if (ctx.index.countUses(imp.name, imp.line) > 0) return;
     const msg = try std.fmt.allocPrint(
@@ -25712,7 +25725,7 @@ const PendingFnStart = struct {
 };
 
 /// Count function parameters by counting colons at depth 1.
-/// Excludes `self` parameter — it's implicit in method call syntax and not
+/// Excludes `self` parameter — it is implicit in method call syntax and not
 /// a semantic parameter chosen by the caller.
 fn countFnParams(t: []const u8) usize {
     const p = mem.indexOf(u8, t, "(") orelse return 0;
@@ -26553,7 +26566,7 @@ fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void 
     if (isBodilessFnDecl(t)) return;
 
     // New top-level function definition resets state even if in_fn is true
-    // This handles cases where brace counting didn't detect function end
+    // This handles cases where brace counting did not detect function end
     if (state.in_fn and isNewFunctionDef(t)) {
         state.* = .{}; // Reset state for new function
     }
@@ -26899,11 +26912,15 @@ fn analyzeComplexity(
 
 /// AST tier driver: parse each file with the host std.Ast and run the
 /// AST-native rules (currently ZA111). Files with parse errors are skipped
-/// inside the tier; the line tier still covers them.
+/// inside the tier; the line tier still covers them. A non-null
+/// `parse_sink` receives one ZA503 warning per file the host parser
+/// rejects (EPH-I0742) — the check pipeline routes those to the
+/// structure report; commands without that report pass null.
 fn analyzeAstTier(
     allocator: Allocator,
     graph: *ImportGraph,
     stats: ?*ast_tier.Stats,
+    parse_sink: ?*std.ArrayListUnmanaged(Issue),
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     errdefer deinitIssues(&issues, allocator);
@@ -26913,6 +26930,7 @@ fn analyzeAstTier(
         try ast_tier.analyzeFileAstTier(allocator, .{
             .issues = &issues,
             .stats = stats,
+            .parse_issues = parse_sink,
         }, fa.path, fa.content);
     }
     return issues;
@@ -27018,7 +27036,7 @@ fn stringLiteralEnd(line: []const u8, i: usize) usize {
     return j;
 }
 
-/// String-content stats for the ZA701 tail contract: `content` is the
+/// String-content stats for the ZA701 tail guarantee: `content` is the
 /// total string-literal content (quotes excluded) and `code` everything
 /// else (the quotes themselves count as neither). The exemption covers
 /// unbreakable opaque tokens (ENRs, hashes, enodes) that dominate their
@@ -27284,7 +27302,7 @@ const NameViolation = struct {
 };
 
 /// Emit a naming-convention issue from a NamingLineCtx (keeps call sites
-/// brace-less so the struct literal doesn't inflate nesting).
+/// brace-less so the struct literal does not inflate nesting).
 fn reportNaming(ctx: NamingLineCtx, v: NameViolation) !void {
     try reportNamingIssue(ctx.issues, ctx.allocator, .{
         .path = ctx.path,
@@ -27305,7 +27323,7 @@ fn reportNaming(ctx: NamingLineCtx, v: NameViolation) !void {
 /// The relation keys on the TERMINAL segment of the RHS path, read after
 /// the LAST dot (EPH-I0463): the first-dot check read the second segment
 /// of a multi-segment path, so both `const eql = std.mem.eql;` and
-/// `const parseJson = std.json.parse;` FP'd as constants. The terminal is
+/// `const parseJson = std.json.parse;` was mistaken for a constant. The terminal is
 /// scanned to its identifier and the tail byte decides FIRST
 /// (EPH-I1103 FA-1): a call tail (`(`) or index tail (`[`) binds a call
 /// result or an element, not the function — `const callTail =
@@ -27517,7 +27535,7 @@ fn checkConstDeclName(
     // for naming.
     if (isTypeDefinitionLine(decl_seg)) {
         if (isTitleCase(name)) return;
-        // Non-TitleCase name on a type-looking line — check if it's actually a
+        // Non-TitleCase name on a type-looking line — check if it is actually a
         // closure-wrapping function alias (`const x = struct { fn ... }.call;`).
         if (!isClosureFunctionAlias(decl_seg, content, t_start + name_end)) {
             try reportNamingIssue(ctx.issues, ctx.allocator, .{
@@ -27642,7 +27660,7 @@ fn fnReturnsType(t: []const u8, after_name: usize) bool {
 
     // Check if return type is literally "type" as a standalone word
     if (i + 4 <= t.len and mem.eql(u8, t[i .. i + 4], "type")) {
-        // Ensure it's not a prefix of a longer identifier
+        // Ensure it is not a prefix of a longer identifier
         if (i + 4 >= t.len or !isIdent(t[i + 4])) return true;
     }
     return false;
@@ -28471,7 +28489,7 @@ fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
     // depth-0 return-position gate is EPH-I0075)
     state.fn_returns_error = lineHasErrorReturnMarker(t, 0);
 
-    // Detect noreturn functions: memory leaks don't matter in noreturn
+    // Detect noreturn functions: memory leaks do not matter in noreturn
     // fns, so the leak-coverage rules (ZA101/ZA103) skip them
     // (EPH-I0073; the word-bounded depth-gated marker is the same
     // helper's twin).
@@ -29692,7 +29710,7 @@ fn checkMustReturnRef(ctx: MustReturnRefCtx) !void {
 /// carry no payload guard by design (band-B11 F13, EPH-I0483): the
 /// null-safety, panic-pattern, and error families emit static message
 /// strings only, so an OOM at a transfer leaks nothing — the array defer
-/// frees the whole list. A future allocPrint'd message in one of these
+/// frees the whole list. A future message built with allocPrint in one of these
 /// families must add the B45-1 owns-payloads guard (runCFGMemoryAnalyses
 /// shows the pattern). Pinned by the EPH-I0483 test.
 fn runCFGSafetyAnalyses(run: CFGRunCtx) !void {
@@ -31091,7 +31109,7 @@ fn lineHasTypeOfOpenerInCode(line: []const u8) bool {
 
 /// Check if `catch unreachable` is inside a @TypeOf() expression (compile-time only).
 /// Walks backwards through preceding lines accumulating paren depth. If a line
-/// contains `@TypeOf(` while cumulative depth shows we're still inside its parens,
+/// contains `@TypeOf(` while cumulative depth shows we are still inside its parens,
 /// the catch unreachable is compile-time only and safe to suppress.
 fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u8) bool {
     // Check current line first (fast path) — scan left of the catch site.
@@ -31120,7 +31138,7 @@ fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u
         if (parensStayOpen(t, i + opener_len, pos)) return true;
     }
     // Multi-line: accumulate paren depth from current line backwards.
-    // If we find @TypeOf( on a line where depth > 0, we're nested inside it.
+    // If we find @TypeOf( on a line where depth > 0, we are nested inside it.
     // The opener match must sit at a code position (EPH-I1155): the pre-fix
     // fallback accepted a string-carried `@TypeOf(` on an earlier line, and
     // the depth + indexOf gate then suppressed a runtime catch (the I0929
@@ -33474,7 +33492,7 @@ fn hasEndsWithStartsWithGuard(lines: []const []const u8, current_idx: usize) boo
         if (mem.indexOf(u8, ctx, "endsWith(") != null or
             mem.indexOf(u8, ctx, "startsWith(") != null)
         {
-            // If there's an assert on this line, it's a guard
+            // If there is an assert on this line, it is a guard
             if (mem.indexOf(u8, ctx, "assert(") != null) return true;
             if (mem.indexOf(u8, ctx, "assert (") != null) return true;
             // Also check for conditional early exits: if (!endsWith) return;
@@ -33888,11 +33906,11 @@ fn isInComptimeBlock(lines: []const []const u8, current_idx: usize) bool {
         if (isCommentOrMultilineString(ctx)) continue;
         // Count braces going backward; literal braces are data (EPH-I0949).
         brace_depth = trackBraceDepthBackward(ctx, brace_depth);
-        // If we're at negative depth, we're inside an enclosing block
+        // If we are at negative depth, we are inside an enclosing block
         if (brace_depth < 0) {
             // Check if this line contains "comptime" before the opening brace
             if (mem.indexOf(u8, ctx, "comptime") != null) return true;
-            // Reset - we're inside a non-comptime block
+            // Reset - we are inside a non-comptime block
             return false;
         }
         // Stop at function boundary
@@ -34126,7 +34144,7 @@ fn extractIndexSubtraction(line: []const u8) ?IdxSub {
         if (idx_var.len == 0 or !isIdent(idx_var[0])) return null;
         // Parse the numeric subtrahend after the '-', skipping
         // whitespace. The literal parser covers the base prefixes and
-        // the underscore separators, or the witness binds a wrong
+        // the underline separators, or the witness binds a wrong
         // amount (`0x1` as 0, `1_0` as 1 — EPH-I0977).
         var dpos = i + 1 + sub + 1;
         while (dpos < line.len and (line[dpos] == ' ' or line[dpos] == '\t')) dpos += 1;
@@ -34137,7 +34155,7 @@ fn extractIndexSubtraction(line: []const u8) ?IdxSub {
 }
 
 /// Check if init value after = is >= subtrahend (direct or via + offset)
-/// The literal parser owns the base prefixes and the underscore
+/// The literal parser owns the base prefixes and the underline
 /// separators: `var i = 0x10` witnesses 16, not a parse failure
 /// (EPH-I0994). A witness binds only when its literal closes the
 /// init text, or the operator after it cannot decrease the value: a
@@ -34276,14 +34294,14 @@ const NumLit = struct {
 
 /// The Zig integer literal starting at `start` and its value, or null
 /// when the token is not well-formed. The base-0 std parse owns the
-/// prefix and underscore semantics: `0x`/`0X` hex, `0b`/`0B` binary,
-/// `0o`/`0O` octal, and underscore-separated digits (`1_0` is 10,
+/// prefix and underline semantics: `0x`/`0X` hex, `0b`/`0B` binary,
+/// `0o`/`0O` octal, and underline-separated digits (`1_0` is 10,
 /// `0x1_0` is 16). The digit scan skips underscores and consumes the
 /// base's full alphabet (hex digits for a hex token); the token ends
 /// at the first character outside both. The parse then owns the valid
 /// prefix only, so a trailing letter truncates the token (`0x1g`
 /// parses as 1, the scan ends before the `g`). Null comes only from a
-/// bare `0x` prefix, an underscore at the digit-run boundary (`0x_1`,
+/// bare `0x` prefix, an underline at the digit-run boundary (`0x_1`,
 /// `1_`), a digit the base rejects (`0b2`), or overflow, and the
 /// caller's conservative verdict then holds and the shape stays a
 /// finding (EPH-I0977).
@@ -37561,7 +37579,7 @@ const RuntimeOptions = struct {
     /// stream (EPH-I0213).
     json_stream: bool = false,
     /// When set, runRuntimeAnalysis writes whether the analysis ran here
-    /// (EPH-I0734): false means the can't-run path fired (spawn failure,
+    /// (EPH-I0734): false means the cannot-run path fired (spawn failure,
     /// capture overflow, missing target directory), and the caller must
     /// not read the run as a clean pass. Null skips the report (direct
     /// test callers).
@@ -37595,7 +37613,7 @@ fn runRuntimeAnalysis(
     errdefer deinitIssues(&issues, allocator);
     // The report is authoritative in both directions (EPH-I0734): the
     // default is not-run, and only a successful child spawn flips it.
-    // A caller-initialized true would otherwise survive the can't-run
+    // A caller-initialized true would otherwise survive the cannot-run
     // path and read a failed run as a pass.
     if (opts.analysis_ran) |ran| ran.* = false;
     var argv_buf: [64][]const u8 = undefined;
@@ -37635,7 +37653,7 @@ fn runRuntimeAnalysis(
         .{ .path = path },
     ) catch |err| return reportSpawnFailure(allocator, &issues, opts, err);
     // The spawn succeeded, so the analysis infrastructure ran (EPH-I0734):
-    // only the can't-run shapes (spawn failure, StreamTooLong, a missing
+    // only the cannot-run shapes (spawn failure, StreamTooLong, a missing
     // target directory) leave the report false.
     if (opts.analysis_ran) |ran| ran.* = true;
     defer allocator.free(result.stdout);
@@ -37678,7 +37696,7 @@ fn reportSpawnFailure(
 /// (EPH-I0733): zig walks UP from the target cwd to find a build file,
 /// so a scratch dir silently ran the nearest ancestor project before
 /// this pre-check. The finding names the target, and the run fails the
-/// can't-run class (analysis_ran stays false, so handleRuntime exits
+/// cannot-run class (analysis_ran stays false, so handleRuntime exits
 /// nonzero). The path crosses the terminal sanitizer (EPH-I0147).
 fn reportNoBuildZig(
     allocator: Allocator,
@@ -37787,7 +37805,7 @@ const RuntimeParseState = struct {
 /// raw stderr otherwise (the production default, byte-identical with
 /// std.debug.print). A full capture buffer fails the write and the
 /// content assertion, so the WriteFailed swallow is a truncation policy,
-/// not a silent error path (the types.printWriteFallback contract).
+/// not a silent error path (the types.printWriteFallback guarantee).
 fn printVerboseRuntimeLine(ctx: RuntimeEmitCtx, label: []const u8, t: []const u8) !void {
     var safe = try types.sanitizeTerminal(ctx.allocator, t);
     defer safe.deinit(ctx.allocator);
@@ -38676,7 +38694,7 @@ fn consumeIgnoredScopeLine(scope: *ScopeIgnore, line: []const u8, is_target: boo
 ///   1. Same-line: a directive trailing the code — suppresses that line only
 ///   2. Scope-aware: an ignore directive on a comment-only line before a function
 ///      or block — automatically suppresses the entire scope (tracks braces)
-///      If the next line doesn't open a scope, suppresses just the next line.
+///      If the next line does not open a scope, suppresses just the next line.
 ///   3. File-level: an ignore-file directive with a rule — suppresses entire file
 fn isInlineDisabled(content: []const u8, line_num: usize, rule: []const u8) bool {
     if (hasFileLevelIgnore(content, rule)) return true;
@@ -39681,7 +39699,7 @@ const EntriesRoots = struct {
 
 /// Convert relative entry paths to absolute paths based on config file
 /// location. Untrusted configs (EPH-I0195): every entry must realpath
-/// inside the realpath'd scan root — the textual ancestor test is
+/// inside the realpath-resolved scan root — the textual ancestor test is
 /// traversal-blind, and a nonexistent entry must fail closed, not pass.
 /// Violators drop and count toward a per-file note at the call site.
 /// Returns the drop count.
@@ -39758,7 +39776,7 @@ fn entryPassesTrust(io: std.Io, trusted: bool, root_real: ?[]const u8, abs: []co
 }
 
 /// EPH-I0195 containment core: realpath the candidate and require it under
-/// the realpath'd root. Fails closed when the candidate does not resolve.
+/// the realpath-resolved root. Fails closed when the candidate does not resolve.
 /// B13-16 (EPH-I0520): every containment gate realpaths to decide, then
 /// the caller opens the ORIGINAL textual path — a check/use gap. A tree
 /// mutated DURING the scan could swap a symlink between gate and open
@@ -39802,7 +39820,7 @@ fn skipJsonStringSpan(content: []const u8, start: usize) usize {
 /// span (escapes are not decoded — only span scanning needs them). On an
 /// unterminated string, val runs to content.len and end == content.len, so
 /// downstream indexes stay inside the buffer (RED1-1).
-/// B13-10 (EPH-I0518): the raw span is the CONSUMER contract, not a scan
+/// B13-10 (EPH-I0518): the raw span is the CONSUMER guarantee, not a scan
 /// detail. A value used as a pattern or path carries its escape bytes
 /// verbatim: `"a\/b"` yields the seven bytes `a\/b` and never matches the
 /// path `a/b`. Write values without escape sequences.
@@ -40067,7 +40085,7 @@ const JsonCodeScanner = struct {
 /// falls back to the default, and no generated config produces the
 /// shape (writeDefaultConfig and the install writer emit one pair per
 /// line). Pinned by the EPH-I1049 tests so a future cross-line scan
-/// cannot silently change the grammar contract.
+/// cannot silently change the grammar guarantee.
 /// Returns the colon position, or the stop-byte position (content.len
 /// at EOF) when the separator is missing.
 fn findKeySeparator(content: []const u8, start: usize) usize {
@@ -40165,7 +40183,7 @@ fn parseThresholdPair(ctx: ConfigParseCtx, start: usize) usize {
     const raw = std.fmt.parseInt(usize, content[num_start..i], 10) catch {
         // B13-11 (EPH-I0518): a digit run that overflows usize (or an
         // empty run) is skipped with a warning — the pre-fix code skipped
-        // it silently, so a typo'd huge threshold reverted to the default
+        // it silently, so a mistyped huge threshold reverted to the default
         // without a signal, inconsistent with the clampThreshold policy.
         warnBadThresholdValue(ctx, key_result.val, content[num_start..i]);
         return i;
@@ -40928,7 +40946,7 @@ fn writeDefaultConfig(io: std.Io) !void {
 
 /// Owned dupe with an OOM fallback the caller can always free (B13-17,
 /// EPH-I0520). The fallback is a static zero-length slice: free of a
-/// zero-length slice is a no-op per the Allocator contract, so the
+/// zero-length slice is a no-op per the Allocator guarantee, so the
 /// callers' unconditional frees are legal. The pre-fix `catch "."`
 /// returned a non-empty static literal callers later freed — a crash.
 fn dupeOrEmpty(allocator: Allocator, value: []const u8) []const u8 {
@@ -40941,7 +40959,7 @@ fn dupeOrEmpty(allocator: Allocator, value: []const u8) []const u8 {
 /// source directory passes the string checks yet resolves outside the
 /// project). A violation warns and falls back to the "." default. Every
 /// diagnostic routes through cliDiag: JSON mode owns the stream as a
-/// machine contract (EPH-I0213).
+/// machine guarantee (EPH-I0213).
 fn detectPathDirFromBuildZig(diag: *DiagCtx, allocator: Allocator) []const u8 {
     const content = Fs.cwd(diag.io).readFileAlloc(
         allocator,
@@ -41118,7 +41136,7 @@ fn createInstallConfig(diag: *DiagCtx, allocator: Allocator, ver: []const u8) !v
         return;
     } else |_| {}
 
-    // File doesn't exist - create it
+    // File does not exist - create it
     const root_dir = detectPathDirFromBuildZig(diag, allocator);
     defer allocator.free(root_dir);
     var entries = try collectInstallEntries(diag.io, allocator, root_dir);
@@ -41407,9 +41425,15 @@ fn requireZigFloor(diag: *DiagCtx, allocator: Allocator) error{ZigTooOld}!void {
         "No ephor release newer than {s} builds with this Zig.\n",
         .{zig015_era_release},
     );
+    // EPH-I1160: the remedy names both installers. Pre-fix it named
+    // install.sh only — a Windows user got a POSIX-script remedy. Both
+    // installers pin the same 0.15-era release (install.sh
+    // EPHOR_0_15_COMMIT, install.ps1 the same commit), so the message
+    // names one release for either platform.
     cliDiag(
         diag,
-        "Use install.sh instead. It installs {s}, the newest release this Zig builds.\n",
+        "Use install.sh on POSIX or install.ps1 on Windows instead. " ++
+            "Both install {s}, the newest release this Zig builds.\n",
         .{zig015_era_release},
     );
     return error.ZigTooOld;
@@ -41720,6 +41744,11 @@ fn buildZigIsSymlink(io: std.Io, dir: std.Io.Dir) bool {
 
 /// Patch build.zig to add ephor step. Returns line number
 /// where inserted, or null if already exists.
+/// EPH-I0721: the append terminates the block with a newline.
+/// EPHOR_BUILD_BLOCK itself carries none (the marker-replacement path at
+/// tryIntegrationMarkerPair relies on the original file's newline after
+/// the end marker), so without it the next original line glues onto the
+/// block end and zig fmt --check flags the result.
 fn patchBuildZig(diag: *DiagCtx, allocator: Allocator, project_dir: std.Io.Dir) !?usize {
     // EPH-I0670: never read build.zig through a planted symlink —
     // the splice would copy the victim's content into the repo tree. The
@@ -41769,7 +41798,10 @@ fn patchBuildZig(diag: *DiagCtx, allocator: Allocator, project_dir: std.Io.Dir) 
     for (line_list.items, 0..) |line, idx| {
         try new_content.appendSlice(allocator, line);
         try new_content.append(allocator, '\n');
-        if (idx == insert_after) try new_content.appendSlice(allocator, EPHOR_BUILD_BLOCK);
+        // EPH-I0721: terminate the block or the next original line
+        // glues onto it (see the patchBuildZig doc).
+        if (idx == insert_after)
+            try new_content.appendSlice(allocator, EPHOR_BUILD_BLOCK ++ "\n");
     }
 
     // The composed file must parse before it replaces the live one
@@ -42039,7 +42071,7 @@ const UpgradeRun = struct {
         return error.UpgradeFailed;
     }
 
-    /// Pins the splice-boundary contract (EPH-I0668): every source of
+    /// Pins the splice-boundary guarantee (EPH-I0668): every source of
     /// `ver` is strict-gated at its ingest point (explicit --version,
     /// tags API, zon fallback). An unparseable target must never reach
     /// buildPackageUrl, the ephor.json splice, the cache write, or the
@@ -42120,7 +42152,7 @@ const UpgradeRun = struct {
 
         // Update build.zig integration to match current canonical block.
         // Only the symlink refusal errors here (EPH-I0670); every
-        // other miss is best-effort by the function's contract.
+        // other miss is best-effort by the function's guarantee.
         updateBuildZigIntegration(self.diag, self.allocator) catch {
             cliDiag(
                 self.diag,
@@ -43584,7 +43616,7 @@ fn extractPathJoin(allocator: Allocator, line: []const u8, start: usize) !?[]con
     return joinPathSegments(allocator, segments[0..result.count], result.total_len);
 }
 
-/// Add entry if the file exists and isn't already added
+/// Add entry if the file exists and is not already added
 fn addEntryIfValid(ctx: EntryScanCtx, path: []const u8) !void {
     if (ctx.added.contains(path)) return;
     Fs.cwd(ctx.diag.io).access(path, .{}) catch return;
@@ -43626,7 +43658,7 @@ const EntryScanCtx = struct {
 /// content is attacker-controlled and must not steer reads outside the
 /// scan root (EPH-I0195).
 fn addEntryWithPrefix(ctx: EntryScanCtx, path: []const u8) !void {
-    // When prefix is ".", don't add it (avoid "./src/file.zig" paths)
+    // When prefix is ".", do not add it (avoid "./src/file.zig" paths)
     const is_dot = ctx.prefix.len == 1 and ctx.prefix[0] == '.';
     const full_path = if (is_dot)
         try ctx.allocator.dupe(u8, path)
@@ -44020,7 +44052,7 @@ fn parseSimpleFlag(diag: *DiagCtx, arg: []const u8, cfg: *Config) !bool {
     if (mem.eql(u8, arg, "--format=json") or mem.eql(u8, arg, "-f=json")) {
         cfg.format = .json;
         // JSON mode routes human diagnostics off the shared stream, which
-        // becomes the machine JSON contract (EPH-I0213).
+        // becomes the machine JSON guarantee (EPH-I0213).
         diag.json_stream = true;
         return true;
     }
@@ -44392,7 +44424,7 @@ fn isJsonFormatToken(arg: []const u8) bool {
 
 /// Pre-scan argv for the JSON format flag so the stream gate arms before
 /// the config load (EPH-I0213): config diagnostics (unreadable file, bad
-/// fail_on/strict values) fire there, and the machine contract must
+/// fail_on/strict values) fire there, and the machine guarantee must
 /// swallow them. format is not a config key, so the scan cannot misread
 /// a config value. Infallible by construction (EPH-I1056): the raw argv
 /// vector is scanned without an allocated iterator copy, so an OOM can
@@ -44538,7 +44570,7 @@ fn utf16Literal(comptime s: []const u8) [s.len]u16 {
     return buf;
 }
 
-/// JSON mode is a machine contract: the verbose diagnostics would break
+/// JSON mode is a machine guarantee: the verbose diagnostics would break
 /// the stream, so --verbose is a no-op when the final format is json
 /// (EPH-I0213). Applied after the flag loop so either flag order lands on
 /// the same outcome.
@@ -44983,7 +45015,7 @@ fn loadKnownIssues(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
 /// Read the known-issues list bytes. OOM is never "no list": it
 /// propagates (EPH-I0521). An unreadable EXPLICIT --known-issues=<file>
 /// is a hard usage error naming the path — help and README promise the
-/// explicit path is always honored, and a typo'd path must not silently
+/// explicit path is always honored, and a mistyped path must not silently
 /// un-filter every known issue (fail-open on an operator-specified
 /// suppression control). Only the auto-detected probe returns null on
 /// absence. Caller owns the returned slice.
@@ -45032,7 +45064,7 @@ fn loadKnownIssuesOnce(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void
     const content = (try readKnownIssuesContent(diag, allocator, path, explicit)) orelse return;
     defer allocator.free(content);
 
-    // Track how many keys we've successfully added for cleanup on error
+    // Track how many keys we have successfully added for cleanup on error
     var keys_added: usize = 0;
     errdefer {
         // On error, clean up any keys we already added
@@ -45739,7 +45771,7 @@ fn coverageGateAppliesToScan(ctx: *const RunCtx) bool {
 /// missing or broken file never reads as a clean gate state: text mode
 /// warns and leaves the runner legs unevaluated (the gate script fails
 /// on the warning); JSON mode carries the failure through the machine
-/// contract — the run exits 1 with the abort object, no silent skip.
+/// guarantee — the run exits 1 with the abort object, no silent skip.
 /// The file is operator-supplied plumbing.
 fn loadRunCoverageEvidence(ctx: *RunCtx) void {
     const path = ctx.cfg.coverage_evidence_path orelse return;
@@ -45765,7 +45797,7 @@ fn loadRunCoverageEvidence(ctx: *RunCtx) void {
 /// require_all_passed) evaluate only when --coverage-evidence supplied
 /// the runner's counts. Text mode prints one informational ratio line and
 /// one failure line per tripped leg; JSON mode stays silent (the exit
-/// code carries the gate), the same contract as applyStrictGate.
+/// code carries the gate), the same guarantee as applyStrictGate.
 fn applyCoverageGate(ctx: *RunCtx, counts: UntestedFnCounts) void {
     if (!ctx.cfg.coverage.present) return;
     const ratio = coverageRatio(counts);
@@ -45943,7 +45975,7 @@ fn printIssuesJson(a: AnalyzerJsonArgs, out: ReportOutCtx) void {
 }
 
 /// Print one analyzer's issues in the configured format and return the
-/// printable tallies. This is the output contract's dispatcher: JSON
+/// printable tallies. This is the output guarantee's dispatcher: JSON
 /// mode buffers one object per analyzer and writes it once
 /// (buildIssuesJson), text mode prints each issue through printText.
 /// The tallies exclude suppressed findings; they feed the footer, the
@@ -46235,7 +46267,7 @@ fn formatSummaryJson(
 /// Print the JSON summary. The buffer math (summary_json_buf_bytes)
 /// proves the format cannot overflow; on the impossible overflow the
 /// summary drops silently instead of emitting a bare-text notice: a
-/// notice would break the JSON machine contract (EPH-I0213), and the
+/// notice would break the JSON machine guarantee (EPH-I0213), and the
 /// summary is a trailing optional document (EPH-I0540).
 fn printSummaryJson(counts: IssueCounts, s: ProjectStats, suppression: SuppressionStats) void {
     var buf: [summary_json_buf_bytes]u8 = undefined;
@@ -46630,7 +46662,9 @@ fn handleMemory(ctx: *RunCtx) !void {
     // AST tier (ZA111) is a memory-family rule — include it here too.
     // Stats stay null: check is the coverage surface (its summary carries
     // the parsed/skipped counts, EPH-I0200). memory prints findings only.
-    var ast_issues = try analyzeAstTier(ctx.alloc, &g, null);
+    // The ZA503 parse sink stays null here too: the check command owns
+    // the structure report (EPH-I0742).
+    var ast_issues = try analyzeAstTier(ctx.alloc, &g, null, null);
     // Atomic move (EPH-I0690, F-2): the ZA111 payloads are owned, so an
     // OOM mid-move keeps them with this list for the errdefer; after the
     // move the list is empty and the explicit deinit frees only the
@@ -46823,7 +46857,7 @@ fn runtimePromptText(
 /// Interactive gate for `runtime`: the analysis compiles and executes the
 /// target, so the user confirms unless --yes was passed. Returns false on
 /// any answer other than y/Y (EOF included). JSON mode owns the stream as
-/// a machine contract (EPH-I1099): no prompt text may print and no silent
+/// a machine guarantee (EPH-I1099): no prompt text may print and no silent
 /// stdin read may hang a machine consumer, so the call declines without
 /// printing or reading; the caller routes the decline to the abort object.
 fn confirmRuntime(ctx: *const RunCtx) !bool {
@@ -46880,7 +46914,7 @@ fn handleRuntime(ctx: *RunCtx) !void {
         },
     );
     defer deinitIssues(&issues, ctx.alloc);
-    // Can't-run class (EPH-I0734): a spawn failure, a capture overflow,
+    // Cannot-run class (EPH-I0734): a spawn failure, a capture overflow,
     // or a missing target directory means the analysis never ran. The
     // ZR104 finding names the cause, and the exit code fails the run
     // like a declined prompt (EPH-I0261) regardless of fail_on — a CI
@@ -47203,10 +47237,18 @@ fn collectCheckFindings(ctx: *const RunCtx, g: *ImportGraph) !CheckFindings {
     var orphan_issues = try g.getOrphanIssues(alloc, ctx.cfg);
     errdefer deinitIssues(&orphan_issues, alloc);
     try mergeSkippedIssues(alloc, g, &orphan_issues);
-    sortIssuesByFile(orphan_issues.items);
     var cfg_mem_issues = try analyzeCFGMemory(alloc, g);
     errdefer deinitIssues(&cfg_mem_issues, alloc);
     try mergeIntCastIssues(alloc, g, &cfg_mem_issues);
+    // AST tier: ZA111 findings join the memory list, ZA503 parse
+    // findings join the structure list before its sort so the merged
+    // list stays file-ordered (EPH-I0742).
+    var ast_stats = ast_tier.Stats{};
+    try mergeAstTierIssues(alloc, g, &ast_stats, .{
+        .cfg = &cfg_mem_issues,
+        .structure = &orphan_issues,
+    });
+    sortIssuesByFile(orphan_issues.items);
     var err_issues = try analyzeErrors(alloc, g);
     errdefer deinitIssues(&err_issues, alloc);
     var unused_issues = try analyzeUnused(alloc, g);
@@ -47224,8 +47266,6 @@ fn collectCheckFindings(ctx: *const RunCtx, g: *ImportGraph) !CheckFindings {
     errdefer deinitIssues(&test_issues, alloc);
     var conc_issues = try analyzeConcurrency(alloc, g);
     errdefer deinitIssues(&conc_issues, alloc);
-    var ast_stats = ast_tier.Stats{};
-    try mergeAstTierIssues(alloc, g, &ast_stats, &cfg_mem_issues);
     noteAstTierSkips(ctx.diag, ast_stats);
     var ignored_err_issues = try analyzeIgnoredErrors(alloc, g);
     errdefer deinitIssues(&ignored_err_issues, alloc);
@@ -47262,20 +47302,31 @@ fn mergeIntCastIssues(
     cast_issues = .empty;
 }
 
-/// AST tier (ZA111): merged into cfg_mem_issues so it flows through the
-/// ZA1 → memory category filter and the export list. Item ownership
-/// moves with the atomic moveIssues transfer (EPH-I0690, F-2), so the
-/// tier list frees only its array on the success path; an OOM keeps the
-/// owned payloads with the list for the errdefer.
+/// Sink pair for mergeAstTierIssues (EPH-I0742): ZA111 findings merge
+/// into the memory list, ZA503 parse findings into the structure list.
+/// One struct keeps the merge signature at four parameters.
+const AstTierMergeSinks = struct {
+    cfg: *std.ArrayListUnmanaged(Issue),
+    structure: *std.ArrayListUnmanaged(Issue),
+};
+
+/// AST tier: ZA111 findings merge into the memory list so they flow
+/// through the ZA1 → memory category filter and the export list; ZA503
+/// parse findings merge into the structure list (EPH-I0742) so they
+/// print beside the other file-level skips. Item ownership moves with
+/// the atomic moveIssues transfer (EPH-I0690, F-2), so the tier list
+/// frees only its array on the success path; an OOM keeps the owned
+/// payloads with the list for the errdefer. The parse findings append
+/// directly into `sinks.structure`, whose own errdefer covers them.
 fn mergeAstTierIssues(
     alloc: Allocator,
     g: *ImportGraph,
     stats: *ast_tier.Stats,
-    into: *std.ArrayListUnmanaged(Issue),
+    sinks: AstTierMergeSinks,
 ) !void {
-    var ast_issues = try analyzeAstTier(alloc, g, stats);
+    var ast_issues = try analyzeAstTier(alloc, g, stats, sinks.structure);
     errdefer deinitIssues(&ast_issues, alloc);
-    try moveIssues(alloc, into, &ast_issues);
+    try moveIssues(alloc, sinks.cfg, &ast_issues);
     ast_issues.deinit(alloc);
     ast_issues = .empty;
 }
@@ -47496,7 +47547,7 @@ fn collectAllIssues(
 }
 
 /// Error exit path (EPH-I0543). JSON mode owns the stream as a machine
-/// contract: the runtime's bare error line would break it (EPH-I0213),
+/// guarantee: the runtime's bare error line would break it (EPH-I0213),
 /// so the run emits one machine-readable error object and returns the
 /// failure code (EPH-I1067). `msg` rides as the message member — the
 /// stashed diagnostic for a parse abort, empty for a mid-run handler
@@ -47522,7 +47573,7 @@ fn errorExitCode(diag: *DiagCtx, allocator: Allocator, err: anyerror, msg: []con
 /// Print the JSON-mode abort object once (EPH-I1067): the error name and
 /// the message render into one buffer, so a render failure cannot strand
 /// a partial object in the machine stream (the buildIssuesJson
-/// contract). On failure the run degrades to the allocation-free object
+/// guarantee). On failure the run degrades to the allocation-free object
 /// of the same shape with an empty message: the machine stream must
 /// still carry a valid document.
 fn printAbortJson(allocator: Allocator, err: anyerror, msg: []const u8) void {
@@ -47696,7 +47747,7 @@ fn runEphor(init: std.process.Init) !u8 {
     };
     switch (entry.handler) {
         .infallible => |h| h(&ctx),
-        // JSON mode owns the stream as a machine contract: the runtime's
+        // JSON mode owns the stream as a machine guarantee: the runtime's
         // bare error line would break it, so a failing handler emits the
         // machine error object with no diagnostic message (a mid-run
         // message does not belong to the abort) and returns the failure
@@ -48222,7 +48273,7 @@ test "dupeOrEmpty always returns a freeable slice (B13-17)" {
     // The OOM fallback must survive the callers' unconditional frees:
     // the pre-fix `catch "."` returned a non-empty static literal that
     // callers freed — a crash. The empty fallback is safe because free
-    // of a zero-length slice is a no-op per the Allocator contract.
+    // of a zero-length slice is a no-op per the Allocator guarantee.
     const allocator = std.testing.allocator;
 
     // Normal path: the value is duped and freeable.
@@ -49119,7 +49170,7 @@ test "check ZA2 ownership: every dropped CFG ZA2 has an errors twin (EPH-I0174)"
 
     // Half two: the CFG list CAN carry ZA2 items — the CFG error tier
     // emits ZA202/ZA203 on this fixture — and filterMemIssues drops
-    // them. Pin both halves of the drop's contract: every dropped CFG
+    // them. Pin both halves of the drop's guarantee: every dropped CFG
     // ZA2 item has a same-(file, line, rule) twin in the errors list,
     // and the drop is the only thing keeping ZA2 out of the buckets.
     var cfg_issues = try analyzeCFGMemory(allocator, &run.graph);
@@ -50572,7 +50623,7 @@ test "detectStandardEntries frees both duped entries on append failure (EPH-I103
     // the list 0 -> 9). The src/ test-file walk appends seven _test.zig
     // files; the 7th walk append is the 10th append overall and exceeds
     // the 9-slot first-growth capacity, so it triggers a growth
-    // allocation the fail_index sweep covers — order-robust, because the
+    // allocation the fail_index sweep covers — order-independent, because the
     // growth lands on the walk's last append in any readdir order.
     // std growCapacity(1) = 1 + cache_line / @sizeOf([]const u8): 9 on
     // both aarch64 and x86_64 (cache_line 128 for both in the pinned
@@ -50616,7 +50667,7 @@ test "detectStandardEntries frees both duped entries on append failure (EPH-I103
     // The detection reads cwd (Fs.cwd): chdir into the fixture and
     // restore before the test ends, so the sweep sees a controlled tree.
     // The restore is the ZT104-sanctioned defer-cleanup form: it cannot
-    // fail in practice (old_cwd was realpath'd moments ago and exists),
+    // fail in practice (old_cwd went through realpath moments ago and exists),
     // and a failed restore would only poison the tests that follow.
     var old_buf: [Fs.max_path_bytes]u8 = undefined;
     const old_cwd = try Fs.cwd(std.testing.io).realpath(".", &old_buf);
@@ -51033,7 +51084,7 @@ test "parseCommandIntoArgv strips quotes and honors escapes (EPH-I0507)" {
     try std.testing.expectEqualStrings("run", buf[1]);
     try std.testing.expectEqualStrings("a b", buf[2]);
     try std.testing.expectEqualStrings("c'd", buf[3]);
-    // The `"it's"` shape: the inner single quote is a literal byte
+    // An inner single quote inside a string literal is a literal byte
     // inside double quotes, so quoting does not end early.
     const parsed2 = parseCommandIntoArgv("echo \"it's\"", &buf, &scratch);
     try std.testing.expectEqual(@as(usize, 2), parsed2.argc);
@@ -51045,7 +51096,7 @@ test "parseCommandIntoArgv unclosed quote consumes the tail; tabs split (EPH-I02
     var buf: [64][]const u8 = undefined;
     var scratch: [1024]u8 = undefined;
     // An unterminated quote consumes the rest of the command as one
-    // token; the quote byte itself is stripped (the d383904 contract,
+    // token; the quote byte itself is stripped (the d383904 guarantee,
     // EPH-I0244). The pre-fix tokenizer kept the quote bytes and lumped
     // the remainder into the last token silently.
     const parsed = parseCommandIntoArgv("\"echo", &buf, &scratch);
@@ -51493,7 +51544,7 @@ test "runtimePromptText sanitizes the command and the scan path (EPH-I0173, EPH-
 }
 
 test "runtime JSON decline stashes the remedy and fails the run (EPH-I1099)" {
-    // JSON mode owns the stream as a machine contract: the prompt text
+    // JSON mode owns the stream as a machine guarantee: the prompt text
     // must never print and the decline must not end the armed stream
     // empty. confirmRuntime declines without a prompt read, handleRuntime
     // stashes the --yes remedy, and the epilogue abort object rides the
@@ -51532,7 +51583,7 @@ test "runtime JSON decline stashes the remedy and fails the run (EPH-I1099)" {
 }
 
 test "declined runtime prompt carries a nonzero exit code (EPH-I0261)" {
-    // The exit code is the CI contract: a declined prompt means the
+    // The exit code is the CI guarantee: a declined prompt means the
     // analysis did not run, and the run must not read as a pass. The
     // prompt's stdin read is not injectable in-process, so the pin lives
     // on the exit-code decision the abort branch returns.
@@ -64025,7 +64076,7 @@ test "analyzeCFGMemory no false positive for proper defer" {
     // rule-absence across all issues so an FP with an empty or mangled
     // file field cannot slip the filter (band-T02 F-02 shape, EPH-I1102).
     for (issues.items) |issue| {
-        // If we find ZA105 or ZA106 in properly written code, that's a false positive
+        // If we find ZA105 or ZA106 in properly written code, that is a false positive
         try std.testing.expect(!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE));
         try std.testing.expect(!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE));
     }
@@ -66794,7 +66845,7 @@ test "ZA205 type-aware: unknown receiver falls through to legacy" {
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // Variable type can't be determined (comes from function param)
+    // Variable type cannot be determined (comes from function param)
     // Should fall through to legacy pattern matching
     const content =
         \\fn use(x: anytype) void {
@@ -67444,7 +67495,7 @@ test "isInlineDisabled detects disable comment" {
 
     // Line 2 has disable for ZA201
     try std.testing.expect(isInlineDisabled(content, 2, "ZA201"));
-    // Line 1 doesn't have disable
+    // Line 1 does not have disable
     try std.testing.expect(!isInlineDisabled(content, 1, "ZA201"));
     // ZA202 is not disabled on line 2
     try std.testing.expect(!isInlineDisabled(content, 2, "ZA202"));
@@ -69136,6 +69187,38 @@ test "detectCFPattern word-bounds the else/else-if prefixes (EPH-I0090)" {
     try std.testing.expectEqual(CFPattern.else_start, detectCFPattern("} else {"));
     try std.testing.expectEqual(CFPattern.else_start, detectCFPattern("} else{"));
     try std.testing.expectEqual(CFPattern.else_start, detectCFPattern("} else"));
+}
+
+test "detectCFPattern strips a loop label before the table match (EPH-I0115)" {
+    // A label hides the opener keyword, so the loop entry never existed
+    // and bare break/continue inside bound to nothing (FN direction).
+    // The labeled jump itself stays unclassified by design: line-based
+    // analysis cannot tell a labeled loop break from a labeled block
+    // break (EPH-I0094), so only the opener recognition is modeled.
+    try std.testing.expectEqual(CFPattern.while_start, detectCFPattern("outer: while (c) {"));
+    try std.testing.expectEqual(CFPattern.for_start, detectCFPattern("outer: for (x) |y| {"));
+    try std.testing.expectEqual(CFPattern.switch_start, detectCFPattern("outer: switch (x) {"));
+    // Documented bound pins: a labeled block opens no loop, and the
+    // labeled jump forms stay .none (fall-through semantics).
+    try std.testing.expectEqual(CFPattern.none, detectCFPattern("outer: {"));
+    try std.testing.expectEqual(CFPattern.none, detectCFPattern("break :outer;"));
+    try std.testing.expectEqual(CFPattern.none, detectCFPattern("continue :outer;"));
+    // The unlabeled forms keep their classifications.
+    try std.testing.expectEqual(CFPattern.while_start, detectCFPattern("while (c) {"));
+    try std.testing.expectEqual(CFPattern.break_stmt, detectCFPattern("break;"));
+    // A struct-field line never strips into a pattern: the fallbacks see
+    // the original line and find nothing.
+    try std.testing.expectEqual(CFPattern.none, detectCFPattern("name: u32,"));
+}
+
+test "isWhileLiteralTrue reads through a loop label (EPH-I0115)" {
+    // A labeled `while (true)` keeps its literal-true treatment, so no
+    // phantom zero-trip edge wires (the EPH-I0110 direction). Without
+    // the strip the labeled form read false and blamed post-loop reads.
+    try std.testing.expect(isWhileLiteralTrue("outer: while (true) {"));
+    try std.testing.expect(isWhileLiteralTrue("outer: while ((true)) {"));
+    try std.testing.expect(!isWhileLiteralTrue("outer: while (c) {"));
+    try std.testing.expect(isWhileLiteralTrue("while (true) {"));
 }
 
 test "buildCFG: arrow text in a body string opens no phantom arm (EPH-I0679)" {
@@ -71444,6 +71527,71 @@ test "ZA607: multi-line while(true) fill dominating the break stays silent (EPH-
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_wt_multi.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: a labeled while with a bare break models the zero-trip path (EPH-I0115)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Pre-fix the label hid the while opener: the fill attributed to the
+    // function block, the break bound to no loop, and the read after the
+    // loop looked covered on every path. The loop may run zero times, so
+    // the read is genuinely uncovered — the finding is the correct
+    // verdict, and its absence was the FN.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn labeledWhileBreak(cond: bool) void {
+        \\    var x: u32 = undefined;
+        \\    outer: while (cond) {
+        \\        x = 1;
+        \\        break;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_labeled.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_labeled.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: a labeled while(true) fill dominating the break stays silent (EPH-I0115)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The coherence pin: the labeled literal-true condition keeps its
+    // no-false-edge treatment (isWhileLiteralTrue strips the label), so
+    // the break exit's fill dominates the read. If the strip regresses,
+    // a phantom zero-trip edge fires here.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn labeledTrueBreak() void {
+        \\    var x: u32 = undefined;
+        \\    outer: while (true) {
+        \\        x = 1;
+        \\        break;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_labeled_true.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_labeled_true.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 
@@ -78390,7 +78538,7 @@ test "ZA607: switch prong arrow does not count as assignment" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // EPH-I0082: isAssignmentOp accepted `=>`, so `x => ...` both gen'd x
+    // EPH-I0082: isAssignmentOp accepted `=>`, so `x => ...` both generated a phantom x assignment
     // and blinded the genuine prong read.
     const content =
         \\fn reproSwitch(c: u32) u32 {
@@ -81995,7 +82143,7 @@ test "parseVersionFromTagsApi rejects a name match inside a raw string value (EP
     // appears at a non-key position. This is the only shape the pre-fix
     // scan minted a message candidate from — on valid JSON the
     // serializer's escapes already failed extractTagName. The gate is the
-    // explicit structure contract, so the spoofed 9.9.9 must not win.
+    // explicit structure guarantee, so the spoofed 9.9.9 must not win.
     const json =
         \\[{"name": "v0.14.2", "message": "x "name": "v9.9.9" y"}]
     ;
@@ -82626,7 +82774,7 @@ fn runCheckAnalysisBattery(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !
     var conc_issues = try analyzeConcurrency(allocator, &g);
     defer deinitIssues(&conc_issues, allocator);
     var ast_stats = ast_tier.Stats{};
-    var ast_issues = try analyzeAstTier(allocator, &g, &ast_stats);
+    var ast_issues = try analyzeAstTier(allocator, &g, &ast_stats, null);
     defer deinitIssues(&ast_issues, allocator);
 }
 
@@ -86191,7 +86339,7 @@ test "buildNoFreeParamFunctions skips function definitions" {
     var result = try buildNoFreeParamFunctions(a, content);
     defer result.deinit(a);
 
-    // "doStuff" should NOT be detected — it's a definition, not a call
+    // "doStuff" should NOT be detected — it is a definition, not a call
     try std.testing.expect(!result.contains("doStuff"));
 }
 
@@ -88453,7 +88601,7 @@ test "extractMultilineFirstArg skips type param for type-first patterns" {
 test "no FP for non-memory alloc method (ZA103)" {
     var diag = testDiagCtx();
     // Non-allocator structs can have .alloc() methods (e.g. SPIR-V register allocation).
-    // These should NOT trigger ZA101/ZA103 since they don't allocate heap memory.
+    // These should NOT trigger ZA101/ZA103 since they do not allocate heap memory.
     // std.mem.Allocator.alloc() always takes a type as first arg (u8, MyStruct, etc.).
     // Non-memory .alloc() takes runtime values (ids, counts, etc.).
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -92752,7 +92900,7 @@ test "isCleanupMethodCall applies camelCase boundaries to keywords (EPH-I0409)" 
 }
 
 test "isCleanupMethodCall keeps snake_case segment suppressions (EPH-I0875)" {
-    // An underscore before the match is a segment boundary: the
+    // An underline before the match is a segment boundary: the
     // snake_case compound peer_teardown keeps its legit ZA201 suppression.
     try std.testing.expect(isCleanupMethodCall("x.peer_teardown() catch {}"));
     try std.testing.expect(isCleanupMethodCall("x.pre_deinit() catch {}"));
@@ -93035,7 +93183,7 @@ test "countLineCognitive weights by nesting and counts else/orelse" {
     // — EPH-I0458.
     try std.testing.expectEqual(@as(usize, 0), countLineCognitive("try foo();", 0, 0));
     try std.testing.expectEqual(@as(usize, 1), countLineCognitive("x catch |e| {", 0, 0));
-    // else costs 1 at the closed scope's level (else_nest) but doesn't
+    // else costs 1 at the closed scope's level (else_nest) but does not
     // increase nesting
     try std.testing.expectEqual(@as(usize, 1), countLineCognitive("} else {", 0, 0));
     try std.testing.expectEqual(@as(usize, 2), countLineCognitive("} else {", 2, 1));
@@ -96944,7 +97092,7 @@ test "ZA903: non-decimal range-end subtrahends parse by base (EPH-I0977)" {
     // compound tail check reject the range end as unclassifiable, so
     // every non-decimal twin fired as unknowable regardless of n.
     // The base-0 std parse owns the
-    // prefix and underscore semantics (EPH-I0977). The fire twins
+    // prefix and underline semantics (EPH-I0977). The fire twins
     // pin the parse: the fire-twin amounts exceed their witnesses
     // (hex/bin/oct/mix by one; `1_0` = 10 exceeds n = 4 by six).
     // `n - 0x2` with n = 2 is SILENT — 0x2 is 2 and 2 - 2 does not
@@ -101464,7 +101612,7 @@ test "analyzer drivers free their issue lists on the happy path (EPH-I0459)" {
     defer deinitIssues(&err_issues, allocator);
     var cx_issues = try analyzeComplexity(allocator, &graph, th);
     defer deinitIssues(&cx_issues, allocator);
-    var ast_issues = try analyzeAstTier(allocator, &graph, null);
+    var ast_issues = try analyzeAstTier(allocator, &graph, null, null);
     defer deinitIssues(&ast_issues, allocator);
     var style_issues = try analyzeStyle(allocator, &graph, th);
     defer deinitIssues(&style_issues, allocator);
@@ -104500,7 +104648,7 @@ test "ZT102: assert word-boundary classes still join the witness set (EPH-I0048)
     const allocator = gpa.allocator();
 
     // Controls for the word-boundary matcher: camelCase `fxAssert`,
-    // underscore `assert_invariants`, and the hardware `assertCs` method
+    // underline `assert_invariants`, and the hardware `assertCs` method
     // all carry `assert` as a whole word and keep mediating. assertCs is
     // the documented residual: it is an error-returning hardware check
     // (RhyOS `SpiError!void`), so the mediation direction matches the
@@ -106453,7 +106601,7 @@ test "ZT105 EPH-I0031: quoted fn name is a candidate and a test call is evidence
     // Pre-fix a `pub fn @"..."` decl was skipped (the name scan only
     // accepted identifier starts), so quoted-name fns were never
     // candidates — tested or not. The test calls the hyphenated one; the
-    // underscore one stays unreferenced. plain_api is the control.
+    // underline one stays unreferenced. plain_api is the control.
     const content =
         \\pub fn @"quoted-name"() void {}
         \\pub fn @"quoted_unused"() void {}
@@ -113235,7 +113383,7 @@ test "list-tests JSON listing parses and counts (EPH-I1088)" {
     try buildTestListingJson(&obj, allocator, &blocks);
 
     // The rendered document must re-parse and carry both entries plus the
-    // count — the machine contract the gate's cross-check reads.
+    // count — the machine guarantee the gate's cross-check reads.
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, obj.buf.items, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
@@ -113922,7 +114070,7 @@ test "duplicate list keys accumulate, duplicate scalars last-win (B13-12)" {
 }
 
 test "config values are used raw, escapes are not decoded (B13-10)" {
-    // The raw span is the consumer contract: `a\/b` stays the seven
+    // The raw span is the consumer guarantee: `a\/b` stays the seven
     // bytes a\/b and never matches the path a/b.
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -114029,7 +114177,7 @@ test "config pair with a cross-line colon keeps its default (EPH-I1049)" {
     // first newline, so a separator colon on a later line cannot bind.
     // The pair is skipped — the key keeps its default, no warning — and
     // a clean pair that parsed before it stays intact. Pinned so a
-    // future cross-line scan cannot silently change the grammar contract.
+    // future cross-line scan cannot silently change the grammar guarantee.
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var cfg = testConfig();
@@ -114118,7 +114266,7 @@ test "unresolvedScanRootExit text mode sanitizes the cannot-resolve line (EPH-I1
     // RED4-7 regression pin (EPH-I0172 abort half): the scan path may
     // carry scanned-tree bytes, so the raw-path render must never return.
     // The sanitized line prints once and the call returns the failure
-    // exit code — the I0728 one-line contract replaces the pre-fix
+    // exit code — the I0728 one-line guarantee replaces the pre-fix
     // propagate-and-reprint shape with a silent code.
     var diag = testDiagCtx();
     var capture = CaptureSink{};
@@ -114177,7 +114325,7 @@ test "errorExitCode keeps one error line per failure (EPH-I0728)" {
     // silent exit code instead of propagating (the runtime would add a
     // second bare "error: X" line). An error no diagnostic named still
     // propagates so the runtime line stays the only signal. JSON mode
-    // keeps the abort-object contract.
+    // keeps the abort-object guarantee.
     var quiet = testDiagCtx();
     try std.testing.expectError(
         error.OutOfMemory,
@@ -114202,7 +114350,7 @@ test "errorExitCode keeps one error line per failure (EPH-I0728)" {
 test "cliDiag latches the printed-error flag on the error keyword (EPH-I0728)" {
     // The latch keys on the comptime "error: " prefix: a warning or note
     // never arms it, and the armed latch drives the one-line exit
-    // contract in errorExitCode.
+    // guarantee in errorExitCode.
     var diag = testDiagCtx();
     var capture = CaptureSink{};
     diag.diag_sink = capture.sink();
@@ -114420,7 +114568,7 @@ test "autoDetectPath normalizes a ./-spelled root_source_file (EPH-I1041)" {
     // The detection reads cwd (Fs.cwd): chdir into the fixture and
     // restore before the test ends. The restore is the ZT104-sanctioned
     // defer-cleanup form: it cannot fail in practice (old_cwd was
-    // realpath'd moments ago and exists), and a failed restore would
+    // went through realpath moments ago and exists), and a failed restore would
     // only poison the tests that follow.
     var old_buf: [Fs.max_path_bytes]u8 = undefined;
     const old_cwd = try Fs.cwd(std.testing.io).realpath(".", &old_buf);
@@ -114444,7 +114592,7 @@ test "autoDetectPath normalizes a ./-spelled root_source_file (EPH-I1041)" {
     // testing allocator at teardown, the discriminator. Earlier indices
     // fail inside the detection, which falls back to "." or "" and still
     // returns success with an owned path, so the success branch only
-    // asserts the ownership contract, never a spelling. The read-failure
+    // asserts the ownership guarantee, never a spelling. The read-failure
     // indices echo the "no build.zig found" diagnostic through cliDiag:
     // muted per the error-path test convention.
     diag.cli_diagnostics_enabled = false;
@@ -115912,7 +116060,7 @@ test "config path_dir aliases code, src, root all route to the same key (B13-10)
 
 test "config thresholds overflow warns and keeps the default (B13-11)" {
     // A digit run overflowing usize is unparseable: the pre-fix code
-    // skipped it silently, so a typo'd huge value reverted to the default
+    // skipped it silently, so a mistyped huge value reverted to the default
     // with no signal. Now it warns (EPH-I0518).
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -116994,7 +117142,7 @@ test "a successful export leaves the exit flag clear (EPH-I0741)" {
 }
 
 test "file-level findings render with a position (EPH-I0739)" {
-    // The chosen I0739 contract: every finding line carries :line:col,
+    // The chosen I0739 guarantee: every finding line carries :line:col,
     // file-level findings included, so the single documented VS Code
     // problemMatcher regex matches all of them. The pre-fix drop branch
     // printed `f.zig: warning[ZA501]: ...` — invisible to the matcher —
@@ -117444,6 +117592,10 @@ test "patchBuildZig inserts the ephor block at the anchored point (EPH-I0512)" {
     // The block lands after the last build-fn statement, before the close.
     try std.testing.expect(block_pos > mem.indexOf(u8, after, "_ = optimize;").?);
     try std.testing.expect(mem.endsWith(u8, after, "}\n"));
+    // EPH-I0721: the block is newline-terminated before the next original
+    // line. Pre-fix the byte at block end was `}` — the closing brace
+    // glued onto `...step);` — and zig fmt --check flagged the file.
+    try std.testing.expectEqual(@as(u8, '\n'), after[block_pos + EPHOR_BUILD_BLOCK.len]);
 }
 
 test "patchBuildZig rejects a mid-expression splice and keeps the file (EPH-I0512)" {
@@ -117985,6 +118137,11 @@ test "requireZigFloor refuses a detected Zig below 0.16.0 (EPH-I0239)" {
         std.mem.indexOf(u8, capture.slice(), "requires Zig 0.16.0 or newer") != null,
     );
     try std.testing.expect(std.mem.indexOf(u8, capture.slice(), "Detected Zig 0.15") != null);
+    // EPH-I1160: the remedy names the platform installer for both OS
+    // families, and the shared 0.15-era release pin.
+    try std.testing.expect(std.mem.indexOf(u8, capture.slice(), "install.sh on POSIX") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.slice(), "install.ps1 on Windows") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.slice(), zig015_era_release) != null);
 }
 
 test "install refuses a detected Zig below 0.16.0 before the fetch (EPH-I0239)" {
@@ -119164,7 +119321,7 @@ test "suppression: .ephor-ignore auto-load discloses itself (RED3-7)" {
 test "CLI explicit known-issues path must be readable (EPH-I0521)" {
     var diag = testDiagCtx();
     // Regression: a missing explicit --known-issues=<file> fell into the
-    // auto-load's silent `catch return`, so a typo'd path un-filtered
+    // auto-load's silent `catch return`, so a mistyped path un-filtered
     // every known issue despite help/README promising the explicit path
     // is always honored (a fail-open suppression control).
     diag.cli_diagnostics_enabled = false;
@@ -119661,6 +119818,45 @@ fn buildOneFileGraph(
     return graph;
 }
 
+test "analyzeFileAstTier emits one ZA503 for a parse-broken file (EPH-I0742)" {
+    const a = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, a);
+    var parse_issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&parse_issues, a);
+    try ast_tier.analyzeFileAstTier(a, .{
+        .issues = &issues,
+        .parse_issues = &parse_issues,
+    }, "broken.zig", "fn broken( {");
+    // The rule list stays empty (the tier skipped the broken file); the
+    // parse sink carries one warning naming the host parser's verdict.
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+    try std.testing.expectEqual(@as(usize, 1), parse_issues.items.len);
+    const finding = parse_issues.items[0];
+    try std.testing.expectEqualStrings("ZA503", finding.rule);
+    try std.testing.expect(finding.severity == .warning);
+    try std.testing.expectEqualStrings("broken.zig", finding.file);
+    try std.testing.expect(finding.line >= 1);
+    try std.testing.expect(finding.col >= 1);
+    try std.testing.expect(finding.message.len > 0);
+    try std.testing.expect(finding.message.len <= types.parse_error_message_cap_bytes);
+    try std.testing.expectEqualStrings(
+        "fix the syntax error; the AST tier skipped this file",
+        finding.help.?,
+    );
+
+    // A well-formed file produces no ZA503 through the same sink.
+    var good_parse: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&good_parse, a);
+    var good_issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&good_issues, a);
+    try ast_tier.analyzeFileAstTier(a, .{
+        .issues = &good_issues,
+        .parse_issues = &good_parse,
+    }, "ok.zig", "fn f() void {}\n");
+    try std.testing.expectEqual(@as(usize, 0), good_parse.items.len);
+}
+
 test "EPH-I0191: analyzeAstTier skips over-budget nesting without crashing" {
     var diag = testDiagCtx();
     const a = std.testing.allocator;
@@ -119669,7 +119865,7 @@ test "EPH-I0191: analyzeAstTier skips over-budget nesting without crashing" {
     var graph = try buildOneFileGraph(&diag, a, "deep.zig", src);
     defer graph.deinit();
     var stats = ast_tier.Stats{};
-    var issues = try analyzeAstTier(a, &graph, &stats);
+    var issues = try analyzeAstTier(a, &graph, &stats, null);
     defer deinitIssues(&issues, a);
     try std.testing.expectEqual(@as(usize, 1), stats.skipped);
     try std.testing.expectEqual(@as(usize, 0), stats.parsed);
@@ -119684,7 +119880,7 @@ test "EPH-I0191: analyzeAstTier parses within-budget nesting" {
     var graph = try buildOneFileGraph(&diag, a, "shallow.zig", src);
     defer graph.deinit();
     var stats = ast_tier.Stats{};
-    var issues = try analyzeAstTier(a, &graph, &stats);
+    var issues = try analyzeAstTier(a, &graph, &stats, null);
     defer deinitIssues(&issues, a);
     try std.testing.expectEqual(@as(usize, 1), stats.parsed);
     try std.testing.expectEqual(@as(usize, 0), stats.skipped);

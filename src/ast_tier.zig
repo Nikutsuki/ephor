@@ -4,19 +4,18 @@
 // SPDX-License-Identifier: MIT
 
 //! The line tier is fast but grammar-blind. This tier parses each file
-//! with the host compiler's own std.Ast (ephor is compiled per Zig
-//! version, so the grammar always matches the toolchain) and runs rules
-//! that are impossible or unreliable line-based. It is strictly additive.
+//! with the host std.Ast (the grammar always matches the toolchain) and
+//! runs rules that are impossible line-based. It is strictly additive.
 //!
 //! Degradation guarantee: a parse error makes the tree partial and
 //! `AstContext.ok` false — AST rules skip the file and the line tier
 //! still covers it. Deep delimiter/prefix nesting skips before the parse
-//! runs (EPH-I0191); a refused parse thread skips too (EPH-I0597).
+//! runs (EPH-I0191); a refused thread skips too (EPH-I0597).
 //!
 //! ZA111 (returned-stack-reference) lives in ast_tier_za111.zig, split
 //! out so each half stays under the 64 KiB AST-tier input cap
 //! (EPH-I0601). This file owns the parse, the nesting pre-scan, and the
-//! per-file pipeline. The EPH-I0046 extension tests live in
+//! per-file pipeline. EPH-I0046 extension tests live in
 //! ast_tier_za111_tests.zig for the same cap.
 
 const std = @import("std");
@@ -48,13 +47,12 @@ pub const AstContext = struct {
     /// hard half of the EPH-I0191 guarantee (EPH-I0268). Parser stack
     /// need grows with input size, so the byte cap plus this stack bound
     /// the worst case by construction, with no grammar assumptions. The
-    /// caller blocks in join while the worker allocates, so every
-    /// allocation happens-before the caller resumes: no concurrent
+    /// caller blocks in join while the worker allocates, so no concurrent
     /// allocator access. Direct use on untrusted input above
     /// `max_ast_file_bytes` still reopens the crash class. Production
-    /// callers must go through `analyzeFileAstTier`. A refusal to create
-    /// the worker thread surfaces as `error.ThreadSpawnFailed`; the tier
-    /// turns it into a counted skip (EPH-I0597).
+    /// callers must go through `analyzeFileAstTier`. A refused worker
+    /// thread surfaces as `error.ThreadSpawnFailed`; the tier counts it
+    /// as a skip (EPH-I0597).
     pub fn init(allocator: Allocator, source: []const u8) !AstContext {
         return switch (runGuardedParse(allocator, source, spawnParseWorker)) {
             .ok => |ctx| ctx,
@@ -81,7 +79,7 @@ pub const Stats = struct {
     /// (allocation) is not counted here (EPH-I0600).
     parsed: usize = 0,
     /// Files degraded to line-tier coverage: parse errors, deep nesting,
-    /// a size past the byte cap, or a refused parse thread (EPH-I0597).
+    /// a size past the byte cap, or a refused thread (EPH-I0597).
     skipped: usize = 0,
 };
 
@@ -124,23 +122,23 @@ fn parseOnCurrentThread(allocator: Allocator, source: []const u8) !AstContext {
 /// propagates allocation errors (EPH-I0597).
 const ParseOutcome = union(enum) {
     ok: AstContext,
-    /// The worker thread could not be created. Parsing on the caller's
+    /// The worker thread could not be created; parsing on the caller's
     /// stack would reopen the EPH-I0191 crash class, so the file
-    /// degrades to line-tier coverage instead.
+    /// degrades to line-tier coverage.
     spawn_refused,
     /// The worker ran and failed (allocation).
     err: anyerror,
 };
 
-/// Creates the parse worker thread. Split out so the degrade contract
-/// is testable: tests inject a refusing spawner (EPH-I0597).
+/// Creates the parse worker thread. Split out so tests inject a
+/// refusing spawner (EPH-I0597).
 ///
 /// Worker-thread contract (F10, EPH-I0697): the worker must never call
 /// compat helpers. compat.cached_tables is a plain unsynchronized lazy
 /// global, and its race-freedom rests on compat being reachable from
 /// the main thread only (the thread-safety comment in compat.zig names
 /// the same invariant). The join-then-resume shape makes the worker
-/// the process's only concurrent code: keep it allocator- and Ast-only.
+/// the only concurrent code: keep it allocator- and Ast-only.
 fn spawnParseWorker(job: *ParseJob) anyerror!std.Thread {
     return std.Thread.spawn(.{ .stack_size = parse_stack_bytes }, parseWorker, .{job});
 }
@@ -175,9 +173,12 @@ fn resolveParseOutcome(outcome: ParseOutcome, stats: ?*Stats) !?AstContext {
 }
 
 /// Sink for one file's AST-tier analysis: issues plus optional counters.
+/// `parse_issues` (optional) receives one ZA503 warning per file the
+/// parser rejects (EPH-I0742; helpers live in types.zig).
 pub const AstTierOut = struct {
     issues: *std.ArrayListUnmanaged(Issue),
     stats: ?*Stats = null,
+    parse_issues: ?*std.ArrayListUnmanaged(Issue) = null,
 };
 
 // ============================================================================
@@ -189,20 +190,19 @@ pub const AstTierOut = struct {
 /// parseExprPrecedence → parsePrefixExpr → parsePrimaryExpr →
 /// parseCurlySuffixExpr → parseTypeExpr → parseErrorUnionExpr →
 /// parseSuffixExpr → parsePrimaryTypeExpr → expectExpr). At that rate
-/// 20-50k nested parens exhaust the 8 MB default stack and SIGSEGV
-/// mid-run with no output. Prefix operators recurse two to five frames
-/// each without any delimiter, so the pre-scan budgets them with the
-/// same constant. Real code nests tens of levels, so 512 keeps a wide
-/// margin.
+/// 20-50k nested parens exhaust the 8 MB default stack and SIGSEGV with
+/// no output. Prefix operators recurse two to five frames each, so the
+/// pre-scan budgets them with the same constant. Real code nests tens
+/// of levels, so 512 keeps a wide margin.
 pub const max_nesting_depth: usize = 512;
 
 /// AST-tier input byte cap (EPH-I0268). Parser stack need grows with
 /// input size, so this cap plus `parse_stack_bytes` bounds the worst
 /// case by construction: the pre-scan and the grammar audit table are
-/// the cheap first gate, this is the guarantee that needs no grammar
+/// the cheap first gate, the guarantee that needs no grammar
 /// assumptions. 64 KiB sits past ZA702's exceptional-file threshold
 /// (50 KB default), so real code is unaffected. Over-cap files degrade
-/// to line-tier coverage, the same guarantee as parse errors.
+/// to line-tier coverage like parse errors.
 pub const max_ast_file_bytes: usize = 64 * 1024;
 
 /// Carried state for the pre-scan: two counters that estimate live
@@ -460,8 +460,8 @@ pub fn analyzeFileAstTier(
         return;
     }
     // Deep delimiter or operator nesting SIGSEGVs the recursive host
-    // parser mid-run (EPH-I0191). Degrade to line-tier coverage, the
-    // same guarantee as parse errors.
+    // parser mid-run (EPH-I0191). Degrade to line-tier coverage like
+    // parse errors.
     if (exceedsNestingBudget(content, max_nesting_depth)) {
         if (out.stats) |s| s.skipped += 1;
         return;
@@ -471,6 +471,7 @@ pub fn analyzeFileAstTier(
     defer parsed.deinit(a);
     if (!parsed.ok) {
         if (out.stats) |s| s.skipped += 1;
+        try types.noteParseError(out.parse_issues, a, path, &parsed.tree);
         return;
     }
     var tidx = try za111.buildTypeIndex(a, &parsed.tree);

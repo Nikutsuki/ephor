@@ -377,6 +377,72 @@ pub const escapeJson = sanitize.escapeJson;
 pub const sanitizeMarkdown = sanitize.sanitizeMarkdown;
 pub const sanitizeSnippet = sanitize.sanitizeSnippet;
 
+// ============================================================================
+// ZA503 parse-error finding (EPH-I0742)
+// ============================================================================
+// A file the host parser rejects is a real defect; before this finding
+// the AST tier skipped it in silence, so a syntax-broken file exited 0
+// under every strictness. One warning per file, at the first non-note
+// parse error. The helpers live here, not in ast_tier.zig, so
+// ast_tier.zig stays under its 64 KiB ZA111 input cap (the F12 pin).
+
+/// Byte cap on a rendered parse-error message: renderError prints one
+/// short line per error, so the cap is a bound, not a budget.
+pub const parse_error_message_cap_bytes: usize = 200;
+
+/// The first non-note parse error of `tree`. Note entries annotate a
+/// primary error, so the primary is the finding's anchor. A tree whose
+/// errors are all notes falls back to the first entry.
+fn firstRealParseError(tree: *const std.zig.Ast) std.zig.Ast.Error {
+    for (tree.errors) |e| {
+        if (!e.is_note) return e;
+    }
+    return tree.errors[0];
+}
+
+/// One ZA503 warning for a file the host parser rejects. The message
+/// is the rendered primary error, capped; the location is the error
+/// token's 1-based line/col. `file` borrows the caller's path, the
+/// same lifetime pattern as the ZA111 findings.
+pub fn parseErrorIssue(a: Allocator, path: []const u8, tree: *const std.zig.Ast) !Issue {
+    const err = firstRealParseError(tree);
+    // The Allocating writer owns the render buffer; toArrayList hands
+    // the bytes to a managed list whose toOwnedSlice transfers them to
+    // the issue (no fallible call follows the transfer).
+    var aw = std.Io.Writer.Allocating.init(a);
+    defer aw.deinit();
+    try tree.renderError(err, &aw.writer);
+    var list = aw.toArrayList();
+    defer list.deinit(a);
+    if (list.items.len > parse_error_message_cap_bytes) {
+        list.shrinkRetainingCapacity(parse_error_message_cap_bytes - 3);
+        try list.appendSlice(a, "...");
+    }
+    const loc = tree.tokenLocation(0, err.token);
+    return .{
+        .file = path,
+        .line = loc.line + 1,
+        .col = loc.column + 1,
+        .severity = .warning,
+        .rule = "ZA503",
+        .message = try list.toOwnedSlice(a),
+        .message_owned = true,
+        .help = "fix the syntax error; the AST tier skipped this file",
+    };
+}
+
+/// Append one ZA503 warning to the parse sink when it exists.
+pub fn noteParseError(
+    sink: ?*std.ArrayListUnmanaged(Issue),
+    a: Allocator,
+    path: []const u8,
+    tree: *const std.zig.Ast,
+) !void {
+    if (sink) |s| {
+        try s.append(a, try parseErrorIssue(a, path, tree));
+    }
+}
+
 /// Buffered byte sink for the issue format cores: pairs the output list
 /// with its allocator so formatter signatures stay within the param cap.
 pub const OutBuf = struct {

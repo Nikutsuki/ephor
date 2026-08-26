@@ -22,7 +22,7 @@ a directory named `style`.
 
 ## Installation
 
-**Requires**: A Zig project with `build.zig` and `build.zig.zon` (run `zig init` if you don't have these).
+**Requires**: A Zig project with `build.zig` and `build.zig.zon` (run `zig init` if you do not have these).
 
 **macOS / Linux:**
 ```bash
@@ -42,7 +42,7 @@ Then run:
 zig build ephor
 ```
 
-That's it.
+That is it.
 
 ### Upgrading
 
@@ -445,7 +445,7 @@ An override that is not absolute or does not resolve prints a warning and falls 
 | **ZA305** | warning | OFF | Function has high cyclomatic complexity — McCabe CCN (default: 10) |
 | **ZA306** | warning | OFF | Function has high cognitive complexity — Sonar-style weighted nesting (default: 15) |
 
-**Note:** Functions returning `type` (comptime type factories like `fn Bind(T: type) type`) automatically get relaxed limits since they're metaprogramming constructs that build types at compile time. `inline for/while` loops are not counted as branches since they're compile-time unrolled.
+**Note:** Functions returning `type` (comptime type factories like `fn Bind(T: type) type`) automatically get relaxed limits since they are metaprogramming constructs that build types at compile time. `inline for/while` loops are not counted as branches since they are compile-time unrolled.
 
 **Data-dispatch functions** (parse/deserialize/serialize/config loaders — one branch per field) get an 8x limit on ZA304, ZA305, and ZA306. **Flat-chain functions** (routers/dispatchers where cognitive <= cyclomatic x 1.5 and max nesting <= 2) get a 2x limit on ZA305 and ZA306. **Flat switch dispatchers** (a top-level switch whose arms sit at one level with trivial bodies — the cognitive excess over cyclomatic is at most the arm count, the switch scope's per-arm scaling) get a 2x limit on ZA304, ZA305, and ZA306. **Data tables** (structurally detected pure data mapping — constant arms, literal-assignment rows, no calls or control flow) get a 20x limit on ZA301, ZA304, ZA305, and ZA306.
 
@@ -475,6 +475,7 @@ ZA305 and ZA306 are off by default. To enable them, remove `"ZA305"` and `"ZA306
 |------|----------|---------|-------------|
 | **ZA501** | warning | ON | Orphan file (not imported from entry points) |
 | **ZA502** | warning | ON | File reaches or exceeds the 10 MiB source read cap and is skipped from analysis (split the file into smaller units) |
+| **ZA503** | warning | ON | File does not parse (the AST tier's host-parser check rejected it): one finding per file, located at the first parse error, naming the error. The line tier still scans the file, but `zig build` cannot compile it (EPH-I0742) |
 
 **ZA501 and the build graph:** build.zig contributes reachability
 through its `b.path("...")` references — test roots and tools that
@@ -594,7 +595,7 @@ variable, a `std.math.cast` checked conversion of the same variable, or a
 cast), or a range-for index capture over a bounded range (`for (0..N) |i|` —
 last capture only, and the range expression must be present; iterating a
 slice with `for (items) |x|` is not a proof). `testing.expect` lines are
-skipped entirely (assertions construct fixtures, they don't need guards).
+skipped entirely (assertions construct fixtures, they do not need guards).
 Only plain-identifier arguments are analyzed — literals (already
 comptime-known), expressions, field accesses, and multi-line calls are
 skipped silently. Note that `@truncate` can never panic (it is defined to
@@ -909,7 +910,7 @@ Use this to automatically run Ephor whenever you save a `.zig` file.
 | Field | Value |
 |-------|-------|
 | **Name** | `Ephor` |
-| **File type** | `Zig` (or `Any` if Zig isn't listed) |
+| **File type** | `Zig` (or `Any` if Zig is not listed) |
 | **Scope** | `Project Files` |
 | **Program** | `/usr/local/bin/ephor` |
 | **Arguments** | `check $FilePath$` |
@@ -930,7 +931,7 @@ In the **Advanced Options** section:
 
 **Step 4: File Type Configuration (if Zig not recognized)**
 
-If IntelliJ doesn't recognize `.zig` files:
+If IntelliJ does not recognize `.zig` files:
 
 1. Go to **Settings** → **Editor** → **File Types**
 2. Click **+** to add a new file type, or find an existing one to modify
@@ -1165,7 +1166,7 @@ Ephor has four analysis entry points:
 | `analyzeFileErrors` | Full file, line-by-line | ZA201-ZA208, ZA210 (in `checkLineErrors`), ZA209 (whole-body scan) | `TypeContext` via `parseFileTypeContext(content)` |
 | `analyzeIgnoredErrorsInFile` | Full file, line-by-line | ZA205 (in `checkIgnoredError`) | `TypeContext` via `parseFileTypeContext(content)` |
 | `analyzeCFGFile` | Full file, per-function CFG | ZA101-ZA106, ZA110, ZA607, ZA8xx, ZA901/ZA903 (ZA904 runs standalone) | `CFGState` with file-level `no_free_fields` |
-| `analyzeAstTier` | Project import graph, per-file AST | ZA111 | `std.Ast` parse per file (`src/ast_tier.zig`); files with parse errors are skipped |
+| `analyzeAstTier` | Project import graph, per-file AST | ZA111, ZA503 | `std.Ast` parse per file (`src/ast_tier.zig`); files with parse errors are skipped for ZA111 and reported as ZA503 (EPH-I0742) |
 
 Error analysis (`analyzeFileErrors`, `analyzeIgnoredErrorsInFile`) uses `TypeContext` for type-aware method return resolution. Memory analysis (`analyzeCFGFile`) uses CFG-based control flow analysis with type-based allocator suppression. ZA103 is the one exception: its errdefer verdict uses a line-interval model, not the CFG (see the Memory Analysis Path section).
 
@@ -1312,7 +1313,7 @@ Memory analysis runs three specialized analyzers. ZA101, ZA102, ZA105, and ZA106
 2. **Function extraction**: Split file into individual functions
 3. **Per-function analysis** (`processFunction`): Run `runCFGMemoryAnalyses` (ZA101-ZA106), `runCFGSafetyAnalyses` (ZA8xx, ZA901/ZA903 — ZA904 runs standalone), and `runDefiniteAssignmentAnalysis`
 
-**No-free allocator suppression** — allocations that don't need per-allocation free:
+**No-free allocator suppression** — allocations that do not need per-allocation free:
 
 | Detection Method | What It Catches | Example |
 |-----------------|-----------------|---------|
@@ -1356,7 +1357,7 @@ The 64 KiB AST-tier cap is an accepted residual (EPH-I0293). It is a parser-stac
 | Cross-file type resolution | Types defined in imported files | Falls through to `.unknown` → vocab |
 | Generic type parameters | `ArrayList(u8)` stored as full text, lookup mismatch | Falls through to `.unknown` → vocab |
 | Type aliases | `const MyList = ArrayList;` not tracked | Falls through to `.unknown` → vocab |
-| Variable reassignment | `x = NewType.init()` doesn't update type | Uses original declaration type |
+| Variable reassignment | `x = NewType.init()` does not update type | Uses original declaration type |
 | Method chaining | `a.b().c()` — only sees last receiver | May resolve wrong receiver |
 | Nested function definitions | Functions inside functions | Registered as top-level |
 | Comptime-generated types | Types from `comptime` blocks | Falls through to `.unknown` → vocab |

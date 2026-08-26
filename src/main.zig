@@ -135,9 +135,14 @@ const Fs = struct {
 
 /// Spawn paths for the external tools ephor executes (EPH-I0154). main
 /// resolves them once from the EPHOR_ZIG_PATH / EPHOR_CURL_PATH env
-/// overrides. The bare defaults route the spawn through PATH.
+/// overrides, then through PATH to an absolute path (EPH-I0163): the
+/// spawn names the resolved binary, never a per-spawn PATH lookup name.
+/// The buffers back the resolved absolute paths, so no allocation is
+/// needed at startup.
 var tool_zig_path: []const u8 = "zig";
+var tool_zig_buf: [Fs.max_path_bytes]u8 = undefined;
 var tool_curl_path: []const u8 = "curl";
+var tool_curl_buf: [Fs.max_path_bytes]u8 = undefined;
 
 /// An external tool ephor spawns, for EPHOR_*_PATH resolution (EPH-I0154).
 const ToolKind = enum {
@@ -161,12 +166,17 @@ const ToolKind = enum {
     }
 };
 
-/// Resolve the spawn path of an external tool (EPH-I0154). An absolute env
-/// override that exists and is not a directory wins. An empty value counts
-/// as unset (EPH-I0314). Anything else falls back to the bare name and
-/// PATH with a warning. The fallback is fail-open, not a hard error: the
-/// threat is a hostile environment, which the operator controls, and a
-/// path typo must not brick the run.
+/// Resolve the spawn path of an external tool (EPH-I0154, EPH-I0163). An
+/// absolute env override that exists and is not a directory wins. An
+/// empty value counts as unset (EPH-I0314). Without a valid override the
+/// bare name resolves through PATH to an ABSOLUTE path at startup
+/// (EPH-I0163): the spawn then names the resolved binary instead of a
+/// per-spawn PATH lookup name, so the executed tool is fixed at startup
+/// and the subprocess boundary is deterministic. A PATH that yields no
+/// match keeps the bare name: the late spawn then fails with the same
+/// clear error as before. The fallback stays fail-open, not a hard
+/// error: the threat is a hostile environment, which the operator
+/// controls, and a path typo must not brick the run.
 ///
 /// The check is a fast-fail convenience, not a security gate (EPH-I0312):
 /// it validates existence and not-a-directory only. Executability is not
@@ -177,18 +187,27 @@ const ToolKind = enum {
 /// the same race for access()); it is accepted because the environment is
 /// operator-controlled and a swapped path fails at spawn with a clear
 /// error.
-fn resolveToolFromEnv(diag: *DiagCtx, tool: ToolKind, env_val: ?[]const u8) []const u8 {
-    const val = env_val orelse return tool.bareName();
+fn resolveToolFromEnv(
+    diag: *DiagCtx,
+    tool: ToolKind,
+    env_val: ?[]const u8,
+    path_env: ?[]const u8,
+) []const u8 {
+    const buf = switch (tool) {
+        .zig => &tool_zig_buf,
+        .curl => &tool_curl_buf,
+    };
+    const val = env_val orelse return resolveToolFromPath(diag, tool, buf, path_env);
     // An empty override is not an override: treat it as unset, silently
     // (EPH-I0314). The pre-fix warning called it "not an absolute path".
-    if (val.len == 0) return tool.bareName();
+    if (val.len == 0) return resolveToolFromPath(diag, tool, buf, path_env);
     if (!std.fs.path.isAbsolute(val)) {
         cliDiag(
             diag,
             "warning: ignoring {s} value '{s}' (not an absolute path). Using PATH.\n",
             .{ tool.envVar(), val },
         );
-        return tool.bareName();
+        return resolveToolFromPath(diag, tool, buf, path_env);
     }
     // statFile subsumes the existence check: it resolves the path and
     // reports the kind in one call. A directory would fail confusingly at
@@ -199,7 +218,7 @@ fn resolveToolFromEnv(diag: *DiagCtx, tool: ToolKind, env_val: ?[]const u8) []co
             "warning: {s} path '{s}' does not resolve. Using PATH.\n",
             .{ tool.envVar(), val },
         );
-        return tool.bareName();
+        return resolveToolFromPath(diag, tool, buf, path_env);
     };
     if (st.kind == .directory) {
         cliDiag(
@@ -207,15 +226,46 @@ fn resolveToolFromEnv(diag: *DiagCtx, tool: ToolKind, env_val: ?[]const u8) []co
             "warning: {s} path '{s}' is a directory. Using PATH.\n",
             .{ tool.envVar(), val },
         );
-        return tool.bareName();
+        return resolveToolFromPath(diag, tool, buf, path_env);
     }
     return val;
 }
 
+/// Resolve the bare tool name through PATH to an absolute path
+/// (EPH-I0163). The first PATH entry whose dir/name resolves as an
+/// existing non-directory wins; the name gets a ".exe" suffix on
+/// Windows, where the PATH entries hold extensionless names. An empty
+/// PATH entry (including the empty-list shape) and an unresolvable
+/// candidate skip silently — PATH conventions are per-platform, and the
+/// bare-name fallback keeps the pre-fix spawn failure for a tool no
+/// PATH entry names. The resolved path lands in `buf`, which backs
+/// tool_zig_path / tool_curl_path for the whole run.
+fn resolveToolFromPath(
+    diag: *DiagCtx,
+    tool: ToolKind,
+    buf: *[Fs.max_path_bytes]u8,
+    path_env: ?[]const u8,
+) []const u8 {
+    const name = tool.bareName();
+    const path_list = path_env orelse return name;
+    const exe_suffix: []const u8 = if (@import("builtin").os.tag == .windows) ".exe" else "";
+    var iter = mem.splitScalar(u8, path_list, std.fs.path.delimiter);
+    while (iter.next()) |dir| {
+        if (dir.len == 0) continue;
+        const candidate = std.fmt.bufPrint(buf, "{s}/{s}{s}", .{ dir, name, exe_suffix }) catch
+            continue;
+        const st = std.Io.Dir.cwd().statFile(diag.io, candidate, .{}) catch continue;
+        if (st.kind == .directory) continue;
+        return candidate;
+    }
+    return name;
+}
+
 /// Resolve every tool spawn path once from the process environment.
 fn initToolPaths(diag: *DiagCtx, environ_map: *const std.process.Environ.Map) void {
-    tool_zig_path = resolveToolFromEnv(diag, .zig, environ_map.get("EPHOR_ZIG_PATH"));
-    tool_curl_path = resolveToolFromEnv(diag, .curl, environ_map.get("EPHOR_CURL_PATH"));
+    const path_env = environ_map.get("PATH");
+    tool_zig_path = resolveToolFromEnv(diag, .zig, environ_map.get("EPHOR_ZIG_PATH"), path_env);
+    tool_curl_path = resolveToolFromEnv(diag, .curl, environ_map.get("EPHOR_CURL_PATH"), path_env);
 }
 
 /// Diagnostics and I/O context for one ephor run (EPH-I0771). Replaces the
@@ -320,6 +370,11 @@ const DiagCtx = struct {
     /// Outside-root entry notes printed. The gates print one note per
     /// config file or per extraction run, never per entry.
     entries_reject_note_count: usize = 0,
+    /// "CLI --entry values kept alongside target entries" notes
+    /// (EPH-I0201). One per run, when a dir-target switch keeps the
+    /// explicit CLI entries and a target source contributes entries
+    /// alongside them.
+    cli_entries_note_count: usize = 0,
     /// zig fmt output lines the EPH-I0197 safety gates rejected (hostile
     /// bytes, outside-root paths).
     fmt_reject_count: usize = 0,
@@ -15652,14 +15707,30 @@ const ImportGraph = struct {
                 return Fs.cwd(self.diag.io).realpath(dir, buf) catch continue;
             }
         }
-        // 2. Try parent of target path
+        // 2. Try parent of target path (EPH-I0161): the parent search
+        // is gated. The operator's own tree (the cwd and its ancestors)
+        // stays the documented exempt channel; a foreign parent needs
+        // --include-parent.
         const trimmed = mem.trimEnd(u8, cfg.path, "/");
-        if (self.checkBuildZigAt(
-            std.fs.path.dirname(trimmed) orelse ".",
-            buf,
-        )) |r| return r;
+        const parent = std.fs.path.dirname(trimmed) orelse ".";
+        if (self.parentSearchAllowed(cfg, parent)) {
+            if (self.checkBuildZigAt(parent, buf)) |r| return r;
+        }
         // 3. Try target path itself
         return self.checkBuildZigAt(trimmed, buf);
+    }
+
+    /// EPH-I0161 (RED4-4): true when the parent-dir build-reference
+    /// search may run. The parent of the operator's own tree (the cwd
+    /// and its ancestors — isConfigDirTrusted geometry) stays the
+    /// documented exempt channel: the README grants "the working
+    /// directory's own build.zig" outside-root reach. A foreign parent
+    /// (a neighbor of the scanned tree) needs the explicit
+    /// --include-parent flag, which never widens the containment gates:
+    /// every mark still passes isWithinScanRoot.
+    fn parentSearchAllowed(self: *ImportGraph, cfg: *const Config, parent: []const u8) bool {
+        if (cfg.include_parent) return true;
+        return isConfigDirTrusted(self.diag.io, parent);
     }
 
     /// Check if dir/build.zig exists and return realpath of dir.
@@ -15877,13 +15948,15 @@ const ImportGraph = struct {
         const trimmed = mem.trimEnd(u8, cfg.path, "/");
         var search_roots: [2][]const u8 = undefined;
         var rc: usize = 0;
-        var rb1: [Fs.max_path_bytes]u8 = undefined;
-        self.addSearchRoot(
-            std.fs.path.dirname(trimmed) orelse ".",
-            &rb1,
-            &search_roots,
-            &rc,
-        );
+        // EPH-I0161 (RED4-4): the parent search root joins only when the
+        // parent search is allowed (the operator's own tree, or the
+        // --include-parent opt-in). The default search stays inside the
+        // scan root.
+        const parent = std.fs.path.dirname(trimmed) orelse ".";
+        if (self.parentSearchAllowed(cfg, parent)) {
+            var rb1: [Fs.max_path_bytes]u8 = undefined;
+            self.addSearchRoot(parent, &rb1, &search_roots, &rc);
+        }
         var rb2: [Fs.max_path_bytes]u8 = undefined;
         self.addSearchRoot(trimmed, &rb2, &search_roots, &rc);
         defer for (search_roots[0..rc]) |r| self.allocator.free(r);
@@ -16036,7 +16109,12 @@ const ImportGraph = struct {
         self.markZigFilesRecursive(dir_path, 0) catch return;
     }
 
-    /// Mark a single .zig file as reachable via realpath resolution
+    /// Mark a single .zig file as reachable via realpath resolution.
+    /// EPH-I0161 (RED4-4): the walk marking channel gates on the scan
+    /// root, like the b.path channel (tryMarkBuildPath). Pre-fix this
+    /// channel marked matches with no containment, so a module-dir
+    /// match rooted at the parent (or any search root outside the scan
+    /// root) marked outside files reachable and the ref-scan read them.
     fn markSingleZigFile(self: *ImportGraph, dir_path: []const u8, name: []const u8) void {
         const full = std.fmt.allocPrint(
             self.allocator,
@@ -16046,6 +16124,7 @@ const ImportGraph = struct {
         defer self.allocator.free(full);
         var rbuf: [Fs.max_path_bytes]u8 = undefined;
         const resolved = Fs.cwd(self.diag.io).realpath(full, &rbuf) catch return;
+        if (!self.isWithinScanRoot(resolved)) return;
         if (!self.reachable.contains(resolved))
             self.markReachableResolved(resolved) catch return;
     }
@@ -38641,6 +38720,13 @@ const Config = struct {
     // scanned target's ephor.json. Default: untrusted configs set only
     // entries and path_dir (see isConfigDirTrusted).
     trust_target_config: bool = false,
+    // --include-parent (EPH-I0161): include the scan path's parent
+    // directory in the build-reference search (parent build.zig and the
+    // parent module-dir root). Off by default for a parent outside the
+    // operator's working directory; the cwd and its ancestors stay the
+    // documented exempt channel either way (README: "the working
+    // directory's own build.zig may point outside the scan root").
+    include_parent: bool = false,
     // Bitmask of Thresholds fields locked by CLI flags (RED3-6): a config
     // file must not overwrite a field the user set on the command line.
     threshold_cli_mask: u8 = 0,
@@ -42853,16 +42939,110 @@ fn isCwdDir(diag: *DiagCtx, dir: []const u8) bool {
     return mem.eql(u8, dir_real, cwd_real);
 }
 
-fn detectTargetEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
+fn detectTargetEntries(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    cfg: *Config,
+    cli_entries: bool,
+) !void {
     // EPH-I0801: a file target has no target tree to switch into, so it
     // takes its own path below. A directory target switches project
     // context: the target tree's own entries replace the cwd config's.
     if (isFileTarget(diag, cfg.path)) return detectFileTargetEntries(diag, allocator, cfg);
+    // EPH-I0201 (RED3-2): an explicit --entry is operator intent. The
+    // unconditional wipe below discarded it, so a hostile target config
+    // replaced the victim's pinned entry and defeated the orphan scan.
+    // The CLI-entry path keeps the entries while the target sources
+    // load, then re-appends them.
+    if (cli_entries) return detectCliEntriesTarget(diag, allocator, cfg);
     for (cfg.entries.items) |e| allocator.free(e);
     cfg.entries.clearRetainingCapacity();
     try loadConfigFromTargetPath(diag, allocator, cfg, cfg.path);
     if (cfg.entries.items.len > 0) return;
     try scanTargetTreeEntries(diag, allocator, cfg);
+}
+
+/// EPH-I0201 dir-target entry detection with explicit CLI entries. The
+/// CLI entries move OUT of cfg.entries while the target config load and
+/// the tree scan run (the EPH-I0801 move pattern: makeEntriesAbsolute
+/// rebases and gates every entry it sees, and CLI entries must keep
+/// their operator spelling), then re-append after — the scan stays the
+/// CLI path UNION the honored entries (EPH-I0784). A note names the
+/// target source that contributed entries alongside the CLI set.
+fn detectCliEntriesTarget(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
+    var kept = cfg.entries;
+    cfg.entries = .empty;
+    // Whatever survives in `kept` was re-appended. The buffer and its
+    // remaining strings die here, on success and on error.
+    defer {
+        for (kept.items) |e| allocator.free(e);
+        kept.deinit(allocator);
+    }
+    try loadConfigFromTargetPath(diag, allocator, cfg, cfg.path);
+    const from_tree = cfg.entries.items.len == 0;
+    if (from_tree) try scanTargetTreeEntries(diag, allocator, cfg);
+    const contributed = cfg.entries.items.len;
+    const cli_count = kept.items.len;
+    // Re-append the kept CLI entries the target sources did not add
+    // themselves. Capacity first: one fallible call, so the move loop
+    // cannot fail with ownership half-moved.
+    try cfg.entries.ensureUnusedCapacity(allocator, kept.items.len);
+    var remaining: usize = 0;
+    for (kept.items) |e| {
+        if (containsEntry(cfg.entries.items, e)) {
+            kept.items[remaining] = e;
+            remaining += 1;
+            continue;
+        }
+        cfg.entries.appendAssumeCapacity(e);
+    }
+    // Moved entries sit past the new length, so the deferred cleanup
+    // frees only the duplicates.
+    kept.shrinkRetainingCapacity(remaining);
+    if (contributed > 0)
+        try noteCliEntriesKept(diag, allocator, cfg, .{
+            .kept = cli_count,
+            .contributed = contributed,
+            .from_tree = from_tree,
+        });
+}
+
+/// EPH-I0201 note payload: the kept CLI count, the target's
+/// contribution, and the contribution source. Grouped so the note
+/// function stays inside the parameter budget.
+const CliEntriesNote = struct {
+    kept: usize,
+    contributed: usize,
+    from_tree: bool,
+};
+
+/// EPH-I0201 note: the dir-target switch kept the explicit CLI entries
+/// and a target source contributed entries alongside them. Names the
+/// source (target config or target-tree scan), both counts, and the
+/// target path, which can derive from config bytes (EPH-I0147: it
+/// crosses the terminal sanitizer).
+fn noteCliEntriesKept(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    cfg: *const Config,
+    note: CliEntriesNote,
+) !void {
+    var safe_path = try types.sanitizeTerminal(allocator, cfg.path);
+    defer safe_path.deinit(allocator);
+    // B13-21 (EPH-I0520): count only after the fallible sanitize
+    // succeeded — an OOM before the note prints must not count it.
+    diag.cli_entries_note_count += 1;
+    cliDiag(
+        diag,
+        "note: honoring {d} CLI --entry {s} alongside {d} entries from the target {s} at {s}\n",
+        .{
+            note.kept,
+            if (note.kept == 1) @as([]const u8, "value") else "values",
+            note.contributed,
+            if (note.from_tree) @as([]const u8, "tree scan") else "config",
+            safe_path.slice,
+        },
+    );
 }
 
 /// Discover entries in the target tree: conventional entry files, the
@@ -43537,6 +43717,28 @@ fn requireCommandScope(
     return error.FlagWrongCommand;
 }
 
+/// Command-scoped flags: parse, then fail closed on a command that does
+/// not honor them (EPH-I0525). Every match is an exact-name compare, so
+/// check order cannot shadow a sibling flag.
+fn parseCommandScopedFlag(diag: *DiagCtx, arg: []const u8, cfg: *Config) !bool {
+    if (mem.eql(u8, arg, "--build") or mem.eql(u8, arg, "-b")) {
+        try requireCommandScope(diag, cfg, arg, build_scope);
+        cfg.init_build = true;
+        return true;
+    }
+    if (mem.eql(u8, arg, "--yes") or mem.eql(u8, arg, "-y")) {
+        try requireCommandScope(diag, cfg, arg, yes_scope);
+        cfg.auto_approve = true;
+        return true;
+    }
+    if (mem.eql(u8, arg, "--force")) {
+        try requireCommandScope(diag, cfg, arg, force_scope);
+        cfg.force_upgrade = true;
+        return true;
+    }
+    return false;
+}
+
 /// Parse simple flags (returns true if handled)
 fn parseSimpleFlag(diag: *DiagCtx, arg: []const u8, cfg: *Config) !bool {
     if (mem.eql(u8, arg, "-V") or mem.eql(u8, arg, "--verbose")) {
@@ -43558,16 +43760,7 @@ fn parseSimpleFlag(diag: *DiagCtx, arg: []const u8, cfg: *Config) !bool {
         cfg.format = .text;
         return true;
     }
-    if (mem.eql(u8, arg, "--build") or mem.eql(u8, arg, "-b")) {
-        try requireCommandScope(diag, cfg, arg, build_scope);
-        cfg.init_build = true;
-        return true;
-    }
-    if (mem.eql(u8, arg, "--yes") or mem.eql(u8, arg, "-y")) {
-        try requireCommandScope(diag, cfg, arg, yes_scope);
-        cfg.auto_approve = true;
-        return true;
-    }
+    if (try parseCommandScopedFlag(diag, arg, cfg)) return true;
     if (mem.eql(u8, arg, "--strict")) {
         setFailOn(cfg, .warning, .cli);
         return true;
@@ -43576,13 +43769,12 @@ fn parseSimpleFlag(diag: *DiagCtx, arg: []const u8, cfg: *Config) !bool {
         cfg.trust_target_config = true;
         return true;
     }
-    if (mem.eql(u8, arg, "--no-suppression")) {
-        cfg.no_suppression = true;
+    if (mem.eql(u8, arg, "--include-parent")) {
+        cfg.include_parent = true;
         return true;
     }
-    if (mem.eql(u8, arg, "--force")) {
-        try requireCommandScope(diag, cfg, arg, force_scope);
-        cfg.force_upgrade = true;
+    if (mem.eql(u8, arg, "--no-suppression")) {
+        cfg.no_suppression = true;
         return true;
     }
     return false;
@@ -43855,6 +44047,7 @@ const cli_default_config = Config{
     .auto_approve = false,
     .runtime_command = null,
     .install_version = null,
+    .include_parent = false,
 };
 
 /// Strip trailing slashes from an owned path to prevent double-slash in output
@@ -44174,7 +44367,8 @@ fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) 
     try stripTrailingSlashes(allocator, &cfg);
     try autoDetectPath(diag, allocator, &cfg);
     if (cfg.path_owned and !mem.eql(u8, cfg.path, "src"))
-        try detectTargetEntries(diag, allocator, &cfg);
+        // EPH-I0201: an explicit --entry survives the target switch.
+        try detectTargetEntries(diag, allocator, &cfg, cli_entries);
     if (cfg.entries.items.len == 0) try detectStandardEntries(diag, allocator, &cfg);
     return cfg;
 }
@@ -44229,6 +44423,12 @@ fn printHelp() void {
         \\                       auto-load. Without it, a config outside the
         \\                       working directory and its ancestors sets only
         \\                       "entries". The rest is ignored with a note.
+        \\  --include-parent    Include the scan path's parent directory in
+        \\                       the build-reference search (the parent
+        \\                       build.zig and the parent module-directory
+        \\                       root). Off by default for a parent outside
+        \\                       the working directory. The reachability marks
+        \\                       still stay inside the scan root.
         \\  --no-suppression     Audit mode: inline directives and the
         \\                       known-issues list no longer hide findings.
         \\                       The findings print, and the suppression note
@@ -44270,6 +44470,15 @@ fn printHelp() void {
         \\                          spawns. Ephor executes the zig and curl found via
         \\                          PATH. A poisoned PATH is code execution, so pin
         \\                          these in a hostile environment.
+        \\SUBPROCESS BOUNDARY: the check and fmt-check commands spawn one
+        \\                          child process per run: 'zig fmt --check' on
+        \\                          the scanned path. The child is read-only
+        \\                          (no build, no test, no execution of scanned
+        \\                          code), its output is byte-capped, and its
+        \\                          paths gate on the scan root. Ephor resolves
+        \\                          the zig binary to an absolute path at
+        \\                          startup, so the spawned binary is fixed
+        \\                          before any scan input is read.
         \\
         \\INSTALL/UPGRADE EXAMPLES:
         \\  ephor install                    # Install current binary version
@@ -44546,8 +44755,8 @@ fn loadKnownIssuesOnce(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void
         const trimmed = mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
         if (trimmed[0] == '#') continue; // Comment
-        // Format: file:line or file:line:rule
-        // We store just file:line for matching
+        // Format: file:line or file:line:rule (EPH-I0158). The full line
+        // is stored; isKnownIssue parses the rule suffix at match time.
         const key = try allocator.dupe(u8, trimmed);
         errdefer allocator.free(key);
         try cfg.known_issues.append(allocator, key);
@@ -44621,26 +44830,54 @@ fn probeKnownIssuesDir(
 }
 
 /// True when the issue's file:line matches a loaded known-issue key.
-/// Keys are "file:line" lines; the line number is the last
-/// colon-separated field, so a file path containing ':' still parses
-/// (the line part must be a number). Both sides strip one leading
-/// "./" prefix before the compare (EPH-I0738): findings render relative
-/// to the invocation cwd, so `ephor check .` prints `./src/x.zig`
-/// while a hand-written key says `src/x.zig` — the pre-fix byte-exact
-/// compare silently un-matched from another CWD. Beyond the prefix the
-/// compare stays byte-exact. No fixed-size key buffer: a file path
-/// longer than 512 bytes used to fail bufPrint and silently never
-/// matched (B14-12). The linear scan is O(issues x keys); acceptable at
-/// current list sizes.
+/// Two key forms (EPH-I0158): "file:line" suppresses every rule at the
+/// line; "file:line:rule" suppresses only that rule. The line number is
+/// the last colon-separated numeric field, so a file path containing
+/// ':' still parses (the line part must be a number); a non-numeric
+/// last field is the rule suffix, and the line then sits one field
+/// earlier. Both sides strip one leading "./" prefix before the
+/// compare (EPH-I0738): findings render relative to the invocation cwd,
+/// so `ephor check .` prints `./src/x.zig` while a hand-written key
+/// says `src/x.zig` — the pre-fix byte-exact compare silently
+/// un-matched from another CWD. Beyond the prefix the compare stays
+/// byte-exact. No fixed-size key buffer: a file path longer than 512
+/// bytes used to fail bufPrint and silently never matched (B14-12).
+/// The linear scan is O(issues x keys); acceptable at current list
+/// sizes.
+/// Does the finding match one known-issues key? The 3-field form
+/// (file:line:rule, EPH-I0158) suppresses only that rule. The 2-field
+/// form (file:line) suppresses every rule. A malformed line field skips
+/// the key, never the whole list.
+fn knownIssueKeyMatches(issue: Issue, issue_file: []const u8, known: []const u8) bool {
+    const last_sep = mem.lastIndexOfScalar(u8, known, ':') orelse return false;
+    const known_line = std.fmt.parseInt(usize, known[last_sep + 1 ..], 10) catch
+        return knownIssueKeyMatchesRule(issue, issue_file, known, last_sep);
+    const known_file = stripDotPrefix(known[0..last_sep]);
+    return known_line == issue.line and mem.eql(u8, known_file, issue_file);
+}
+
+/// 3-field arm of knownIssueKeyMatches: the last field is a rule, not a
+/// line number, so the second-to-last field holds the line (EPH-I0158).
+fn knownIssueKeyMatchesRule(
+    issue: Issue,
+    issue_file: []const u8,
+    known: []const u8,
+    last_sep: usize,
+) bool {
+    const line_sep = mem.lastIndexOfScalar(u8, known[0..last_sep], ':') orelse return false;
+    const rule_line = std.fmt.parseInt(usize, known[line_sep + 1 .. last_sep], 10) catch
+        return false;
+    if (rule_line != issue.line) return false;
+    const known_file = stripDotPrefix(known[0..line_sep]);
+    const known_rule = known[last_sep + 1 ..];
+    return mem.eql(u8, known_file, issue_file) and mem.eql(u8, known_rule, issue.rule);
+}
+
 fn isKnownIssue(issue: Issue, cfg: *const Config) bool {
     if (cfg.known_issues.items.len == 0) return false;
     const issue_file = stripDotPrefix(issue.file);
-
     for (cfg.known_issues.items) |known| {
-        const sep = mem.lastIndexOfScalar(u8, known, ':') orelse continue;
-        const known_line = std.fmt.parseInt(usize, known[sep + 1 ..], 10) catch continue;
-        const known_file = stripDotPrefix(known[0..sep]);
-        if (known_line == issue.line and mem.eql(u8, known_file, issue_file)) return true;
+        if (knownIssueKeyMatches(issue, issue_file, known)) return true;
     }
     return false;
 }
@@ -48136,6 +48373,9 @@ test "markZigFilesRecursive stops at the depth cap" {
     defer graph.deinit();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
+    // Production shape (EPH-I0172): handlers set the containment root,
+    // and the EPH-I0161 walk gate keys on it.
+    graph.scan_root = root;
     try graph.markZigFilesRecursive(root, 0);
 
     const shallow = try tmpFilePath(allocator, &tmp, "shallow.zig");
@@ -49187,6 +49427,9 @@ test "markAllZigFilesReachable memoizes overlapping roots" {
     defer allocator.free(root);
     const inner = try tmpFilePath(allocator, &tmp, "src/inner");
     defer allocator.free(inner);
+    // Production shape (EPH-I0172): the EPH-I0161 walk gate keys on the
+    // containment root.
+    graph.scan_root = root;
 
     graph.markAllZigFilesReachable(root);
     const memo_after_first = graph.marked_dirs.count();
@@ -49219,6 +49462,9 @@ test "markZigFilesRecursive does not memoize a depth-capped dir" {
     defer graph.deinit();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
+    // Production shape (EPH-I0172): the EPH-I0161 walk gate keys on the
+    // containment root, so the depth-0 walk here actually marks a.zig.
+    graph.scan_root = root;
 
     // The cap check runs before the memo (EPH-I0204): a capped entry
     // leaves no memo record, so a later closer root can still cover it.
@@ -49226,6 +49472,71 @@ test "markZigFilesRecursive does not memoize a depth-capped dir" {
     try std.testing.expectEqual(@as(u32, 0), graph.marked_dirs.count());
     try graph.markZigFilesRecursive(root, 0);
     try std.testing.expectEqual(@as(u32, 1), graph.marked_dirs.count());
+}
+
+test "markZigFilesRecursive stays inside the scan root (EPH-I0161)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // proj/ is the scan root; out.zig sits beside it. A walk rooted at
+    // the tmp root (the module-dir parent-search shape) must mark the
+    // in-root file and skip the sibling. Pre-fix markSingleZigFile
+    // marked with no containment, so out.zig landed in reachable.
+    try tmp.dir.createDirPath(std.testing.io, "proj");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "out.zig", .data = "" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "proj/in.zig", .data = "" });
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const walk_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(walk_root);
+    const scan_root = try std.fs.path.join(allocator, &.{ walk_root, "proj" });
+    defer allocator.free(scan_root);
+    graph.scan_root = scan_root;
+
+    try graph.markZigFilesRecursive(walk_root, 0);
+
+    const in_path = try tmpFilePath(allocator, &tmp, "proj/in.zig");
+    defer allocator.free(in_path);
+    const out_path = try tmpFilePath(allocator, &tmp, "out.zig");
+    defer allocator.free(out_path);
+    try std.testing.expect(graph.reachable.contains(in_path));
+    try std.testing.expect(!graph.reachable.contains(out_path));
+    try std.testing.expectEqual(@as(u32, 1), graph.reachable.count());
+}
+
+test "parent build.zig search is opt-in for a foreign parent (EPH-I0161)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // parent/build.zig sits outside the scan root (parent/sub). The
+    // default run must not adopt it; --include-parent opts in.
+    try tmp.dir.createDirPath(std.testing.io, "parent/sub");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/build.zig", .data = "" });
+
+    const walk_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(walk_root);
+    const sub_path = try std.fmt.allocPrint(allocator, "{s}/parent/sub", .{walk_root});
+    defer allocator.free(sub_path);
+    const parent_path = try std.fmt.allocPrint(allocator, "{s}/parent", .{walk_root});
+    defer allocator.free(parent_path);
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, sub_path);
+
+    var buf: [Fs.max_path_bytes]u8 = undefined;
+    // The tmp tree is not the operator's cwd, so the parent is foreign:
+    // the default refuses the parent build.zig.
+    try std.testing.expect(graph.findBuildRoot(&cfg, &buf) == null);
+    cfg.include_parent = true;
+    const opt_in_root = graph.findBuildRoot(&cfg, &buf);
+    try std.testing.expect(opt_in_root != null);
+    try std.testing.expectEqualStrings(parent_path, opt_in_root.?);
 }
 
 // ============================================================================
@@ -50147,8 +50458,12 @@ test "isKnownIssue matches file paths beyond 512 bytes (EPH-I0532)" {
         .help = null,
     };
     try std.testing.expect(isKnownIssue(colon_issue, &cfg));
-    // A three-field entry ("file:line:rule") never matches — the line
-    // part does not parse as a number (EPH-I0158 behavior preserved).
+    // A three-field entry ("file:line:rule") suppresses only the named
+    // rule (EPH-I0158). Pre-fix the suffix made the whole key never
+    // match — the line part did not parse as a number and the key was
+    // skipped. The matching rule is now suppressed, a different rule on
+    // the same line still reports, and the same rule on another line
+    // still reports.
     try cfg.known_issues.append(allocator, try allocator.dupe(u8, "plain.zig:3:ZA101"));
     const rule_issue = Issue{
         .file = "plain.zig",
@@ -50159,7 +50474,39 @@ test "isKnownIssue matches file paths beyond 512 bytes (EPH-I0532)" {
         .message = "m",
         .help = null,
     };
-    try std.testing.expect(!isKnownIssue(rule_issue, &cfg));
+    try std.testing.expect(isKnownIssue(rule_issue, &cfg));
+    const other_rule_issue = Issue{
+        .file = "plain.zig",
+        .line = 3,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA201",
+        .message = "m",
+        .help = null,
+    };
+    try std.testing.expect(!isKnownIssue(other_rule_issue, &cfg));
+    const other_line_issue = Issue{
+        .file = "plain.zig",
+        .line = 4,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA101",
+        .message = "m",
+        .help = null,
+    };
+    try std.testing.expect(!isKnownIssue(other_line_issue, &cfg));
+    // The 2-field form stays all-rules: a different rule on the pinned
+    // line is still suppressed.
+    const two_field_other_rule = Issue{
+        .file = long_file,
+        .line = 42,
+        .col = 1,
+        .severity = .warning,
+        .rule = "ZA306",
+        .message = "m",
+        .help = null,
+    };
+    try std.testing.expect(isKnownIssue(two_field_other_rule, &cfg));
 }
 
 test "known-issue keys match across the ./ display prefix (EPH-I0738)" {
@@ -81535,8 +81882,10 @@ test "zigContentParses gates the replacement on a clean parse (EPH-I0168)" {
 
 test "resolveToolFromEnv falls back to the bare name when unset (EPH-I0154)" {
     var diag = testDiagCtx();
-    try std.testing.expectEqualStrings("zig", resolveToolFromEnv(&diag, .zig, null));
-    try std.testing.expectEqualStrings("curl", resolveToolFromEnv(&diag, .curl, null));
+    // Null override and null PATH: nothing to resolve, the bare name
+    // keeps the late-spawn failure behavior.
+    try std.testing.expectEqualStrings("zig", resolveToolFromEnv(&diag, .zig, null, null));
+    try std.testing.expectEqualStrings("curl", resolveToolFromEnv(&diag, .curl, null, null));
 }
 
 test "resolveToolFromEnv accepts an absolute override that resolves (EPH-I0154)" {
@@ -81549,7 +81898,40 @@ test "resolveToolFromEnv accepts an absolute override that resolves (EPH-I0154)"
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sh", .data = "" });
     const tool_path = try tmpFilePath(allocator, &tmp, "sh");
     defer allocator.free(tool_path);
-    try std.testing.expectEqualStrings(tool_path, resolveToolFromEnv(&diag, .zig, tool_path));
+    try std.testing.expectEqualStrings(
+        tool_path,
+        resolveToolFromEnv(&diag, .zig, tool_path, null),
+    );
+}
+
+test "resolveToolFromEnv resolves the bare name through PATH absolutely (EPH-I0163)" {
+    // RED5-9 arm: the spawn path resolves to an absolute path at
+    // startup, so the executed binary is fixed before any scan input is
+    // read. The first PATH entry naming an existing non-directory wins;
+    // a PATH that names no tool falls back to the bare name.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "zig", .data = "" });
+    const tool_path = try tmpFilePath(allocator, &tmp, "zig");
+    defer allocator.free(tool_path);
+    const path_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(path_dir);
+    try std.testing.expectEqualStrings(
+        tool_path,
+        resolveToolFromEnv(&diag, .zig, null, path_dir),
+    );
+
+    // A PATH that names no zig keeps the bare name.
+    var tmp2 = std.testing.tmpDir(.{});
+    defer tmp2.cleanup();
+    const empty_dir = try tmp2.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(empty_dir);
+    try std.testing.expectEqualStrings(
+        "zig",
+        resolveToolFromEnv(&diag, .zig, null, empty_dir),
+    );
 }
 
 test "resolveToolFromEnv warns and falls back on a relative override (EPH-I0154)" {
@@ -81558,7 +81940,7 @@ test "resolveToolFromEnv warns and falls back on a relative override (EPH-I0154)
     diag.diag_sink = capture.sink();
     try std.testing.expectEqualStrings(
         "zig",
-        resolveToolFromEnv(&diag, .zig, "tools/zig"),
+        resolveToolFromEnv(&diag, .zig, "tools/zig", null),
     );
     // The warning reaches the capture in-process (EPH-I1051): the sink
     // replaced the mute-and-state-only assertion shape, and this positive
@@ -81581,8 +81963,8 @@ test "resolveToolFromEnv empty override falls back to the bare name (EPH-I0314, 
     var diag = testDiagCtx();
     var capture = CaptureSink{};
     diag.diag_sink = capture.sink();
-    try std.testing.expectEqualStrings("zig", resolveToolFromEnv(&diag, .zig, ""));
-    try std.testing.expectEqualStrings("curl", resolveToolFromEnv(&diag, .curl, ""));
+    try std.testing.expectEqualStrings("zig", resolveToolFromEnv(&diag, .zig, "", null));
+    try std.testing.expectEqualStrings("curl", resolveToolFromEnv(&diag, .curl, "", null));
     try std.testing.expectEqual(@as(usize, 0), capture.len);
 }
 
@@ -81594,7 +81976,7 @@ test "resolveToolFromEnv warns and falls back on a directory override (EPH-I0312
     // fails confusingly at the late spawn; the not-dir gate catches it here.
     try std.testing.expectEqualStrings(
         "zig",
-        resolveToolFromEnv(&diag, .zig, "/bin"),
+        resolveToolFromEnv(&diag, .zig, "/bin", null),
     );
 }
 
@@ -81604,7 +81986,7 @@ test "resolveToolFromEnv warns and falls back on an unresolvable override (EPH-I
     diag.cli_diagnostics_enabled = false;
     try std.testing.expectEqualStrings(
         "zig",
-        resolveToolFromEnv(&diag, .zig, "/nonexistent/ephor-i0154/zig"),
+        resolveToolFromEnv(&diag, .zig, "/nonexistent/ephor-i0154/zig", null),
     );
 }
 
@@ -106536,6 +106918,7 @@ test "ZC101: ZC and ZC1 prefix filters disable the rule; default is ON" {
         .auto_approve = false,
         .runtime_command = null,
         .install_version = null,
+        .include_parent = false,
     };
     defer cfg.deinit(allocator);
 
@@ -110642,6 +111025,7 @@ test "ZA210: off by default; explicit enable turns it on" {
         .auto_approve = false,
         .runtime_command = null,
         .install_version = null,
+        .include_parent = false,
     };
     defer cfg.deinit(allocator);
 
@@ -110680,6 +111064,7 @@ fn testConfig() Config {
         .auto_approve = false,
         .runtime_command = null,
         .install_version = null,
+        .include_parent = false,
     };
 }
 
@@ -113227,7 +113612,7 @@ test "target build.zig entries outside the scan root are dropped (EPH-I0195)" {
     defer cfg.deinit(allocator);
     try setOwnedPath(allocator, &cfg, root_path);
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg);
+    try detectTargetEntries(&diag, allocator, &cfg, false);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     const want_entry = try std.fmt.allocPrint(allocator, "{s}/inside.zig", .{root_path});
@@ -113268,7 +113653,7 @@ test "file target keeps the cwd config's entries (EPH-I0801)" {
     // The cwd config's entry, as loadConfigFile leaves it (relative).
     try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg);
+    try detectTargetEntries(&diag, allocator, &cfg, false);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);
@@ -113303,12 +113688,52 @@ test "directory target still replaces the cwd config's entries (EPH-I0801)" {
     try setOwnedPath(allocator, &cfg, target_path);
     try cfg.entries.append(allocator, try allocator.dupe(u8, "stale.zig"));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg);
+    try detectTargetEntries(&diag, allocator, &cfg, false);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     const want_entry = try std.fmt.allocPrint(allocator, "{s}/src/main.zig", .{target_path});
     defer allocator.free(want_entry);
     try std.testing.expectEqualStrings(want_entry, cfg.entries.items[0]);
+}
+
+test "detectTargetEntries keeps CLI --entry values on a dir target (EPH-I0201)" {
+    var diag = testDiagCtx();
+    // RED3-2 pin: an explicit --entry is operator intent. Pre-fix the
+    // dir-target wipe discarded it, so a hostile target config replaced
+    // the victim's pinned entry and defeated the orphan scan. The fix
+    // keeps the CLI entry while the target sources load, and a note
+    // names the contributing source.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "target/src");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "victim.zig",
+        .data = "pub fn v() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "target/src/main.zig",
+        .data = "pub fn main() void {}\n",
+    });
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const target_path = try std.fmt.allocPrint(allocator, "{s}/target", .{tmp_path});
+    defer allocator.free(target_path);
+    const victim = try std.fmt.allocPrint(allocator, "{s}/victim.zig", .{tmp_path});
+    defer allocator.free(victim);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try setOwnedPath(allocator, &cfg, target_path);
+    // The CLI entry, as handleEntryArg leaves it.
+    try cfg.entries.append(allocator, try allocator.dupe(u8, victim));
+    diag.cli_diagnostics_enabled = false;
+    try detectTargetEntries(&diag, allocator, &cfg, true);
+
+    // The CLI entry survives and the tree-scanned entry joins it.
+    try std.testing.expectEqual(@as(usize, 2), cfg.entries.items.len);
+    try std.testing.expect(containsEntry(cfg.entries.items, victim));
+    try std.testing.expectEqual(@as(usize, 1), diag.cli_entries_note_count);
 }
 
 /// Build the EPH-I0801 reviewer sandbox in tmp: proj/main.zig,
@@ -113353,7 +113778,7 @@ test "file target keeps the cwd config's entries past an untrusted parent config
     try setOwnedPath(allocator, &cfg, file_path);
     try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg);
+    try detectTargetEntries(&diag, allocator, &cfg, false);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);
@@ -113383,7 +113808,7 @@ test "file target attributes only the parent config's own drops (EPH-I0801)" {
     try setOwnedPath(allocator, &cfg, file_path);
     try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg);
+    try detectTargetEntries(&diag, allocator, &cfg, false);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);
@@ -113408,7 +113833,7 @@ test "file target keeps the cwd config's entries past a trusted parent config (E
     try setOwnedPath(allocator, &cfg, file_path);
     try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg);
+    try detectTargetEntries(&diag, allocator, &cfg, false);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);
@@ -113434,7 +113859,7 @@ test "file target unions a trusted parent config's entries (EPH-I0801)" {
     try setOwnedPath(allocator, &cfg, file_path);
     try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg);
+    try detectTargetEntries(&diag, allocator, &cfg, false);
 
     try std.testing.expectEqual(@as(usize, 2), cfg.entries.items.len);
     const parent_dir = std.fs.path.dirname(file_path).?;
@@ -113467,7 +113892,7 @@ test "file target survives a dot-slash-infix parent config load (EPH-I0801)" {
     try setOwnedPath(allocator, &cfg, file_path);
     try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg);
+    try detectTargetEntries(&diag, allocator, &cfg, false);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);

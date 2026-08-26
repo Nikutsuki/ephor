@@ -115,11 +115,16 @@ latest_ephor_tag() {
     # 30s: the Codeberg API has answered in 20s+ on slow days; refusals still fail fast.
     # EPH-I0156: an https fetch is clamped to the https scheme, redirects
     # included, and capped at 1 MiB. A hostile network cannot redirect the
-    # fetch into a local file read or spew an unbounded body. The
-    # EPHOR_TAGS_API test channel (file://, http://) skips the clamp: the
-    # operator picks that URL, and the strict-tag filter below still gates
-    # the result. The word split of $proto_flags is intentional.
-    proto_flags=""
+    # fetch into a local file read or spew an unbounded body.
+    # EPH-I0207 (RED2-6): the 1 MiB body cap now applies to every scheme,
+    # so the operator-picked test channel (file://, http://) gets the
+    # same byte bound as production. --max-time bounds duration, not
+    # bytes; --max-filesize bounds bytes, so a fast network-path attacker
+    # cannot stream gigabytes into the shell variable inside the 30s
+    # window. An over-cap transfer fails curl (rc 63), which fails the
+    # resolution and takes the pinned fallback. The word split of
+    # $proto_flags is intentional.
+    proto_flags="--max-filesize 1048576"
     case "$TAGS_API" in
         https://*) proto_flags="--proto =https --proto-redir =https --max-filesize 1048576" ;;
     esac

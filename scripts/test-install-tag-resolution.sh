@@ -132,7 +132,7 @@ expect_curl_clamp() {
 
 # Assert that the recorded curl arguments carry no --proto flag.
 # A missing args file is a FAIL: the fake curl must have run.
-expect_curl_no_clamp() {
+expect_curl_no_proto() {
     TESTS=$((TESTS + 1))
     if [ -s "$2" ] && ! grep -q -- '--proto' "$2"; then
         echo "ok   $1"
@@ -236,8 +236,9 @@ ACTUAL_OUT=$(
 expect "https fetch resolves through the clamped curl" "v0.14.2" "0"
 expect_curl_clamp "https fetch carries the clamp flags" "$WORK/curl-args-https"
 
-# 15. EPH-I0661: the operator-picked http test channel skips the clamp
-# (install.sh comment at latest_ephor_tag).
+# 15. EPH-I0207: every scheme carries the 1 MiB body cap; only the https
+# arm carries the proto clamp (EPH-I0156, install.sh latest_ephor_tag).
+# The fake curl records the arguments.
 ACTUAL_OUT=$(
     PATH="$WORK/bin:$PATH"
     CURL_ARGS_FILE="$WORK/curl-args-http"
@@ -246,8 +247,26 @@ ACTUAL_OUT=$(
     export CURL_ARGS_FILE CURL_BODY_FILE
     latest_ephor_tag
 ); ACTUAL_RC=$?
-expect "http test channel resolves without the clamp" "v0.14.2" "0"
-expect_curl_no_clamp "http test channel carries no clamp flags" "$WORK/curl-args-http"
+expect "http test channel resolves through the capped curl" "v0.14.2" "0"
+expect_curl_no_proto "http test channel carries no proto flags" "$WORK/curl-args-http"
+if [ -s "$WORK/curl-args-http" ] && grep -q -- '--max-filesize 1048576' "$WORK/curl-args-http"; then
+    echo "ok   http test channel carries the byte cap (EPH-I0207)"
+    TESTS=$((TESTS + 1))
+else
+    echo "FAIL http test channel lacks the --max-filesize cap"
+    echo "  args: $(cat "$WORK/curl-args-http" 2>/dev/null)"
+    TESTS=$((TESTS + 1))
+    FAILS=$((FAILS + 1))
+fi
+
+# 15b. EPH-I0207: a real curl fetches an over-cap file:// body through
+# the capped arm and must fail closed (rc 1), so the resolver takes the
+# pinned fallback instead of buffering the oversized response. Pre-fix
+# the file:// arm carried no byte cap and the tag resolved.
+(printf '[{"name":"v0.14.2",'; head -c 1200000 /dev/zero | tr '\0' 'x'; printf '}]') \
+    > "$WORK/over-cap.json"
+ACTUAL_OUT=$(TAGS_API="file://$WORK/over-cap.json"; latest_ephor_tag); ACTUAL_RC=$?
+expect "over-cap response fails resolution (EPH-I0207)" "" "1"
 
 # 16. EPH-I0662: known-answer pins for the extracted functions the cases
 # above never drive directly. A truncated extraction still sources, so a

@@ -127,14 +127,58 @@ error: zig is not installed or not on PATH.
         # future redirect takes the fallback path instead of being
         # followed. This is stricter than install.sh, which still follows
         # https-to-https redirects.
-        # EPH-I0652: the clamp covers the default https URL only. A
-        # test-channel URL (http:// or file://) skips it, matching
-        # install.sh's scheme check, so a local test server may redirect.
-        $irmParams = @{ Uri = $TAGS_API; TimeoutSec = 30 }
-        if ($TAGS_API.StartsWith("https://")) { $irmParams.MaximumRedirection = 0 }
-        $tagsJson = Invoke-RestMethod @irmParams
+        # EPH-I0207 (RED2-6): the response is byte-capped at 1 MiB. A
+        # fast network-path attacker could stream gigabytes inside the
+        # 30 s timeout window; the bounded read below stops at the cap,
+        # warns, and fails the resolution, so the resolver takes the
+        # pinned fallback. TimeoutSec bounds duration, not bytes.
+        # The capped read uses HttpClient, which serves http and https
+        # only. A non-http test-channel URL (file://) keeps the old
+        # Invoke-RestMethod path: the operator picked that URL, the
+        # bytes are local, and the strict-tag filter below still gates
+        # the result.
         $maxTag = $null
         $maxVersion = $null
+        $tagsJson = $null
+        if ($TAGS_API.StartsWith("https://") -or $TAGS_API.StartsWith("http://")) {
+            $handler = [System.Net.Http.HttpClientHandler]::new()
+            if ($TAGS_API.StartsWith("https://")) { $handler.MaxAutomaticRedirections = 0 }
+            $client = [System.Net.Http.HttpClient]::new($handler)
+            $response = $null
+            $stream = $null
+            $buffer = $null
+            try {
+                $client.Timeout = [TimeSpan]::FromSeconds(30)
+                $response = $client.GetAsync(
+                    $TAGS_API,
+                    [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+                ).GetAwaiter().GetResult()
+                $response.EnsureSuccessStatusCode()
+                $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                $bytes = New-Object byte[] 1048576
+                $buffer = [System.IO.MemoryStream]::new()
+                $total = 0
+                while ($total -lt 1048576) {
+                    $n = $stream.Read($bytes, 0, [Math]::Min($bytes.Length, 1048576 - $total))
+                    if ($n -le 0) { break }
+                    $buffer.Write($bytes, 0, $n)
+                    $total += $n
+                }
+                if ($total -ge 1048576 -and $stream.ReadByte() -ne -1) {
+                    Write-Stderr "warning: the tags API response exceeds the 1 MiB cap."
+                    return $null
+                }
+                $text = [System.Text.Encoding]::UTF8.GetString($buffer.ToArray())
+                $tagsJson = $text | ConvertFrom-Json
+            } finally {
+                if ($null -ne $buffer) { $buffer.Dispose() }
+                if ($null -ne $stream) { $stream.Dispose() }
+                if ($null -ne $response) { $response.Dispose() }
+                $client.Dispose()
+            }
+        } else {
+            $tagsJson = Invoke-RestMethod -Uri $TAGS_API -TimeoutSec 30
+        }
         foreach ($entry in $tagsJson) {
             $name = $entry.name
             if ($name -notmatch '^v\d+\.\d+\.\d+$') { continue }

@@ -290,6 +290,12 @@ error: no build.zig found in current directory
     # follows the link and cannot see it. The fresh-zon write above
     # already replaced the name through Set-ContentNoFollow's rename, so
     # a link that survives to here existed before the install.
+    # EPH-I1165: the check-to-fetch window stays open: a concurrent
+    # writer could swap in a symlink after this check and before the
+    # zig fetch below. The no-active-adversary-during-install
+    # assumption scopes the window out, because a concurrent
+    # same-privilege writer during the install is the invoking user,
+    # and the clone-time-planting class is closed by this check.
     $zonItem = Get-Item "build.zig.zon" -Force -ErrorAction SilentlyContinue
     if ($zonItem -and
         ($zonItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
@@ -642,16 +648,25 @@ error: could not repair the fingerprint in build.zig.zon
         Warn-BlockLayout "ephor dependency found but build steps have non-standard layout"
     } else {
         # Fresh install - add the block after the last installArtifact
-        # line. install.sh parity note: sh anchors this probe to code
-        # lines and extends the insert to the statement terminator
-        # (EPH-I0626); the ps1 boundary is the last installArtifact
-        # line (EPH-I1158).
+        # statement (EPH-I1158; install.sh EPH-I0626 parity). The probe
+        # anchors to code lines with the same idiom as the action probe
+        # above, so a comment that mentions installArtifact cannot win
+        # the anchor. The insert extends forward to the first line that
+        # ends with the statement terminator (a semicolon plus
+        # whitespace), so a multi-line b.installArtifact(exe, .{ ... });
+        # statement is not split mid-statement. A statement that never
+        # reaches a terminator refuses with a manual-edit message
+        # instead of writing a broken build.zig. A trailing line
+        # comment after the terminator masks the semicolon match
+        # (b.installArtifact(exe); // note): the block then lands after
+        # the next terminator line, which is still valid Zig, or the
+        # install refuses when no terminator line follows.
         Write-Host "Adding ephor build steps to build.zig..."
 
+        $installArtifactProbe = '^\s*[^/.\s\\].*installArtifact'
         $lastInstallLine = -1
-
         for ($i = 0; $i -lt $buildLines.Count; $i++) {
-            if ($buildLines[$i] -match "installArtifact") {
+            if ($buildLines[$i] -cmatch $installArtifactProbe) {
                 $lastInstallLine = $i
             }
         }
@@ -666,11 +681,28 @@ error: could not repair the fingerprint in build.zig.zon
             return 1
         }
 
+        $terminatorLine = -1
+        for ($i = $lastInstallLine; $i -lt $buildLines.Count; $i++) {
+            if ($buildLines[$i] -cmatch ';[\s]*$') {
+                $terminatorLine = $i
+                break
+            }
+        }
+        if ($terminatorLine -eq -1) {
+            # EPH-I0626 parity: the statement never reaches a semicolon,
+            # so refuse instead of guessing a cut point and writing a
+            # broken build.zig.
+            Write-Stderr "warning: the installArtifact statement does not end before the end of build.zig."
+            Write-Stderr "The ephor build steps were not added."
+            Write-Stderr "Add them manually (see README)."
+            return 1
+        }
+
         $newLines = @()
-        $newLines += $buildLines[0..$lastInstallLine]
+        $newLines += $buildLines[0..$terminatorLine]
         $newLines += $EPHOR_BLOCK
-        if ($lastInstallLine + 1 -lt $buildLines.Count) {
-            $newLines += $buildLines[($lastInstallLine + 1)..($buildLines.Count - 1)]
+        if ($terminatorLine + 1 -lt $buildLines.Count) {
+            $newLines += $buildLines[($terminatorLine + 1)..($buildLines.Count - 1)]
         }
         Set-ContentNoFollow -Path "build.zig" -Value $newLines
     }

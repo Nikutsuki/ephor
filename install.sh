@@ -350,6 +350,12 @@ fi
 # (lstat), so it sees the link itself. A fresh-zon mv above already
 # replaces the name, so a link that survives to here existed before
 # the install. The symlink-to-a-directory shape refused earlier.
+# EPH-I1165: the check-to-fetch window stays open: a concurrent writer
+# could swap in a symlink after this lstat check and before the zig
+# fetch below. The no-active-adversary-during-install assumption
+# scopes the window out, because a concurrent same-privilege writer
+# during the install is the invoking user, and the
+# clone-time-planting class is closed by this check.
 if [ -L "build.zig.zon" ]; then
     echo "error: build.zig.zon is a symlink." >&2
     echo "Replace it with a regular file before installing ephor." >&2
@@ -549,7 +555,13 @@ CANON_END='^[[:space:]]*ephor_upgrade_step\.dependOn\(&ephor_upgrade_cmd\.step\)
 LEGACY_START='^[[:space:]]*    // === Ephor Static Analysis ==='
 LEGACY_END='^[[:space:]]*ephor_step\.dependOn\(&b\.addRunArtifact\(ephor_exe\)\.step\);'
 
-if grep -qE "$CANON_START" build.zig; then
+# EPH-I1159: each branch condition fires on the start OR the end
+# marker, mirroring install.ps1. A truncated block whose start marker
+# (and dependency line) the user deleted but whose end lines remain
+# then lands here, where the empty start line makes the marker-pair
+# validation refuse instead of falling through to the fresh-install
+# splice and redeclaring the retained end lines.
+if grep -qE "$CANON_START" build.zig || grep -qE "$CANON_END" build.zig; then
     # Ephor block exists - replace it with the canonical version.
     # EPH-I0625: the markers anchor like the Zig-side upgrade gate
     # (EPH-I0168). The old unanchored grep took the first match
@@ -590,10 +602,10 @@ if grep -qE "$CANON_START" build.zig; then
     mv "$INSTALL_TMP" build.zig
     INSTALL_TMP=""
     echo "Updated ephor build steps in build.zig"
-elif grep -qE "$LEGACY_START" build.zig; then
+elif grep -qE "$LEGACY_START" build.zig || grep -qE "$LEGACY_END" build.zig; then
     # Old v0.11.x snippet - replace with canonical block. The markers
     # anchor and validate the same way as the canonical branch
-    # (EPH-I0625/26/28).
+    # (EPH-I0625/26/28, EPH-I1159).
     START_LINE=$(grep -nE "$LEGACY_START" build.zig | head -1 | cut -d: -f1)
     END_LINE=$(grep -nE "$LEGACY_END" build.zig | head -1 | cut -d: -f1)
     START_COUNT=$(grep -cE "$LEGACY_START" build.zig | cat)

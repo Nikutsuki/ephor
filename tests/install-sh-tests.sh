@@ -2,7 +2,8 @@
 # Regression suite for install.sh (batch B65: EPH-I0625 through EPH-I0630;
 # batch B66: EPH-I0631 through EPH-I0636; batch B67: EPH-I0637 through
 # EPH-I0642; batch B85: EPH-I0205; batch B86f: EPH-I1104/I1106/I1107/
-# I1110/I1111; batch B93p: EPH-I0717/I0720; batch B94: EPH-I0060/I0284).
+# I1110/I1111; batch B93p: EPH-I0717/I0720; batch B94: EPH-I0060/I0284;
+# batch B93a: EPH-I1159).
 # Runs the real installer against planted fixtures in scratch dirs under
 # .tmp/install-sh-tests. Hermetic: the fake zig on PATH answers version
 # and fetch, and the tags API is a local file, so no network is touched.
@@ -1087,6 +1088,64 @@ while [ "$L" -ge 1 ] && [ -z "$(sed -n "${L}p" "$D/build.zig")" ]; do
 done
 assert_eq 1 "$ABOVE_BLANKS" 'second run did not stay at the canonical single blank'
 pass "t45 blank run above the block converges on re-run (EPH-I0060)"
+
+# --- t46 (EPH-I1159): a truncated canonical block whose start marker
+# (and dependency const line) the user deleted, but whose end lines
+# remain, must refuse instead of splicing a fresh block and
+# redeclaring the retained lines. The end-marker-only shape matches
+# neither start-marker branch pre-fix, so the old code fell through to
+# the fresh-install splice and left ephor_upgrade_cmd and
+# ephor_upgrade_step declared twice. The canonical branch now fires on
+# the end marker alone, and the empty start line makes the marker-pair
+# validation refuse.
+D="$TEST_ROOT/t46"
+mkdir -p "$D"
+{
+    echo 'const std = @import("std");'
+    echo 'pub fn build(b: *std.Build) !void {'
+    echo '    const target = b.standardTargetOptions(.{});'
+    echo '    const optimize = b.standardOptimizeOption(.{});'
+    echo '    const exe = b.addExecutable(.{ .name = "demo", .root_module = b.createModule(.{}) });'
+    echo '    b.installArtifact(exe);'
+    echo '    const ephor_upgrade_cmd = b.addRunArtifact(ephor_artifact);'
+    echo '    ephor_upgrade_cmd.addArgs(&.{"upgrade"});'
+    echo '    const ephor_upgrade_step = b.step("ephor-upgrade", "Upgrade ephor to latest version");'
+    echo '    ephor_upgrade_step.dependOn(&ephor_upgrade_cmd.step);'
+    echo '}'
+} > "$D/build.zig"
+cp "$D/build.zig" "$D/build.zig.orig"
+run_installer "$D"
+assert_rc 1
+assert_grep "$D/err.log" 'missing one of its markers' 'no refusal warning'
+assert_not_grep "$D/out.log" 'Adding ephor build steps' 'fresh branch taken for an end-marker-only file'
+assert_unchanged "$D/build.zig" "$D/build.zig.orig" 'build.zig'
+pass "t46 end-marker-only canonical block refuses (EPH-I1159)"
+
+# --- t47 (EPH-I1159): the same truncated shape on the legacy snippet:
+# the start marker and dependency line deleted, the v0.11.x end line
+# remains. Pre-fix this fell through to the fresh-install splice and
+# left the retained ephor_step.dependOn(...) line beside the new
+# canonical block, where ephor_exe is undeclared - a broken file. The
+# legacy branch now fires on the end marker alone and refuses.
+D="$TEST_ROOT/t47"
+mkdir -p "$D"
+{
+    echo 'const std = @import("std");'
+    echo 'pub fn build(b: *std.Build) !void {'
+    echo '    const target = b.standardTargetOptions(.{});'
+    echo '    const optimize = b.standardOptimizeOption(.{});'
+    echo '    const exe = b.addExecutable(.{ .name = "demo", .root_module = b.createModule(.{}) });'
+    echo '    b.installArtifact(exe);'
+    echo '    ephor_step.dependOn(&b.addRunArtifact(ephor_exe).step);'
+    echo '}'
+} > "$D/build.zig"
+cp "$D/build.zig" "$D/build.zig.orig"
+run_installer "$D"
+assert_rc 1
+assert_grep "$D/err.log" 'missing one of its markers' 'no refusal warning'
+assert_not_grep "$D/out.log" 'Adding ephor build steps' 'fresh branch taken for an end-marker-only file'
+assert_unchanged "$D/build.zig" "$D/build.zig.orig" 'build.zig'
+pass "t47 end-marker-only legacy snippet refuses (EPH-I1159)"
 
 echo ""
 echo "install-sh tests: $PASS_COUNT passed"

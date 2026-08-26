@@ -6,28 +6,25 @@
 //! The line tier is fast but grammar-blind. This tier parses each file
 //! with the host compiler's own std.Ast (ephor is compiled per Zig
 //! version, so the grammar always matches the toolchain) and runs rules
-//! that are impossible or unreliable line-based. It is strictly additive:
-//! line-tier rules and their baselines are unaffected.
+//! that are impossible or unreliable line-based. It is strictly additive.
 //!
-//! Degradation guarantee: when a file's parse produces errors the tree is
-//! partial and `AstContext.ok` is false — AST rules skip the file and the
-//! line tier still covers it. Files that nest delimiters or prefix
-//! operators past `max_nesting_depth` skip the same way before the parse
-//! runs (EPH-I0191). A refused parse thread skips the file too
-//! (EPH-I0597). Nothing is logged per file. Corpus runs touch thousands
-//! of files.
+//! Degradation guarantee: a parse error makes the tree partial and
+//! `AstContext.ok` false — AST rules skip the file and the line tier
+//! still covers it. Deep delimiter/prefix nesting skips before the parse
+//! runs (EPH-I0191); a refused parse thread skips too (EPH-I0597).
 //!
 //! ZA111 (returned-stack-reference) lives in ast_tier_za111.zig, split
 //! out so each half stays under the 64 KiB AST-tier input cap
-//! (EPH-I0601): the file that implements the rule must stay small
-//! enough for the rule to analyze it. This file owns the parse, the
-//! nesting pre-scan, and the per-file pipeline.
+//! (EPH-I0601). This file owns the parse, the nesting pre-scan, and the
+//! per-file pipeline. The EPH-I0046 extension tests live in
+//! ast_tier_za111_tests.zig for the same cap.
 
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const types = @import("types.zig");
 const za111 = @import("ast_tier_za111.zig");
+const za111_tests = @import("ast_tier_za111_tests.zig");
 
 const Issue = types.Issue;
 const Ast = std.zig.Ast;
@@ -503,18 +500,20 @@ pub fn analyzeFileAstTier(
 test {
     // Test-reference idiom: the ast_tier_za111 split's tests must join
     // the suite (EPH-I0601). Body-only references do not force analysis
-    // of test declarations.
+    // of test declarations. The za111_tests half joins the same way
+    // (EPH-I0046).
     _ = za111;
+    _ = za111_tests;
 }
 
-fn runZa111(a: Allocator, content: []const u8) !std.ArrayListUnmanaged(Issue) {
+pub fn runZa111(a: Allocator, content: []const u8) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     errdefer types.deinitIssues(&issues, a);
     try analyzeFileAstTier(a, .{ .issues = &issues }, "test.zig", content);
     return issues;
 }
 
-fn expectZa111(
+pub fn expectZa111(
     issues: []const Issue,
     line: usize,
     needle: []const u8,
@@ -590,6 +589,8 @@ test "F12 guard: both AST-tier halves stay under the ZA111 byte cap (EPH-I0601)"
     // fix. A re-crossing would silently drop the rule's own second home.
     try std.testing.expect(@embedFile("types.zig").len <= max_ast_file_bytes);
     try std.testing.expect(@embedFile("sanitize.zig").len <= max_ast_file_bytes);
+    try std.testing.expect(@embedFile("ast_tier_za111_tests.zig").len <= max_ast_file_bytes);
+    try std.testing.expect(@embedFile("ast_tier_za111_walk.zig").len <= max_ast_file_bytes);
 }
 
 test "ZA111: field of local var fires" {

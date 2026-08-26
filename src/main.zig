@@ -844,13 +844,20 @@ const JumpKind = enum { none, loop_break, loop_continue };
 const CFPatternEntry = struct {
     prefix: []const u8,
     exact: bool, // true = exact match, false = startsWith
+    /// True = startsWith plus a word boundary after the prefix: the next
+    /// byte must be a non-identifier or the end of the line. `} else
+    /// ifx;` is an else branch whose braceless statement is the
+    /// identifier `ifx` — a raw startsWith reads it as an else-if arm
+    /// (EPH-I0090). `elseif` is one identifier token, so `} elseif(` is a
+    /// block end plus a call, not an else arm.
+    word_bound: bool = false,
     result: CFPattern,
 };
 
 /// Patterns checked in order (first match wins)
 const cf_patterns = [_]CFPatternEntry{
-    .{ .prefix = "} else if", .exact = false, .result = .else_if },
-    .{ .prefix = "} else", .exact = false, .result = .else_start },
+    .{ .prefix = "} else if", .exact = false, .word_bound = true, .result = .else_if },
+    .{ .prefix = "} else", .exact = false, .word_bound = true, .result = .else_start },
     // Line-start else-if (close on previous line); word-delimited like if/if(
     // A bare `else if` line (condition on a later line, Allman style)
     // carries no trailing token; the exact entry catches it before the
@@ -965,6 +972,16 @@ fn isArmHeaderLine(t: []const u8) bool {
     return true;
 }
 
+/// One table entry's match against the trimmed line. The word-bound form
+/// (EPH-I0090) extends startsWith with a right boundary: the next byte
+/// must be a non-identifier or the end of the line.
+fn matchesCFPatternEntry(trimmed: []const u8, p: CFPatternEntry) bool {
+    if (p.exact) return mem.eql(u8, trimmed, p.prefix);
+    if (!mem.startsWith(u8, trimmed, p.prefix)) return false;
+    if (!p.word_bound) return true;
+    return trimmed.len == p.prefix.len or !isIdent(trimmed[p.prefix.len]);
+}
+
 /// Detect the control-flow pattern of a trimmed line; first table match
 /// wins, and non-control lines fall through to the catch and prong tests.
 /// Documented approximation (EPH-I0750): a whole switch on one line
@@ -978,11 +995,7 @@ fn detectCFPattern(t: []const u8) CFPattern {
     const trimmed = mem.trim(u8, t, " \t\r");
 
     for (cf_patterns) |p| {
-        if (p.exact) {
-            if (mem.eql(u8, trimmed, p.prefix)) return p.result;
-        } else {
-            if (mem.startsWith(u8, trimmed, p.prefix)) return p.result;
-        }
+        if (matchesCFPatternEntry(trimmed, p)) return p.result;
     }
 
     if (isUnbalancedCatchBlock(trimmed)) return .catch_start;
@@ -28076,17 +28089,28 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
 // errdefer does NOT fire on the success path, so it is correctly silent.
 // Accepted FNs (v1): labeled-block returns (`break :blk list`) — tracked
 // for ZA110 under EPH-I0481 (EPH-I0046 covers the labeled-block shape for
-// ZA111 only) — and `return self.field` dual-owner forms with no armed
-// defer on the exact path: the `take()` idiom needs a visible field reset
-// to adjudicate (EPH-I0038, v2). The exact-path armed-defer subset is not
-// dual-owner: the defer frees the backing the by-value copy hands out, so
-// it fires (EPH-I0482). The armed-whole/field-return reverse (`defer
+// ZA111 only). The exact-path armed-defer subset of the dual-owner form
+// is not silent: the defer frees the backing the by-value copy hands out,
+// so it fires (EPH-I0482). The armed-whole/field-return reverse (`defer
 // w.deinit(); return w.list;`) stays silent: whether the whole-owner
 // deinit frees the returned field's backing is owner-dependent, the same
-// uncertainty that scopes the dual-owner direction (EPH-I1046). Copy
+// uncertainty that scopes the v2 direction (EPH-I1046). Copy
 // aliases drop when the alias or its RHS reassigns after the declaration;
 // the sweep is conservative — a conditional rebind also drops, FN-only
 // (EPH-I1048).
+//
+// v2 (EPH-I0038): `return self.field;` from a managed-container fn copies
+// the header while the receiver stays alive in the caller — two live
+// owners, a double-free once both deinit. The take() idiom adjudicates
+// with a visible field reset (`const x = self.list; self.list = .empty;
+// return x;` — returned path is the local x, v2-invisible — or
+// `self.list = .empty; return self.list;`). v2 fires on a non-local
+// field path with no armed exact-path defer when no reset of that exact
+// path is visible before the return line (inclusive; a statement after a
+// return cannot compile). A visible reset anywhere — even a conditional
+// one — suppresses: the FN-only conservative direction. Receiver shapes
+// are not discriminated: a by-value or pointer receiver and a module
+// global all leave a live owner in the caller.
 //
 // EPH-I0037 divergence, recorded: the pedantic by-value-container-return
 // audit (the pre-0.14.0 ZA110 candidate variant) is NOT implemented. The
@@ -28680,6 +28704,55 @@ fn emitMustReturnRef(ctx: MustReturnRefCtx, site: MustReturnRefSite) !void {
     });
 }
 
+/// Emit the ZA110 v2 dual-owner warning (EPH-I0038): a managed-container
+/// field returned by value with no visible field reset. The returned
+/// header copy and the receiver share one backing; a later deinit on
+/// either side frees the other's backing (a double-free when both run).
+fn emitDualOwnerReturn(
+    ctx: MustReturnRefCtx,
+    line: []const u8,
+    idx: usize,
+    path: []const u8,
+) !void {
+    const msg = try std.fmt.allocPrint(
+        ctx.a,
+        "returned field '{s}' copies a managed container the owner keeps — " ++
+            "two live owners share one backing",
+        .{path},
+    );
+    errdefer ctx.a.free(msg);
+    try ctx.out.append(ctx.a, .{
+        .file = ctx.fp,
+        .line = ctx.fstart + idx,
+        .col = skipLeadingWhitespace(line) + 1,
+        .severity = .warning,
+        .rule = RULE_MUST_RETURN_REF,
+        .message = msg,
+        .message_owned = true,
+        .help = "transfer ownership by resetting the field before the return " ++
+            "(self.list = .empty), or return a pointer/slice",
+    });
+}
+
+/// True when a reset of the exact field path (`self.list = ...`) is
+/// visible on any line from the fn start through the return line. The
+/// take() idiom resets the field so the receiver stops owning the
+/// backing; the returned copy is then the single owner. Comment text is
+/// data (findCommentStart) and string text never assigns
+/// (isRebindAssignment masks literals). A statement after a return on the
+/// same line cannot compile, so the inclusive scan is sound; a reset
+/// before the return on the same line reads correctly. A reset inside a
+/// conditional also suppresses — the FN-only conservative direction
+/// (EPH-I0038).
+fn fieldResetVisible(fl: []const []const u8, ret_idx: usize, path: []const u8) bool {
+    for (fl[0 .. ret_idx + 1]) |line| {
+        const code_end = findCommentStart(line) orelse line.len;
+        const code = line[0..code_end];
+        if (isRebindAssignment(code, path)) return true;
+    }
+    return false;
+}
+
 /// Bounded fn-scan sets for ZA110 (locals, armed defer paths, aliases).
 const MustReturnRefScan = struct {
     locals: [max_tracked_locals][]const u8 = undefined,
@@ -28709,6 +28782,52 @@ fn collectLocalsAndDefers(fl: []const []const u8, scan: *MustReturnRefScan) void
     }
 }
 
+/// One body line's ZA110 analysis (EPH-I0038): the armed-defer v1 fire,
+/// plus the v2 dual-owner fire for a non-local field path with no armed
+/// exact-path defer and no visible field reset.
+fn checkMustReturnRefLine(
+    ctx: MustReturnRefCtx,
+    scan: *const MustReturnRefScan,
+    line: []const u8,
+    i: usize,
+) !void {
+    // Same comment discipline as the collect pass: comment text must
+    // never read as a return statement (EPH-I0478).
+    const code_end = findCommentStart(line) orelse line.len;
+    const t = mem.trim(u8, line[0..code_end], " \t\r");
+    if (t.len == 0 or isCommentOrMultilineString(t)) return;
+    const path = returnedLocalPath(t) orelse return;
+    const head = mem.sliceTo(path, '.');
+    // `return error.Exists;` is an error VALUE, not a field path: `error`
+    // is a reserved keyword that can never name a receiver (EPH-I0038
+    // corpus catch — sig returns `error.X` from !ManagedContainer fns).
+    if (mem.eql(u8, head, "error")) return;
+    const head_is_local = containsName(scan.locals[0..scan.local_count], head);
+    // A bare non-local return (`return self;`) is the whole-owner shape:
+    // the armed-whole/field-return uncertainty scopes it silent (band-B11
+    // F7, EPH-I1046), and the dual-owner form copies a field, not the
+    // whole. The exact-path armed-defer subset fires even when the head is
+    // not a local (EPH-I0482): the defer frees the backing the by-value
+    // copy hands out, with no take()-reset adjudication needed.
+    if (!head_is_local and path.len == head.len) return;
+    if (deferPathArmsReturn(
+        scan.defer_paths[0..scan.defer_count],
+        path,
+        head,
+        scan.aliases[0..scan.alias_count],
+    )) |kind| {
+        try emitMustReturnRef(ctx, .{ .line = line, .idx = i, .ident = path, .kind = kind });
+        return;
+    }
+    // v2 (EPH-I0038): a non-local field path with no armed defer is the
+    // dual-owner shape — the returned header copy and the live receiver
+    // share one backing. A visible reset of the exact path adjudicates
+    // the take() idiom.
+    if (head_is_local) return;
+    if (fieldResetVisible(ctx.fl, i, path)) return;
+    try emitDualOwnerReturn(ctx, line, i, path);
+}
+
 /// ZA110: flag managed-container fns returning a local whose deinit is
 /// still armed by a defer when the by-value copy leaves.
 fn checkMustReturnRef(ctx: MustReturnRefCtx) !void {
@@ -28722,41 +28841,12 @@ fn checkMustReturnRef(ctx: MustReturnRefCtx) !void {
 
     var scan = MustReturnRefScan{};
     collectLocalsAndDefers(ctx.fl, &scan);
-    if (scan.defer_count == 0) return;
+    // No armed-defer early-out: v2 (EPH-I0038) fires on dual-owner field
+    // returns with zero armed paths too.
     dropReboundVarAliases(ctx.fl, &scan);
 
     for (ctx.fl, 0..) |line, i| {
-        // Same comment discipline as the collect pass: comment text must
-        // never read as a return statement (EPH-I0478).
-        const code_end = findCommentStart(line) orelse line.len;
-        const t = mem.trim(u8, line[0..code_end], " \t\r");
-        if (t.len == 0 or isCommentOrMultilineString(t)) continue;
-        const path = returnedLocalPath(t) orelse continue;
-        const head = mem.sliceTo(path, '.');
-        // The locals gate silences non-local heads (`self.field`): the
-        // receiver is not a tracked local, and a bare `return self.list;`
-        // is the dual-owner take()-idiom shape (EPH-I0038, v2). The
-        // exact-path armed-defer subset is the one exception (band-B11
-        // F8, EPH-I0482): a defer armed on the exact returned field path
-        // frees that backing at scope exit regardless of dual-owner
-        // semantics, so it fires even when the head is not a local. The
-        // whole-owner non-local form (`return self;` under an armed
-        // `self.list.deinit()`) stays silent — the same uncertainty that
-        // scopes the F7 direction applies there.
-        const head_is_local = containsName(scan.locals[0..scan.local_count], head);
-        if (!head_is_local and path.len == head.len) continue;
-        const arm_kind = deferPathArmsReturn(
-            scan.defer_paths[0..scan.defer_count],
-            path,
-            head,
-            scan.aliases[0..scan.alias_count],
-        ) orelse continue;
-        try emitMustReturnRef(ctx, .{
-            .line = line,
-            .idx = i,
-            .ident = path,
-            .kind = arm_kind,
-        });
+        try checkMustReturnRefLine(ctx, &scan, line, i);
     }
 }
 
@@ -67576,6 +67666,23 @@ test "buildCFG: single-line switch arms attribute to the header (EPH-I0750 appro
         if (e.from == header and e.kind == .branch_true) arm_edges += 1;
     }
     try std.testing.expectEqual(@as(usize, 0), arm_edges);
+}
+
+test "detectCFPattern word-bounds the else/else-if prefixes (EPH-I0090)" {
+    // The misfire: `} else ifx;` is an else branch whose braceless
+    // statement is the identifier `ifx` — a raw startsWith read it as an
+    // else-if arm and moved the branch boundary. `} elseif(` is a block
+    // end plus a call on the same line, not an else arm at all.
+    try std.testing.expectEqual(CFPattern.else_start, detectCFPattern("} else ifx;"));
+    try std.testing.expectEqual(CFPattern.none, detectCFPattern("} elseif( x );"));
+    // The real arm forms keep classifying: spaced, tight-paren, and the
+    // Allman close-brace form with the condition on the next line.
+    try std.testing.expectEqual(CFPattern.else_if, detectCFPattern("} else if (x) {"));
+    try std.testing.expectEqual(CFPattern.else_if, detectCFPattern("} else if(x) {"));
+    try std.testing.expectEqual(CFPattern.else_if, detectCFPattern("} else if"));
+    try std.testing.expectEqual(CFPattern.else_start, detectCFPattern("} else {"));
+    try std.testing.expectEqual(CFPattern.else_start, detectCFPattern("} else{"));
+    try std.testing.expectEqual(CFPattern.else_start, detectCFPattern("} else"));
 }
 
 test "buildCFG: arrow text in a body string opens no phantom arm (EPH-I0679)" {
@@ -107412,12 +107519,16 @@ test "ZA110: field of a local with armed defer fires" {
     );
 }
 
-test "ZA110: self field return is silent (receiver owned by caller)" {
+test "ZA110 v2: self field return without a reset fires (EPH-I0038)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
+    // v2: `return self.list;` copies the header while the receiver stays
+    // alive in the caller — two live owners. v1 stayed silent because the
+    // take() idiom needs the visible reset to adjudicate; v2 fires when
+    // no reset of the exact path is visible before the return.
     const content =
         \\const std = @import("std");
         \\const Store = struct {
@@ -107431,9 +107542,59 @@ test "ZA110: self field return is silent (receiver owned by caller)" {
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
-        @as(usize, 0),
+        @as(usize, 1),
         countRuleIssues(run.issues.items, "za110_selffield.zig", RULE_MUST_RETURN_REF),
     );
+}
+
+test "ZA110 v2: a visible field reset silences the dual-owner return (EPH-I0038)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The reset adjudicates: `self.list = .empty; return self.list;`
+    // empties the receiver's field first, so the returned copy (an empty
+    // list) is the single owner. The take() idiom (`const x = self.list;
+    // self.list = .empty; return x;`) is v2-invisible — its returned path
+    // is the local x. A defer-form reset also reads (it runs after the
+    // copy, which is exactly the ownership transfer). All three stay
+    // silent; the fourth fn has no reset and fires.
+    const content =
+        \\const std = @import("std");
+        \\const Store = struct {
+        \\    list: std.ArrayList(u8),
+        \\    fn emptied(self: *Store) std.ArrayList(u8) {
+        \\        self.list = .empty;
+        \\        return self.list;
+        \\    }
+        \\    fn taken(self: *Store) std.ArrayList(u8) {
+        \\        const x = self.list;
+        \\        self.list = .empty;
+        \\        return x;
+        \\    }
+        \\    fn deferred(self: *Store) std.ArrayList(u8) {
+        \\        defer self.list = .empty;
+        \\        return self.list;
+        \\    }
+        \\    fn raw(self: *Store) std.ArrayList(u8) {
+        \\        return self.list;
+        \\    }
+        \\};
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_selffield_reset.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za110_selffield_reset.zig", RULE_MUST_RETURN_REF),
+    );
+    // The one fire names the raw path's field.
+    try std.testing.expect(mem.indexOf(
+        u8,
+        run.issues.items[0].message,
+        "'self.list'",
+    ) != null);
 }
 
 test "ZA110: self field return with exact-path armed defer fires (EPH-I0482)" {

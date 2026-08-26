@@ -8,17 +8,22 @@
 //! (EPH-I0601): the file that implements the rule must stay small
 //! enough for the rule to analyze it. ast_tier.zig owns the parse
 //! (AstContext), the nesting pre-scan, and the per-file pipeline
-//! (analyzeFileAstTier); this file owns the per-file ZA111 analysis and
-//! its collection passes. The split is mechanical: no behavior changed.
-//! Only `buildTypeIndex`, `Za111Ctx`, and `analyzeFileZa111` are
-//! exported, for the pipeline in ast_tier.zig.
+//! (analyzeFileAstTier); this file owns the per-file ZA111 analysis,
+//! its type index, and its collection passes. The fn-body walker lives
+//! in ast_tier_za111_walk.zig (EPH-I0046), the same 64 KiB reason. Only
+//! `buildTypeIndex`, `Za111Ctx`, and `analyzeFileZa111` are exported,
+//! for the pipeline in ast_tier.zig.
 
 const std = @import("std");
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const types = @import("types.zig");
+const walk = @import("ast_tier_za111_walk.zig");
 
 const Issue = types.Issue;
+const Walker = walk.Walker;
+const CaptureRecord = walk.CaptureRecord;
+const insideComptime = walk.insideComptime;
 const Ast = std.zig.Ast;
 const NodeIndex = Ast.Node.Index;
 const OptIndex = Ast.Node.OptionalIndex;
@@ -26,51 +31,37 @@ const OptIndex = Ast.Node.OptionalIndex;
 // ZA111: returned-stack-reference
 // ============================================================================
 //
-// Compiler-gap evidence (zig 0.16.0, `zig build-obj -fno-emit-bin` probes):
-//   CAUGHT:   return &var_local;           (Sema errors on the bare form)
-//   MISSED:   return &var.field;           (silent — stack UB)
-//   MISSED:   return &var[i];              (silent, comptime index too)
-//   MISSED:   return var[lo..hi];          (slice of local array — silent)
-//   MISSED:   return &param;               (params are stack slots — silent)
-//   MISSED:   return &param.field;         (silent)
-//   MISSED:   return &var.slice_field;     (no index — slot address, silent)
-//   MISSED:   return &var.ptr_field;       (slot address, silent)
-//   MISSED:   return &opt.?;               (?*T and ?[]T payloads, silent)
-//   MISSED:   const p = &var; return p;    (const alias — silent)
-//   SAFE:     const x: u32 = 42; return &x; (comptime const → static memory)
-//   SAFE:     comptime params / comptime-only typed params (→ static)
-//   SAFE:     comptime var (comptime string-builder idiom → static memory)
+// Compiler-gap evidence (zig 0.16.0, build-obj -fno-emit-bin probes):
+//   CAUGHT: return &var_local;  MISSED: &var.field, &var[i], var[lo..hi],
+//   &param, &param.field, &var.slice_field, &var.ptr_field, &opt.?,
+//   const p = &var; return p.  SAFE: comptime consts, comptime params,
+//   comptime var (the comptime string-builder idiom).
 // ZA111 covers exactly the MISSED forms; the bare-var form is skipped so
-// ephor never duplicates a hard compile error.
-// (The three slot-address rows re-verified 2026-08-23,
-// .tmp/b75-probes/f1_gaps.zig — EPH-I0590.)
+// ephor never duplicates a hard compile error. (Slot-address rows
+// re-verified 2026-08-23, EPH-I0590.)
 //
-// Precision policy (ephor's false-positive-elimination rule): a chained
-// address-of is flagged only when every hop provably stays inside the
-// stack frame. A hop through a pointer/slice(-typed) binding or field is
-// safe (caller memory) when hops remain behind it; an unresolvable hop
-// (out-of-file type, inferred anonymous type, @field builtin) is SILENT,
-// not flagged. Deferred forms (tracked): runtime-known const locals,
-// out-param escape, labeled-block escape, payload-capture escape,
-// @ptrCast evasion, named array aliases, var-alias pointer return, var
-// slice-binding return, slice of array field, slice of array param,
-// global-var stores (`g = &x;`), field stores (`caller.field = &x;`),
-// destructured-binding chains (no type node on lhs patterns).
+// Precision policy: a chained address-of is flagged only when every hop
+// provably stays inside the stack frame. A hop through a pointer/slice
+// binding or field is caller memory (safe) when hops remain behind it;
+// an unresolvable hop is SILENT. Deferred forms: runtime-known const
+// locals (needs comptime-provenance), global-var stores, field stores
+// on non-param roots, destructured-binding chains, and the no-rebind
+// var binding shapes — hard compile errors never echoed, except the
+// element-mutated var slice binding, which compiles but stays silent
+// without a rebind (EPH-I0046).
 
 const RULE_ZA111 = types.RULE_RETURNED_STACK_REF;
 
 /// A `var` local: always a runtime stack slot.
 const StackLocal = struct {
     name: []const u8,
-    /// True only when the type is provably an array — slicing a slice
-    /// copies a caller-owned pointer and must not be flagged.
+    /// Provably an array type — only arrays slice as stack storage.
     provably_array: bool,
-    /// True when the binding's type is a pointer/slice. `&ptr.x` and
-    /// `&ptr[i]` address memory BEHIND the pointer (owned by the caller),
-    /// not the stack slot — only the bare slot address is escapable.
+    /// Pointer/slice-typed: `&ptr.x` addresses caller memory, not the
+    /// stack slot — only the bare slot address is escapable.
     is_pointer: bool,
-    /// Explicit type annotation (or the type of an explicit init), .none
-    /// when the type is inferred and unprovable.
+    /// Explicit type annotation (or the init's explicit type), .none
+    /// when inferred and unprovable.
     type_node: OptIndex,
 };
 
@@ -79,12 +70,46 @@ const Param = struct {
     name: []const u8,
     is_pointer: bool,
     type_node: OptIndex,
+    /// Provably an array type — slicing an array param points into the
+    /// param's stack slot; slicing a slice/pointer copies caller memory
+    /// (EPH-I0046).
+    provably_array: bool = false,
 };
 
 /// A `const p = &x...;` binding: p's value points into root's stack slot.
+/// `var` aliases (EPH-I0046) compile only when rebound — the no-rebind
+/// shape is a hard compile error, never echoed — and fire only when
+/// every rebind RHS stays stack-rooted.
 const Alias = struct {
     name: []const u8,
     root: []const u8,
+    /// The resolving init: decl init for const, last rebind RHS for var.
+    init: OptIndex = .none,
+    is_var: bool = false,
+    decl_tok: u32 = 0,
+    /// Set when the rebind adjudication or the fixpoint drops the alias;
+    /// aliasRoot skips dropped entries (EPH-I0046).
+    dropped: bool = false,
+};
+
+/// A `const/var s = arr[a..b];` binding whose sliced root is a provable
+/// stack array (EPH-I0046). Var bindings follow the pointer-alias rebind
+/// rule: no rebind (compile error) or a non-array rebind RHS drops.
+const SliceBinding = struct {
+    name: []const u8,
+    root: []const u8,
+    is_var: bool = false,
+    decl_tok: u32 = 0,
+};
+
+/// A resolved payload capture (EPH-I0046): name, stack root binding,
+/// and the body token range that scopes the name.
+const Capture = struct {
+    name: []const u8,
+    root: []const u8,
+    is_param: bool = false,
+    first_tok: u32,
+    last_tok: u32,
 };
 
 /// Per-function collected state for ZA111.
@@ -92,11 +117,15 @@ const FnScan = struct {
     locals: std.ArrayListUnmanaged(StackLocal) = .empty,
     aliases: std.ArrayListUnmanaged(Alias) = .empty,
     params: std.ArrayListUnmanaged(Param) = .empty,
+    slice_bindings: std.ArrayListUnmanaged(SliceBinding) = .empty,
+    captures: std.ArrayListUnmanaged(Capture) = .empty,
 
     fn deinit(self: *FnScan, a: Allocator) void {
         self.locals.deinit(a);
         self.aliases.deinit(a);
         self.params.deinit(a);
+        self.slice_bindings.deinit(a);
+        self.captures.deinit(a);
     }
 
     fn localByName(self: *const FnScan, name: []const u8) ?StackLocal {
@@ -108,7 +137,15 @@ const FnScan = struct {
 
     fn aliasRoot(self: *const FnScan, name: []const u8) ?[]const u8 {
         for (self.aliases.items) |al| {
+            if (al.dropped) continue;
             if (mem.eql(u8, al.name, name)) return al.root;
+        }
+        return null;
+    }
+
+    fn sliceBindingRoot(self: *const FnScan, name: []const u8) ?[]const u8 {
+        for (self.slice_bindings.items) |sb| {
+            if (mem.eql(u8, sb.name, name)) return sb.root;
         }
         return null;
     }
@@ -122,343 +159,6 @@ const FnScan = struct {
 };
 
 // ============================================================================
-// Body walker
-// ============================================================================
-//
-// std.Ast's Node.Data is an untagged union, so children are reached through
-// the tree's typed full.* helpers (composite constructs) plus a per-tag
-// shape switch (simple expressions). Nested container declarations are a
-// hard boundary: their methods are separate functions, reached by the
-// file-wide fn_decl scan — walking into them would misattribute their
-// locals/returns to the enclosing function.
-//
-// Coverage policy: an unlisted tag pushes no children. That can only cause
-// a missed detection (false negative), never a crash or a false positive.
-// `await` needs no arm: async was removed in 0.15 and the 0.16.0 stdlib
-// has no await tag — `await` parses as an identifier leaf (EPH-I0596).
-// `assign_destructure` pushes its lhs binding patterns so destructured
-// `var` names enter FnScan as by-value untyped locals (EPH-I0596).
-
-const Walker = struct {
-    a: Allocator,
-    tree: *const Ast,
-    stack: std.ArrayListUnmanaged(NodeIndex) = .empty,
-    var_decls: std.ArrayListUnmanaged(NodeIndex) = .empty,
-    returns: std.ArrayListUnmanaged(NodeIndex) = .empty,
-
-    fn deinit(self: *Walker) void {
-        self.stack.deinit(self.a);
-        self.var_decls.deinit(self.a);
-        self.returns.deinit(self.a);
-    }
-
-    fn push(self: *Walker, node: NodeIndex) !void {
-        try self.stack.append(self.a, node);
-    }
-
-    fn pushOpt(self: *Walker, node: OptIndex) !void {
-        try self.push(node.unwrap() orelse return);
-    }
-
-    fn pushAll(self: *Walker, nodes: []const NodeIndex) !void {
-        for (nodes) |n| try self.push(n);
-    }
-
-    /// DFS over one function body, recording var decls and returns.
-    fn run(self: *Walker, body: NodeIndex) !void {
-        try self.push(body);
-        while (self.stack.pop()) |node| {
-            switch (self.tree.nodeTag(node)) {
-                .local_var_decl, .simple_var_decl, .aligned_var_decl => {
-                    try self.var_decls.append(self.a, node);
-                },
-                .@"return" => try self.returns.append(self.a, node),
-                else => {},
-            }
-            try self.pushChildren(node);
-        }
-    }
-
-    fn pushChildren(self: *Walker, node: NodeIndex) !void {
-        const tag = self.tree.nodeTag(node);
-        if (isBoundaryTag(tag)) return;
-        if (try self.pushCompositeStmt(node)) return;
-        if (try self.pushCompositeExpr(node)) return;
-        try self.pushShaped(node);
-    }
-
-    /// Composite statement constructs, via the tree's typed helpers.
-    fn pushCompositeStmt(self: *Walker, node: NodeIndex) !bool {
-        const tree = self.tree;
-        switch (tree.nodeTag(node)) {
-            .local_var_decl, .simple_var_decl, .aligned_var_decl => {
-                const vd = tree.fullVarDecl(node) orelse return true;
-                try self.pushOpt(vd.ast.type_node);
-                try self.pushOpt(vd.ast.init_node);
-            },
-            .if_simple, .@"if" => {
-                const f = tree.fullIf(node) orelse return true;
-                try self.push(f.ast.cond_expr);
-                try self.push(f.ast.then_expr);
-                try self.pushOpt(f.ast.else_expr);
-            },
-            .while_simple, .while_cont, .@"while" => {
-                const w = tree.fullWhile(node) orelse return true;
-                try self.push(w.ast.cond_expr);
-                try self.pushOpt(w.ast.cont_expr);
-                try self.push(w.ast.then_expr);
-                try self.pushOpt(w.ast.else_expr);
-            },
-            .for_simple, .@"for" => {
-                const f = tree.fullFor(node) orelse return true;
-                try self.pushAll(f.ast.inputs);
-                try self.push(f.ast.then_expr);
-                try self.pushOpt(f.ast.else_expr);
-            },
-            .@"switch", .switch_comma => {
-                const s = tree.fullSwitch(node) orelse return true;
-                try self.push(s.ast.condition);
-                try self.pushAll(s.ast.cases);
-            },
-            .switch_case_one,
-            .switch_case,
-            .switch_case_inline_one,
-            .switch_case_inline,
-            => {
-                const c = tree.fullSwitchCase(node) orelse return true;
-                try self.pushAll(c.ast.values);
-                try self.push(c.ast.target_expr);
-            },
-            .block, .block_semicolon, .block_two, .block_two_semicolon => {
-                var buf: [2]NodeIndex = undefined;
-                try self.pushAll(tree.blockStatements(&buf, node) orelse return true);
-            },
-            else => return false,
-        }
-        return true;
-    }
-
-    /// Composite expression constructs, via the tree's typed helpers.
-    fn pushCompositeExpr(self: *Walker, node: NodeIndex) !bool {
-        switch (self.tree.nodeTag(node)) {
-            .call, .call_comma, .call_one, .call_one_comma => try self.pushCall(node),
-            .builtin_call,
-            .builtin_call_comma,
-            .builtin_call_two,
-            .builtin_call_two_comma,
-            => try self.pushBuiltinCall(node),
-            .struct_init,
-            .struct_init_comma,
-            .struct_init_dot,
-            .struct_init_dot_comma,
-            .struct_init_dot_two,
-            .struct_init_dot_two_comma,
-            .struct_init_one,
-            .struct_init_one_comma,
-            => try self.pushStructInit(node),
-            .array_init,
-            .array_init_comma,
-            .array_init_dot,
-            .array_init_dot_comma,
-            .array_init_dot_two,
-            .array_init_dot_two_comma,
-            .array_init_one,
-            .array_init_one_comma,
-            => try self.pushArrayInit(node),
-            .slice_open, .slice, .slice_sentinel => try self.pushSlice(node),
-            .array_type, .array_type_sentinel => try self.pushArrayType(node),
-            else => return false,
-        }
-        return true;
-    }
-
-    fn pushCall(self: *Walker, node: NodeIndex) !void {
-        var buf: [1]NodeIndex = undefined;
-        const c = self.tree.fullCall(&buf, node) orelse return;
-        try self.push(c.ast.fn_expr);
-        try self.pushAll(c.ast.params);
-    }
-
-    fn pushBuiltinCall(self: *Walker, node: NodeIndex) !void {
-        var buf: [2]NodeIndex = undefined;
-        try self.pushAll(self.tree.builtinCallParams(&buf, node) orelse return);
-    }
-
-    fn pushStructInit(self: *Walker, node: NodeIndex) !void {
-        var buf: [2]NodeIndex = undefined;
-        const s = self.tree.fullStructInit(&buf, node) orelse return;
-        try self.pushOpt(s.ast.type_expr);
-        try self.pushAll(s.ast.fields);
-    }
-
-    fn pushArrayInit(self: *Walker, node: NodeIndex) !void {
-        var buf: [2]NodeIndex = undefined;
-        const ai = self.tree.fullArrayInit(&buf, node) orelse return;
-        try self.pushOpt(ai.ast.type_expr);
-        try self.pushAll(ai.ast.elements);
-    }
-
-    fn pushSlice(self: *Walker, node: NodeIndex) !void {
-        const s = self.tree.fullSlice(node) orelse return;
-        try self.push(s.ast.sliced);
-        try self.push(s.ast.start);
-        try self.pushOpt(s.ast.end);
-        try self.pushOpt(s.ast.sentinel);
-    }
-
-    fn pushArrayType(self: *Walker, node: NodeIndex) !void {
-        const at = self.tree.fullArrayType(node) orelse return;
-        try self.push(at.ast.elem_count);
-        try self.pushOpt(at.ast.sentinel);
-        try self.push(at.ast.elem_type);
-    }
-
-    /// Destructured `var` bindings are stack slots and must enter FnScan
-    /// through their lhs patterns. The patterns carry no type node, so
-    /// their chains resolve silent under the precision policy (EPH-I0596).
-    fn pushDestructure(self: *Walker, node: NodeIndex) !void {
-        const d = self.tree.assignDestructure(node);
-        try self.pushAll(d.ast.variables);
-        try self.push(d.ast.value_expr);
-    }
-
-    /// Children of the `extra_and_node` tags: plain pointer types push
-    /// their elem type; `assign_destructure` pushes lhs bindings plus
-    /// the value (EPH-I0596).
-    fn pushShapedTail(self: *Walker, node: NodeIndex) !void {
-        const data = self.tree.nodeData(node);
-        if (self.tree.nodeTag(node) == .assign_destructure) {
-            try self.pushDestructure(node);
-            return;
-        }
-        try self.push(data.extra_and_node[1]);
-    }
-
-    /// Simple expressions: children follow directly from the tag's fixed
-    /// data shape. Unlisted tags are leaves for this walk's purposes.
-    fn pushShaped(self: *Walker, node: NodeIndex) !void {
-        if (try self.pushShapedBinary(node)) return;
-        const data = self.tree.nodeData(node);
-        switch (self.tree.nodeTag(node)) {
-            .field_access, .unwrap_optional, .grouped_expression => {
-                try self.push(data.node_and_token[0]);
-            },
-            .address_of,
-            .deref,
-            .bool_not,
-            .negation,
-            .negation_wrap,
-            .bit_not,
-            .optional_type,
-            .@"try",
-            .@"comptime",
-            .@"defer",
-            .@"suspend",
-            .@"resume",
-            .@"nosuspend",
-            => try self.push(data.node),
-            .@"return" => try self.pushOpt(data.opt_node),
-            .@"errdefer" => try self.push(data.opt_token_and_node[1]),
-            .anyframe_type => try self.push(data.token_and_node[1]),
-            .@"break", .@"continue" => {
-                try self.pushOpt(data.opt_token_and_opt_node[1]);
-            },
-            .ptr_type_aligned, .ptr_type_sentinel => {
-                const opt, const elem = data.opt_node_and_node;
-                try self.pushOpt(opt);
-                try self.push(elem);
-            },
-            .ptr_type, .ptr_type_bit_range, .assign_destructure => {
-                try self.pushShapedTail(node);
-            },
-            else => {},
-        }
-    }
-
-    /// Binary operators, assignments, ranges, catch/orelse, error unions —
-    /// all `node_and_node` (verified against Parse.zig's operTable).
-    fn pushShapedBinary(self: *Walker, node: NodeIndex) !bool {
-        const tag = self.tree.nodeTag(node);
-        const data = self.tree.nodeData(node);
-        if (binary_like_tags.contains(tag)) {
-            const lhs, const rhs = data.node_and_node;
-            try self.push(lhs);
-            try self.push(rhs);
-            return true;
-        }
-        // `lhs..rhs` and open `lhs..` — the end is optional (shape is
-        // node_and_opt_node, NOT node_and_node; verified against
-        // Parse.zig forPrefix).
-        if (tag == .for_range) {
-            const lhs, const rhs = data.node_and_opt_node;
-            try self.push(lhs);
-            try self.pushOpt(rhs);
-            return true;
-        }
-        return false;
-    }
-};
-
-/// Tags whose data is `node_and_node` (binary ops, assignments, ranges,
-/// catch/orelse, error unions — verified against Parse.zig's operTable).
-const binary_like_tags = blk: {
-    var set = std.EnumSet(Ast.Node.Tag).initEmpty();
-    const tags = [_]Ast.Node.Tag{
-        .assign,          .assign_mul,      .assign_div,      .assign_mod,
-        .assign_add,      .assign_sub,      .assign_shl,      .assign_shl_sat,
-        .assign_shr,      .assign_bit_and,  .assign_bit_xor,  .assign_bit_or,
-        .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap, .assign_mul_sat,
-        .assign_add_sat,  .assign_sub_sat,  .equal_equal,     .bang_equal,
-        .less_than,       .greater_than,    .less_or_equal,   .greater_or_equal,
-        .mul,             .div,             .mod,             .array_mult,
-        .mul_wrap,        .mul_sat,         .add,             .sub,
-        .array_cat,       .add_wrap,        .sub_wrap,        .add_sat,
-        .sub_sat,         .shl,             .shl_sat,         .shr,
-        .bit_and,         .bit_xor,         .bit_or,          .bool_and,
-        .bool_or,         .@"orelse",       .@"catch",        .merge_error_sets,
-        .switch_range,    .error_union,     .array_access,
-    };
-    for (tags) |t| set.insert(t);
-    break :blk set;
-};
-
-/// Tags whose subtrees must not be entered during a fn-body walk.
-fn isBoundaryTag(tag: Ast.Node.Tag) bool {
-    return switch (tag) {
-        .root,
-        .test_decl,
-        .error_set_decl,
-        .container_decl,
-        .container_decl_trailing,
-        .container_decl_two,
-        .container_decl_two_trailing,
-        .container_decl_arg,
-        .container_decl_arg_trailing,
-        .tagged_union,
-        .tagged_union_trailing,
-        .tagged_union_two,
-        .tagged_union_two_trailing,
-        .tagged_union_enum_tag,
-        .tagged_union_enum_tag_trailing,
-        .global_var_decl,
-        .fn_decl,
-        .fn_proto,
-        .fn_proto_one,
-        .fn_proto_simple,
-        .fn_proto_multi,
-        .container_field,
-        .container_field_init,
-        .container_field_align,
-        .asm_simple,
-        .@"asm",
-        .asm_input,
-        .asm_output,
-        => true,
-        else => false,
-    };
-}
-
-// ============================================================================
 // Same-file type index (field-type resolution for chained address-of)
 // ============================================================================
 //
@@ -470,15 +170,11 @@ fn isBoundaryTag(tag: Ast.Node.Tag) bool {
 // .unknown and the caller stays silent.
 
 const TypeIndex = struct {
-    /// name -> declared containers, each with its lexical scope. Scoped
-    /// per fn (EPH-I0592): two disjoint fn-local types with one name no
-    /// longer collide, and a fn-local type shadows a same-named
-    /// file-scope type for chains inside its function. Residual
-    /// over-approximation, documented honestly: block scopes inside a
-    /// fn are folded into the fn body, so two same-named types in
-    /// sibling blocks of one fn still collide (later declaration wins).
-    /// A chain whose type is not visible falls back to silence, the
-    /// precision policy for unprovable hops.
+    /// name -> declared containers, each with its lexical scope, scoped
+    /// per fn (EPH-I0592): a fn-local type shadows a same-named
+    /// file-scope type inside its function. Block scopes fold into the
+    /// fn body, so same-named types in sibling blocks still collide
+    /// (later declaration wins) — a documented over-approximation.
     map: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(TypeEntry)) = .empty,
 
     pub fn deinit(self: *TypeIndex, a: Allocator) void {
@@ -496,22 +192,22 @@ const TypeIndex = struct {
         tree: *const Ast,
         name: []const u8,
         body: NodeIndex,
-    ) ?NodeIndex {
+    ) ?TypeEntry {
         const entries = self.map.get(name) orelse return null;
         const body_first = tree.firstToken(body);
         const body_last = tree.lastToken(body);
-        var scoped: ?NodeIndex = null;
+        var scoped: ?TypeEntry = null;
         var scoped_len: u32 = 0;
-        var file_scope: ?NodeIndex = null;
+        var file_scope: ?TypeEntry = null;
         for (entries.items) |entry| {
             const sb = entry.scope_body orelse {
-                file_scope = entry.container;
+                file_scope = entry;
                 continue;
             };
             if (!bodyInside(tree, sb, body_first, body_last)) continue;
             const len = tree.lastToken(sb) - tree.firstToken(sb);
             if (scoped == null or len <= scoped_len) {
-                scoped = entry.container;
+                scoped = entry;
                 scoped_len = len;
             }
         }
@@ -519,9 +215,14 @@ const TypeIndex = struct {
     }
 };
 
-/// One indexed container declaration plus its lexical scope.
+/// One indexed type declaration plus its lexical scope: a container
+/// (`const S = struct/union/enum {...};`) or a type alias (`const
+/// V = [4]u32;`, `const P = *S;` — EPH-I0046: alias-indexed array
+/// chains like `&v[i]` used to resolve unknown and stay silent).
 const TypeEntry = struct {
-    container: NodeIndex,
+    container: ?NodeIndex = null,
+    /// The aliased type expression node when this entry is an alias.
+    alias_type: OptIndex = .none,
     /// The innermost fn body containing the declaration, null at file
     /// scope. See TypeIndex for the block-scope over-approximation.
     scope_body: ?NodeIndex,
@@ -553,9 +254,9 @@ fn isContainerDeclTag(tag: Ast.Node.Tag) bool {
 }
 
 /// Index every `const Name = struct/union/enum {...};` in the file,
-/// including fn-local ones (a fn-local type's methods are analyzed with
-/// their own function scans). Each entry records its innermost fn body
-/// so lookups resolve per function (EPH-I0592).
+/// including fn-local ones. Each entry records its innermost fn body
+/// so lookups resolve per function (EPH-I0592). Type aliases join the
+/// index too: alias-typed chains used to resolve unknown (EPH-I0046).
 pub fn buildTypeIndex(a: Allocator, tree: *const Ast) !TypeIndex {
     var idx = TypeIndex{};
     errdefer idx.deinit(a);
@@ -571,17 +272,40 @@ pub fn buildTypeIndex(a: Allocator, tree: *const Ast) !TypeIndex {
     while (i < tree.nodes.len) : (i += 1) {
         const node: NodeIndex = @enumFromInt(@as(u32, @intCast(i)));
         const vd = tree.fullVarDecl(node) orelse continue;
+        if (!mem.eql(u8, tree.tokenSlice(vd.ast.mut_token), "const")) continue;
         const init = vd.ast.init_node.unwrap() orelse continue;
-        if (!isContainerDeclTag(tree.nodeTag(init))) continue;
+        const scope_body = innermostFnBody(tree, bodies.items, tree.firstToken(node));
+        const entry: TypeEntry = if (isContainerDeclTag(tree.nodeTag(init)))
+            .{ .container = init, .scope_body = scope_body }
+        else if (isTypeExprTag(tree.nodeTag(init)))
+            .{ .alias_type = init.toOptional(), .scope_body = scope_body }
+        else
+            continue;
         const name = tree.tokenSlice(vd.ast.mut_token + 1);
         const gop = try idx.map.getOrPut(a, name);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
-        try gop.value_ptr.append(a, .{
-            .container = init,
-            .scope_body = innermostFnBody(tree, bodies.items, tree.firstToken(node)),
-        });
+        try gop.value_ptr.append(a, entry);
     }
     return idx;
+}
+
+/// True for a bare TYPE expression: the shapes a `const V = <type>;`
+/// alias can carry. Array/pointer/optional types and type names. Array
+/// and struct INIT values (`[4]u32{...}`, `S{...}`) are not types and
+/// must not index (EPH-I0046).
+fn isTypeExprTag(tag: Ast.Node.Tag) bool {
+    return switch (tag) {
+        .array_type,
+        .array_type_sentinel,
+        .ptr_type,
+        .ptr_type_aligned,
+        .ptr_type_sentinel,
+        .ptr_type_bit_range,
+        .optional_type,
+        .identifier,
+        => true,
+        else => false,
+    };
 }
 
 /// The innermost fn body whose token range contains `tok`, null when the
@@ -653,21 +377,52 @@ fn classifyTypeNode(tree: *const Ast, node: NodeIndex) TypeStep {
 fn stepThroughHop(sctx: ScanCtx, cur: TypeStep, hop: Hop) TypeStep {
     switch (cur) {
         .safe, .unknown => return cur,
-        .array_elem => |elem| {
-            if (hop != .index) return .unknown;
-            return classifyTypeNode(sctx.tree, elem);
-        },
-        .optional_payload => |payload| {
-            if (hop != .unwrap) return .unknown;
-            return classifyTypeNode(sctx.tree, payload);
-        },
-        .named => |name| {
-            const container = sctx.tidx.lookup(sctx.tree, name, sctx.body) orelse return .unknown;
-            if (hop != .field) return .unknown;
-            const ft = fieldTypeNode(sctx.tree, container, hop.field) orelse return .unknown;
-            return classifyTypeNode(sctx.tree, ft);
-        },
+        .array_elem => |elem| return stepThroughIndex(sctx, elem, hop),
+        .optional_payload => |payload| return stepThroughUnwrap(sctx, payload, hop),
+        .named => |name| return stepThroughNamed(sctx, name, hop),
     }
+}
+
+fn stepThroughIndex(sctx: ScanCtx, elem: NodeIndex, hop: Hop) TypeStep {
+    if (hop != .index) return .unknown;
+    return classifyTypeNode(sctx.tree, elem);
+}
+
+fn stepThroughUnwrap(sctx: ScanCtx, payload: NodeIndex, hop: Hop) TypeStep {
+    if (hop != .unwrap) return .unknown;
+    return classifyTypeNode(sctx.tree, payload);
+}
+
+/// The named-type hop: a container field lookup, or — for a type alias
+/// — the same hop applied to the aliased type (`&v[i]` with `v: V`,
+/// `V = [4]u32` — EPH-I0046). The flatten bounds alias chains; cycles
+/// are compile errors in real code.
+fn stepThroughNamed(sctx: ScanCtx, name: []const u8, hop: Hop) TypeStep {
+    const entry = sctx.tidx.lookup(sctx.tree, name, sctx.body) orelse return .unknown;
+    if (entry.alias_type.unwrap()) |at| {
+        const flat = flattenAlias(sctx, at, 0);
+        return stepThroughHop(sctx, classifyTypeNode(sctx.tree, flat), hop);
+    }
+    const container = entry.container orelse return .unknown;
+    return stepThroughField(sctx, container, hop);
+}
+
+fn stepThroughField(sctx: ScanCtx, container: NodeIndex, hop: Hop) TypeStep {
+    if (hop != .field) return .unknown;
+    const ft = fieldTypeNode(sctx.tree, container, hop.field) orelse return .unknown;
+    return classifyTypeNode(sctx.tree, ft);
+}
+
+/// Resolve an alias chain (`const A = B; const B = [4]u32;`) to its
+/// final type node, bounded by the alias-table size (cycles are compile
+/// errors in real code; the bound makes adversarial input terminate).
+fn flattenAlias(sctx: ScanCtx, node: NodeIndex, depth: usize) NodeIndex {
+    if (depth >= 64) return node;
+    if (sctx.tree.nodeTag(node) != .identifier) return node;
+    const name = sctx.tree.tokenSlice(sctx.tree.nodeMainToken(node));
+    const entry = sctx.tidx.lookup(sctx.tree, name, sctx.body) orelse return node;
+    const at = entry.alias_type.unwrap() orelse return node;
+    return flattenAlias(sctx, at, depth + 1);
 }
 
 const ChainSafety = enum { unsafe, safe, unknown };
@@ -718,21 +473,31 @@ fn unwrapGroup(tree: *const Ast, node: NodeIndex) NodeIndex {
 /// One hop of an address-of chain.
 const Hop = union(enum) {
     field: []const u8,
+    /// `@field(parent, expr)` with a non-literal field name: the hop
+    /// cannot resolve a field type, so chains through it stay unknown
+    /// (EPH-I0046, the tigerbeetle forest.zig:875 shape).
+    dynamic_field,
     index,
     unwrap,
 };
 
 /// Peeled address-of chain: `s.a[i].?` roots at `s` with hops
-/// [unwrap, index, field a] collected outermost-first (resolution walks
-/// them in reverse). Chains longer than the buffer are unresolvable.
+/// collected outermost-first (resolution walks them in reverse).
+/// Chains longer than the buffer are unresolvable. A `@unionInit(U,
+/// "f", ...)` root records the union type instead of a name: the
+/// union temporary lives on the stack frame (EPH-I0046).
 const ChainInfo = struct {
     root: []const u8 = "",
+    root_type_node: OptIndex = .none,
     hops: [8]Hop = undefined,
     hop_count: usize = 0,
     overflow: bool = false,
 };
 
 /// Peel one chain hop, advancing `cur` past it; null ends the chain.
+/// `@field(parent, "name")` peels as a field hop on `parent` (an lvalue
+/// builtin chain — EPH-I0046): a literal field name resolves the field
+/// type, a non-literal one records dynamic_field.
 fn peelHop(tree: *const Ast, cur: *NodeIndex) ?Hop {
     cur.* = unwrapGroup(tree, cur.*);
     switch (tree.nodeTag(cur.*)) {
@@ -749,8 +514,28 @@ fn peelHop(tree: *const Ast, cur: *NodeIndex) ?Hop {
             cur.* = tree.nodeData(cur.*).node_and_node[0];
             return .index;
         },
+        else => return peelBuiltinHop(tree, cur),
+    }
+}
+
+/// The @field arm of peelHop, isolated so the tag switch stays flat
+/// (EPH-I0046). @field requires two params: the parent continues the
+/// chain, the field name decides resolvability.
+fn peelBuiltinHop(tree: *const Ast, cur: *NodeIndex) ?Hop {
+    switch (tree.nodeTag(cur.*)) {
+        .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {},
         else => return null,
     }
+    const name = tree.tokenSlice(tree.nodeMainToken(cur.*));
+    if (!mem.eql(u8, name, "@field")) return null;
+    var buf: [2]NodeIndex = undefined;
+    const params = tree.builtinCallParams(&buf, cur.*) orelse return null;
+    if (params.len != 2) return null;
+    cur.* = params[0];
+    const fname = unwrapGroup(tree, params[1]);
+    if (tree.nodeTag(fname) != .string_literal) return .dynamic_field;
+    const lit = tree.tokenSlice(tree.nodeMainToken(fname));
+    return .{ .field = lit[1 .. lit.len - 1] };
 }
 
 fn chainInfo(tree: *const Ast, start: NodeIndex) ChainInfo {
@@ -766,6 +551,17 @@ fn chainInfo(tree: *const Ast, start: NodeIndex) ChainInfo {
     }
     if (tree.nodeTag(cur) == .identifier) {
         info.root = tree.tokenSlice(tree.nodeMainToken(cur));
+        return info;
+    }
+    // @unionInit roots a stack temporary (EPH-I0046): record the union
+    // type so resolution can walk its fields from the slot.
+    if (tree.nodeTag(cur) == .builtin_call or tree.nodeTag(cur) == .builtin_call_two) {
+        const name = tree.tokenSlice(tree.nodeMainToken(cur));
+        if (mem.eql(u8, name, "@unionInit")) {
+            var buf: [2]NodeIndex = undefined;
+            const params = tree.builtinCallParams(&buf, cur) orelse return info;
+            if (params.len >= 1) info.root_type_node = params[0].toOptional();
+        }
     }
     return info;
 }
@@ -775,10 +571,11 @@ fn chainInfo(tree: *const Ast, start: NodeIndex) ChainInfo {
 /// anytype params cannot be proven runtime from the AST alone.
 fn collectParams(
     a: Allocator,
-    tree: *const Ast,
+    sctx: ScanCtx,
     proto: NodeIndex,
     scan: *FnScan,
 ) !void {
+    const tree = sctx.tree;
     var buf: [1]NodeIndex = undefined;
     const fp = tree.fullFnProto(&buf, proto) orelse return;
     var it = fp.iterate(tree);
@@ -789,18 +586,32 @@ fn collectParams(
             if (mem.eql(u8, tree.tokenSlice(t), "comptime")) continue;
         }
         var is_pointer = false;
+        var provably_array = false;
         var type_node: OptIndex = .none;
         if (param.type_expr) |te| {
             if (isComptimeOnlyType(tree, te)) continue;
             is_pointer = isPointerTypeExpr(tree, te);
+            provably_array = typeNodeIsArray(sctx, te);
             type_node = te.toOptional();
         }
         try scan.params.append(a, .{
             .name = tree.tokenSlice(name_tok),
             .is_pointer = is_pointer,
             .type_node = type_node,
+            .provably_array = provably_array,
         });
     }
+}
+
+/// True when a type expression is provably an array: direct `[N]T`/
+/// `[N:0]T`, or an alias chain ending at one (`const V = [4]u32;` —
+/// EPH-I0046). Everything else stays false, the FN-only direction.
+fn typeNodeIsArray(sctx: ScanCtx, node: NodeIndex) bool {
+    const flat = flattenAlias(sctx, node, 0);
+    return switch (sctx.tree.nodeTag(flat)) {
+        .array_type, .array_type_sentinel => true,
+        else => false,
+    };
 }
 
 fn isComptimeOnlyType(tree: *const Ast, node: NodeIndex) bool {
@@ -860,10 +671,9 @@ fn varDeclTypeNode(tree: *const Ast, vd: Ast.full.VarDecl) OptIndex {
 }
 
 /// Pointer-ness of a var local: explicit pointer annotation, an
-/// address-of init (`var p = &x;` — address-of always yields a pointer),
-/// or an inferred type copied from a binding already known to be a
-/// pointer (`var q = p;`). Anything else inferred is unprovable from the
-/// AST — treated as by-value.
+/// address-of init (`var p = &x;`), or an inferred copy from a known
+/// pointer binding (`var q = p;`). Other inferred types are treated
+/// as by-value — the FN-only direction.
 fn isPointerVarDecl(tree: *const Ast, vd: Ast.full.VarDecl, scan: *const FnScan) bool {
     if (vd.ast.type_node.unwrap()) |t| return isPointerTypeExpr(tree, t);
     const init = vd.ast.init_node.unwrap() orelse return false;
@@ -916,9 +726,10 @@ const ScanCtx = struct {
     body: NodeIndex,
 };
 
-/// Phase 2: const aliases (`const p = &x...;`). Fixed-point over the decl
-/// list so transitive aliases (`const q = p;`) resolve regardless of the
-/// walk's discovery order. Bounded by one round per declaration.
+/// Phase 2: pointer aliases (`const p = &x...;` and the rebound `var p`
+/// forms, EPH-I0046). Fixed-point over the decl list so transitive
+/// aliases (`const q = p;`) resolve regardless of the walk's discovery
+/// order. Bounded by one round per declaration.
 fn collectAliases(
     a: Allocator,
     sctx: ScanCtx,
@@ -943,27 +754,172 @@ fn tryCollectAlias(
 ) !bool {
     const tree = sctx.tree;
     const vd = tree.fullVarDecl(node) orelse return false;
-    if (!mem.eql(u8, tree.tokenSlice(vd.ast.mut_token), "const")) return false;
+    const is_var = mem.eql(u8, tree.tokenSlice(vd.ast.mut_token), "var");
+    if (!is_var and !mem.eql(u8, tree.tokenSlice(vd.ast.mut_token), "const")) return false;
     const name = tree.tokenSlice(vd.ast.mut_token + 1);
     if (scan.aliasRoot(name) != null) return false;
     const init = vd.ast.init_node.unwrap() orelse return false;
     const root = aliasTarget(sctx, scan, init) orelse return false;
-    try scan.aliases.append(a, .{ .name = name, .root = root });
+    try scan.aliases.append(a, .{
+        .name = name,
+        .root = root,
+        .init = init.toOptional(),
+        .is_var = is_var,
+        .decl_tok = tree.firstToken(node),
+    });
     return true;
 }
 
-/// The stack local or param an alias initializer points into, if provable.
-/// A chained address resolved safe/unknown (`&ptr.x`, `&v.slice[i]`, or
-/// unresolvable) does not point into the stack frame — no alias.
-fn aliasTarget(sctx: ScanCtx, scan: *const FnScan, init: NodeIndex) ?[]const u8 {
-    const e = unwrapGroup(sctx.tree, init);
-    switch (sctx.tree.nodeTag(e)) {
-        .address_of => return aliasAddressTarget(sctx, scan, e),
-        .identifier => {
-            const name = sctx.tree.tokenSlice(sctx.tree.nodeMainToken(e));
-            return scan.aliasRoot(name);
-        },
+/// Source-order sort for plain assign records (the walker discovers them
+/// in pop order, reverse of source).
+fn assignTokLessThan(tree: *const Ast, a: AssignRecord, b: AssignRecord) bool {
+    return tree.firstToken(a.node) < tree.firstToken(b.node);
+}
+
+/// One plain `=` assign: the node plus its lhs/rhs operand nodes.
+const AssignRecord = struct {
+    node: NodeIndex,
+    lhs: NodeIndex,
+    rhs: NodeIndex,
+};
+
+/// Source-ordered assign records (EPH-I0046). Fixed cap, FN-only on
+/// overflow: an invisible assign can only keep a var alias silent,
+/// never a false fire.
+const AssignList = struct {
+    items: [64]AssignRecord = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const AssignList) []const AssignRecord {
+        return self.items[0..self.len];
+    }
+};
+
+/// Build source-ordered assign records for the rebind passes (EPH-I0046).
+fn collectAssignRecords(tree: *const Ast, assigns: []const NodeIndex) AssignList {
+    var out = AssignList{};
+    for (assigns) |node| {
+        if (out.len >= out.items.len) break;
+        const lhs, const rhs = tree.nodeData(node).node_and_node;
+        out.items[out.len] = .{ .node = node, .lhs = lhs, .rhs = rhs };
+        out.len += 1;
+    }
+    std.sort.pdq(AssignRecord, out.items[0..out.len], tree, assignTokLessThan);
+    return out;
+}
+
+/// The last rebind RHS of a var alias, or null when the alias is never
+/// reassigned after its declaration (EPH-I0046). A never-rebound `var p
+/// = &x;` is a hard compiler error (the pointless-var lint) — the rule
+/// never echoes it, so the alias drops.
+fn lastRebindRhs(
+    tree: *const Ast,
+    assigns: []const AssignRecord,
+    name: []const u8,
+    decl_tok: u32,
+) ?NodeIndex {
+    var found: ?NodeIndex = null;
+    for (assigns) |rec| {
+        if (tree.firstToken(rec.node) <= decl_tok) continue;
+        const lhs = unwrapGroup(tree, rec.lhs);
+        if (tree.nodeTag(lhs) != .identifier) continue;
+        if (!mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(lhs)), name)) continue;
+        found = rec.rhs;
+    }
+    return found;
+}
+
+/// Adjudicate var aliases against their rebinds, then re-resolve every
+/// alias root against the surviving set (EPH-I0046): no rebind drops
+/// (compile-error shape), a non-stack rebind RHS drops, and a root
+/// that names a dropped alias drops too (transitive, fixpoint-bounded).
+fn resolveAliasRebinds(sctx: ScanCtx, scan: *FnScan, records: *const AssignList) void {
+    for (scan.aliases.items) |*al| {
+        if (!al.is_var) continue;
+        const rhs = lastRebindRhs(sctx.tree, records.slice(), al.name, al.decl_tok) orelse {
+            al.dropped = true;
+            continue;
+        };
+        al.init = rhs.toOptional();
+    }
+    var rounds: usize = 0;
+    while (reresolveAliasRoots(sctx, scan) and rounds <= scan.aliases.items.len) : (rounds += 1) {}
+    var i: usize = 0;
+    while (i < scan.aliases.items.len) {
+        if (scan.aliases.items[i].dropped) {
+            scan.aliases.items[i] = scan.aliases.items[scan.aliases.items.len - 1];
+            scan.aliases.items.len -= 1;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// One fixpoint round: re-resolve every surviving alias root against
+/// the current set, dropping the unresolvable. Returns true when
+/// anything changed, driving the bounded fixpoint in
+/// resolveAliasRebinds.
+fn reresolveAliasRoots(sctx: ScanCtx, scan: *FnScan) bool {
+    var changed = false;
+    for (scan.aliases.items) |*al| {
+        if (al.dropped) continue;
+        const init = al.init.unwrap() orelse {
+            al.dropped = true;
+            changed = true;
+            continue;
+        };
+        const root = aliasTarget(sctx, scan, init) orelse {
+            al.dropped = true;
+            changed = true;
+            continue;
+        };
+        if (mem.eql(u8, al.root, root)) continue;
+        al.root = root;
+        changed = true;
+    }
+    return changed;
+}
+
+/// The inner operand of an @as/@ptrCast builtin call, or null for any
+/// other builtin or a malformed call (EPH-I0046). Shared by the return
+/// classifier and the alias resolver: both peel the evasion layers to
+/// the address-of beneath.
+fn peelCastBuiltin(tree: *const Ast, node: NodeIndex) ?NodeIndex {
+    switch (tree.nodeTag(node)) {
+        .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => {},
         else => return null,
+    }
+    const name = tree.tokenSlice(tree.nodeMainToken(node));
+    var buf: [2]NodeIndex = undefined;
+    const params = tree.builtinCallParams(&buf, node) orelse return null;
+    if (mem.eql(u8, name, "@as")) {
+        if (params.len != 2) return null;
+        return unwrapGroup(tree, params[1]);
+    }
+    if (mem.eql(u8, name, "@ptrCast")) {
+        if (params.len != 1) return null;
+        return unwrapGroup(tree, params[0]);
+    }
+    return null;
+}
+
+/// The stack local or param an alias initializer points into, if
+/// provable. A chained address resolved safe/unknown does not point
+/// into the stack frame — no alias. @as/@ptrCast layers peel
+/// (EPH-I0046).
+fn aliasTarget(sctx: ScanCtx, scan: *const FnScan, init: NodeIndex) ?[]const u8 {
+    var e = unwrapGroup(sctx.tree, init);
+    while (true) {
+        switch (sctx.tree.nodeTag(e)) {
+            .address_of => return aliasAddressTarget(sctx, scan, e),
+            .identifier => {
+                const name = sctx.tree.tokenSlice(sctx.tree.nodeMainToken(e));
+                return scan.aliasRoot(name);
+            },
+            else => {
+                e = peelCastBuiltin(sctx.tree, e) orelse return null;
+            },
+        }
     }
 }
 
@@ -1003,15 +959,10 @@ fn chainIsUnsafe(sctx: ScanCtx, info: ChainInfo, bind: Bind) bool {
 /// The slot-address discrimination for pointer/slice roots (EPH-I1122):
 /// a lone `.len`/`.ptr` field hop on a slice root addresses the pointer
 /// value stored in the root's own stack slot, so the chain is unsafe.
-/// Every other hop shape stays caller-owned memory and silent: an index
-/// into the backing array (`&v[i]`), a pointee field through a
-/// single-item pointer (`&p.len` on a `*S` addresses `(*S).len`), and any
-/// deeper chain (`&v[i].len` addresses the element's field). A root whose
-/// type is unprovable from the AST (an inferred local) stays silent too —
-/// the FN-only direction. The `.many` arm is defensive coverage only:
-/// Zig's `[*]T` carries no `.len`/`.ptr` field access (std.mem.len scans
-/// for a sentinel), so `&p.len` on a many-pointer binding is a compile
-/// error — the scanner sees the text regardless and fires defensively.
+/// Every other hop shape stays caller-owned memory and silent. The
+/// `.many` arm is defensive coverage only: `[*]T` carries no field
+/// access, so `&p.len` there is a compile error the scanner fires on
+/// defensively.
 fn finalHopIsOwnSlot(sctx: ScanCtx, info: ChainInfo, bind: Bind) bool {
     if (info.hop_count != 1) return false;
     const field = switch (info.hops[0]) {
@@ -1031,6 +982,11 @@ fn finalHopIsOwnSlot(sctx: ScanCtx, info: ChainInfo, bind: Bind) bool {
 // ZA111 return classification + emission
 // ============================================================================
 
+/// How the stack reference escapes the function (EPH-I0046): through a
+/// return, an out-param store, a labeled-block break value, or a
+/// payload-capture return. The form picks the emit message.
+const EscapeForm = enum { returned, out_param, block_break, capture };
+
 const Finding = struct {
     /// Stack local or param the returned pointer/slice refers to.
     name: []const u8,
@@ -1038,6 +994,9 @@ const Finding = struct {
     via: ?[]const u8,
     is_slice: bool,
     is_param: bool = false,
+    /// @unionInit-temporary roots carry no binding name (EPH-I0046).
+    is_temporary: bool = false,
+    escape: EscapeForm = .returned,
 };
 
 fn classifyReturn(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Finding {
@@ -1045,15 +1004,48 @@ fn classifyReturn(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Finding 
     const e = unwrapGroup(sctx.tree, expr);
     return switch (sctx.tree.nodeTag(e)) {
         .address_of => classifyAddressOf(sctx, scan, e),
-        .slice_open, .slice, .slice_sentinel => classifySlice(sctx.tree, scan, e),
-        .identifier => classifyAliasReturn(sctx.tree, scan, e),
+        .slice_open, .slice, .slice_sentinel => classifySlice(sctx, scan, e),
+        .identifier => classifyAliasReturn(sctx, scan, e),
+        .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => blk: {
+            break :blk classifyBuiltinReturn(sctx, scan, e);
+        },
         else => null,
     };
 }
 
+/// `return @as(*u32, @ptrCast(&x));` — peel the @as/@ptrCast evasion
+/// layers and classify the address-of beneath (EPH-I0046). Other
+/// builtins stay silent. The peel allows a bare `&x`: the compiler
+/// catches the bare form, but @ptrCast hides it (probe-verified
+/// silent on 0.16.0).
+fn classifyBuiltinReturn(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Finding {
+    var cur = node;
+    while (true) {
+        cur = unwrapGroup(sctx.tree, cur);
+        switch (sctx.tree.nodeTag(cur)) {
+            .address_of => return classifyAddressOfAllowBare(sctx, scan, cur),
+            else => cur = peelCastBuiltin(sctx.tree, cur) orelse return null,
+        }
+    }
+}
+
+/// classifyAddressOf with the bare-local form allowed: inside a
+/// @ptrCast/@as peel the compiler's bare-&var check is evaded, so the
+/// bare form fires (EPH-I0046).
+fn classifyAddressOfAllowBare(sctx: ScanCtx, scan: *const FnScan, amp: NodeIndex) ?Finding {
+    const info = chainInfo(sctx.tree, sctx.tree.nodeData(amp).node);
+    if (info.root.len == 0) return classifyTemporaryAddressOf(sctx, info);
+    const bind = bindForRoot(info.root, scan) orelse return null;
+    if (info.hop_count == 0) {
+        return .{ .name = info.root, .via = null, .is_slice = false, .is_param = bind.is_param };
+    }
+    if (!chainIsUnsafe(sctx, info, bind)) return null;
+    return .{ .name = info.root, .via = null, .is_slice = false, .is_param = bind.is_param };
+}
+
 fn classifyAddressOf(sctx: ScanCtx, scan: *const FnScan, amp: NodeIndex) ?Finding {
     const info = chainInfo(sctx.tree, sctx.tree.nodeData(amp).node);
-    if (info.root.len == 0) return null;
+    if (info.root.len == 0) return classifyTemporaryAddressOf(sctx, info);
     const bind = bindForRoot(info.root, scan) orelse return null;
     if (info.hop_count == 0) {
         // Bare &var is a hard compile error (Zig Sema) — never echo it.
@@ -1064,26 +1056,305 @@ fn classifyAddressOf(sctx: ScanCtx, scan: *const FnScan, amp: NodeIndex) ?Findin
     return .{ .name = info.root, .via = null, .is_slice = false, .is_param = bind.is_param };
 }
 
-fn classifySlice(tree: *const Ast, scan: *const FnScan, node: NodeIndex) ?Finding {
-    const s = tree.fullSlice(node) orelse return null;
-    const sliced = unwrapGroup(tree, s.ast.sliced);
-    if (tree.nodeTag(sliced) != .identifier) return null;
-    const name = tree.tokenSlice(tree.nodeMainToken(sliced));
-    const local = scan.localByName(name) orelse return null;
-    // Only provable arrays: slicing a slice copies the caller-owned pointer.
-    if (!local.provably_array) return null;
-    return .{ .name = name, .via = null, .is_slice = true };
+/// A chain rooted at a `@unionInit(...)` temporary (EPH-I0046): the
+/// union value materializes in a callee-frame stack slot, so a chain
+/// whose every hop stays inside the slot is escapable. Resolution
+/// walks from the union type node; a pointer/slice-typed field hop
+/// leaves the slot. A bare `&@unionInit(...)` is an rvalue address
+/// (a compile error) and stays silent.
+fn classifyTemporaryAddressOf(sctx: ScanCtx, info: ChainInfo) ?Finding {
+    if (info.hop_count == 0) return null;
+    const tn = info.root_type_node.unwrap() orelse return null;
+    if (resolveChainSafety(sctx, info, tn.toOptional()) != .unsafe) return null;
+    return .{ .name = "temporary", .via = null, .is_slice = false, .is_temporary = true };
 }
 
-fn classifyAliasReturn(tree: *const Ast, scan: *const FnScan, node: NodeIndex) ?Finding {
-    const name = tree.tokenSlice(tree.nodeMainToken(node));
-    const root = scan.aliasRoot(name) orelse return null;
+/// The stack array a slice expression provably slices, or null: an
+/// identifier local/param with a provable array type, or a field chain
+/// whose hops stay inside a by-value stack binding and end at an array
+/// (EPH-I0046 — `holder.arr[0..2]`, array-param `a[0..2]`). Slicing a
+/// slice or a pointee copies a caller-owned pointer.
+fn sliceRoot(sctx: ScanCtx, scan: *const FnScan, sliced: NodeIndex) ?[]const u8 {
+    const s = unwrapGroup(sctx.tree, sliced);
+    if (sctx.tree.nodeTag(s) == .identifier) {
+        return sliceIdentRoot(sctx, scan, s);
+    }
+    const info = chainInfo(sctx.tree, s);
+    if (info.root.len == 0) return null;
+    const bind = bindForRoot(info.root, scan) orelse return null;
+    if (!sliceChainIsStack(sctx, info, bind)) return null;
+    return info.root;
+}
+
+/// The identifier arm of sliceRoot (EPH-I0046): a local or param whose
+/// type is a provable array.
+fn sliceIdentRoot(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?[]const u8 {
+    const name = sctx.tree.tokenSlice(sctx.tree.nodeMainToken(node));
+    if (scan.localByName(name)) |l| {
+        if (!l.provably_array) return null;
+        return name;
+    }
+    if (scan.paramByName(name)) |p| {
+        if (!p.provably_array) return null;
+        return name;
+    }
+    return null;
+}
+
+/// True when a chain whose final use is a SLICE provably slices a stack
+/// array: every hop must stay inside the root's slot and the last type
+/// must be an array (EPH-I0046). A pointer/slice hop leaves the slot —
+/// caller memory — and stays silent.
+fn sliceChainIsStack(sctx: ScanCtx, info: ChainInfo, bind: Bind) bool {
+    if (info.overflow or bind.is_pointer) return false;
+    const root_node = bind.type_node.unwrap() orelse return false;
+    var cur = classifyTypeNode(sctx.tree, root_node);
+    var hi = info.hop_count;
+    while (hi > 0) {
+        hi -= 1;
+        cur = stepThroughHop(sctx, cur, info.hops[hi]);
+        if (!stepStaysInSlot(cur)) return false;
+    }
+    return switch (cur) {
+        .array_elem => true,
+        else => false,
+    };
+}
+
+/// True while a resolution step keeps the address inside the root's
+/// slot: arrays, optionals, and named types qualify; a pointer/slice
+/// hop or an unresolvable type leaves the slot.
+fn stepStaysInSlot(cur: TypeStep) bool {
+    return switch (cur) {
+        .safe, .unknown => false,
+        else => true,
+    };
+}
+
+fn classifySlice(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Finding {
+    const s = sctx.tree.fullSlice(node) orelse return null;
+    const root = sliceRoot(sctx, scan, s.ast.sliced) orelse return null;
     return .{
         .name = root,
-        .via = name,
-        .is_slice = false,
+        .via = null,
+        .is_slice = true,
         .is_param = scan.paramByName(root) != null,
     };
+}
+
+fn classifyAliasReturn(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Finding {
+    const name = sctx.tree.tokenSlice(sctx.tree.nodeMainToken(node));
+    // Payload captures first: the capture shadows any same-named outer
+    // binding inside its body range (EPH-I0046).
+    if (captureForReturn(sctx, scan, node, name)) |cap| {
+        return .{
+            .name = cap.root,
+            .via = name,
+            .is_slice = false,
+            .is_param = cap.is_param,
+            .escape = .capture,
+        };
+    }
+    if (scan.aliasRoot(name)) |root| {
+        return .{
+            .name = root,
+            .via = name,
+            .is_slice = false,
+            .is_param = scan.paramByName(root) != null,
+        };
+    }
+    if (scan.sliceBindingRoot(name)) |root| {
+        return .{
+            .name = root,
+            .via = name,
+            .is_slice = true,
+            .is_param = scan.paramByName(root) != null,
+        };
+    }
+    return null;
+}
+
+/// The pointer capture a return operand names, when the reference sits
+/// inside the capture's body range (EPH-I0046).
+fn captureForReturn(
+    sctx: ScanCtx,
+    scan: *const FnScan,
+    ident: NodeIndex,
+    name: []const u8,
+) ?Capture {
+    const tok = sctx.tree.firstToken(ident);
+    for (scan.captures.items) |cap| {
+        if (!mem.eql(u8, cap.name, name)) continue;
+        if (tok < cap.first_tok or tok > cap.last_tok) continue;
+        return cap;
+    }
+    return null;
+}
+
+/// The root identifier of an assign lhs chain (deref/field/unwrap/
+/// array-access hops peeled), or null for compound lhss (EPH-I0046).
+/// `out.* = x` and `out.field = x` both root at `out`; a chain through
+/// a local pointer or a non-identifier root stays unresolvable.
+fn assignLhsRoot(tree: *const Ast, lhs: NodeIndex) ?[]const u8 {
+    var cur = lhs;
+    var hops: usize = 0;
+    while (hops < 8) : (hops += 1) {
+        cur = unwrapGroup(tree, cur);
+        if (tree.nodeTag(cur) == .identifier) {
+            return tree.tokenSlice(tree.nodeMainToken(cur));
+        }
+        cur = peelAssignLhsHop(tree, cur) orelse return null;
+    }
+    return null;
+}
+
+/// One lhs hop for assignLhsRoot: deref/field/unwrap/array-access
+/// descend to their base operand; anything else ends the peel.
+fn peelAssignLhsHop(tree: *const Ast, cur: NodeIndex) ?NodeIndex {
+    return switch (tree.nodeTag(cur)) {
+        .deref => tree.nodeData(cur).node,
+        .field_access, .unwrap_optional => tree.nodeData(cur).node_and_token[0],
+        .array_access => tree.nodeData(cur).node_and_node[0],
+        else => null,
+    };
+}
+
+/// Out-param escape (EPH-I0046): `out.* = &local;` and
+/// `out.field = &local;` store a stack address into a pointer param's
+/// pointee — caller storage that outlives the frame. The lhs must
+/// root at a pointer-typed param (a by-value param's field write
+/// touches a local copy); the rhs must resolve to a stack root.
+fn checkEscapeAssign(
+    ctx: *const Za111Ctx,
+    sctx: ScanCtx,
+    scan: *const FnScan,
+    node: NodeIndex,
+) !void {
+    const lhs, const rhs = sctx.tree.nodeData(node).node_and_node;
+    const root_name = assignLhsRoot(sctx.tree, lhs) orelse return;
+    const param = scan.paramByName(root_name) orelse return;
+    if (!param.is_pointer) return;
+    const target = aliasTarget(sctx, scan, rhs) orelse return;
+    try emitZa111(ctx, node, .{
+        .name = target,
+        .via = null,
+        .is_slice = false,
+        .is_param = scan.paramByName(target) != null,
+        .escape = .out_param,
+    });
+}
+
+/// Labeled-block escape (EPH-I0046): `break :blk &local;` hands a stack
+/// address to the enclosing expression as the block's value. Loop
+/// breaks carry no operand and never reach here (the walker filters).
+fn checkEscapeBreak(
+    ctx: *const Za111Ctx,
+    sctx: ScanCtx,
+    scan: *const FnScan,
+    node: NodeIndex,
+) !void {
+    const operand = sctx.tree.nodeData(node).opt_token_and_opt_node[1].unwrap() orelse return;
+    const target = aliasTarget(sctx, scan, operand) orelse return;
+    try emitZa111(ctx, node, .{
+        .name = target,
+        .via = null,
+        .is_slice = false,
+        .is_param = scan.paramByName(target) != null,
+        .escape = .block_break,
+    });
+}
+
+/// Bundled inputs for the slice-binding collection (EPH-I0046): keeps
+/// the collector within the parameter threshold.
+const BindingCollectCtx = struct {
+    a: Allocator,
+    sctx: ScanCtx,
+    records: AssignList,
+};
+
+/// Collect slice bindings (`const/var s = arr[a..b];` with a provable
+/// stack-array root — EPH-I0046). Var bindings follow the pointer-alias
+/// rebind rule: no rebind drops, a non-array rebind RHS drops. Slice
+/// rebind RHSs resolve against locals and params only, which never
+/// drop — one pass suffices.
+fn collectSliceBindings(
+    ctx: BindingCollectCtx,
+    decls: []const NodeIndex,
+    scan: *FnScan,
+) !void {
+    for (decls) |node| {
+        try collectOneSliceBinding(ctx, node, scan);
+    }
+}
+
+fn collectOneSliceBinding(ctx: BindingCollectCtx, node: NodeIndex, scan: *FnScan) !void {
+    const tree = ctx.sctx.tree;
+    const vd = tree.fullVarDecl(node) orelse return;
+    const is_var = mem.eql(u8, tree.tokenSlice(vd.ast.mut_token), "var");
+    if (!is_var and !mem.eql(u8, tree.tokenSlice(vd.ast.mut_token), "const")) return;
+    const name = tree.tokenSlice(vd.ast.mut_token + 1);
+    const init = vd.ast.init_node.unwrap() orelse return;
+    const e = unwrapGroup(tree, init);
+    if (!isSliceTag(tree.nodeTag(e))) return;
+    var root = sliceRoot(ctx.sctx, scan, tree.fullSlice(e).?.ast.sliced) orelse return;
+    if (is_var) {
+        const rebind = lastRebindRhs(tree, ctx.records.slice(), name, tree.firstToken(node)) orelse
+            return;
+        const re = unwrapGroup(tree, rebind);
+        if (!isSliceTag(tree.nodeTag(re))) return;
+        root = sliceRoot(ctx.sctx, scan, tree.fullSlice(re).?.ast.sliced) orelse return;
+    }
+    try scan.slice_bindings.append(ctx.a, .{
+        .name = name,
+        .root = root,
+        .is_var = is_var,
+        .decl_tok = tree.firstToken(node),
+    });
+}
+
+fn isSliceTag(tag: Ast.Node.Tag) bool {
+    return switch (tag) {
+        .slice_open, .slice, .slice_sentinel => true,
+        else => false,
+    };
+}
+
+/// Resolve the walker's capture records against the collected bindings
+/// (EPH-I0046). By-value captures return values — skip. An if-capture
+/// roots at the condition operand's own slot: any local or param
+/// qualifies, pointer-typed included. A for-capture roots at the
+/// input: `&arr` or a by-value provable array; slice and pointer
+/// inputs iterate caller memory.
+fn collectCaptures(
+    a: Allocator,
+    sctx: ScanCtx,
+    records: []const CaptureRecord,
+    scan: *FnScan,
+) !void {
+    for (records) |rec| {
+        if (!rec.is_ptr) continue;
+        const root_name = captureRootName(sctx, scan, rec) orelse continue;
+        try scan.captures.append(a, .{
+            .name = rec.name,
+            .root = root_name,
+            .is_param = scan.paramByName(root_name) != null,
+            .first_tok = rec.first_tok,
+            .last_tok = rec.last_tok,
+        });
+    }
+}
+
+fn captureRootName(sctx: ScanCtx, scan: *const FnScan, rec: CaptureRecord) ?[]const u8 {
+    var root_node = unwrapGroup(sctx.tree, rec.root);
+    if (rec.is_for and sctx.tree.nodeTag(root_node) == .address_of) {
+        root_node = unwrapGroup(sctx.tree, sctx.tree.nodeData(root_node).node);
+    }
+    if (sctx.tree.nodeTag(root_node) != .identifier) return null;
+    const name = sctx.tree.tokenSlice(sctx.tree.nodeMainToken(root_node));
+    if (!rec.is_for) return if (bindForRoot(name, scan) != null) name else null;
+    if (scan.localByName(name)) |l| return if (l.provably_array and !l.is_pointer) name else null;
+    if (scan.paramByName(name)) |p| return if (p.provably_array and !p.is_pointer) name else null;
+    return null;
 }
 
 pub const Za111Ctx = struct {
@@ -1099,15 +1370,29 @@ pub const Za111Ctx = struct {
 
 fn emitZa111(ctx: *const Za111Ctx, node: NodeIndex, f: Finding) !void {
     const what = if (f.is_param) "parameter" else "local";
-    const msg = if (f.via) |via|
-        try std.fmt.allocPrint(ctx.a, "returned pointer '{s}' refers to stack {s} " ++
-            "'{s}' — its storage expires when the function returns", .{ via, what, f.name })
-    else if (f.is_slice)
-        try std.fmt.allocPrint(ctx.a, "returned slice refers to stack array " ++
-            "'{s}' — its storage expires when the function returns", .{f.name})
-    else
-        try std.fmt.allocPrint(ctx.a, "returned pointer refers to stack {s} " ++
-            "'{s}' — its storage expires when the function returns", .{ what, f.name });
+    const msg = switch (f.escape) {
+        .out_param => try std.fmt.allocPrint(ctx.a, "stored pointer to stack {s} " ++
+            "'{s}' into an out parameter — its storage expires when the " ++
+            "function returns", .{ what, f.name }),
+        .block_break => try std.fmt.allocPrint(ctx.a, "pointer to stack {s} " ++
+            "'{s}' escapes through a labeled block break — its storage " ++
+            "expires when the function returns", .{ what, f.name }),
+        .capture => try std.fmt.allocPrint(ctx.a, "returned payload pointer refers " ++
+            "to stack {s} '{s}' — its storage expires when the function " ++
+            "returns", .{ what, f.name }),
+        .returned => if (f.is_temporary)
+            try std.fmt.allocPrint(ctx.a, "returned pointer refers to a stack " ++
+                "temporary — its storage expires when the function returns", .{})
+        else if (f.is_slice)
+            try std.fmt.allocPrint(ctx.a, "returned slice refers to stack array " ++
+                "'{s}' — its storage expires when the function returns", .{f.name})
+        else if (f.via) |via|
+            try std.fmt.allocPrint(ctx.a, "returned pointer '{s}' refers to stack {s} " ++
+                "'{s}' — its storage expires when the function returns", .{ via, what, f.name })
+        else
+            try std.fmt.allocPrint(ctx.a, "returned pointer refers to stack {s} " ++
+                "'{s}' — its storage expires when the function returns", .{ what, f.name }),
+    };
     // The append below allocates the Issue before the message slot is
     // committed: on append failure the message must not leak (EPH-I0594).
     errdefer ctx.a.free(msg);
@@ -1138,13 +1423,30 @@ fn analyzeOneFn(
     const sctx = ScanCtx{ .tree = ctx.tree, .tidx = ctx.tidx, .body = body };
     var scan = FnScan{};
     defer scan.deinit(ctx.a);
-    try collectParams(ctx.a, sctx.tree, proto, &scan);
+    try collectParams(ctx.a, sctx, proto, &scan);
     try collectLocals(ctx.a, sctx.tree, walker.var_decls.items, &scan);
     try collectAliases(ctx.a, sctx, walker.var_decls.items, &scan);
+    const records = collectAssignRecords(ctx.tree, walker.assigns.items);
+    resolveAliasRebinds(sctx, &scan, &records);
+    try collectSliceBindings(
+        .{ .a = ctx.a, .sctx = sctx, .records = records },
+        walker.var_decls.items,
+        &scan,
+    );
+    try collectCaptures(ctx.a, sctx, walker.captures.items, &scan);
 
     for (walker.returns.items) |ret| {
+        if (insideComptime(walker.comptime_ranges.items, ctx.tree.firstToken(ret))) continue;
         const f = classifyReturn(sctx, &scan, ret) orelse continue;
         try emitZa111(ctx, ret, f);
+    }
+    for (walker.assigns.items) |asgn| {
+        if (insideComptime(walker.comptime_ranges.items, ctx.tree.firstToken(asgn))) continue;
+        try checkEscapeAssign(ctx, sctx, &scan, asgn);
+    }
+    for (walker.breaks.items) |brk| {
+        if (insideComptime(walker.comptime_ranges.items, ctx.tree.firstToken(brk))) continue;
+        try checkEscapeBreak(ctx, sctx, &scan, brk);
     }
 }
 

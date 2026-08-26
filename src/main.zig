@@ -1344,6 +1344,15 @@ const LineScanCtx = struct {
     out: BraceScanOut = .{},
 };
 
+/// Deferred branch_false wiring state for a multi-line `while` condition
+/// (EPH-I0130): the header block that owns the false edge, the false
+/// block to wire it into, and the accumulated condition text.
+const WhileLitPending = struct {
+    header_block: usize,
+    false_block: usize,
+    text: std.ArrayListUnmanaged(u8) = .empty,
+};
+
 /// Build CFG from function lines
 /// State passed through CFG building for each line
 const CFGBuildCtx = struct {
@@ -1376,8 +1385,37 @@ const CFGBuildCtx = struct {
     // the body block handleBranch already switched to (EPH-I0102).
     cond_origin: ?usize = null,
 
+    // Deferred branch_false wiring for a `while` whose condition spans
+    // lines: the false edge wires when the condition closes, after the
+    // literal-true check sees the full condition text (EPH-I0130). A
+    // nested multi-line while while the slot is busy wires its false edge
+    // immediately — the conservative pre-I0130 behavior for that shape.
+    while_lit: ?WhileLitPending = null,
+
     fn setStartLine(self: *CFGBuildCtx, line: usize) void {
         self.cfg.blocks.items[self.current_block].start_line = line;
+    }
+
+    /// Accumulate a continuation line of a deferred multi-line while
+    /// condition (EPH-I0130). The opener line appended its own text in
+    /// handleBranch; every later line with the condition still open
+    /// extends it.
+    fn extendWhileCondition(self: *CFGBuildCtx, code: []const u8) !void {
+        if (self.while_lit == null or self.paren_depth == 0) return;
+        try self.while_lit.?.text.appendSlice(self.allocator, code);
+        try self.while_lit.?.text.append(self.allocator, ' ');
+    }
+
+    /// Close a deferred multi-line while condition when its `)` has
+    /// closed: wire the false edge unless the full condition text is the
+    /// literal `true` (EPH-I0130).
+    fn finishWhileCondition(self: *CFGBuildCtx) !void {
+        if (self.paren_depth != 0 or self.while_lit == null) return;
+        const w = &self.while_lit.?;
+        if (!isWhileLiteralTrue(w.text.items))
+            try self.cfg.addEdge(w.header_block, w.false_block, .branch_false);
+        w.text.deinit(self.allocator);
+        self.while_lit = null;
     }
 
     /// Clear the top entry's pending control brace; returns true when a
@@ -1523,7 +1561,19 @@ const CFGBuildCtx = struct {
         if (line_scan.virtual_seen) return;
         line_scan.virtual_seen = true;
         if (!line_scan.virtual_ok or line_scan.claimed) return;
-        if (peekBodyStart(line_scan.code, i) != .statement) return;
+        // A while continuation (`while (c) : (cont) {`) sits between the
+        // condition's `)` and the body: probing from the `)` reads the
+        // continuation as a statement body, opens a phantom virtual body,
+        // and leaves the real brace an expression brace. Skip the
+        // continuation group first (EPH-I0130).
+        var probe = i;
+        var after = i + 1;
+        while (after < line_scan.code.len and
+            (line_scan.code[after] == ' ' or line_scan.code[after] == '\t')) : (after += 1)
+        {}
+        const skipped = skipLoopContinuation(line_scan.code, after);
+        if (skipped > 0) probe = skipped - 1;
+        if (peekBodyStart(line_scan.code, probe) != .statement) return;
         // A virtual body opened after the line's else keyword (`else if (d)
         // x = 1;`) is the else body itself: the pending mark must not
         // survive (EPH-I0089).
@@ -1627,6 +1677,20 @@ const CFGBuildCtx = struct {
         return 0;
     }
 
+    /// Whether a line's same-line brace-less body may open a virtual body
+    /// (EPH-I0129): the if/else-if and while openers, or the condition-end
+    /// line of a pending if/else-if. A brace-less for stays excluded —
+    /// its pre-B2 attribution keeps the corpus's block-expression bodies
+    /// (`for (&arr) |*p| p.* = blk: { ... };`) silent — and the one-line
+    /// braced for fires through the existing close_control arm spans. The
+    /// condition-end form of a multi-line loop condition stays excluded.
+    fn virtualOkFor(pattern: CFPattern, cond_end: bool) bool {
+        return switch (pattern) {
+            .if_start, .else_if, .while_start => true,
+            else => cond_end,
+        };
+    }
+
     /// Scan one comment-stripped line, updating carried brace/paren state and
     /// collecting the line's ordered control events. suppress_pending marks
     /// a pending opener's virtual-body line: its braces are expressions.
@@ -1638,13 +1702,15 @@ const CFGBuildCtx = struct {
     ) !BraceScanOut {
         self.event_scratch.clearRetainingCapacity();
         // The condition-end line of a multi-line if/else-if opener may
-        // carry the body; a pending while/for never takes a virtual body.
+        // carry the body. A same-line brace-less while body takes a
+        // virtual body (EPH-I0129); the for opener stays excluded (see
+        // virtualOkFor).
         const cond_end = self.paren_depth > 0 and self.topIsPendingIfElse();
         var line_scan: LineScanCtx = .{
             .code = code,
             .opener = isControlOpener(pattern),
             .dispatch_pop = isPopDispatch(pattern),
-            .virtual_ok = pattern == .if_start or pattern == .else_if or cond_end,
+            .virtual_ok = virtualOkFor(pattern, cond_end),
             .suppress_pending = suppress_pending,
         };
         var mode: QuoteMode = .none;
@@ -1674,9 +1740,21 @@ const CFGBuildCtx = struct {
         try self.cfg.addEdge(self.current_block, true_block, .branch_true);
         // A `while (true)` condition never goes false, so the zero-trip
         // exit is a phantom path. Wiring it would blame post-loop reads
-        // that the body always covers before a break (EPH-I0110).
-        if (bt != .while_block or !isWhileLiteralTrue(t))
+        // that the body always covers before a break (EPH-I0110). A
+        // condition that has not closed on this line defers the false
+        // edge to the close line, where the accumulated condition text
+        // re-runs the literal-true check (EPH-I0130).
+        if (bt == .while_block and self.paren_depth > 0 and self.while_lit == null) {
+            self.while_lit = .{
+                .header_block = self.current_block,
+                .false_block = false_block,
+                .text = .empty,
+            };
+            try self.while_lit.?.text.appendSlice(self.allocator, t);
+            try self.while_lit.?.text.append(self.allocator, ' ');
+        } else if (bt != .while_block or !isWhileLiteralTrue(t)) {
             try self.cfg.addEdge(self.current_block, false_block, .branch_false);
+        }
         const origin: ?usize = if (bt == .while_block or bt == .for_block)
             self.current_block
         else
@@ -2078,6 +2156,7 @@ const CFGBuildCtx = struct {
 
     /// Process one comment-stripped, non-comment line of a function body.
     fn processCFGLine(self: *CFGBuildCtx, code: []const u8, line: usize) !void {
+        try self.extendWhileCondition(code);
         // A pending brace-less if/else opener whose next line is a
         // statement (not an Allman `{`, not a labeled block) takes that
         // line as its virtual body. A multi-line condition still open is
@@ -2103,6 +2182,7 @@ const CFGBuildCtx = struct {
         if (virtual_else) try self.handleElse(code, line, 0);
         self.attributeLineSpan(line, paren_at_start, claims_deferred);
         if (self.paren_depth == 0) self.cond_origin = null;
+        try self.finishWhileCondition();
         try self.walkLineEvents(pattern, code, line);
         // Opener whose control `{` is on a later line (Allman, multi-line
         // condition); an inline-return else has no brace coming at all.
@@ -2208,12 +2288,16 @@ const CFGBuildCtx = struct {
     /// the block's line range (EPH-I0846/49). Only the first open/close
     /// pair records: a line's first control brace claims the opener, and
     /// later same-line control braces are expression braces that emit no
-    /// events. A virtual body (close_virtual) records no span, keeping
-    /// the locked entry-block verdict for braceless one-line bodies
-    /// (EPH-I0111). A non-opener line's pending claim (Allman `{`)
-    /// records no block id: callers fall back to whole-line attribution.
+    /// events. A virtual body (close_virtual) records its span too, so a
+    /// brace-less one-line body's fill lands on the arm's own block
+    /// instead of the entry block (EPH-I0134) — except on an else-carrying
+    /// line, where the chain-arm residual pins (EPH-I0871/72) keep the
+    /// entry-block attribution. A non-opener line's pending claim (Allman
+    /// `{`) records no block id: callers fall back to whole-line
+    /// attribution.
     fn recordArmSpan(self: *CFGBuildCtx, walk: *EventWalkCtx, event: ControlEvent) !void {
-        if (event.kind != .close_control) return;
+        if (event.kind == .close_virtual and walk.has_else) return;
+        if (event.kind != .close_control and event.kind != .close_virtual) return;
         const start = walk.arm_open_col orelse return;
         walk.arm_open_col = null;
         try self.cfg.oneline_arms.append(self.allocator, .{
@@ -2442,8 +2526,11 @@ const CFGBuildCtx = struct {
 
 /// True when the line opens a `while` whose condition is the literal
 /// `true`: the false exit is a phantom path, since the loop can only end
-/// through a break (EPH-I0110). A condition that spans lines has no `)`
-/// on this line and keeps the false edge, the conservative direction.
+/// through a break (EPH-I0110). Grouping parens around the literal
+/// (`while ((true))`) normalize away before the comparison (EPH-I0130).
+/// A condition that spans lines has no `)` on this line and returns
+/// false here — the CFG builder defers the false edge to the condition's
+/// close line, where the accumulated text re-runs this check (EPH-I0130).
 fn isWhileLiteralTrue(t: []const u8) bool {
     if (!mem.startsWith(u8, t, "while")) return false;
     const open = mem.indexOfScalar(u8, t, '(') orelse return false;
@@ -2454,9 +2541,28 @@ fn isWhileLiteralTrue(t: []const u8) bool {
         depth -= 1;
         if (depth != 0) continue;
         const cond = mem.trim(u8, t[open + 1 .. open + i], " \t");
-        return mem.eql(u8, cond, "true");
+        return mem.eql(u8, stripGroupingParens(cond), "true");
     }
     return false;
+}
+
+/// Strip balanced grouping-paren pairs that wrap the whole condition:
+/// `(true)` becomes `true`, `((true))` becomes `true`. A pair whose
+/// close lands before the final char (`(a) and (b)`) stays (EPH-I0130).
+fn stripGroupingParens(cond: []const u8) []const u8 {
+    var rest = cond;
+    while (rest.len >= 2 and rest[0] == '(' and rest[rest.len - 1] == ')') {
+        var balance: usize = 1;
+        var k: usize = 1;
+        while (k < rest.len - 1) : (k += 1) {
+            if (rest[k] == '(') balance += 1;
+            if (rest[k] == ')') balance -= 1;
+            if (balance == 0) break;
+        }
+        if (balance == 0) break; // the outer pair closed before the end
+        rest = mem.trim(u8, rest[1 .. rest.len - 1], " \t");
+    }
+    return rest;
 }
 
 /// True when the line's real else token has an inline `return` body
@@ -2554,6 +2660,9 @@ fn buildCFG(
         .paren_depth = 0,
         .seen_fn_body = false,
     };
+    // A mid-build failure with a deferred while condition pending must
+    // still release the accumulated text (EPH-I0130).
+    defer if (ctx.while_lit) |*w| w.text.deinit(allocator);
 
     for (lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
@@ -2567,6 +2676,14 @@ fn buildCFG(
     // the loop-back and merge wiring survive (EPH-I0086).
     if (ctx.pending_else != null)
         try ctx.finishPendingElse(func_line + lines.len);
+
+    // A multi-line while condition that never closed keeps its false edge
+    // unwired — wire it conservatively at the fn end (EPH-I0130).
+    if (ctx.while_lit) |*w| {
+        try cfg.addEdge(w.header_block, w.false_block, .branch_false);
+        w.text.deinit(allocator);
+        ctx.while_lit = null;
+    }
 
     if (cfg.exit_blocks.items.len == 0)
         try cfg.exit_blocks.append(allocator, ctx.current_block);
@@ -3488,11 +3605,9 @@ const FillScan = struct {
     active: bool = false,
 
     /// Handle a `.fill` verdict's first line: true when the fill wins
-    /// immediately (the statement terminates on this line, or the line is
-    /// a loop header — loop fills stay header-granular). Otherwise the
+    /// immediately (the statement terminates on this line). Otherwise the
     /// scan goes pending and `step` classifies the continuation lines.
     fn start(self: *FillScan, check_line: []const u8) bool {
-        if (isLoopStart(check_line)) return true;
         self.depth = 0;
         self.mode = .none;
         if (scanLineForStatementEnd(check_line, 0, &self.depth, &self.mode) != null)
@@ -3521,21 +3636,107 @@ const FillScan = struct {
 
     /// Fill verdict for a line outside any pending fill: null when the
     /// line decides nothing, false on a top-level self-read use, true on
-    /// an unconditional fill whose statement completes on this line.
+    /// an unconditional fill whose statement completes on this line. A
+    /// fill on a loop-opener line splits by position: a header-position
+    /// fill (condition, continuation, payload) replays every trip and
+    /// wins, while a direct assignment in the body stays conditional —
+    /// the loop may run zero times — and defers to the CFG (EPH-I0129).
+    /// An element store in the body keeps the documented-strictness win
+    /// (EPH-I0132).
     fn classifyLine(
         self: *FillScan,
         check_line: []const u8,
         name: []const u8,
         nesting_depth: usize,
+        fill_col: ?usize,
     ) ?bool {
         if (nesting_depth != 0 and !isLoopStart(check_line)) return null;
-        return switch (classifyFillLine(check_line, name)) {
-            .not_fill => null,
-            .self_read_use => if (nesting_depth == 0) false else null,
-            .fill => if (self.start(check_line)) true else null,
-        };
+        const verdict = classifyFillLine(check_line, name);
+        if (verdict == .not_fill) return null;
+        if (verdict == .self_read_use) return if (nesting_depth == 0) false else null;
+        if (isLoopStart(check_line)) {
+            if (loopBodyFillAt(check_line, name, fill_col)) return null;
+            return true;
+        }
+        return if (self.start(check_line)) true else null;
     }
 };
+
+/// True when the fill at `fill_col` is a DIRECT assignment inside a loop
+/// line's body (past the condition's `)`, continuation, and payload) —
+/// the shape that must defer to the CFG (EPH-I0129). An element store
+/// (`arr[i] = v`, `p.* = v`), a field write, or an address-of fill keeps
+/// the documented-strictness win: an element store kills the whole
+/// variable (EPH-I0132), so the historical silent verdict stands. Null
+/// fills and multi-line headers (no `)` on the line) fall back to the
+/// header-fill verdict — the conservative pre-I0129 direction.
+fn loopBodyFillAt(t: []const u8, name: []const u8, fill_col: ?usize) bool {
+    const fill = fill_col orelse return false;
+    if (!isDirectAssignment(t, name, fill)) return false;
+    const body_start = loopBodyStartCol(t) orelse return false;
+    return fill >= body_start;
+}
+
+/// Column where a loop line's body begins: past the condition's closing
+/// `)`, the optional `: (continuation)` group, and the optional payload
+/// capture. Null when the condition does not close on this line — the
+/// body lives on a later line, and fills here are header fills.
+fn loopBodyStartCol(t: []const u8) ?usize {
+    const close = loopCondCloseCol(t) orelse return null;
+    var j = close + 1;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    j = skipPayloadCapture(t, j);
+    j = skipLoopContinuation(t, j);
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    return j;
+}
+
+/// Column just past the closing `)` of the loop line's condition, or null
+/// when the condition does not close on this line.
+fn loopCondCloseCol(t: []const u8) ?usize {
+    var depth: usize = 0;
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (mode != .none) continue;
+        if (c == '(') depth += 1;
+        if (c != ')') continue;
+        if (depth == 0) continue;
+        depth -= 1;
+        if (depth == 0) return i;
+    }
+    return null;
+}
+
+/// Skip a `|payload|` capture at `j` (the for-loop header form); without
+/// one the position is unchanged.
+fn skipPayloadCapture(t: []const u8, j: usize) usize {
+    if (j >= t.len or t[j] != '|') return j;
+    const close = mem.indexOfScalarPos(u8, t, j + 1, '|') orelse return j;
+    var k = close + 1;
+    while (k < t.len and (t[k] == ' ' or t[k] == '\t')) k += 1;
+    return k;
+}
+
+/// Skip a `: (continuation)` group at `j` (the while-header form);
+/// without one the position is unchanged.
+fn skipLoopContinuation(t: []const u8, j: usize) usize {
+    if (j >= t.len or t[j] != ':') return j;
+    var k = j + 1;
+    while (k < t.len and (t[k] == ' ' or t[k] == '\t')) k += 1;
+    if (k >= t.len or t[k] != '(') return j;
+    var depth: usize = 1;
+    var mode: QuoteMode = .none;
+    const close = scanLineForParenClose(t, k + 1, &depth, &mode) orelse return j;
+    var after = close;
+    while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
+    return after;
+}
 
 /// True when a whole-word `else` immediately precedes the `{` at i
 /// (whitespace allowed): the brace opens an else arm. A mid-line
@@ -3660,6 +3861,11 @@ const CondNesting = struct {
     // Whether that header keyword was `switch` (EPH-I0334): the same
     // transition discipline as paren_container.
     paren_container_switch: bool = false,
+    // Lines since the flag pair was set (0 = this line, 1 = the
+    // immediately preceding line). A line-initial `{` consults the flags
+    // only at age 1 — the Allman header shape — so a stale flag from
+    // unrelated earlier code stays inert (EPH-I0128).
+    container_age: u8 = 0,
     // The line-start opener was counted on this line, so a control `{`
     // later on the line must not count twice. Only a mid-line else brace
     // after a statement (`_ = c; } else {`) still re-opens the depth
@@ -3673,6 +3879,7 @@ const CondNesting = struct {
         if (isCommentOrMultilineString(check_line)) return;
         self.opener_counted = false;
         self.first_close = null;
+        self.container_age +|= 1;
         // An if/else keyword inside a pending expression is an if-EXPRESSION
         // (or junk): its body never contains scanned statements.
         if (self.paren_depth == 0 and self.pending_expr == 0 and
@@ -3701,6 +3908,7 @@ const CondNesting = struct {
                     const kw = identBefore(code, i);
                     self.paren_container = isContainerKeyword(kw);
                     self.paren_container_switch = mem.eql(u8, kw, "switch");
+                    self.container_age = 0;
                 }
                 self.paren_depth += 1;
             },
@@ -3755,13 +3963,16 @@ const CondNesting = struct {
     /// paren_container flag recorded at the span's opening paren decides
     /// instead. The flag is always fresh here: in balanced code the `)`
     /// that returned paren_depth to 0 closed the span whose opening set
-    /// the flag.
+    /// the flag. An Allman brace (line-initial `{`) consults the flag
+    /// too, gated to a flag set on the immediately preceding line
+    /// (EPH-I0128): the header line and the brace line are the only pair
+    /// the flag can prove.
     fn isExprBraceOpen(self: *const CondNesting, code: []const u8, i: usize) bool {
         if (self.paren_depth > 0) return true;
         if (self.pending_expr > 0) return true;
         var j = i;
         while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t')) j -= 1;
-        if (j == 0) return false;
+        if (j == 0) return self.paren_container and self.container_age == 1;
         const prev = code[j - 1];
         switch (prev) {
             '.', '=', '(', '[', ',', '>', ':' => return true,
@@ -3794,7 +4005,8 @@ const CondNesting = struct {
         if (self.paren_depth > 0 or self.pending_expr > 0) return false;
         var j = i;
         while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t')) j -= 1;
-        if (j == 0 or code[j - 1] != ')') return false;
+        if (j == 0) return self.paren_container_switch and self.container_age == 1;
+        if (code[j - 1] != ')') return false;
         return isSwitchParenHeader(code, j - 1) or self.paren_container_switch;
     }
 };
@@ -3818,15 +4030,15 @@ fn hasUnconditionalFillBeforeUse(
         // A fill textually before the line's first depth-paying close ran
         // inside the arm (`x = 1; }`), so judge it at the depth open
         // before the close, not at the end-of-line depth (EPH-I0111).
+        const assign_col = findAssignmentOccurrence(check_line, name);
+        const call_col = findFillCallOccurrence(check_line, name);
+        const fill_col = assign_col orelse call_col;
         var fill_depth = nesting.depth;
         if (nesting.first_close) |fc| {
-            const assign_col = findAssignmentOccurrence(check_line, name);
-            const call_col = findFillCallOccurrence(check_line, name);
-            const fill_col = assign_col orelse call_col;
             if (fill_col != null and fill_col.? < fc.col)
                 fill_depth = @max(fill_depth, fc.depth_before);
         }
-        if (scan.classifyLine(check_line, name, fill_depth)) |verdict| return verdict;
+        if (scan.classifyLine(check_line, name, fill_depth, fill_col)) |verdict| return verdict;
         if (isRealUseOfVar(check_line, name) and nesting.depth == 0) return false;
         if (mem.startsWith(u8, check_line, "return ")) break;
         if (mem.eql(u8, check_line, "}")) break;
@@ -5286,6 +5498,10 @@ fn readIsUncovered(sc: *const ReadScanCtx, var_name: []const u8, idx: usize) boo
     // Check if the read is inside a correlated guard: the same if-condition
     // that gates the read also gates an earlier assignment of the variable.
     if (isCorrelatedGuardRead(sc.da.lines, idx, read_col, var_name)) return false;
+    // Check if a zero-trip guard proves the loop-carried element fill
+    // covers the read: `if (count == 0) return;` after a loop that fills
+    // the var per trip and increments count (EPH-I0131).
+    if (isZeroTripGuardCovered(sc.da.lines, idx, var_name)) return false;
     // Check if the read is inside a null-guard on a variable that is only
     // set non-null in blocks that also assign the flagged variable.
     if (isNullGuardCorrelatedRead(sc.da.lines, idx, read_col, var_name)) return false;
@@ -5441,6 +5657,248 @@ fn isCorrelatedGuardRead(
         const if_line = findEnclosingIfLine(lines, search_from) orelse break;
         if (if_line == 0) break;
         search_from = if_line;
+    }
+    return false;
+}
+
+/// True when a zero-trip guard proves a loop-carried element fill covers
+/// the read (EPH-I0131): a loop fills `var_name` through element stores
+/// indexed by a counter declared `= 0`, the counter increments once per
+/// trip, and a guard returns when the counter is zero. Every path that
+/// reaches the read then ran at least one trip, and under the documented
+/// strictness semantic an element store kills the whole variable
+/// (EPH-I0132). The window bounds match the guard family (EPH-I0225): a
+/// guard or loop beyond the window is missed — accepted FN.
+fn isZeroTripGuardCovered(
+    lines: []const []const u8,
+    read_idx: usize,
+    var_name: []const u8,
+) bool {
+    const guard_idx = findZeroTripGuard(lines, read_idx) orelse return false;
+    const guard_line = mem.trim(u8, lines[guard_idx], " \t\r");
+    const counter = zeroTripGuardCounter(guard_line) orelse return false;
+    const loop = findCounterLoop(lines, guard_idx, counter) orelse return false;
+    // The guard's zero reading must mean zero trips: the counter has no
+    // other write between its `= 0` decl and the guard, outside the
+    // loop's own one-step increments.
+    if (!declaredZeroBefore(lines, loop.loop_idx, counter)) return false;
+    if (counterWrittenOutsideLoop(lines, loop, guard_idx, counter)) return false;
+    // The loop body fills the var (element stores count as whole-var
+    // fills under the EPH-I0132 strictness semantic).
+    if (!loopBodyFillsVar(lines, loop, var_name)) return false;
+    return guardDominatesRead(lines, guard_idx, read_idx);
+}
+
+/// Span of the loop whose trip counter `counter` increments: the opener
+/// line and the line after its closing `}` (the body end).
+const CounterLoop = struct {
+    loop_idx: usize,
+    body_end: usize,
+};
+
+/// The nearest loop before `guard_idx` whose continuation or body carries
+/// a one-step increment of `counter`. The window matches the guard
+/// family's lookback (EPH-I0225).
+fn findCounterLoop(
+    lines: []const []const u8,
+    guard_idx: usize,
+    counter: []const u8,
+) ?CounterLoop {
+    const stop = guard_idx -| guard_candidate_window;
+    var i = guard_idx;
+    while (i > stop) {
+        i -= 1;
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (!isLoopOpenerLine(t)) continue;
+        const body_end = loopIncrementSpan(lines, i, guard_idx, counter) orelse continue;
+        return .{ .loop_idx = i, .body_end = body_end };
+    }
+    return null;
+}
+
+/// End line of the loop at `loop_idx` when it increments `counter` — in
+/// the header line's continuation or in the braced body — else null.
+/// The body spans the lines up to its closing `}`.
+fn loopIncrementSpan(
+    lines: []const []const u8,
+    loop_idx: usize,
+    guard_idx: usize,
+    counter: []const u8,
+) ?usize {
+    const t = mem.trim(u8, lines[loop_idx], " \t\r");
+    var found_inc = lineHasIncrement(t, counter);
+    var j = loop_idx + 1;
+    while (j < guard_idx) : (j += 1) {
+        const body = mem.trim(u8, lines[j], " \t\r");
+        if (mem.eql(u8, body, "}")) return if (found_inc) j else null;
+        if (lineHasIncrement(body, counter)) found_inc = true;
+    }
+    return null;
+}
+
+/// True when a word-bounded occurrence of `name` in `t` is a one-step
+/// increment: `name += 1` or `name +%= 1`.
+fn lineHasIncrement(t: []const u8, name: []const u8) bool {
+    var iter = VarOccurrenceIter{ .t = t, .name = name };
+    while (iter.next()) |pos| {
+        const after = mem.trimStart(u8, t[pos + name.len ..], " \t");
+        if (!mem.startsWith(u8, after, "+=") and !mem.startsWith(u8, after, "+%=")) continue;
+        const rhs = mem.trim(u8, after[2..], " \t");
+        if (rhs.len > 0 and rhs[0] == '1' and (rhs.len == 1 or !isIdent(rhs[1]))) return true;
+    }
+    return false;
+}
+
+/// The guard line whose condition is `<counter> == 0`, nearest before the
+/// read: the same-line `if (c == 0) return;` form, or the braced form
+/// whose body carries a top-level `return;` before the read.
+fn findZeroTripGuard(lines: []const []const u8, read_idx: usize) ?usize {
+    const stop = read_idx -| guard_candidate_window;
+    var i = read_idx;
+    while (i > stop) {
+        i -= 1;
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (zeroTripGuardCounter(t) == null) continue;
+        if (mem.indexOf(u8, t, ") return;") != null) return i;
+        // Braced: a top-level `return;` inside the body before the read.
+        // The brace-depth walk keeps a nested conditional's return from
+        // arming the suppressor.
+        if (guardedBodyReturns(lines, i, read_idx)) return i;
+    }
+    return null;
+}
+
+/// True when the braced guard at `guard_idx` carries a top-level bare
+/// `return;` before `read_idx` (EPH-I0131).
+fn guardedBodyReturns(lines: []const []const u8, guard_idx: usize, read_idx: usize) bool {
+    var bdepth: usize = 0;
+    var j = guard_idx + 1;
+    while (j < read_idx) : (j += 1) {
+        const body = mem.trim(u8, lines[j], " \t\r");
+        if (mem.eql(u8, body, "return;") and bdepth == 0) return true;
+        if (mem.eql(u8, body, "}") and bdepth == 0) return false;
+        const braces = braceCountOnLine(body);
+        bdepth +|= braces.opens;
+        bdepth -|= braces.closes;
+    }
+    return false;
+}
+
+/// Open and close brace counts on one line, quote-masked (EPH-I0131).
+const BraceLineCount = struct {
+    opens: usize = 0,
+    closes: usize = 0,
+};
+
+/// Count the quote-free `{` and `}` chars on a line.
+fn braceCountOnLine(t: []const u8) BraceLineCount {
+    var count: BraceLineCount = .{};
+    var mode: QuoteMode = .none;
+    for (t) |c| {
+        if (scanQuoteStep(&mode, c)) |_| continue;
+        if (mode != .none) continue;
+        if (c == '{') count.opens += 1;
+        if (c == '}') count.closes += 1;
+    }
+    return count;
+}
+
+/// The counter name in a `if (<counter> == 0)` guard condition, or null.
+fn zeroTripGuardCounter(t: []const u8) ?[]const u8 {
+    if (!mem.startsWith(u8, t, "if ")) return null;
+    const eq = mem.indexOf(u8, t, "== 0") orelse return null;
+    var start = eq;
+    while (start > 0 and (t[start - 1] == ' ' or t[start - 1] == '\t')) start -= 1;
+    var end = start;
+    while (end > 0 and isIdent(t[end - 1])) end -= 1;
+    if (end == start) return null;
+    return t[end..start];
+}
+
+/// True when `counter` declares with a literal-zero initializer before
+/// `before_idx` (the loop opener), with no counter write in between.
+fn declaredZeroBefore(lines: []const []const u8, before_idx: usize, counter: []const u8) bool {
+    const stop = before_idx -| guard_candidate_window;
+    var decl: ?usize = null;
+    var i = before_idx;
+    while (i > stop) {
+        i -= 1;
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (!isZeroCounterDecl(t, counter)) continue;
+        // The first `var <counter> = 0` is the counter's origin — any
+        // earlier counter write contradicts it, so it wins.
+        decl = i;
+        break;
+    }
+    const decl_idx = decl orelse return false;
+    // A counter write between the decl and the loop breaks the guard's
+    // zero reading meaning zero trips.
+    var j = decl_idx + 1;
+    while (j < before_idx) : (j += 1) {
+        const t = mem.trim(u8, lines[j], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (lineWritesName(t, counter)) return false;
+    }
+    return true;
+}
+
+/// True when `t` declares `counter` with a literal-zero initializer.
+fn isZeroCounterDecl(t: []const u8, counter: []const u8) bool {
+    if (!mem.startsWith(u8, t, "var ")) return false;
+    const decl_name = extractVarDeclName(t) orelse return false;
+    if (!mem.eql(u8, decl_name, counter)) return false;
+    const after = declInitializerStart(t) orelse return false;
+    const rhs = mem.trim(u8, t[after..], " \t");
+    if (!mem.startsWith(u8, rhs, "0")) return false;
+    return rhs.len == 1 or (!isIdent(rhs[1]) and rhs[1] != '.');
+}
+
+/// True when a counter write exists outside the loop body between the
+/// loop opener and the guard: such a write breaks the guard's zero
+/// reading meaning zero trips.
+fn counterWrittenOutsideLoop(
+    lines: []const []const u8,
+    loop: CounterLoop,
+    guard_idx: usize,
+    counter: []const u8,
+) bool {
+    var i = loop.body_end + 1;
+    while (i < guard_idx) : (i += 1) {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (lineWritesName(t, counter)) return true;
+    }
+    return false;
+}
+
+/// True when a word-bounded occurrence of `name` in `t` is a write: a
+/// plain or compound assignment target. `==` and `=>` never write.
+fn lineWritesName(t: []const u8, name: []const u8) bool {
+    var iter = VarOccurrenceIter{ .t = t, .name = name };
+    while (iter.next()) |pos| {
+        const after = mem.trimStart(u8, t[pos + name.len ..], " \t");
+        if (isAssignmentOp(after)) return true;
+        const compounds = [_][]const u8{ "+=", "-=", "*=", "/=", "%=", "+%=", "-%=", "*%=", "&=", "|=", "^=", "<<=", ">>=" };
+        for (compounds) |op| {
+            if (mem.startsWith(u8, after, op)) return true;
+        }
+    }
+    return false;
+}
+
+/// True when any line inside the loop body fills `var_name`.
+fn loopBodyFillsVar(
+    lines: []const []const u8,
+    loop: CounterLoop,
+    var_name: []const u8,
+) bool {
+    var i = loop.loop_idx + 1;
+    while (i < loop.body_end) : (i += 1) {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (isFillPattern(t, var_name)) return true;
     }
     return false;
 }
@@ -68211,6 +68669,454 @@ test "buildCFG: while(true) wires no false exit" {
     try std.testing.expect(cfgHasEdge(&cfg, body, header, .loop_back));
 }
 
+test "buildCFG: multi-line while(true) wires no false exit (EPH-I0130)" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The condition spans lines, so the false edge defers to the close
+    // line. The accumulated text `while ( true ) {` names the literal
+    // true, and no false edge wires. The non-literal multi-line twin
+    // keeps its false edge.
+    const lines = [_][]const u8{
+        "fn f() void {", // 1
+        "    while (", // 2
+        "        true", // 3
+        "    ) {", // 4
+        "        g();", // 5
+        "    }", // 6
+        "}", // 7
+    };
+
+    var cfg = try buildCFG(allocator, "f", 1, &lines);
+    defer cfg.deinit();
+
+    const header = findBlockForLine(&cfg, 2) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(cfgSucc(&cfg, header, .branch_false) == null);
+
+    const lines_c = [_][]const u8{
+        "fn f() void {", // 1
+        "    while (", // 2
+        "        c", // 3
+        "    ) {", // 4
+        "        g();", // 5
+        "    }", // 6
+        "}", // 7
+    };
+    var cfg_c = try buildCFG(allocator, "f", 1, &lines_c);
+    defer cfg_c.deinit();
+
+    const header_c = findBlockForLine(&cfg_c, 2) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(cfgSucc(&cfg_c, header_c, .branch_false) != null);
+}
+
+test "ZA607: paren-wrapped while(true) fill dominating the break stays silent (EPH-I0130)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I0130 e2: the grouping parens around the literal normalize away
+    // before the literal-true check, so the phantom zero-trip edge stays
+    // unwired and the break exit's fill dominates the read.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn parenTrueBreak() void {
+        \\    var x: u32 = undefined;
+        \\    while ((true)) {
+        \\        x = 1;
+        \\        break;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_wt_paren.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_wt_paren.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: multi-line while(true) fill dominating the break stays silent (EPH-I0130)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I0130 e4: the condition spans lines, so the false-edge wiring
+    // defers to the close line, where the accumulated condition text
+    // names the literal true. The break exit's fill dominates the read.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn multilineTrueBreak() void {
+        \\    var x: u32 = undefined;
+        \\    while (
+        \\        true
+        \\    ) {
+        \\        x = 1;
+        \\        break;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_wt_multi.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_wt_multi.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line while body fill does not cover the zero-trip path (EPH-I0129)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I0129 e7: the one-line loop body's fill is conditional (the
+    // loop may run zero times). The former loop-header carve-out scored
+    // it unconditionally and the read stayed silent; the narrowed
+    // position split defers the body fill to the CFG, which fires.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn oneLineWhileBody() void {
+        \\    var x: u32 = undefined;
+        \\    var i: u32 = 0;
+        \\    while (i < 3) { x = 1; }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_while_oneline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_while_oneline.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braceless while body fill does not cover the zero-trip path (EPH-I0129)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I0129 f2: the brace-less body is a virtual body in the CFG now,
+    // so the fill lands on the loop's true block and the zero-trip exit
+    // keeps the post-loop read uncovered.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn bracelessWhileBody(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    while (c) x = 1;
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_while_braceless.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_while_braceless.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: zero-trip guard after an element-fill loop covers the read (EPH-I0131)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The tigerbeetle lsm/tree.zig:381-384 shape: the loop fills the
+    // array per trip, the guard returns when the trip counter is zero,
+    // and under the documented strictness semantic (EPH-I0132) an
+    // element store kills the whole variable — so every path reaching
+    // the read ran at least one filling trip.
+    const content =
+        \\fn useArr(a: [4]u64) void {
+        \\    _ = a;
+        \\}
+        \\fn zeroTripGuarded(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var arr: [4]u64 = undefined;
+        \\    while (c) : (count += 1) {
+        \\        arr[count] = 1;
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(arr);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_guard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_zt_guard.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: element-fill loop without the zero-trip guard still fires (EPH-I0131)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The suppressor's guard requirement: without the `count == 0`
+    // return the zero-trip path reaches the read unfilled, and the
+    // warning fires.
+    const content =
+        \\fn useArr(a: [4]u64) void {
+        \\    _ = a;
+        \\}
+        \\fn noGuard(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var arr: [4]u64 = undefined;
+        \\    while (c) : (count += 1) {
+        \\        arr[count] = 1;
+        \\    }
+        \\    useArr(arr);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_noguard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_zt_noguard.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: reassigned counter keeps the zero-trip guard inert (EPH-I0131)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A counter write between the decl and the loop breaks the
+    // correlation: `count == 0` at the guard no longer means zero trips,
+    // so the suppressor stays silent and the read fires.
+    const content =
+        \\fn useArr(a: [4]u64) void {
+        \\    _ = a;
+        \\}
+        \\fn reassignedCounter(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var arr: [4]u64 = undefined;
+        \\    count = 5;
+        \\    while (c) : (count += 1) {
+        \\        arr[count] = 1;
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(arr);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_reassign.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_zt_reassign.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: Allman switch prong fill keeps the conditional verdict (EPH-I0128)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The Allman arm-list brace consults the paren-container flag at
+    // line start, so the prong fill counts as conditional and the CFG
+    // fires the post-switch read. The pre-fix depth hole scored the
+    // prong fill unconditional and the read stayed silent.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn allmanSwitchFill(y: u32) void {
+        \\    var x: u32 = undefined;
+        \\    switch (y)
+        \\    {
+        \\        1 => {},
+        \\        else => {
+        \\            x = 1;
+        \\        },
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_allman_switch.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_allman_switch.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: Allman union body fill keeps the conditional verdict (EPH-I0128)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The Allman union(enum) brace opens an expression brace through the
+    // paren-container consult, so the `};` close pays it off instead of
+    // the enclosing if — the fill after the decl stays conditional.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn allmanUnion(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        const U = union(enum)
+        \\        {
+        \\            a: u32,
+        \\        };
+        \\        x = 1;
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_allman_union.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_allman_union.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line braceless if fill does not cover the later read (EPH-I0134)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I0134 b5: the virtual body's span records at the close_virtual
+    // event now, so the braceless arm's fill lands on the arm block
+    // instead of the entry block. The false path reaches the read
+    // unfilled and the warning fires.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn sameLineBraceless(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) x = 1;
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_b5.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_b5.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line else-if arm fill keeps the conditional verdict (EPH-I0134)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I0134 b4: the mid-line `} else if (d) {` arm fill is
+    // conditional. The statement-end scan's carried brace depth defers
+    // the fill to the CFG, whose arm-span machinery keeps the false
+    // path uncovered.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn oneLineElseIf(c: bool, d: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) { use(1); } else if (d) { x = 1; }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_b4.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_b4.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braceless stmt-close else arm fill keeps the conditional verdict (EPH-I0134)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I0134 c1: the braceless else arm after the statement-close `;`
+    // fills x, and the then arm does not. The read after the construct
+    // fires on the then path.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn stmtCloseElse(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    if (c) use(1); else x = 1;
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_c1.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_c1.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line while with continuation does not cover the zero-trip path (EPH-I0134)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I0134 s4 (overlaps EPH-I0129): the `: (i += 1)` continuation
+    // sits between the condition and the body. The fill scan and the
+    // CFG's virtual-body probe both skip the continuation group, so the
+    // body fill stays conditional and the next-line read fires.
+    const content =
+        \\fn use(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn oneLineContLoop() void {
+        \\    var x: u32 = undefined;
+        \\    var i: u32 = 0;
+        \\    while (i < 3) : (i += 1) { x = 1; }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_s4.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_s4.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "ZA607: switch-arm break does not poison the switch merge" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -69030,14 +69936,17 @@ test "buildCFG: nested same-line if is one plain virtual body" {
     try std.testing.expectEqual(merge, findBlockForLine(&cfg, 3));
 }
 
-test "buildCFG: brace-less while body degrades exactly as before" {
+test "buildCFG: brace-less while body closes into its merge (EPH-I0129)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Brace-less while/for are out of B2 scope: the pending entry lingers
-    // until the fn close pops it, so h() and x = 1 both stay attributed
-    // to the loop body block (pre-B2 shape).
+    // EPH-I0129 supersedes the pre-B2 brace-less while degradation: the
+    // body takes a virtual body now, so the loop closes at its `;` and
+    // the following lines attribute to the merge instead of a lingering
+    // body block. The former pin (h() and x = 1 in the body block until
+    // the fn close, merge starting on the line after) locked the B2-scope
+    // exclusion this fix lifts.
     const lines = [_][]const u8{
         "fn f(a: bool) void {", // 1
         "    while (a) g();", // 2
@@ -69054,13 +69963,14 @@ test "buildCFG: brace-less while body degrades exactly as before" {
         return error.TestUnexpectedResult;
     const merge = cfgSucc(&cfg, entry, .branch_false) orelse
         return error.TestUnexpectedResult;
-    try std.testing.expectEqual(body, findBlockForLine(&cfg, 3));
-    try std.testing.expectEqual(body, findBlockForLine(&cfg, 4));
-    // A `}` line is attributed to the block it closes, so the body extent
-    // runs to the fn close; the pending entry pops there, starting the
-    // merge on the line after — not right after h().
-    try std.testing.expectEqual(@as(usize, 5), cfg.blocks.items[body].end_line);
-    try std.testing.expectEqual(@as(usize, 6), cfg.blocks.items[merge].start_line);
+    // h() and x = 1 attribute to the merge: the virtual body closed on
+    // the loop line, and the deferred loop close finished on line 3.
+    try std.testing.expectEqual(merge, findBlockForLine(&cfg, 3));
+    try std.testing.expectEqual(merge, findBlockForLine(&cfg, 4));
+    try std.testing.expectEqual(@as(usize, 3), cfg.blocks.items[merge].start_line);
+    try std.testing.expectEqual(@as(usize, 5), cfg.blocks.items[merge].end_line);
+    // The virtual body re-enters the header through the loop-back edge.
+    try std.testing.expect(cfgHasEdge(&cfg, body, entry, .loop_back));
 }
 
 // ============================================================================
@@ -70240,18 +71150,19 @@ test "ZA607: chained same-line return guards before dominating assignment are si
     );
 }
 
-test "ZA607: same-line guarded assignment keeps the locked verdict" {
+test "ZA607: same-line braceless guarded assignment keeps the arm-conditional verdict (EPH-I0134)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The mid-line `y = 1;` virtual body runs only on the a-true path, but
-    // later-line reads keep the locked same-line-if verdict: the entry
-    // block's gen bit covers them (EPH-I0111). The braceless virtual-body
-    // form is the documented residual of the EPH-I0849 fix, which covers
-    // the braced one-line form; the CFG alone decides — no textual
-    // dominance suppressor (EPH-I0681, F7 shape).
+    // The mid-line `y = 1;` virtual body runs only on the a-true path.
+    // The former locked verdict (the entry block's gen bit covering
+    // later-line reads — the documented EPH-I0849 braceless residual,
+    // EPH-I0111) is superseded by EPH-I0134: the virtual body records an
+    // arm span now, so the fill attributes to the arm block and the
+    // false path reaches the read uncovered. The CFG alone decides — no
+    // textual dominance suppressor (EPH-I0681, F7 shape).
     const content =
         \\fn sameLineGuardedAssign(a: bool) u32 {
         \\    var y: u32 = undefined;
@@ -70263,7 +71174,7 @@ test "ZA607: same-line guarded assignment keeps the locked verdict" {
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
-        0,
+        1,
         countRuleIssues(run.issues.items, "da_same_line_guard.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
@@ -75918,6 +76829,10 @@ test "isContainerParenHeader masks parens inside strings (EPH-I0340)" {
     // F-14). The literal-masked scan names `switch`.
     try std.testing.expect(isContainerParenHeader("switch (\"(\", y) {", 14));
     try std.testing.expect(!isContainerParenHeader("f(\"(\", y) {", 10));
+    // The EPH-I0126 call-arg shape: the string inside the header call
+    // carries the unpaired paren, and the scan still names `switch`.
+    try std.testing.expect(isContainerParenHeader("switch (f(\"(\")) {", 14));
+    try std.testing.expect(!isContainerParenHeader("f(g(\"(\")) {", 8));
 }
 
 test "findFillCallOccurrence grouping-paren non-call matches (EPH-I0123 doc)" {

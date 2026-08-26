@@ -1140,12 +1140,34 @@ fn stripLineComment(t: []const u8) []const u8 {
 /// doc string carries `@import("orphan.zig")` marks orphan.zig reachable
 /// and silences its genuine ZA501 orphan warning.
 fn findTagInCode(line: []const u8, tag: []const u8, from: usize) ?usize {
-    var lit = types.LiteralState.forLine(line) orelse return null;
-    var i: usize = 0;
-    while (i < line.len) : (i += 1) {
-        if (lit.updateForChar(line, i) == null) continue;
-        if (i < from) continue;
-        if (i + tag.len > line.len) return null;
+    // Whole-line multiline-string bodies carry no code position (EPH-I0671).
+    if (mem.startsWith(u8, mem.trimStart(u8, line, " \t"), "\\\\")) return null;
+    var cls = LineClassifier.init(line);
+    const comment_start = findCommentStart(line);
+    return findTagInCodeScan(tag, from, &cls, comment_start);
+}
+
+/// Scan for `tag` at a code position at or after `from`, reusing caller-held
+/// line state (EPH-I0306): `cls` must be a classifier whose queries ascend,
+/// and `comment_start` its string-aware comment start. A loop that advances
+/// `from` across matches then walks the line once total instead of once per
+/// occurrence (the pre-fix cost: O(k * line) per line with k matches).
+/// Positions at or after the comment start are prose and never match. The
+/// delimiter divergence from the old LiteralState form is the classifier's
+/// documented semantic: an opening quote or `\\` opener at `i` itself
+/// reports code, its content reports literal — no current tag starts with
+/// a quote, a comment opener, or a backslash.
+fn findTagInCodeScan(
+    tag: []const u8,
+    from: usize,
+    cls: *LineClassifier,
+    comment_start: ?usize,
+) ?usize {
+    const line = cls.line;
+    var i = from;
+    while (i + tag.len <= line.len) : (i += 1) {
+        if (comment_start != null and i >= comment_start.?) return null;
+        if (cls.isInsideLiteral(i)) continue;
         if (mem.eql(u8, line[i .. i + tag.len], tag)) return i;
     }
     return null;
@@ -14059,10 +14081,11 @@ fn checkErrdeferOwnershipTransfer(
         const code = maskedCodeLine(line, &blank_buf);
         scan.pos = 0;
         const line_depth = scan.depth;
-        // A same-line try exit precedes any transfer STORE on the line:
-        // the try's error path propagates before the store executes, so
-        // the transfer never covers that path (EPH-I0068).
-        if (tryPrecedesTransferStore(code, mem.trim(u8, line, " \t\r"), alloc.name)) return;
+        // A same-line try plus a transfer anchor is an uncovered error exit
+        // whichever comes first: the store form propagates before the store
+        // executes, and the wrapped form (`try list.append(x)`) took
+        // nothing on its error path (EPH-I0307, EPH-I0068).
+        if (uncoveredTryTransferLine(code, mem.trim(u8, line, " \t\r"), alloc.name)) return;
         // A transfer inside a conditional block does not dominate the
         // alloc's fall-through — keep scanning (EPH-I0368).
         if (dominatingTransferAt(&scan, code, alloc.name, alloc_depth)) {
@@ -14217,26 +14240,26 @@ fn realTryPos(code: []const u8) ?usize {
     return null;
 }
 
-/// True when a same-line try exit precedes a transfer STORE: the try's
-/// error path propagates before the store executes, so the transfer never
-/// covers that path (EPH-I0068). The store form (`self.field = try
-/// f(buf)`) now reads like the already-correct return form
-/// (`return try f(buf)`). Fires only when the transfer anchor sits
-/// textually BEFORE the try — the try is the RHS of the store. When the
-/// try wraps the transfer itself (`try list.append(x)`), the transfer
-/// still credits: the append-failure leak is the model's accepted bound
-/// (pre-existing). defer/errdefer statement lines stay exempt — a try
-/// there is a compile error (mirrors isUncoveredErrorExit). Masked code:
-/// prose in comments and strings never exits.
-fn tryPrecedesTransferStore(
+/// True when a same-line try and transfer anchor make the line an uncovered
+/// error exit, whichever comes first (EPH-I0307). The store form (`self.field
+/// = try f(buf)`, anchor before the try — EPH-I0068): the try's error path
+/// propagates before the store executes, so the transfer never covers that
+/// path. The wrapped form (`try list.append(x)`, try before the anchor): the
+/// transfer call itself is the try, and on its error path the container took
+/// nothing — the append-failure leak is exactly this shape, and a later
+/// transfer cannot cover the already-propagated error path. The pre-fix
+/// model credited the wrapped form as a transfer and stayed silent on the
+/// dupe-then-try-append leak. defer/errdefer statement lines stay exempt —
+/// a try there is a compile error (mirrors isUncoveredErrorExit). Masked
+/// code: prose in comments and strings never exits or transfers.
+fn uncoveredTryTransferLine(
     code: []const u8,
     t: []const u8,
     alloc_name: []const u8,
 ) bool {
     if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "errdefer ")) return false;
-    const try_pos = realTryPos(code) orelse return false;
-    const anchor = errdeferTransferAnchor(code, alloc_name) orelse return false;
-    return anchor < try_pos;
+    if (realTryPos(code) == null) return false;
+    return errdeferTransferAnchor(code, alloc_name) != null;
 }
 
 /// Byte offset within the masked code line where an ownership transfer
@@ -15463,7 +15486,11 @@ const ImportGraph = struct {
         const line_end = mem.indexOfScalarPos(u8, content, start, '\n') orelse content.len;
         const line = content[line_start..line_end];
         var from = start - line_start;
-        while (findTagInCode(line, import_tag, from)) |idx| {
+        // Caller-held line state: one walk per line across all tag queries
+        // (EPH-I0306), instead of a fresh full-line rescan per occurrence.
+        var cls = LineClassifier.init(line);
+        const comment_start = findCommentStart(line);
+        while (findTagInCodeScan(import_tag, from, &cls, comment_start)) |idx| {
             const path_start = idx + import_tag.len;
             var path_end = path_start;
             while (path_end < line.len and line[path_end] != '"') path_end += 1;
@@ -15632,7 +15659,11 @@ const ImportGraph = struct {
         var lines = mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
             var from: usize = 0;
-            while (findTagInCode(line, import_tag, from)) |idx| {
+            // Caller-held line state: one walk per line across all tag
+            // queries (EPH-I0306).
+            var cls = LineClassifier.init(line);
+            const comment_start = findCommentStart(line);
+            while (findTagInCodeScan(import_tag, from, &cls, comment_start)) |idx| {
                 const path_start = idx + import_tag.len;
                 var path_end = path_start;
                 while (path_end < line.len and line[path_end] != '"') path_end += 1;
@@ -15766,7 +15797,11 @@ const ImportGraph = struct {
         var lines = mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
             var from: usize = 0;
-            while (findTagInCode(line, bp_tag, from)) |idx| {
+            // Caller-held line state: one walk per line across all tag
+            // queries (EPH-I0306).
+            var cls = LineClassifier.init(line);
+            const comment_start = findCommentStart(line);
+            while (findTagInCodeScan(bp_tag, from, &cls, comment_start)) |idx| {
                 const str_start = idx + bp_tag.len;
                 var str_end = str_start;
                 while (str_end < line.len and line[str_end] != '"') str_end += 1;
@@ -15793,7 +15828,11 @@ const ImportGraph = struct {
         var offset: usize = 0;
         while (lines.next()) |line| : (offset += line.len + 1) {
             var from: usize = 0;
-            while (findTagInCode(line, tag, from)) |idx| {
+            // Caller-held line state: one walk per line across all tag
+            // queries (EPH-I0306).
+            var cls = LineClassifier.init(line);
+            const comment_start = findCommentStart(line);
+            while (findTagInCodeScan(tag, from, &cls, comment_start)) |idx| {
                 try self.tryMarkPathJoinAt(content, offset + idx + tag.len - 1, build_root);
                 from = idx + tag.len;
             }
@@ -16202,7 +16241,11 @@ const ImportGraph = struct {
         var lines = mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
             var from: usize = 0;
-            while (findTagInCode(line, tag, from)) |idx| {
+            // Caller-held line state: one walk per line across all tag
+            // queries (EPH-I0306).
+            var cls = LineClassifier.init(line);
+            const comment_start = findCommentStart(line);
+            while (findTagInCodeScan(tag, from, &cls, comment_start)) |idx| {
                 const after = idx + tag.len;
                 if (after == line.len or !isIdent(line[after])) return true;
                 from = after;
@@ -30222,25 +30265,44 @@ fn isCallWithIdentAt(code: []const u8, from: usize) bool {
 }
 
 /// True when the line calls into the test framework: `testing.<name>(` at a
-/// word boundary, or an expect-family call `.expect<tail>(` such as
-/// `.expect(`, `.expectEqual(`, `.expectError(`. Call shapes only: names
-/// like `unexpected_total` or `protesting.count(` and string literals no
-/// longer disarm ZA801/ZA802 (EPH-I0224).
+/// word boundary — which covers the expect family (`std.testing.expect(`,
+/// `testing.expectEqual(`, ...) and any other std.testing member. Call
+/// shapes only: names like `unexpected_total` or `protesting.count(` and
+/// string literals no longer disarm ZA801/ZA802 (EPH-I0224).
+/// Receiver-scoped (EPH-I0296): the `testing.` receiver must be the
+/// std.testing module (bare `testing`, or dot-prefixed only by `std`) — a
+/// user method `tokens.expectToken(` or a user field `foo.testing.bar(` is
+/// not a test-framework call and does not disarm. Deliberate false
+/// negative: a renamed import (`const t = std.testing;`) disarms via
+/// `t.expect(` no longer — the receiver is not `testing`.
 fn hasTestingCall(code: []const u8) bool {
     var start: usize = 0;
     while (mem.indexOfPos(u8, code, start, "testing.")) |pos| {
-        const word_edge = pos == 0 or !isIdent(code[pos - 1]);
-        if (word_edge and !isPatternInString(code, pos) and
+        if (!isPatternInString(code, pos) and
+            isStdTestingReceiver(code, pos) and
             isCallWithIdentAt(code, pos + "testing.".len)) return true;
         start = pos + 1;
     }
-    start = 0;
-    while (mem.indexOfPos(u8, code, start, ".expect")) |pos| {
-        if (!isPatternInString(code, pos) and
-            isCallWithIdentAt(code, pos + ".expect".len)) return true;
-        start = pos + 1;
-    }
+    // No separate `.expect<tail>(` scan (EPH-I0296): every `testing.expect...`
+    // and `std.testing.expect...` shape fires through the `testing.` scan
+    // above, and a `.expect` on any other receiver is a user method, not a
+    // test-framework call — the pre-fix scan accepted `tokens.expectToken(`,
+    // which was the over-inclusion.
     return false;
+}
+
+/// True when the `testing` identifier at `pos` names the std.testing module:
+/// line-start or a non-ident boundary qualifies, and a dot-prefix qualifies
+/// only when it is exactly `std.` at an ident boundary (EPH-I0296 —
+/// `foo.testing.` is a field access on a user value, `mystd.testing.` is a
+/// longer ident, and neither is the module).
+fn isStdTestingReceiver(code: []const u8, pos: usize) bool {
+    if (pos == 0) return true;
+    if (isIdent(code[pos - 1])) return false;
+    if (code[pos - 1] != '.') return true;
+    if (pos < 4) return false;
+    if (!mem.eql(u8, code[pos - 4 .. pos], "std.")) return false;
+    return pos == 4 or !isIdent(code[pos - 5]);
 }
 
 /// True when ` orelse ` appears as an operator outside string data. A
@@ -31580,7 +31642,11 @@ fn lineHasBoundNullGuard(
     name: []const u8,
 ) bool {
     var from: usize = 0;
-    while (findTagInCode(line, "== null", from)) |eq_pos| {
+    // Caller-held line state: one walk per line across all tag queries
+    // (EPH-I0306).
+    var cls = LineClassifier.init(line);
+    const comment_start = findCommentStart(line);
+    while (findTagInCodeScan("== null", from, &cls, comment_start)) |eq_pos| {
         from = eq_pos + "== null".len;
         if (!nullPredicateBinds(line, eq_pos, name)) continue;
         if (hasNullCheckExit(line, lookup, eq_pos)) return true;
@@ -43389,7 +43455,11 @@ fn extractPathFromLine(ctx: EntryScanCtx, line: []const u8) !void {
     }
     // Pattern: @import("...") in build.zig (build module imports, entry points)
     var search_pos: usize = 0;
-    while (findTagInCode(line, "@import(\"", search_pos)) |idx| {
+    // Caller-held line state: one walk per line across all tag queries
+    // (EPH-I0306).
+    var cls = LineClassifier.init(line);
+    const comment_start = findCommentStart(line);
+    while (findTagInCodeScan("@import(\"", search_pos, &cls, comment_start)) |idx| {
         const start = idx + 9; // len of '@import("'
         search_pos = start;
         if (extractQuotedPath(line, start)) |path|
@@ -43604,7 +43674,11 @@ fn extractPathTagEntries(ctx: EntryScanCtx, line: []const u8) !void {
 fn extractPathJoinEntries(ctx: EntryScanCtx, line: []const u8) !void {
     const tag = "pathJoin(&.{";
     var pos: usize = 0;
-    while (findTagInCode(line, tag, pos)) |idx| {
+    // Caller-held line state: one walk per line across all tag queries
+    // (EPH-I0306).
+    var cls = LineClassifier.init(line);
+    const comment_start = findCommentStart(line);
+    while (findTagInCodeScan(tag, pos, &cls, comment_start)) |idx| {
         pos = idx + tag.len;
         if (try extractPathJoin(ctx.allocator, line, idx + tag.len - 1)) |joined| {
             defer ctx.allocator.free(joined);
@@ -43626,7 +43700,11 @@ fn isValidZigImport(imp_path: []const u8) bool {
 /// comments).
 fn followImportsInLine(ctx: EntryScanCtx, line: []const u8) !void {
     var imp_pos: usize = 0;
-    while (findTagInCode(line, "@import(\"", imp_pos)) |idx| {
+    // Caller-held line state: one walk per line across all tag queries
+    // (EPH-I0306).
+    var cls = LineClassifier.init(line);
+    const comment_start = findCommentStart(line);
+    while (findTagInCodeScan("@import(\"", imp_pos, &cls, comment_start)) |idx| {
         const istart = idx + 9;
         imp_pos = istart;
         const imp_path = extractQuotedPath(line, istart) orelse continue;
@@ -60234,15 +60312,16 @@ test "ZA103: errdefer covers the same-line try-store (EPH-I0068 lock)" {
     ) == 0);
 }
 
-test "ZA103: try wrapping the transfer itself still credits (EPH-I0068 lock)" {
+test "ZA103: try wrapping the transfer is an uncovered error exit (EPH-I0307)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `try list.append(x)` wraps the transfer in the try: there is no
-    // store after the try point, so the transfer keeps crediting — the
-    // append-failure leak is the model's accepted bound.
+    // `try sink.items.append(allocator, buf)` wraps the transfer in the
+    // try: on the append's failure path the container took nothing, so the
+    // dupe leaks unless an errdefer covers it. EPH-I0307 supersedes the
+    // old EPH-I0068 lock that credited this transfer and stayed silent.
     const content =
         \\const Sink = struct { items: std.ArrayListUnmanaged([]u8) = .empty };
         \\fn append_try(allocator: std.mem.Allocator, sink: *Sink, s: []const u8) !void {
@@ -60256,6 +60335,32 @@ test "ZA103: try wrapping the transfer itself still credits (EPH-I0068 lock)" {
     try std.testing.expect(countRuleIssues(
         run.issues.items,
         "test_append_try.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: try-wrapped append with errdefer stays silent (EPH-I0307)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The errdefer frees the dupe on the append's failure path, so the
+    // try-wrapped transfer is covered.
+    const content =
+        \\const Sink = struct { items: std.ArrayListUnmanaged([]u8) = .empty };
+        \\fn append_try_good(allocator: std.mem.Allocator, sink: *Sink, s: []const u8) !void {
+        \\    const buf = try allocator.dupe(u8, s);
+        \\    errdefer allocator.free(buf);
+        \\    try sink.items.append(allocator, buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_append_try_good.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_append_try_good.zig",
         RULE_ALLOC_NO_ERRDEFER,
     ) == 0);
 }
@@ -65997,6 +66102,23 @@ test "hasTestingCall rejects substrings, strings, and non-calls (EPH-I0224)" {
     try std.testing.expect(!hasTestingCall("const alloc = testing.allocator;"));
 }
 
+test "hasTestingCall is receiver-scoped: user methods and fields do not disarm (EPH-I0296)" {
+    // A user method named expectToken on a non-testing receiver must not
+    // suppress ZA801 (the pre-fix `.expect<tail>(` scan accepted it).
+    try std.testing.expect(!hasTestingCall("tokens.expectToken(v.?);"));
+    try std.testing.expect(!hasTestingCall("_ = self.expectEqual(p.?);"));
+    // A user field named testing must not suppress (the pre-fix word-edge
+    // check let the dot through).
+    try std.testing.expect(!hasTestingCall("foo.testing.bar(p.?);"));
+    try std.testing.expect(!hasTestingCall("mystd.testing.expect(p.?);"));
+    // A renamed import is the documented false negative: the receiver is
+    // not `testing`.
+    try std.testing.expect(!hasTestingCall("t.expect(p.? == 1);"));
+    // The real std.testing shapes still disarm, dot-prefixed by std or bare.
+    try std.testing.expect(hasTestingCall("try std.testing.expect(p.? == 1);"));
+    try std.testing.expect(hasTestingCall("try testing.expectEqual(p.?, 1);"));
+}
+
 test "hasOrelseOperator ignores string literal contents (EPH-I0224)" {
     try std.testing.expect(hasOrelseOperator("const v = p orelse 0;"));
     try std.testing.expect(!hasOrelseOperator("const v = p.? + msg(\"use orelse here\");"));
@@ -67725,6 +67847,43 @@ test "findCommentStart finds a real comment after a char literal with a quote (E
         @as(?usize, 15),
         findCommentStart("const q = '\"'; // error.badName"),
     );
+}
+
+test "findTagInCodeScan returns the same positions as the per-call form (EPH-I0306)" {
+    // The caller-held scan form must match the wrapper on every tag of a
+    // multi-occurrence line, and both must skip string/comment positions.
+    const line = "a = @import(\"x\"); b = @import(\"y\"); // @import(\"z\")";
+    const tag = "@import(\"";
+    var cls = LineClassifier.init(line);
+    const comment_start = findCommentStart(line);
+
+    var expected = std.ArrayListUnmanaged(usize).empty;
+    defer expected.deinit(std.testing.allocator);
+    // Collect expected positions through the wrapper (fresh state per call).
+    var from: usize = 0;
+    while (findTagInCode(line, tag, from)) |idx| {
+        try expected.append(std.testing.allocator, idx);
+        from = idx + 1;
+    }
+    try std.testing.expect(expected.items.len == 2);
+
+    // Collect scan-form positions with the shared state.
+    var got = std.ArrayListUnmanaged(usize).empty;
+    defer got.deinit(std.testing.allocator);
+    var from2: usize = 0;
+    while (findTagInCodeScan(tag, from2, &cls, comment_start)) |idx| {
+        try got.append(std.testing.allocator, idx);
+        from2 = idx + 1;
+    }
+    try std.testing.expectEqualSlices(usize, expected.items, got.items);
+}
+
+test "findTagInCodeScan skips string data and comment prose (EPH-I0306)" {
+    // A tag inside a string or after the comment start never matches.
+    try std.testing.expect(findTagInCode("const s = \"@import(\\\"\";", "@import(\"", 0) == null);
+    try std.testing.expect(findTagInCode("x(); // @import(\"", "@import(\"", 0) == null);
+    // A whole-line multiline-string body carries no code position.
+    try std.testing.expect(findTagInCode("  \\\\ @import(\"", "@import(\"", 0) == null);
 }
 
 test "blankLiteralContents blanks a mid-line multiline opener tail (EPH-I0671)" {
@@ -86516,6 +86675,76 @@ test "analyzeCFGErrdeferCoverage no false positive for dupe with errdefer (ZA103
     for (issues.items) |issue| {
         // Single-file fixture: the file filter is a no-op —
         // assert rule-absence across all issues (EPH-I1147).
+        try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
+    }
+}
+
+test "analyzeCFGErrdeferCoverage flags dupe-then-try-append without errdefer (EPH-I0307)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The I0150-B1 pattern: the try-wrapped append takes the dupe only on
+    // its success path; on append failure the copy leaks with no errdefer.
+    const test_content =
+        \\fn bad_dupe_append(alloc: std.mem.Allocator, list: *std.ArrayList([]const u8)) !void {
+        \\    const copy = try alloc.dupe(u8, "hello");
+        \\    try list.append(copy);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_dupe_append.zig", test_content);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_dupe_append.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    var found_za103 = false;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER)) {
+            found_za103 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_za103);
+}
+
+test "analyzeCFGErrdeferCoverage stays silent on dupe-append with errdefer (EPH-I0307)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The errdefer frees the copy on the append-failure path, so the
+    // try-wrapped append is covered and ZA103 stays silent.
+    const test_content =
+        \\fn good_dupe_append(alloc: std.mem.Allocator, list: *std.ArrayList([]const u8)) !void {
+        \\    const copy = try alloc.dupe(u8, "hello");
+        \\    errdefer alloc.free(copy);
+        \\    try list.append(copy);
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_dupe_append_good.zig",
+        test_content,
+    );
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_dupe_append_good.zig"), {});
+
+    var issues = try analyzeCFGMemory(allocator, &graph);
+    defer deinitIssues(&issues, allocator);
+
+    for (issues.items) |issue| {
         try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
 }
@@ -108047,12 +108276,16 @@ test "ZC101: ZC and ZC1 prefix filters disable the rule; default is ON" {
     try std.testing.expect(cfg.isRuleEnabled(RULE_LOCK_NO_DEFER_UNLOCK));
 
     // "ZC" prefix disables the whole band, "ZC1" the ZC1xx family.
+    // The errdefer covers the append-failure path: the try-wrapped append
+    // takes the dupe only on success (EPH-I0307).
     const zc = try allocator.dupe(u8, "ZC");
+    errdefer allocator.free(zc);
     try cfg.disabled_rules.append(allocator, zc);
     try std.testing.expect(!cfg.isRuleEnabled(RULE_LOCK_NO_DEFER_UNLOCK));
     allocator.free(zc);
     cfg.disabled_rules.clearRetainingCapacity();
     const zc1 = try allocator.dupe(u8, "ZC1");
+    errdefer allocator.free(zc1);
     try cfg.disabled_rules.append(allocator, zc1);
     try std.testing.expect(!cfg.isRuleEnabled(RULE_LOCK_NO_DEFER_UNLOCK));
     allocator.free(zc1);

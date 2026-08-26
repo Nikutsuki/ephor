@@ -563,8 +563,16 @@ path-class heuristic is grounded for them.
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA801** | warning | OFF | Optional unwrap (`.?`) may panic if null — fires on any continuation except `;`, `,`, `)`; suppressed in if/while/orelse/expect/`testing.` contexts (use `--enable=ZA8`) |
+| **ZA801** | warning | OFF | Optional unwrap (`.?`) may panic if null — fires on any continuation except `;`, `,`, `)`; suppressed in if/while/orelse and std.testing-call contexts (use `--enable=ZA8`) |
 | **ZA802** | warning | OFF | Dereferencing a nullable pointer may panic or cause undefined behavior (use `--enable=ZA8`). Fires on `.*` derefs of variables declared `?*T`, `[*c]T`, or `*allowzero T` without a null check on the path. |
+
+**The test-call suppression is receiver-scoped (EPH-I0296).** A line
+disarms through a test call only when the receiver is the std.testing
+module: `testing.expect(...)` and `std.testing.expect(...)` qualify. A
+user method on another receiver (`tokens.expectToken(...)`) or a user
+field (`foo.testing.bar(...)`) does not disarm. A renamed import
+(`const t = std.testing; t.expect(...)`) is a documented false negative:
+the receiver is not `testing`.
 
 **When to enable ZA8xx:** Pre-release audits for safety-critical code (servers, databases) where a null panic means downtime. Off by default because `.?` is extremely common in Zig and usually intentionally guarded.
 
@@ -1131,7 +1139,6 @@ Ephor uses a modular compatibility layer to support Zig 0.16.x API patterns. The
 ```
 src/compat/
 ├── compat.zig     # Main module: version detection, table dispatch, getters
-├── vocab.zig      # Shared vocabulary types (AllocMethod, AllocatorType, etc.)
 ├── v0_15.zig      # Zig 0.15.x pattern and predicate tables
 └── v0_16.zig      # Zig 0.16.x pattern and predicate tables
 ```
@@ -1273,7 +1280,7 @@ Decision:
 - `.unknown` → fall through to next tier
 
 **Tier 3 — Stdlib vocab (trusted for known containers):**
-If the receiver variable is tracked in `stdlib_vars`, check against vocabulary patterns from the compat layer (`getSafeMethodPatterns()`, `getVoidMethodPatterns()`). Method patterns (starting with `.`) only match when the receiver is a confirmed stdlib type.
+If the receiver variable is tracked in `stdlib_vars`, check against vocabulary patterns from the compat layer (`getSafeMethodPatterns()`). Method patterns (starting with `.`) only match when the receiver is a confirmed stdlib type.
 
 **Tier 4 — Legacy patterns (backwards compat):**
 Substring matching for non-stdlib patterns (C FFI uppercase functions, parser internals). Universal patterns (not starting with `.`) always match regardless of receiver type.

@@ -18,25 +18,16 @@
 // never the scanned project's toolchain: the resolved tables serve every
 // scanned project (F17).
 //
-// Each version module exports:
+// Each version module exports (EPH-I0303 trimmed the surface to what a
+// diagnostic consumes):
+//   - version: Module version label
 //   - builtins: All @builtin functions
 //   - optional_methods: Methods returning ?T (safe to discard)
-//   - error_methods: Methods returning !T (should not be discarded)
-//   - alloc_patterns: Allocation method patterns
-//   - create_patterns: Create method patterns
-//   - free_patterns: Deallocation patterns
-//   - destroy_patterns: Destroy method patterns
-//   - panic_patterns: Patterns that may cause runtime panics
-//   - undefined_patterns: Undefined usage patterns
-//   - keywords: Language keywords
-//   - breaking_changes: Changes from previous version
-//   - deprecated_patterns: Old patterns needing updates
-//   - std_modules: Standard library module structure
+//   - Pattern tables behind the getters below
 //   - Helper functions for pattern checking
 
 const std = @import("std");
 const builtin = @import("builtin");
-const vocab = @import("vocab.zig");
 
 // Import all supported version modules
 pub const v0_15 = @import("v0_15.zig");
@@ -103,19 +94,14 @@ pub fn getCurrentVersion() VersionInfo {
 /// Every pattern table and predicate one version module supplies.
 /// tables_0_15 and tables_0_16 are the whole dispatch table: the getters
 /// read fields instead of switching on the version at every call site.
+/// Uncalled tables were deleted (EPH-I0303): the version modules export
+/// only what a main.zig diagnostic consumes through a getter or the
+/// contains* predicate.
 const Tables = struct {
     /// Module version label ("0.15", "0.16") for the fallback warning.
     version_label: []const u8,
     builtins: []const []const u8,
     optional_methods: []const []const u8,
-    error_methods: []const []const u8,
-    alloc_patterns: []const []const u8,
-    create_patterns: []const []const u8,
-    free_patterns: []const []const u8,
-    destroy_patterns: []const []const u8,
-    keywords: []const []const u8,
-    breaking_changes: []const []const u8,
-    std_modules: []const []const u8,
     no_free_init_patterns: []const []const u8,
     no_free_field_type_patterns: []const []const u8,
     all_init_patterns: []const []const u8,
@@ -128,15 +114,11 @@ const Tables = struct {
     container_ownership_methods: []const []const u8,
     no_free_type_ptrs: []const []const u8,
     safe_method_patterns: []const []const u8,
-    void_method_patterns: []const []const u8,
     modifying_method_patterns: []const []const u8,
     stdlib_container_init_patterns: []const []const u8,
     managed_container_type_patterns: []const []const u8,
     contains_optional_method: *const fn (line: []const u8) bool,
-    contains_error_method: *const fn (line: []const u8) bool,
-    contains_allocation: *const fn (line: []const u8) bool,
     contains_builtin: *const fn (line: []const u8) bool,
-    check_deprecated: *const fn (line: []const u8) ?vocab.DeprecatedPattern,
 };
 
 /// Table set for Zig 0.15.x. The knownTablesFor dispatch references this set.
@@ -144,14 +126,6 @@ const tables_0_15 = Tables{
     .version_label = v0_15.version,
     .builtins = &v0_15.builtins,
     .optional_methods = &v0_15.optional_methods,
-    .error_methods = &v0_15.error_methods,
-    .alloc_patterns = &v0_15.alloc_patterns,
-    .create_patterns = &v0_15.create_patterns,
-    .free_patterns = &v0_15.free_patterns,
-    .destroy_patterns = &v0_15.destroy_patterns,
-    .keywords = &v0_15.keywords,
-    .breaking_changes = &v0_15.breaking_changes,
-    .std_modules = &v0_15.std_modules,
     .no_free_init_patterns = v0_15.no_free_init_patterns,
     .no_free_field_type_patterns = v0_15.no_free_field_type_patterns,
     .all_init_patterns = v0_15.all_init_patterns,
@@ -163,15 +137,11 @@ const tables_0_15 = Tables{
     .container_ownership_methods = v0_15.container_ownership_methods,
     .no_free_type_ptrs = v0_15.no_free_type_ptrs,
     .safe_method_patterns = v0_15.safe_method_patterns,
-    .void_method_patterns = v0_15.void_method_patterns,
     .modifying_method_patterns = v0_15.modifying_method_patterns,
     .stdlib_container_init_patterns = v0_15.stdlib_container_init_patterns,
     .managed_container_type_patterns = v0_15.managed_container_type_patterns,
     .contains_optional_method = v0_15.containsOptionalMethod,
-    .contains_error_method = v0_15.containsErrorMethod,
-    .contains_allocation = v0_15.containsAllocation,
     .contains_builtin = v0_15.containsBuiltin,
-    .check_deprecated = v0_15.checkDeprecated,
 };
 
 /// Table set for Zig 0.16.x. The knownTablesFor dispatch references this set.
@@ -179,14 +149,6 @@ const tables_0_16 = Tables{
     .version_label = v0_16.version,
     .builtins = &v0_16.builtins,
     .optional_methods = &v0_16.optional_methods,
-    .error_methods = &v0_16.error_methods,
-    .alloc_patterns = &v0_16.alloc_patterns,
-    .create_patterns = &v0_16.create_patterns,
-    .free_patterns = &v0_16.free_patterns,
-    .destroy_patterns = &v0_16.destroy_patterns,
-    .keywords = &v0_16.keywords,
-    .breaking_changes = &v0_16.breaking_changes,
-    .std_modules = &v0_16.std_modules,
     .no_free_init_patterns = v0_16.no_free_init_patterns,
     .no_free_field_type_patterns = v0_16.no_free_field_type_patterns,
     .all_init_patterns = v0_16.all_init_patterns,
@@ -198,15 +160,11 @@ const tables_0_16 = Tables{
     .container_ownership_methods = v0_16.container_ownership_methods,
     .no_free_type_ptrs = v0_16.no_free_type_ptrs,
     .safe_method_patterns = v0_16.safe_method_patterns,
-    .void_method_patterns = v0_16.void_method_patterns,
     .modifying_method_patterns = v0_16.modifying_method_patterns,
     .stdlib_container_init_patterns = v0_16.stdlib_container_init_patterns,
     .managed_container_type_patterns = v0_16.managed_container_type_patterns,
     .contains_optional_method = v0_16.containsOptionalMethod,
-    .contains_error_method = v0_16.containsErrorMethod,
-    .contains_allocation = v0_16.containsAllocation,
     .contains_builtin = v0_16.containsBuiltin,
-    .check_deprecated = v0_16.checkDeprecated,
 };
 
 /// Minor version of the newest supported Zig release. An unknown newer
@@ -375,82 +333,17 @@ pub fn containsOptionalMethod(line: []const u8) bool {
     return currentTables().contains_optional_method(line);
 }
 
-/// Check if line contains an error-returning method (version-aware)
-/// Used by ZA205 to detect discarded error returns
-pub fn containsErrorMethod(line: []const u8) bool {
-    return currentTables().contains_error_method(line);
-}
-
-/// Check if line contains an allocation pattern (version-aware)
-/// Used by ZA101/ZA102 for memory leak detection
-pub fn containsAllocation(line: []const u8) bool {
-    return currentTables().contains_allocation(line);
-}
-
 /// Check if line contains a builtin function (version-aware)
 pub fn containsBuiltin(line: []const u8) bool {
     return currentTables().contains_builtin(line);
 }
 
-/// Check for deprecated patterns (version-aware)
-/// Returns replacement suggestion if found
-pub fn checkDeprecated(line: []const u8) ?vocab.DeprecatedPattern {
-    return currentTables().check_deprecated(line);
-}
-
 // ============================================================================
 // Direct access to version-specific arrays
 // ============================================================================
-
-/// Get the optional methods list for the current version
-pub fn getOptionalMethods() []const []const u8 {
-    return currentTables().optional_methods;
-}
-
-/// Get the error methods list for the current version
-pub fn getErrorMethods() []const []const u8 {
-    return currentTables().error_methods;
-}
-
-/// Get the builtin functions list for the current version
-pub fn getBuiltins() []const []const u8 {
-    return currentTables().builtins;
-}
-
-/// Get the allocation patterns for the current version
-pub fn getAllocPatterns() []const []const u8 {
-    return currentTables().alloc_patterns;
-}
-
-/// Get the create patterns for the current version
-pub fn getCreatePatterns() []const []const u8 {
-    return currentTables().create_patterns;
-}
-
-/// Get the free patterns for the current version
-pub fn getFreePatterns() []const []const u8 {
-    return currentTables().free_patterns;
-}
-
-/// Get the destroy patterns for the current version
-pub fn getDestroyPatterns() []const []const u8 {
-    return currentTables().destroy_patterns;
-}
-
-/// Get the keywords list for the current version
-pub fn getKeywords() []const []const u8 {
-    return currentTables().keywords;
-}
-
-/// Get the breaking changes list for the current version
-pub fn getBreakingChanges() []const []const u8 {
-    return currentTables().breaking_changes;
-}
-
-/// Get the std modules list for the current version
-pub fn getStdModules() []const []const u8 {
-    return currentTables().std_modules;
-}
+// Only tables a main.zig diagnostic consumes stay exported (EPH-I0303):
+// the optional/builtin/builtin-list tables route through the contains*
+// predicates above, and every other list goes through the getters below.
 
 // ============================================================================
 // Vocabulary access - Stdlib allocator types, methods, and patterns
@@ -514,11 +407,6 @@ pub fn getNoFreeTypePtrs() []const []const u8 {
 /// Stdlib methods safe to discard (void or value-returning, not !T)
 pub fn getSafeMethodPatterns() []const []const u8 {
     return currentTables().safe_method_patterns;
-}
-
-/// Stdlib void methods (subset of safe methods)
-pub fn getVoidMethodPatterns() []const []const u8 {
-    return currentTables().void_method_patterns;
 }
 
 /// Stdlib container mutation methods (fill/modify receiver)
@@ -586,28 +474,6 @@ test "containsOptionalMethod detects optional patterns" {
     try std.testing.expect(containsOptionalMethod("_ = args.next()"));
     try std.testing.expect(containsOptionalMethod("if (map.get(key)) |v|"));
     try std.testing.expect(!containsOptionalMethod("try file.read(buf)"));
-}
-
-test "containsErrorMethod detects error patterns" {
-    try std.testing.expect(containsErrorMethod("try file.read(buf)"));
-    try std.testing.expect(containsErrorMethod("try allocator.alloc(u8, 100)"));
-    try std.testing.expect(!containsErrorMethod("_ = iter.next()"));
-}
-
-test "containsAllocation detects allocation patterns" {
-    try std.testing.expect(containsAllocation("try allocator.alloc(u8, 100)"));
-    try std.testing.expect(containsAllocation("try allocator.create(Node)"));
-    try std.testing.expect(!containsAllocation("const x = 42"));
-}
-
-test "getOptionalMethods returns non-empty list" {
-    const methods = getOptionalMethods();
-    try std.testing.expect(methods.len > 0);
-}
-
-test "getBuiltins returns non-empty list" {
-    const builtins_list = getBuiltins();
-    try std.testing.expect(builtins_list.len > 0);
 }
 
 test "getNoFreeInitPatterns returns non-empty list" {
@@ -680,13 +546,6 @@ test "getSafeMethodPatterns returns non-empty list" {
     try std.testing.expect(patterns.len > 0);
 }
 
-test "getVoidMethodPatterns returns non-empty list" {
-    const patterns = getVoidMethodPatterns();
-    try std.testing.expect(patterns.len > 0);
-    // Void patterns should be a subset of safe patterns
-    try std.testing.expect(patterns.len < getSafeMethodPatterns().len);
-}
-
 test "getModifyingMethodPatterns returns non-empty list" {
     const patterns = getModifyingMethodPatterns();
     try std.testing.expect(patterns.len > 0);
@@ -741,8 +600,8 @@ test "resolveVersion maps 0.15.x to the 0.15 tables without fallback" {
     try std.testing.expect(!r.used_fallback);
     try std.testing.expectEqualStrings("0.15", r.tables.version_label);
     try std.testing.expectEqual(
-        @intFromPtr(&v0_15.keywords),
-        @intFromPtr(r.tables.keywords.ptr),
+        @intFromPtr(&v0_15.builtins),
+        @intFromPtr(r.tables.builtins.ptr),
     );
 }
 
@@ -751,8 +610,8 @@ test "resolveVersion maps 0.16.x-dev to the 0.16 tables without fallback" {
     try std.testing.expect(!r.used_fallback);
     try std.testing.expectEqualStrings("0.16", r.tables.version_label);
     try std.testing.expectEqual(
-        @intFromPtr(&v0_16.keywords),
-        @intFromPtr(r.tables.keywords.ptr),
+        @intFromPtr(&v0_16.builtins),
+        @intFromPtr(r.tables.builtins.ptr),
     );
 }
 
@@ -780,83 +639,6 @@ test "resolveVersion resolves the running compiler without fallback" {
     // Fails when ephor builds with an untested Zig: add the new table set.
     const r = resolveVersion(getCurrentVersion());
     try std.testing.expect(!r.used_fallback);
-}
-
-test "getErrorMethods returns non-empty list" {
-    const methods = getErrorMethods();
-    try std.testing.expect(methods.len > 0);
-    var found_read = false;
-    for (methods) |m| {
-        if (std.mem.eql(u8, m, ".read(")) found_read = true;
-    }
-    try std.testing.expect(found_read);
-}
-
-test "getAllocPatterns returns non-empty list" {
-    const patterns = getAllocPatterns();
-    try std.testing.expect(patterns.len > 0);
-    var found_alloc = false;
-    for (patterns) |p| {
-        if (std.mem.eql(u8, p, ".alloc(")) found_alloc = true;
-    }
-    try std.testing.expect(found_alloc);
-}
-
-test "getCreatePatterns covers create call forms" {
-    const patterns = getCreatePatterns();
-    try std.testing.expect(patterns.len > 0);
-    var found = false;
-    for (patterns) |p| {
-        if (std.mem.eql(u8, p, ".create(")) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "getFreePatterns covers free call forms" {
-    const patterns = getFreePatterns();
-    try std.testing.expect(patterns.len > 0);
-    var found = false;
-    for (patterns) |p| {
-        if (std.mem.eql(u8, p, ".free(")) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "getDestroyPatterns covers destroy call forms" {
-    const patterns = getDestroyPatterns();
-    try std.testing.expect(patterns.len > 0);
-    var found = false;
-    for (patterns) |p| {
-        if (std.mem.eql(u8, p, ".destroy(")) found = true;
-    }
-    try std.testing.expect(found);
-}
-
-test "getKeywords includes core declaration keywords" {
-    const kws = getKeywords();
-    try std.testing.expect(kws.len > 0);
-    var found_fn = false;
-    var found_const = false;
-    for (kws) |k| {
-        if (std.mem.eql(u8, k, "fn ")) found_fn = true;
-        if (std.mem.eql(u8, k, "const ")) found_const = true;
-    }
-    try std.testing.expect(found_fn);
-    try std.testing.expect(found_const);
-}
-
-test "getBreakingChanges returns non-empty list" {
-    try std.testing.expect(getBreakingChanges().len > 0);
-}
-
-test "getStdModules includes std.mem" {
-    const modules = getStdModules();
-    try std.testing.expect(modules.len > 0);
-    var found = false;
-    for (modules) |m| {
-        if (std.mem.eql(u8, m, "std.mem")) found = true;
-    }
-    try std.testing.expect(found);
 }
 
 test "getAllocMethodShortNames includes alloc and create" {

@@ -108276,19 +108276,20 @@ test "ZC101: ZC and ZC1 prefix filters disable the rule; default is ON" {
     try std.testing.expect(cfg.isRuleEnabled(RULE_LOCK_NO_DEFER_UNLOCK));
 
     // "ZC" prefix disables the whole band, "ZC1" the ZC1xx family.
-    // The errdefer covers the append-failure path: the try-wrapped append
-    // takes the dupe only on success (EPH-I0307).
+    // The defer frees each dupe when the test exits normally and keeps
+    // ZA103 silent on the try-wrapped append (the model's defer-coverage
+    // rule, EPH-I0367). An errdefer form cannot sit here: armed for the
+    // rest of the fn, it would fire on a later error path after the
+    // explicit free and double-free the binding (EPH-I1199).
     const zc = try allocator.dupe(u8, "ZC");
-    errdefer allocator.free(zc);
+    defer allocator.free(zc);
     try cfg.disabled_rules.append(allocator, zc);
     try std.testing.expect(!cfg.isRuleEnabled(RULE_LOCK_NO_DEFER_UNLOCK));
-    allocator.free(zc);
     cfg.disabled_rules.clearRetainingCapacity();
     const zc1 = try allocator.dupe(u8, "ZC1");
-    errdefer allocator.free(zc1);
+    defer allocator.free(zc1);
     try cfg.disabled_rules.append(allocator, zc1);
     try std.testing.expect(!cfg.isRuleEnabled(RULE_LOCK_NO_DEFER_UNLOCK));
-    allocator.free(zc1);
     cfg.disabled_rules.clearRetainingCapacity();
 
     // Unrelated prefixes do not touch it.

@@ -1107,7 +1107,9 @@ test "comment or string naming a builtin or method never suppresses (EPH-I0876)"
     // A comment mention never masks a real call on the same line.
     try std.testing.expect(containsBuiltin("_ = @sizeOf(u32); // @sizeOf is a builtin"));
     // Trailing comment names an optional method: no suppression.
-    try std.testing.expect(!containsOptionalMethod("_ = foo(); // map.get(key) returns an optional"));
+    try std.testing.expect(!containsOptionalMethod(
+        "_ = foo(); // map.get(key) returns an optional",
+    ));
     // String data names an optional method: no suppression.
     try std.testing.expect(!containsOptionalMethod("_ = foo(); const s = \"iter.next()\";"));
     // Real code positions still match.

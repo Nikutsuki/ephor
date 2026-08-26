@@ -731,7 +731,10 @@ test "relativePath strips base only on a component boundary (EPH-I0176)" {
     // A raw prefix strip would mangle "/repo-evil/x.zig" for base
     // "/repo" into "-evil/x.zig"; the guarded form renders the full
     // path instead.
-    try std.testing.expectEqualStrings("/repo-evil/x.zig", relativePath("/repo-evil/x.zig", "/repo"));
+    try std.testing.expectEqualStrings(
+        "/repo-evil/x.zig",
+        relativePath("/repo-evil/x.zig", "/repo"),
+    );
     try std.testing.expectEqualStrings("sub/file.zig", relativePath("/repo/sub/file.zig", "/repo"));
     try std.testing.expectEqualStrings("/repo", relativePath("/repo", "/repo"));
     try std.testing.expectEqualStrings("x.zig", relativePath("/repo/x.zig", "/repo/"));

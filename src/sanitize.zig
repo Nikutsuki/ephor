@@ -802,7 +802,11 @@ test "escapeJson escapes the full hostile set (EPH-I0579)" {
                 const pair = cp - 0x10000;
                 const hi: u16 = @intCast(0xD800 + (pair >> 10));
                 const lo: u16 = @intCast(0xDC00 + (pair & 0x3FF));
-                const want = try std.fmt.allocPrint(allocator, "a\\u{X:0>4}\\u{X:0>4}b", .{ hi, lo });
+                const want = try std.fmt.allocPrint(
+                    allocator,
+                    "a\\u{X:0>4}\\u{X:0>4}b",
+                    .{ hi, lo },
+                );
                 defer allocator.free(want);
                 try std.testing.expectEqualStrings(want, result.slice);
             }

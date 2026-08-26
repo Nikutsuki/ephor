@@ -6469,7 +6469,10 @@ fn lineWritesName(t: []const u8, name: []const u8) bool {
     while (iter.next()) |pos| {
         const after = mem.trimStart(u8, t[pos + name.len ..], " \t");
         if (isAssignmentOp(after)) return true;
-        const compounds = [_][]const u8{ "+=", "-=", "*=", "/=", "%=", "+%=", "-%=", "*%=", "&=", "|=", "^=", "<<=", ">>=" };
+        const compounds = [_][]const u8{
+            "+=",  "-=", "*=", "/=", "%=",  "+%=", "-%=",
+            "*%=", "&=", "|=", "^=", "<<=", ">>=",
+        };
         for (compounds) |op| {
             if (mem.startsWith(u8, after, op)) return true;
         }
@@ -25595,6 +25598,14 @@ const ComplexityState = struct {
     params: usize = 0,
     is_type_factory: bool = false,
     is_data_dispatch: bool = false,
+    // EPH-I0276: total switch arms (`=>`) across the fn. Arms skew the
+    // flat-chain ratio (each arm costs 1+cog_nest cognitive but 1
+    // cyclomatic), so the flat-switch allowance needs the arm count.
+    switch_arms: usize = 0,
+    // EPH-I0277: data-table candidate. Opens true for every fn and flips
+    // off on the first logic-bearing body line, so the [dt] tag grants
+    // only when no line disqualifies (conservative by design).
+    is_data_table: bool = false,
     // EPH-I1059/EPH-I1093/EPH-I1096: extern / export / callconv(.c) /
     // callconv(.Stdcall) fns. The pinned ABI fixes the parameter list
     // (skytale proc_pidinfo carries 5 params the macOS libproc C API
@@ -25671,12 +25682,18 @@ fn countFnParams(t: []const u8) usize {
     var lit = types.LiteralState.forLine(t) orelse return 0;
     var i = p + 1;
     var d: usize = 1;
+    // EPH-I0270: sentinel-slice colons live inside brackets (`[*:0]`,
+    // `[:0]`, `[N:0]`). A colon is a param separator only at paren depth 1
+    // AND bracket depth 0, so the sentinel never counts as a param.
+    var b: usize = 0;
     while (i < t.len and d > 0) : (i += 1) {
         if (t[i] == '\n') lit.in_comment = false;
         const pos = lit.updateForChar(t, i) orelse continue;
         if (t[pos] == '(') d += 1;
         if (t[pos] == ')') d -= 1;
-        if (t[pos] == ':' and d == 1) params += 1;
+        if (t[pos] == '[') b += 1;
+        if (t[pos] == ']' and b > 0) b -= 1;
+        if (t[pos] == ':' and d == 1 and b == 0) params += 1;
     }
     // Subtract self parameter if present — `fn foo(self: *T, ...)` counts self as 1
     if (hasSelfParam(t, p)) {
@@ -25917,7 +25934,8 @@ fn calcLimit(base: usize, is_factory: bool, mult: usize) usize {
     return if (is_factory) base * mult else base;
 }
 
-/// Calculate cognitive complexity limit with data dispatch (8x) and flat-chain (2x) multipliers.
+/// Calculate cognitive complexity limit with data dispatch (8x), flat-chain
+/// (2x), and data-table (20x, EPH-I0277) multipliers.
 /// Flat chain: functions where cognitive ≈ cyclomatic (ratio ≤ 1.5) indicate flat branch
 /// patterns (routers, dispatchers) rather than deeply nested control flow.
 fn isFlatChain(state: *const ComplexityState) bool {
@@ -25927,24 +25945,130 @@ fn isFlatChain(state: *const ComplexityState) bool {
         state.max_nest <= 2;
 }
 
+/// Flat switch dispatcher: arms at one level with trivial bodies
+/// (EPH-I0276). The arm cost skews the flat-chain ratio — the switch's own
+/// brace opens a cognitive scope, so each arm costs 1+cog_nest cognitive
+/// (2 at the top level) but only 1 cyclomatic. A dispatcher then exceeds
+/// the 1.5 ratio even with zero logic. The allowance holds when the
+/// cognitive excess over cyclomatic is at most the arm count — exactly
+/// the nest-scaling each top-level arm adds — and the fn nests at most 3
+/// (fn, one guard, switch). Arms with real logic (embedded branches,
+/// try/catch, else blocks) blow the excess bound and stay out; so does a
+/// two-arm switch whose arms carry ifs (the EPH-I0884 probe).
+fn isFlatSwitch(state: *const ComplexityState) bool {
+    return state.switch_arms > 0 and
+        state.cognitive <= state.cyclomatic + state.switch_arms and
+        state.max_nest <= 3;
+}
+
+/// EPH-I0277: a pure data table carries no decision logic — its complexity
+/// is the table's row count, data, not logic. 20x clears the documented
+/// motivating shapes (classifyCodepoint 183 CCN → limit 200;
+/// populateDefaults 87 cognitive → limit 300; applyFrontierEnv 115 rows →
+/// limit 1000 lines).
+const data_table_multiplier = 20;
+
 fn cognitiveLimit(base: usize, state: *const ComplexityState) usize {
+    if (state.is_data_table) return base * data_table_multiplier;
     if (state.is_data_dispatch) return base * 8;
-    if (isFlatChain(state)) return base * 2;
+    if (isFlatChain(state) or isFlatSwitch(state)) return base * 2;
     return base;
 }
 
 /// Calculate cyclomatic complexity limit with multipliers for known flat patterns.
 fn cyclomaticLimit(base: usize, state: *const ComplexityState) usize {
+    if (state.is_data_table) return base * data_table_multiplier;
     if (state.is_data_dispatch) return base * 8;
     if (state.is_type_factory) return base * 3;
-    if (isFlatChain(state)) return base * 2;
+    if (isFlatChain(state) or isFlatSwitch(state)) return base * 2;
     return base;
 }
 
-fn branchLimit(base: usize, is_type_factory: bool, is_data_dispatch: bool) usize {
-    if (is_type_factory) return base * 3;
-    if (is_data_dispatch) return base * 8;
+fn branchLimit(base: usize, state: *const ComplexityState) usize {
+    if (state.is_data_table) return base * data_table_multiplier;
+    if (state.is_type_factory) return base * 3;
+    if (state.is_data_dispatch) return base * 8;
+    // EPH-I0276: the branch allowance covers flat switch dispatchers only.
+    // Flat if-chains keep the base branch limit — the done-when scopes the
+    // multiplier to switch-arm shapes, and the pre-existing 13-branch
+    // if-chain pin (local-struct ZA304) stays out.
+    if (isFlatSwitch(state)) return base * 2;
     return base;
+}
+
+/// Start index of the identifier ending at `pos` (t[pos] is an ident char),
+/// for the data-table call check (EPH-I0277).
+fn identTokenStart(t: []const u8, pos: usize) ?usize {
+    var s = pos;
+    while (s > 0 and isIdent(t[s - 1])) s -= 1;
+    return s;
+}
+
+/// True when `ident` is a control/declaration keyword whose parens are a
+/// header, not a call (EPH-I0277). The list is conservative: an identifier
+/// absent here disqualifies the data-table candidate, never grants it.
+fn isControlHeaderIdent(ident: []const u8) bool {
+    inline for (.{
+        "switch",   "return",      "defer",          "comptime",  "inline",      "fn",
+        "test",     "pub",         "export",         "extern",    "const",       "var",
+        "callconv", "linksection", "align",          "noinline",  "errdefer",    "else",
+        "if",       "while",       "for",            "catch",     "break",       "continue",
+        "struct",   "enum",        "union",          "error",     "orelse",      "packed",
+        "volatile", "atomic",      "noalias",        "async",     "await",       "resume",
+        "suspend",  "anyframe",    "usingnamespace", "addrspace", "threadlocal", "Vector",
+        "Self",     "this",
+    }) |kw| {
+        if (mem.eql(u8, ident, kw)) return true;
+    }
+    return false;
+}
+
+/// True when the code-position char `c` at `pos` disqualifies a
+/// data-table line (EPH-I0277). Split from disqualifiesDataTable so the
+/// per-char arms keep one nesting level each (ZA302).
+fn isDataTableLogicChar(t: []const u8, pos: usize, c: u8) bool {
+    switch (c) {
+        '[', ']', '+', '-', '*', '/', '%', '&', '|' => return true,
+        '^', '!', '<', '~', '?', '@', '\\' => return true,
+        // `=>` is the arm arrow (data); `==` is a comparison (logic).
+        '=' => return pos + 1 < t.len and t[pos + 1] == '=',
+        // `=>` is the arrow (data); a lone `>` is a comparison (logic).
+        '>' => return pos == 0 or t[pos - 1] != '=',
+        '(' => {
+            // A call is an identifier char directly before the paren.
+            if (pos == 0 or !isIdent(t[pos - 1])) return false;
+            const pre = identTokenStart(t, pos - 1) orelse return true;
+            return !isControlHeaderIdent(t[pre..pos]);
+        },
+        else => return false,
+    }
+}
+
+/// True when a data-table candidate line carries logic (EPH-I0277). The
+/// [dt] classifier grants the tag only when NO body line disqualifies, and
+/// a missed disqualifier would grant the multiplier to a real fn — so any
+/// doubt disqualifies. Pure data rows (constant arms, literal assignments)
+/// stay clean: the walk allows letters, digits, `_`, `.`, `,`, `;`, `:`,
+/// `{`, `}`, `(`, `)`, an assignment `=`, and an arm arrow `=>`. Everything
+/// logic-shaped disqualifies: control tokens (if/while/for/try/catch/
+/// orelse/and/or/defer/comptime/inline/break/continue/errdefer, a
+/// standalone else branch), operators and indexing (`[ ] + - * / % & | ^
+/// ! < > ~ ? @ \`), and calls — a `(` preceded by an identifier that is
+/// not a control keyword (`switch (`/`return switch (` are headers, so
+/// they pass; `myFn(` is logic).
+fn disqualifiesDataTable(t: []const u8) bool {
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (isDataTableLogicChar(t, pos, t[pos])) return true;
+    }
+    // Token-level disqualifiers (word-bounded, literal-masked by hasToken).
+    inline for (.{ "if", "while", "for", "try", "catch", "orelse", "and", "or", "defer", "errdefer", "comptime", "inline", "break", "continue", "noinline" }) |kw| {
+        if (hasToken(t, kw)) return true;
+    }
+    // A standalone else block is logic; the arm form `else =>` is data.
+    return hasElseBranch(t);
 }
 
 /// Check if function name indicates a data-dispatch pattern where high branch counts
@@ -25994,10 +26118,15 @@ fn reportSingleComplexity(
     check_def: ComplexityCheck,
 ) !void {
     if (check_def.actual <= check_def.limit) return;
-    const suffix: []const u8 = if (state.is_type_factory)
+    // EPH-I0277: [dt] first — a data table outranks every other pattern.
+    const suffix: []const u8 = if (state.is_data_table)
+        " [dt]"
+    else if (state.is_type_factory)
         " [tf]"
     else if (state.is_data_dispatch)
         " [dd]"
+    else if (isFlatChain(state) or isFlatSwitch(state))
+        " [flat]"
     else
         "";
     const fmt = "function '{s}' has {d} {s} (max {d}){s}";
@@ -26028,6 +26157,14 @@ const ComplexityCheck = struct {
     help: []const u8,
 };
 
+/// ZA301 line limit: a data table relaxes to data rows (EPH-I0277), else
+/// the type-factory 3x applies. Hoisted so buildComplexityChecks stays
+/// within its line budget.
+fn lineLimit(th: Thresholds, state: *const ComplexityState, is_tf: bool) usize {
+    if (state.is_data_table) return th.max_function_lines * data_table_multiplier;
+    return calcLimit(th.max_function_lines, is_tf, 3);
+}
+
 /// Build complexity checks array for a function
 fn buildComplexityChecks(
     state: *const ComplexityState,
@@ -26038,7 +26175,7 @@ fn buildComplexityChecks(
         .{
             .rule = RULE_FUNC_TOO_LONG,
             .actual = state.fn_lines,
-            .limit = calcLimit(th.max_function_lines, is_tf, 3),
+            .limit = lineLimit(th, state, is_tf),
             .metric = "lines",
             .help = "split into smaller functions",
         },
@@ -26059,7 +26196,7 @@ fn buildComplexityChecks(
         .{
             .rule = RULE_TOO_MANY_BRANCHES,
             .actual = state.branches,
-            .limit = branchLimit(th.max_branches, is_tf, state.is_data_dispatch),
+            .limit = branchLimit(th.max_branches, state),
             .metric = "branches",
             .help = "simplify logic",
         },
@@ -26303,6 +26440,9 @@ fn openFnState(
         // marker sits on a later line than the keyword line.
         .is_type_factory = isTypeFactory(sig),
         .is_data_dispatch = pending.is_data_dispatch,
+        // EPH-I0277: every fn opens as a data-table candidate; body lines
+        // with logic disqualify it.
+        .is_data_table = true,
         // EPH-I1059: the C ABI pins the parameter list, so ZA303 skips it.
         .is_c_abi = pending.is_c_abi_prefix or sigSuffixIsCAbi(sig),
         .params = countFnParams(sig),
@@ -26601,14 +26741,21 @@ fn processComplexityLine(
     // detectFnStart reset state; report the in-flight fn's accumulated
     // verdicts first or they are silently discarded.
     if (resetsInFlightFn(view, state)) try reporter.report(state);
+    const was_in_fn = state.in_fn;
     detectFnStart(view, state, line_num);
     if (!state.in_fn) return;
     state.fn_lines += 1;
     state.branches += countLineBranches(t);
     state.cyclomatic += countLineCyclomatic(t);
+    // EPH-I0276: the arm census feeds the flat-switch allowance.
+    state.switch_arms += countSwitchArms(t);
     // EPH-I0453: the else-family cost evaluates at the post-close nesting
     // (`} else {` costs at the if's level, not inside it).
     state.cognitive += countLineCognitive(t, state.cog_nest, elseFamilyNest(t, state));
+    // EPH-I0277: body lines disqualify the data-table candidate. The
+    // state-opening line stays exempt — its signature carries types the
+    // body never does (a wrapped signature's brace line is a pure header).
+    if (was_in_fn and disqualifiesDataTable(t)) state.is_data_table = false;
     if (!trackBraceNesting(t, state)) return;
 
     // Function ended — unwind cognitive nesting, then report
@@ -26801,18 +26948,26 @@ fn stringLiteralEnd(line: []const u8, i: usize) usize {
     return j;
 }
 
-/// Visible length when string-literal CONTENT is excluded (only the two quote
-/// characters count). Unbreakable opaque tokens (ENRs, hashes, enodes) have no
-/// meaningful break point, so a line over-length solely due to one is exempt.
+/// String-content stats for the ZA701 tail contract: `content` is the
+/// total string-literal content (quotes excluded) and `code` everything
+/// else (the quotes themselves count as neither). The exemption covers
+/// unbreakable opaque tokens (ENRs, hashes, enodes) that dominate their
+/// line — a short embedded string never exempts a line whose bulk is
+/// restructurable code (EPH-I0272).
+const StringContentStats = struct {
+    content: usize = 0,
+    code: usize = 0,
+};
+
 /// Codepoint counting matches calculateVisibleLength (EPH-I0248): one
 /// unicode sequence per column.
-fn visibleLengthExcludingStrings(line: []const u8) usize {
-    var visible_len: usize = 0;
+fn stringContentStats(line: []const u8) StringContentStats {
+    var stats = StringContentStats{};
     var i: usize = 0;
     while (i < line.len) {
         const c = line[i];
         if (c == '\t') {
-            visible_len = ((visible_len / 4) + 1) * 4;
+            stats.code = ((stats.code / 4) + 1) * 4;
             i += 1;
             continue;
         }
@@ -26827,21 +26982,20 @@ fn visibleLengthExcludingStrings(line: []const u8) usize {
             // Matched spans are ASCII by the matcher's shape ('\u{...}'
             // escapes, single chars), so the byte length IS the codepoint
             // count here.
-            visible_len += n;
+            stats.code += n;
             i += n;
             continue;
         }
         if (c != '"' or (i > 0 and line[i - 1] == '\\')) {
-            visible_len += 1;
+            stats.code += 1;
             i += utf8SeqLen(line, i);
             continue;
         }
-        visible_len += 1;
-        i = stringLiteralEnd(line, i);
-        if (i < line.len) visible_len += 1;
-        i += 1;
+        const end = stringLiteralEnd(line, i);
+        stats.content += end - i - 1;
+        i = end + 1;
     }
-    return visible_len;
+    return stats;
 }
 
 /// Report file too long issue
@@ -26961,7 +27115,12 @@ fn analyzeStyleFile(
 
         const visible_len = calculateVisibleLength(line);
         if (visible_len <= th.max_line_length) continue;
-        if (visibleLengthExcludingStrings(line) <= th.max_line_length) continue;
+        // EPH-I0267/EPH-I0272: the tail exemption covers unbreakable
+        // string tokens that dominate their line. A line whose bulk is
+        // code with a short embedded string still counts (the messenger
+        // 104-col writeNode line).
+        const stats = stringContentStats(line);
+        if (stats.code <= th.max_line_length and stats.content > stats.code) continue;
         try reportLineTooLong(ctx, line_num, visible_len, th.max_line_length);
     }
 }
@@ -43484,7 +43643,11 @@ fn recurseNestedBuildModule(ctx: EntryScanCtx, imp_path: []const u8) Allocator.E
 fn renderNestedBuildModuleNote(allocator: Allocator, nested: []const u8) error{OutOfMemory}![]u8 {
     var safe = try types.sanitizeTerminal(allocator, nested);
     defer safe.deinit(allocator);
-    return std.fmt.allocPrint(allocator, "note: could not parse nested build module {s}\n", .{safe.slice});
+    return std.fmt.allocPrint(
+        allocator,
+        "note: could not parse nested build module {s}\n",
+        .{safe.slice},
+    );
 }
 
 /// Extract the first .path("...") entry from a build.zig line. The match is
@@ -43830,7 +43993,8 @@ fn parseThresholdArg(diag: *DiagCtx, arg: []const u8, cfg: *Config) !bool {
 /// Parse a single CLI argument
 /// Handle --entry= CLI argument. EPH-I0195 exempt: --entry is operator
 /// intent; only the untrusted channels (target config, target-tree
-/// build.zig extraction) are containment-gated.
+/// build.zig extraction) are containment-gated. The caller validates the
+/// value (EPH-I0289) so the fn stays at 4 params (ZA303).
 fn handleEntryArg(
     allocator: Allocator,
     arg: []const u8,
@@ -43903,21 +44067,40 @@ fn handleOptionalPathArg(
     arg: []const u8,
     cfg: *Config,
 ) !bool {
-    if (mem.startsWith(u8, arg, "--export="))
+    if (mem.startsWith(u8, arg, "--export=")) {
+        try requireNonEmptyFlagValue(diag, "--export", arg[9..]);
         return setOptionalPath(allocator, &cfg.export_path, arg[9..]);
-    if (mem.startsWith(u8, arg, "--known-issues="))
+    }
+    if (mem.startsWith(u8, arg, "--known-issues=")) {
+        try requireNonEmptyFlagValue(diag, "--known-issues", arg[15..]);
         return setOptionalPath(allocator, &cfg.known_issues_path, arg[15..]);
-    if (mem.startsWith(u8, arg, "--coverage-evidence="))
+    }
+    if (mem.startsWith(u8, arg, "--coverage-evidence=")) {
+        try requireNonEmptyFlagValue(diag, "--coverage-evidence", arg[20..]);
         return setOptionalPath(allocator, &cfg.coverage_evidence_path, arg[20..]);
+    }
     if (mem.startsWith(u8, arg, "--command=")) {
         try requireCommandScope(diag, cfg, "--command=", command_scope);
+        try requireNonEmptyFlagValue(diag, "--command", arg[10..]);
         return setOptionalPath(allocator, &cfg.runtime_command, arg[10..]);
     }
     if (mem.startsWith(u8, arg, "--version=")) {
         try requireCommandScope(diag, cfg, "--version=", version_scope);
+        try requireNonEmptyFlagValue(diag, "--version", arg[10..]);
         return setOptionalPath(allocator, &cfg.install_version, arg[10..]);
     }
     return false;
+}
+
+/// EPH-I0289: an empty value on a value-taking flag is a hard usage error.
+/// The flags used to exit 0 silently — --export= exported to the empty
+/// string and --entry= appended an empty entry — the same fail-open class
+/// EPH-I0236 fixed for --disable=/--enable=.
+fn requireNonEmptyFlagValue(diag: *DiagCtx, flag: []const u8, value: []const u8) !void {
+    if (value.len == 0) {
+        cliDiag(diag, "error: {s} requires a value (see ephor --help)\n", .{flag});
+        return error.EmptyFlagValue;
+    }
 }
 
 /// Handle --fail-on=<level> (returns true if the arg matched).
@@ -44010,8 +44193,11 @@ fn parseCliArg(ctx: CliParseCtx, arg: []const u8) !void {
         return;
     }
     if (try parseFailOnArg(ctx.diag, arg, ctx.cfg)) return;
-    if (mem.startsWith(u8, arg, "--entry="))
+    if (mem.startsWith(u8, arg, "--entry=")) {
+        // EPH-I0289: an empty entry silently entered the scan list.
+        try requireNonEmptyFlagValue(ctx.diag, "--entry", arg[8..]);
         return handleEntryArg(ctx.allocator, arg, ctx.cfg, ctx.cli_entries);
+    }
     if (try parseSimpleFlag(ctx.diag, arg, ctx.cfg)) return;
     if (try parseThresholdArg(ctx.diag, arg, ctx.cfg)) return;
     if (try handleListArg(ctx, arg)) return;
@@ -44626,9 +44812,10 @@ fn printHelp() void {
         \\  ZA7xx  Style      (ZA701: line-too-long,
         \\                     ZA702: file-too-long (off by default),
         \\                     ZA703: naming)
-        \\    ZA701 counts columns outside string literals: a line whose
-        \\    code fits the limit stays silent when a long string tail
-        \\    runs past it. Split code that exceeds the limit with ++.
+        \\    ZA701 counts the physical line: a line stays silent only when
+        \\    a long string tail dominates it (unbreakable tokens like
+        \\    hashes); a short embedded string never exempts the line.
+        \\    Split code that exceeds the limit with ++.
         \\  ZR1xx  Runtime    (ZR101: memory-leak, ZR102: double-free,
         \\                     ZR103: use-after-free, ZR104: test-failure,
         \\                     ZR105: panic, ZR106: signal-death)
@@ -47645,17 +47832,35 @@ test "main walk prunes dependency dirs with the shared skip predicate (EPH-I0377
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.testing.io, "src");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/a.zig", .data = "pub fn a() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "src/a.zig",
+        .data = "pub fn a() void {}\n",
+    });
     try tmp.dir.createDirPath(std.testing.io, "node_modules");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "node_modules/dep.zig", .data = "pub fn d() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "node_modules/dep.zig",
+        .data = "pub fn d() void {}\n",
+    });
     try tmp.dir.createDirPath(std.testing.io, "deps");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "deps/dep2.zig", .data = "pub fn d2() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "deps/dep2.zig",
+        .data = "pub fn d2() void {}\n",
+    });
     try tmp.dir.createDirPath(std.testing.io, "vendor");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "vendor/v.zig", .data = "pub fn v() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "vendor/v.zig",
+        .data = "pub fn v() void {}\n",
+    });
     try tmp.dir.createDirPath(std.testing.io, ".build");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".build/b.zig", .data = "pub fn b() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".build/b.zig",
+        .data = "pub fn b() void {}\n",
+    });
     try tmp.dir.createDirPath(std.testing.io, ".packages");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".packages/p.zig", .data = "pub fn p() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".packages/p.zig",
+        .data = "pub fn p() void {}\n",
+    });
 
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
@@ -47730,11 +47935,16 @@ test "zero-zig-files scan is a usage error (EPH-I0726)" {
     try std.testing.expectEqual(@as(usize, 0), g.files.count());
     requireScannedFiles(&ctx, &g);
     try std.testing.expect(ctx.should_exit_error);
-    try std.testing.expect(mem.indexOf(u8, capture.slice(), "error: no Zig files found at") != null);
+    try std.testing.expect(
+        mem.indexOf(u8, capture.slice(), "error: no Zig files found at") != null,
+    );
 
     // A Zig file scan does not trip the gate.
     ctx.should_exit_error = false;
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "real.zig", .data = "pub fn main() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "real.zig",
+        .data = "pub fn main() void {}\n",
+    });
     const zig_path = try tmpFilePath(allocator, &tmp, "real.zig");
     defer allocator.free(zig_path);
     var g2 = ImportGraph.init(allocator, &diag);
@@ -47793,8 +48003,14 @@ test "markBuildPathReferences reads with the shared source cap (EPH-I0376)" {
     // build.zig makes findBuildRoot resolve to the tmp root; the nested
     // build discovery then finds no subdirectories, so the only marking
     // path for target.zig is the b.path() ref scan itself.
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig", .data = "pub fn build(b: *std.Build) void {}\n" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "target.zig", .data = "pub fn t() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig",
+        .data = "pub fn build(b: *std.Build) void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "target.zig",
+        .data = "pub fn t() void {}\n",
+    });
 
     const pad = try allocator.alloc(u8, 4 * 1024 * 1024 + 4096);
     defer allocator.free(pad);
@@ -47832,7 +48048,10 @@ test "analyzeFile releases the analysis when the graph insert fails (EPH-I0375)"
     var diag = testDiagCtx();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.zig", .data = "const x = @import(\"std\");\npub fn f() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "f.zig",
+        .data = "const x = @import(\"std\");\npub fn f() void {}\n",
+    });
     const file_path = try tmpFilePath(allocator, &tmp, "f.zig");
     defer allocator.free(file_path);
 
@@ -47864,7 +48083,10 @@ test "tryAddBareImport leaks nothing under allocation failure (EPH-I0582)" {
     var diag = testDiagCtx();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dep.zig", .data = "pub fn d() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "dep.zig",
+        .data = "pub fn d() void {}\n",
+    });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "f.zig",
         .data = "fn f() void { _ = @import(\"dep.zig\"); }\n",
@@ -48008,10 +48230,19 @@ test "config templates state out-of-root entries are graph-only (EPH-I0255)" {
     // joins the import graph only. Each template must say so, or a clean
     // run reads as covering build.zig when it does not.
     const allocator = std.testing.allocator;
-    try std.testing.expect(mem.indexOf(u8, default_config_template, "joins the import graph only") != null);
-    const content = try buildInstallConfigContent(allocator, "0.14.3", "src", "[\"src/main.zig\", \"build.zig\"]");
+    try std.testing.expect(
+        mem.indexOf(u8, default_config_template, "joins the import graph only") != null,
+    );
+    const content = try buildInstallConfigContent(
+        allocator,
+        "0.14.3",
+        "src",
+        "[\"src/main.zig\", \"build.zig\"]",
+    );
     defer allocator.free(content);
-    try std.testing.expect(mem.indexOf(u8, content, "joins the import graph only") != null);
+    try std.testing.expect(
+        mem.indexOf(u8, content, "joins the import graph only") != null,
+    );
 }
 
 test "ImportGraph.deinit frees reachable keys when the key list append fails (EPH-I0375)" {
@@ -48135,7 +48366,10 @@ test "tryRecordConstImport leaks nothing under allocation failure (EPH-I0691)" {
     var diag = testDiagCtx();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dep.zig", .data = "pub fn d() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "dep.zig",
+        .data = "pub fn d() void {}\n",
+    });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "f.zig",
         .data = "const dep = @import(\"dep.zig\");\n",
@@ -48172,7 +48406,10 @@ test "analyzeFile keeps the first analysis of a duplicate path (EPH-I0693)" {
     var diag = testDiagCtx();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dep.zig", .data = "pub fn d() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "dep.zig",
+        .data = "pub fn d() void {}\n",
+    });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "f.zig",
         .data = "const dep = @import(\"dep.zig\");\npub fn f() void {}\n",
@@ -48201,8 +48438,14 @@ test "extractImports records the true column of a const import (EPH-I0013)" {
     var diag = testDiagCtx();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dep.zig", .data = "pub fn d() void {}\n" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dep2.zig", .data = "pub fn e() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "dep.zig",
+        .data = "pub fn d() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "dep2.zig",
+        .data = "pub fn e() void {}\n",
+    });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "f.zig",
         .data = "const dep = @import(\"dep.zig\");\n    const other = @import(\"dep2.zig\");\n",
@@ -48875,7 +49118,10 @@ test "countOutOfRootEntries counts only .zig entries outside the scan path (EPH-
     const diag = testDiagCtx();
     // The scan path covers its own tree: nothing joins.
     try std.testing.expectEqual(@as(usize, 0), countOutOfRootEntries(diag.io, "src", &.{}));
-    try std.testing.expectEqual(@as(usize, 0), countOutOfRootEntries(diag.io, "src", &.{"src/main.zig"}));
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countOutOfRootEntries(diag.io, "src", &.{"src/main.zig"}),
+    );
     try std.testing.expectEqual(@as(usize, 0), countOutOfRootEntries(
         diag.io,
         "src/main.zig",
@@ -48889,7 +49135,10 @@ test "countOutOfRootEntries counts only .zig entries outside the scan path (EPH-
         &.{ "build.zig", "tools/gen.zig", "README.md" },
     ));
     // Component boundary (RED4-3): a sibling prefix is outside, not inside.
-    try std.testing.expectEqual(@as(usize, 1), countOutOfRootEntries(diag.io, "src", &.{"src-evil/x.zig"}));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countOutOfRootEntries(diag.io, "src", &.{"src-evil/x.zig"}),
+    );
     // Duplicates count once per occurrence: the --entry and config appends
     // do not dedup, so a doubled entry over-reports (never under-reports).
     try std.testing.expectEqual(@as(usize, 2), countOutOfRootEntries(
@@ -49154,7 +49403,11 @@ test "infix-dot CLI path keeps one graph key for a covered entry (EPH-I0812)" {
     });
     var cwd_buf: [Fs.max_path_bytes]u8 = undefined;
     const cwd_real = try Fs.cwd(diag.io).realpath(".", &cwd_buf);
-    const infix = try std.fmt.allocPrint(allocator, "{s}/./ephor-i0812-infix/src/main.zig", .{cwd_real});
+    const infix = try std.fmt.allocPrint(
+        allocator,
+        "{s}/./ephor-i0812-infix/src/main.zig",
+        .{cwd_real},
+    );
     defer allocator.free(infix);
     var cfg = testConfig();
     defer cfg.deinit(allocator);
@@ -49699,14 +49952,23 @@ test "build.zig-blind orphan scan skips main roots and imported modules (EPH-I10
         .data = "const util = @import(\"util.zig\");\n" ++
             "pub fn main() void { _ = util; }\n",
     });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "util.zig", .data = "pub const v: u32 = 1;\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "util.zig",
+        .data = "pub const v: u32 = 1;\n",
+    });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "probe_main.zig",
         .data = "const compat = @import(\"compat.zig\");\n" ++
             "pub fn main() void { _ = compat; }\n",
     });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "compat.zig", .data = "pub const shim = 1;\n" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "dead.zig", .data = "pub const d = 1;\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "compat.zig",
+        .data = "pub const shim = 1;\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "dead.zig",
+        .data = "pub const d = 1;\n",
+    });
 
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
@@ -50371,8 +50633,14 @@ test "extractQuotedPath accepts stdlib-named project files (EPH-I0529)" {
         extractQuotedPath("b.path(\"builtin_extra.zig\")", 8).?,
     );
     // The bare stdlib package names stay rejected by the suffix gate.
-    try std.testing.expectEqual(@as(?[]const u8, null), extractQuotedPath("@import(\"std\")", 9));
-    try std.testing.expectEqual(@as(?[]const u8, null), extractQuotedPath("@import(\"builtin\")", 9));
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        extractQuotedPath("@import(\"std\")", 9),
+    );
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        extractQuotedPath("@import(\"builtin\")", 9),
+    );
 }
 
 test "pathJoin beyond the segment cap fails closed (EPH-I0533)" {
@@ -50775,7 +51043,10 @@ test "parseLocationLine parses the :NN suffix after a file name" {
     try std.testing.expectEqual(@as(?usize, null), parseLocationLine("f.zig", 5));
     // Overflowing line numbers read as no location (null), never a fake
     // line 0 (band-B12 F23, EPH-I0508).
-    try std.testing.expectEqual(@as(?usize, null), parseLocationLine("f.zig:99999999999999999999999999", 5));
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        parseLocationLine("f.zig:99999999999999999999999999", 5),
+    );
 }
 
 test "classifyGPALine routes every gpa_classifications pattern to its rule" {
@@ -50803,14 +51074,20 @@ test "classifyGPALine pins hard-coded rules for two table rows (band-T01 F8, EPH
         defer deinitIssues(&issues, allocator);
         try std.testing.expectEqual(@as(usize, 1), issues.items.len);
         try std.testing.expectEqualStrings("ZR102", issues.items[0].rule);
-        try std.testing.expectEqualStrings("double free detected at runtime", issues.items[0].message);
+        try std.testing.expectEqualStrings(
+            "double free detected at runtime",
+            issues.items[0].message,
+        );
     }
     {
         var issues = try runClassifyGPALine(allocator, "err: Segmentation fault at address 0x0");
         defer deinitIssues(&issues, allocator);
         try std.testing.expectEqual(@as(usize, 1), issues.items.len);
         try std.testing.expectEqualStrings("ZR105", issues.items[0].rule);
-        try std.testing.expectEqualStrings("segmentation fault - invalid memory access", issues.items[0].message);
+        try std.testing.expectEqualStrings(
+            "segmentation fault - invalid memory access",
+            issues.items[0].message,
+        );
     }
 }
 
@@ -50824,13 +51101,43 @@ test "classifyGPALine honors the located flag of each classification" {
     };
     const cases = [_]Case{
         // Located classes take file:line from the diagnostic line itself.
-        .{ .input = "Double free at /x/y.zig:9 now", .rule = RULE_RUNTIME_DOUBLE_FREE, .file = "/x/y.zig", .line = 9 },
-        .{ .input = "use after free in /z.zig:3", .rule = RULE_RUNTIME_USE_AFTER_FREE, .file = "/z.zig", .line = 3 },
-        .{ .input = "Invalid free of /a.zig:5", .rule = RULE_RUNTIME_DOUBLE_FREE, .file = "/a.zig", .line = 5 },
+        .{
+            .input = "Double free at /x/y.zig:9 now",
+            .rule = RULE_RUNTIME_DOUBLE_FREE,
+            .file = "/x/y.zig",
+            .line = 9,
+        },
+        .{
+            .input = "use after free in /z.zig:3",
+            .rule = RULE_RUNTIME_USE_AFTER_FREE,
+            .file = "/z.zig",
+            .line = 3,
+        },
+        .{
+            .input = "Invalid free of /a.zig:5",
+            .rule = RULE_RUNTIME_DOUBLE_FREE,
+            .file = "/a.zig",
+            .line = 5,
+        },
         // Non-located classes anchor at the synthetic "runtime" file.
-        .{ .input = "Segmentation fault at address 0x0", .rule = RULE_RUNTIME_PANIC, .file = "runtime", .line = 1 },
-        .{ .input = "stack overflow in deepRecursion", .rule = RULE_RUNTIME_PANIC, .file = "runtime", .line = 1 },
-        .{ .input = "OutOfMemory while growing", .rule = RULE_RUNTIME_PANIC, .file = "runtime", .line = 1 },
+        .{
+            .input = "Segmentation fault at address 0x0",
+            .rule = RULE_RUNTIME_PANIC,
+            .file = "runtime",
+            .line = 1,
+        },
+        .{
+            .input = "stack overflow in deepRecursion",
+            .rule = RULE_RUNTIME_PANIC,
+            .file = "runtime",
+            .line = 1,
+        },
+        .{
+            .input = "OutOfMemory while growing",
+            .rule = RULE_RUNTIME_PANIC,
+            .file = "runtime",
+            .line = 1,
+        },
     };
     for (cases) |c| {
         var issues = try runClassifyGPALine(allocator, c.input);
@@ -50891,9 +51198,24 @@ test "parseTestOutput classifies failure-summary shapes" {
     };
     const cases = [_]Case{
         // A FAIL line without a path anchors at the "unknown" file.
-        .{ .input = "FAIL (TestFailed)", .rule = RULE_RUNTIME_TEST_FAILURE, .file = "unknown", .line = 0 },
-        .{ .input = "FAIL /src/t.zig:9 boom", .rule = RULE_RUNTIME_TEST_FAILURE, .file = "/src/t.zig", .line = 9 },
-        .{ .input = "thread 9 panic: bad /p.zig:3", .rule = RULE_RUNTIME_PANIC, .file = "/p.zig", .line = 3 },
+        .{
+            .input = "FAIL (TestFailed)",
+            .rule = RULE_RUNTIME_TEST_FAILURE,
+            .file = "unknown",
+            .line = 0,
+        },
+        .{
+            .input = "FAIL /src/t.zig:9 boom",
+            .rule = RULE_RUNTIME_TEST_FAILURE,
+            .file = "/src/t.zig",
+            .line = 9,
+        },
+        .{
+            .input = "thread 9 panic: bad /p.zig:3",
+            .rule = RULE_RUNTIME_PANIC,
+            .file = "/p.zig",
+            .line = 3,
+        },
     };
     for (cases) |c| {
         var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -51609,7 +51931,10 @@ test "reportCommandFailure varies help by command kind" {
         try std.testing.expectEqualStrings("command failed", issue.message);
         try std.testing.expectEqual(Severity.err, issue.severity);
     }
-    try std.testing.expectEqualStrings("run 'zig build test' to see details", issues.items[0].help.?);
+    try std.testing.expectEqualStrings(
+        "run 'zig build test' to see details",
+        issues.items[0].help.?,
+    );
     try std.testing.expectEqualStrings("check command output for details", issues.items[1].help.?);
 }
 
@@ -51789,7 +52114,10 @@ test "reportFmtFailure reports a missing zig as a command failure" {
     try std.testing.expectEqual(Severity.err, issues.items[0].severity);
     try std.testing.expectEqualStrings("cannot run zig fmt: FileNotFound", issues.items[0].message);
     try std.testing.expect(issues.items[0].message_owned);
-    try std.testing.expectEqualStrings("check that zig is installed and on PATH", issues.items[0].help.?);
+    try std.testing.expectEqualStrings(
+        "check that zig is installed and on PATH",
+        issues.items[0].help.?,
+    );
 }
 
 test "reportFmtFailure names the capture cap for StreamTooLong (EPH-I0501)" {
@@ -54710,7 +55038,9 @@ test "signature return-marker helpers: param-type and negation traps stay silent
     // The noreturn twin: word-bounded, never inside a param type or an
     // identifier.
     try std.testing.expect(!lineHasNoreturnMarker("    cb: *const fn () noreturn,", 1));
-    try std.testing.expect(!lineHasNoreturnMarker("    fn die(cb: *const fn () noreturn) void {", 0));
+    try std.testing.expect(
+        !lineHasNoreturnMarker("    fn die(cb: *const fn () noreturn) void {", 0),
+    );
     try std.testing.expect(!lineHasNoreturnMarker("    my_noreturn_helper()", 0));
     try std.testing.expect(lineHasNoreturnMarker("fn die() noreturn {", 0));
     try std.testing.expect(lineHasNoreturnMarker("    noreturn {", 1));
@@ -57162,7 +57492,12 @@ test "ZA105: straight-line root free plus root rebind past a block boundary grad
         \\    _ = d;
         \\}
     ;
-    var run = try runCFGMemoryTest(&diag, allocator, "test_alias_root_rebind_straight.zig", content);
+    var run = try runCFGMemoryTest(
+        &diag,
+        allocator,
+        "test_alias_root_rebind_straight.zig",
+        content,
+    );
     defer run.deinit(allocator);
 
     const file = "test_alias_root_rebind_straight.zig";
@@ -61411,7 +61746,12 @@ test "ZA103: split-RHS statement end does not swallow a later try (EPH-I0675 c2)
         \\const State = struct { s: []const u8 = "" };
         \\fn h() !void {}
     ;
-    var run = try runCFGMemoryTest(&diag, allocator, "test_split_string_paren_trigger.zig", content);
+    var run = try runCFGMemoryTest(
+        &diag,
+        allocator,
+        "test_split_string_paren_trigger.zig",
+        content,
+    );
     defer run.deinit(allocator);
 
     try std.testing.expect(countRuleIssues(
@@ -61849,7 +62189,12 @@ test "ZA103/ZA101: issue col stays inside the physical line on split-RHS and wra
         \\}
         \\fn g() !void {}
     ;
-    var wrapped_run = try runCFGMemoryTest(&diag, allocator, "test_col_wrapped.zig", wrapped_content);
+    var wrapped_run = try runCFGMemoryTest(
+        &diag,
+        allocator,
+        "test_col_wrapped.zig",
+        wrapped_content,
+    );
     defer wrapped_run.deinit(allocator);
     try expectColInLine(wrapped_run.issues.items, "test_col_wrapped.zig", wrapped_content);
 }
@@ -64776,7 +65121,11 @@ test "analyzeCFGMemory ZA801 same-line exits judged at the guard's depth (EPH-I0
 
     try std.testing.expectEqual(
         @as(usize, 1),
-        countRuleIssues(run.issues.items, "test_za801_depth_judge.zig", RULE_OPTIONAL_UNWRAP_UNSAFE),
+        countRuleIssues(
+            run.issues.items,
+            "test_za801_depth_judge.zig",
+            RULE_OPTIONAL_UNWRAP_UNSAFE,
+        ),
     );
 }
 
@@ -65768,7 +66117,11 @@ test "analyzeIgnoredErrors: string brace in a defer line does not arm a phantom 
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_discard_phantom.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_discard_phantom.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_discard_phantom.zig"), {});
 
@@ -65810,7 +66163,11 @@ test "analyzeIgnoredErrors: string close brace in a defer block does not drop th
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_discard_in_defer.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_discard_in_defer.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_discard_in_defer.zig"), {});
 
@@ -68702,12 +69059,17 @@ test "scanLineForStatementEnd stops at a multiline opener (EPH-I0751)" {
     var mode: QuoteMode = .none;
     // Target text: const s = \\ foo(); bar(); — the tail semicolons are
     // string data, so the statement continues on a later line.
-    try std.testing.expect(scanLineForStatementEnd("const s = \\\\ foo(); bar();", 0, &depth, &mode) == null);
+    try std.testing.expect(
+        scanLineForStatementEnd("const s = \\\\ foo(); bar();", 0, &depth, &mode) == null,
+    );
     try std.testing.expectEqual(@as(usize, 0), depth);
     // A real depth-0 semicolon still terminates the statement.
     depth = 0;
     mode = .none;
-    try std.testing.expectEqual(@as(?usize, 6), scanLineForStatementEnd("foo();", 0, &depth, &mode));
+    try std.testing.expectEqual(
+        @as(?usize, 6),
+        scanLineForStatementEnd("foo();", 0, &depth, &mode),
+    );
 }
 
 test "scanLineForParenClose stops at a multiline opener (EPH-I0751)" {
@@ -68820,7 +69182,10 @@ test "computeBraceDepth ignores braces in comments and strings (EPH-I0081)" {
     try std.testing.expectEqual(@as(usize, 0), computeBraceDepth("x = 1; // { }", 0));
     try std.testing.expectEqual(@as(usize, 1), computeBraceDepth("if (c) { // }", 0));
     try std.testing.expectEqual(@as(usize, 0), computeBraceDepth("const s = \"{\" // }", 0));
-    try std.testing.expectEqual(@as(usize, 1), computeBraceDepth("if (c) { const s = \"}\"; // {", 0));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        computeBraceDepth("if (c) { const s = \"}\"; // {", 0),
+    );
 }
 
 test "trackBracesWithZeroDetect ignores braces in comments (EPH-I0081)" {
@@ -75929,10 +76294,16 @@ test "nextAssignmentOccurrence skips whitespace-spaced dot field writes (EPH-I07
     // `foo . buf = 1` writes foo's field through a spaced dot, so the
     // occurrence is no assignment target of the local buf.
     var s: usize = 0;
-    var scan = AssignmentScanCtx{ .cls = LineClassifier.init("foo . buf = 1;"), .comment_start = null };
+    var scan = AssignmentScanCtx{
+        .cls = LineClassifier.init("foo . buf = 1;"),
+        .comment_start = null,
+    };
     try std.testing.expect(nextAssignmentOccurrence("foo . buf = 1;", "buf", &s, &scan) == null);
     s = 0;
-    scan = AssignmentScanCtx{ .cls = LineClassifier.init("foo .\tbuf = 1;"), .comment_start = null };
+    scan = AssignmentScanCtx{
+        .cls = LineClassifier.init("foo .\tbuf = 1;"),
+        .comment_start = null,
+    };
     try std.testing.expect(nextAssignmentOccurrence("foo .\tbuf = 1;", "buf", &s, &scan) == null);
     s = 0;
     scan = AssignmentScanCtx{ .cls = LineClassifier.init("buf = 1;"), .comment_start = null };
@@ -79460,8 +79831,14 @@ test "findFillCallOccurrence matches call-arg dests only" {
     try std.testing.expectEqual(@as(?usize, 7), findFillCallOccurrence("@memcpy(x, y);", "x"));
     try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("const p = &x;", "x"));
     try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("foo(&x[0]);", "x"));
-    try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("@memset(x[0..4], 0);", "x"));
-    try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("const d = x[0..4];", "x"));
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        findFillCallOccurrence("@memset(x[0..4], 0);", "x"),
+    );
+    try std.testing.expectEqual(
+        @as(?usize, null),
+        findFillCallOccurrence("const d = x[0..4];", "x"),
+    );
     try std.testing.expectEqual(@as(?usize, null), findFillCallOccurrence("use(x);", "x"));
 }
 
@@ -81872,8 +82249,12 @@ test "zigContentParses gates the replacement on a clean parse (EPH-I0168)" {
     // here, exactly as it is for runFmtCheck (band-T04 F-1). The bare
     // "zig" default resolves through PATH; an absolute-path toolchain
     // host sets EPHOR_ZIG_PATH for the test run.
-    try std.testing.expect(zigContentParses(std.testing.io, allocator, tmp.dir, "pub fn build() void {}\n"));
-    try std.testing.expect(!zigContentParses(std.testing.io, allocator, tmp.dir, "pub fn build( void {\n"));
+    try std.testing.expect(
+        zigContentParses(std.testing.io, allocator, tmp.dir, "pub fn build() void {}\n"),
+    );
+    try std.testing.expect(
+        !zigContentParses(std.testing.io, allocator, tmp.dir, "pub fn build( void {\n"),
+    );
 
     // Both runs cleaned their temp file: no litter in the project dir.
     var it = tmp.dir.iterate();
@@ -83988,7 +84369,10 @@ test "extractFnName masks fn inside strings and identifiers (EPH-I0975)" {
 test "extractFnReturnType masks fn ( inside strings (EPH-I0975)" {
     try std.testing.expect(extractFnReturnType("const pat = \"fn (\";") == null);
     try std.testing.expect(extractFnReturnType("my_fn (x);") == null);
-    try std.testing.expectEqualStrings("!void", extractFnReturnType("pub fn bar(x: u32) !void {").?);
+    try std.testing.expectEqualStrings(
+        "!void",
+        extractFnReturnType("pub fn bar(x: u32) !void {").?,
+    );
 }
 
 test "registerFnSignature guard masks fn ( in strings (EPH-I0975)" {
@@ -84059,9 +84443,24 @@ test "registerFnSignature falls through on fn-pointer-typed decls (EPH-I0395)" {
     // band-B04 F10: the fn-paren guard matches a fn-pointer TYPE
     // annotation too; such lines are var declarations and must not be
     // consumed as signatures (registerVarDecl then registers the var).
-    try std.testing.expect(!try registerFnSignature(sctx, "const f: fn (u8) void = g;", null, &ctx));
-    try std.testing.expect(!try registerFnSignature(sctx, "var f: *const fn (u8) void = &g;", null, &ctx));
-    try std.testing.expect(!try registerFnSignature(sctx, "const f: ?fn (u8) void = null;", null, &ctx));
+    try std.testing.expect(!try registerFnSignature(
+        sctx,
+        "const f: fn (u8) void = g;",
+        null,
+        &ctx,
+    ));
+    try std.testing.expect(!try registerFnSignature(
+        sctx,
+        "var f: *const fn (u8) void = &g;",
+        null,
+        &ctx,
+    ));
+    try std.testing.expect(!try registerFnSignature(
+        sctx,
+        "const f: ?fn (u8) void = null;",
+        null,
+        &ctx,
+    ));
     // A real signature still registers.
     try std.testing.expect(try registerFnSignature(sctx, "fn g() void {", null, &ctx));
     try std.testing.expect(ctx.function_returns.count() == 1);
@@ -84302,15 +84701,24 @@ test "extractVarTypeName skips pointer then optional markers" {
 
 test "extractVarTypeName skips pointer qualifiers in annotations" {
     try std.testing.expectEqualStrings("Q", extractVarTypeName("var z: *const Q = undefined;").?);
-    try std.testing.expectEqualStrings("T", extractVarTypeName("var t: *volatile T = undefined;").?);
+    try std.testing.expectEqualStrings(
+        "T",
+        extractVarTypeName("var t: *volatile T = undefined;").?,
+    );
     try std.testing.expectEqualStrings("Q", extractVarTypeName("var q: ?*const Q = undefined;").?);
 }
 
 test "extractVarTypeName skips allowzero qualifier (EPH-I0071)" {
     // `*allowzero u8` used to yield the garbage key "allowzero"; the
     // qualifier must be skipped like `volatile ` (I0057 precedent).
-    try std.testing.expectEqualStrings("u8", extractVarTypeName("var z: *allowzero u8 = undefined;").?);
-    try std.testing.expectEqualStrings("u8", extractVarTypeName("var z: *allowzero const u8 = undefined;").?);
+    try std.testing.expectEqualStrings(
+        "u8",
+        extractVarTypeName("var z: *allowzero u8 = undefined;").?,
+    );
+    try std.testing.expectEqualStrings(
+        "u8",
+        extractVarTypeName("var z: *allowzero const u8 = undefined;").?,
+    );
 }
 
 test "extractVarTypeName skips slice and array prefixes" {
@@ -84320,16 +84728,33 @@ test "extractVarTypeName skips slice and array prefixes" {
 }
 
 test "extractVarTypeName skips align specs and compound qualifier chains" {
-    try std.testing.expectEqualStrings("u8", extractVarTypeName("var p: *align(4) u8 = undefined;").?);
-    try std.testing.expectEqualStrings("u8", extractVarTypeName("var p: *align(4) const u8 = undefined;").?);
-    try std.testing.expectEqualStrings("u8", extractVarTypeName("var p: [*c]const u8 = undefined;").?);
+    try std.testing.expectEqualStrings(
+        "u8",
+        extractVarTypeName("var p: *align(4) u8 = undefined;").?,
+    );
+    try std.testing.expectEqualStrings(
+        "u8",
+        extractVarTypeName("var p: *align(4) const u8 = undefined;").?,
+    );
+    try std.testing.expectEqualStrings(
+        "u8",
+        extractVarTypeName("var p: [*c]const u8 = undefined;").?,
+    );
     // Pathological nested parens: simple )-scan must fall to A-null, not mis-skip
-    try std.testing.expect(extractVarTypeName("var p: *align(@alignOf(u8)) u8 = undefined;") == null);
+    try std.testing.expect(
+        extractVarTypeName("var p: *align(@alignOf(u8)) u8 = undefined;") == null,
+    );
 }
 
 test "extractVarTypeName skips error-union prefixes" {
-    try std.testing.expectEqualStrings("Foo", extractVarTypeName("var e: error{X}!Foo = undefined;").?);
-    try std.testing.expectEqualStrings("Foo", extractVarTypeName("var e: anyerror!Foo = undefined;").?);
+    try std.testing.expectEqualStrings(
+        "Foo",
+        extractVarTypeName("var e: error{X}!Foo = undefined;").?,
+    );
+    try std.testing.expectEqualStrings(
+        "Foo",
+        extractVarTypeName("var e: anyerror!Foo = undefined;").?,
+    );
     try std.testing.expectEqualStrings("Foo", extractVarTypeName("var e: !Foo = undefined;").?);
 }
 
@@ -86050,7 +86475,11 @@ test "analyzeCFGErrdeferCoverage no false positive for dupe with errdefer (ZA103
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_dupe_good_errdefer.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_dupe_good_errdefer.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_dupe_good_errdefer.zig"), {});
 
@@ -86371,7 +86800,11 @@ test "analyzeCFGDeferCoverage detects create with no destroy (ZA102)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_create_no_destroy.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_create_no_destroy.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_create_no_destroy.zig"), {});
 
@@ -86517,7 +86950,11 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer for mem.concat (ZA103)
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_concat_errdefer.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_concat_errdefer.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_concat_errdefer.zig"), {});
 
@@ -86789,7 +87226,11 @@ test "no FP for struct field arena: Allocator (name-based heuristic, ZA101)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_arena_name_field.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_arena_name_field.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_arena_name_field.zig"), {});
 
@@ -86864,7 +87305,11 @@ test "no FP for deep field chain self.ctx.arena.alloc (ZA101)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_arena_deep_chain.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_arena_deep_chain.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_arena_deep_chain.zig"), {});
 
@@ -86897,7 +87342,11 @@ test "no FP for allocPrint with arena param (ZA101)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_arena_allocprint.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_arena_allocprint.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_arena_allocprint.zig"), {});
 
@@ -86931,7 +87380,11 @@ test "non-arena param allocator: Allocator SHOULD trigger ZA101" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_non_arena_param.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_non_arena_param.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_non_arena_param.zig"), {});
 
@@ -87076,7 +87529,11 @@ test "no FP for arena param used as receiver and first-arg (ZA103)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_arena_param_mixed.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_arena_param_mixed.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_arena_param_mixed.zig"), {});
 
@@ -87113,7 +87570,11 @@ test "no FP for arena as non-first parameter (ZA103)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_arena_third_param.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_arena_third_param.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_arena_third_param.zig"), {});
 
@@ -87153,7 +87614,11 @@ test "no FP for multiline allocPrint with arena (ZA101)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_multiline_allocprint.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_multiline_allocprint.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_multiline_allocprint.zig"), {});
 
@@ -87189,7 +87654,11 @@ test "no FP for allocPrint with arena alias from ArenaAllocator (ZA101)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_arena_alias_allocprint.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_arena_alias_allocprint.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_arena_alias_allocprint.zig"), {});
 
@@ -87286,7 +87755,11 @@ test "no FP for local arena alias from struct field access (ZA101)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_local_arena_alias.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_local_arena_alias.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_local_arena_alias.zig"), {});
 
@@ -87319,7 +87792,11 @@ test "no FP for custom-receiver dupe with arena first arg (ZA101)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_custom_receiver_dupe_arena.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_custom_receiver_dupe_arena.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_custom_receiver_dupe_arena.zig"), {});
 
@@ -87355,7 +87832,11 @@ test "no FP for multiline custom-receiver dupe with arena first arg (ZA101)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_multiline_receiver_dupe_arena.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_multiline_receiver_dupe_arena.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_multiline_receiver_dupe_arena.zig"), {});
 
@@ -87389,7 +87870,11 @@ test "no FP for replaceOwned with arena-named second arg (ZA101)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_replace_owned_arena_second.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_replace_owned_arena_second.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_replace_owned_arena_second.zig"), {});
 
@@ -87424,7 +87909,11 @@ test "no FP for replaceOwned with dotted arena field second arg (ZA101)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_replace_owned_dotted_arena.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_replace_owned_dotted_arena.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_replace_owned_dotted_arena.zig"), {});
 
@@ -87459,7 +87948,11 @@ test "ZA101 fires for allocator-receiver dupe with arena-named source (lock)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_dupe_arena_source_lock.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_dupe_arena_source_lock.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_dupe_arena_source_lock.zig"), {});
 
@@ -87495,7 +87988,11 @@ test "ZA101 fires for allocator-receiver dupe with plain source (lock)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_dupe_plain_source_lock.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_dupe_plain_source_lock.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_dupe_plain_source_lock.zig"), {});
 
@@ -87531,7 +88028,11 @@ test "ZA101 fires for replaceOwned with real allocator second arg (lock)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_replace_owned_real_alloc_lock.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_replace_owned_real_alloc_lock.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_replace_owned_real_alloc_lock.zig"), {});
 
@@ -87573,7 +88074,11 @@ test "ZA101 fires for custom-receiver dupe with non-arena first arg (lock)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_custom_receiver_dupe_lock.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_custom_receiver_dupe_lock.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_custom_receiver_dupe_lock.zig"), {});
 
@@ -87610,7 +88115,11 @@ test "no FP for multiline replaceOwned with arena second arg (ZA101)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_multiline_replace_owned.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_multiline_replace_owned.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_multiline_replace_owned.zig"), {});
 
@@ -87645,7 +88154,11 @@ test "no FP for replaceOwned with comma-bearing fn-pointer type param (ZA101)" {
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_replace_owned_fn_type.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_replace_owned_fn_type.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_replace_owned_fn_type.zig"), {});
 
@@ -88179,7 +88692,11 @@ test "ZA202 second catch site fires after a @TypeOf-suppressed first (EPH-I0508 
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_za202_second_site.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_za202_second_site.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_za202_second_site.zig"), {});
 
@@ -88211,7 +88728,11 @@ test "ZA202 second catch site fires after a bufPrint-suppressed first (EPH-I0945
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_za202_bufprint_site.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_za202_bufprint_site.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_za202_bufprint_site.zig"), {});
 
@@ -88243,7 +88764,11 @@ test "ZA202 second catch site fires after a safe-stdlib-suppressed first (EPH-I0
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_za202_stdlib_site.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_za202_stdlib_site.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_za202_stdlib_site.zig"), {});
 
@@ -88278,7 +88803,11 @@ test "ZA202 second catch site fires on a multi-line bufPrint closing line (EPH-I
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_za202_ml_bufprint.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_za202_ml_bufprint.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_za202_ml_bufprint.zig"), {});
 
@@ -88315,7 +88844,11 @@ test "ZA202 second catch site fires on a zig-fmt bufPrint closing line (EPH-I096
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_za202_ml_bufprint2.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_za202_ml_bufprint2.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_za202_ml_bufprint2.zig"), {});
 
@@ -88348,7 +88881,11 @@ test "ZA202 second catch site fires on a multi-line safe-stdlib closing line (EP
         \\}
     ;
 
-    const analysis = try createTestFileAnalysis(allocator, "test_za202_ml_stdlib.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_za202_ml_stdlib.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_za202_ml_stdlib.zig"), {});
 
@@ -88461,7 +88998,11 @@ test "analyzeErrors ZA203 still fires on the unguarded and nested-exit shapes (E
 
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
-    const analysis = try createTestFileAnalysis(allocator, "test_za203_unguarded.zig", test_content);
+    const analysis = try createTestFileAnalysis(
+        allocator,
+        "test_za203_unguarded.zig",
+        test_content,
+    );
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "test_za203_unguarded.zig"), {});
 
@@ -90652,10 +91193,27 @@ test "isDataDispatchFunction rejects regular names" {
     try std.testing.expect(!isDataDispatchFunction(""));
 }
 
-test "branchLimit applies 8x for data dispatch" {
-    try std.testing.expectEqual(@as(usize, 96), branchLimit(12, false, true));
-    try std.testing.expectEqual(@as(usize, 36), branchLimit(12, true, false));
-    try std.testing.expectEqual(@as(usize, 12), branchLimit(12, false, false));
+test "branchLimit applies the pattern multipliers" {
+    // EPH-I0276: the flat arm covers flat SWITCH dispatchers only — a
+    // flat if-chain keeps the base limit (the local-struct ZA304 pin).
+    const flat_switch = ComplexityState{
+        .cognitive = 10,
+        .cyclomatic = 10,
+        .switch_arms = 8,
+        .max_nest = 2,
+    };
+    try std.testing.expectEqual(@as(usize, 24), branchLimit(12, &flat_switch));
+    const flat_chain = ComplexityState{ .cognitive = 10, .cyclomatic = 10, .max_nest = 2 };
+    try std.testing.expectEqual(@as(usize, 12), branchLimit(12, &flat_chain));
+    const dd = ComplexityState{ .is_data_dispatch = true };
+    try std.testing.expectEqual(@as(usize, 96), branchLimit(12, &dd));
+    const tf = ComplexityState{ .is_type_factory = true };
+    try std.testing.expectEqual(@as(usize, 36), branchLimit(12, &tf));
+    const plain = ComplexityState{};
+    try std.testing.expectEqual(@as(usize, 12), branchLimit(12, &plain));
+    // EPH-I0277: a data table outranks every other pattern (20x).
+    const dt = ComplexityState{ .is_data_table = true, .is_data_dispatch = true };
+    try std.testing.expectEqual(@as(usize, 240), branchLimit(12, &dt));
 }
 
 test "ZA304 suppressed for fromJson with many branches" {
@@ -90712,6 +91270,258 @@ test "ZA304 suppressed for fromJson with many branches" {
 }
 
 // ============================================================================
+// EPH-I0275/I0276/I0277 — flat-switch, while-continuation, data-table pins
+// ============================================================================
+
+test "while continuation adds no nesting depth (EPH-I0275)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // fh-explorer pool.zig acquire: the 2026-07-25 log reported depth 4
+    // where actual is 3. The continuation `: (retry += 1)` adds no brace;
+    // the phantom rode the anonymous-struct literal on the catch line
+    // (the `.{}` open counted as a real block before EPH-I0811). Both
+    // twins carry the same braced if, so a cap of 2 fires both at exactly
+    // depth 3 — identical messages pin the invariant.
+    const code =
+        \\fn acquire(self: *Pool) !*Conn {
+        \\    var retry: usize = 0;
+        \\    while (retry < 3) : (retry += 1) {
+        \\        if (self.tryAcquire()) |conn| return conn;
+        \\        if (retry + 1 >= 3) {
+        \\            continue;
+        \\        }
+        \\        sleep(self, 50) catch |se| warn("pool: sleep failed: {}", .{se});
+        \\    }
+        \\    return error.NoAvailableConnections;
+        \\}
+        \\fn acquire_no_cont(self: *Pool) !*Conn {
+        \\    var retry: usize = 0;
+        \\    while (retry < 3) {
+        \\        if (self.tryAcquire()) |conn| return conn;
+        \\        if (retry + 1 >= 3) {
+        \\            continue;
+        \\        }
+        \\        sleep(self, 50) catch |se| warn("pool: sleep failed: {}", .{se});
+        \\        retry += 1;
+        \\    }
+        \\    return error.NoAvailableConnections;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_while_cont.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_while_cont.zig"), {});
+
+    // Cap 2: both fns report exactly depth 3 — identical messages.
+    const th = Thresholds{ .max_nesting_depth = 2 };
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    var cont_msg: ?[]const u8 = null;
+    var nocont_msg: ?[]const u8 = null;
+    for (issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_NESTING_TOO_DEEP)) continue;
+        if (mem.startsWith(u8, issue.message, "function 'acquire' ")) cont_msg = issue.message;
+        const no_cont = "function 'acquire_no_cont' ";
+        if (mem.startsWith(u8, issue.message, no_cont)) nocont_msg = issue.message;
+    }
+    try std.testing.expectEqualStrings(
+        "function 'acquire' has 3 nesting depth (max 2)",
+        cont_msg orelse return error.PinFailed,
+    );
+    try std.testing.expectEqualStrings(
+        "function 'acquire_no_cont' has 3 nesting depth (max 2)",
+        nocont_msg orelse return error.PinFailed,
+    );
+}
+
+test "flat switch dispatcher receives the flat-chain allowance (EPH-I0276)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // A flat exception router (the RhyOS isr.zig dispatchException shape):
+    // 11 arms at one level with trivial bodies. The switch's own brace
+    // opens a cognitive scope, so each arm costs 2 cognitive but 1
+    // cyclomatic: 23-vs-13 breaks the flat-chain ratio, so ZA304/305/306
+    // all fired pre-fix. nestedDispatch adds two guard blocks: depth 4,
+    // real nesting, still fires.
+    const code =
+        \\fn dispatchException(vector: u8, frame: *u8) bool {
+        \\    switch (vector) {
+        \\        0 => handler0(frame),
+        \\        1 => handler0(frame),
+        \\        2 => handler0(frame),
+        \\        3 => handler0(frame),
+        \\        4 => handler0(frame),
+        \\        6 => handler0(frame),
+        \\        8 => handler0(frame),
+        \\        13 => handler0(frame),
+        \\        14 => handler0(frame),
+        \\        18 => handler0(frame),
+        \\        else => return false,
+        \\    }
+        \\    return true;
+        \\}
+        \\fn nestedDispatch(vector: u8, frame: *u8) bool {
+        \\    if (vector < 32) {
+        \\        if (vector != 2) {
+        \\            switch (vector) {
+        \\                0 => handler0(frame),
+        \\                1 => handler0(frame),
+        \\                2 => handler0(frame),
+        \\                3 => handler0(frame),
+        \\                4 => handler0(frame),
+        \\                6 => handler0(frame),
+        \\                8 => handler0(frame),
+        \\                13 => handler0(frame),
+        \\                14 => handler0(frame),
+        \\                18 => handler0(frame),
+        \\                else => return false,
+        \\            }
+        \\        }
+        \\        return true;
+        \\    }
+        \\    return false;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_flat_switch.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_flat_switch.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    var flat_findings: usize = 0;
+    var nested_findings: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.startsWith(u8, issue.message, "function 'dispatchException' ")) {
+            flat_findings += 1;
+        }
+        if (mem.startsWith(u8, issue.message, "function 'nestedDispatch' ")) {
+            nested_findings += 1;
+        }
+    }
+    // The flat router passes the whole ZA3xx family; the nested one does not.
+    try std.testing.expectEqual(@as(usize, 0), flat_findings);
+    try std.testing.expect(nested_findings > 0);
+}
+
+test "data-table pattern grants the multiplier, logic in an arm disqualifies (EPH-I0277)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // classifyCodepoint-shaped: a pure mapping switch with 16 constant
+    // arms (17 branches, 18 cyclomatic, 33 cognitive — all over the
+    // defaults, all pure data). classifyLogic differs by one call in an
+    // arm — real logic, no [dt] tag, still fires.
+    const code =
+        \\fn classify(cp: u32) Class {
+        \\    return switch (cp) {
+        \\        0x00...0x1F => .control,
+        \\        0x20 => .space,
+        \\        0x30...0x39 => .digit,
+        \\        0x41...0x5A => .upper,
+        \\        0x61...0x7A => .lower,
+        \\        0x7F => .delete,
+        \\        0x80...0x9F => .c1,
+        \\        0xA0...0xFF => .latin1,
+        \\        0x100...0x17F => .latin_ext,
+        \\        0x180...0x24F => .latin_b,
+        \\        0x250...0x2AF => .ipa,
+        \\        0x300...0x36F => .combining,
+        \\        0x370...0x3FF => .greek,
+        \\        0x400...0x4FF => .cyrillic,
+        \\        0x500...0x52F => .cyrillic_sup,
+        \\        else => .other,
+        \\    };
+        \\}
+        \\fn classifyLogic(cp: u32) Class {
+        \\    return switch (cp) {
+        \\        0x00...0x1F => .control,
+        \\        0x20 => .space,
+        \\        0x30...0x39 => .digit,
+        \\        0x41...0x5A => .upper,
+        \\        0x61...0x7A => .lower,
+        \\        0x7F => .delete,
+        \\        0x80...0x9F => .c1,
+        \\        0xA0...0xFF => .latin1,
+        \\        0x100...0x17F => .latin_ext,
+        \\        0x180...0x24F => .latin_b,
+        \\        0x250...0x2AF => .ipa,
+        \\        0x300...0x36F => .combining,
+        \\        0x370...0x3FF => .greek,
+        \\        0x400...0x4FF => .cyrillic,
+        \\        0x500...0x52F => .cyrillic_sup,
+        \\        else => mapFallback(cp),
+        \\    };
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "test_data_table.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_data_table.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    var table_findings: usize = 0;
+    var logic_findings: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.startsWith(u8, issue.message, "function 'classify' ")) {
+            table_findings += 1;
+        }
+        if (mem.startsWith(u8, issue.message, "function 'classifyLogic' ")) {
+            logic_findings += 1;
+        }
+    }
+    // The pure table passes the whole ZA3xx family; the call in the last
+    // arm makes classifyLogic logic, so it still fires.
+    try std.testing.expectEqual(@as(usize, 0), table_findings);
+    try std.testing.expect(logic_findings > 0);
+}
+
+test "disqualifiesDataTable separates data rows from logic (EPH-I0277)" {
+    // Clean data rows: constant arms, literal assignments, headers.
+    try std.testing.expect(!disqualifiesDataTable("return switch (cp) {"));
+    try std.testing.expect(!disqualifiesDataTable("switch (cp) {"));
+    try std.testing.expect(!disqualifiesDataTable("0x30...0x39 => .digit,"));
+    try std.testing.expect(!disqualifiesDataTable("else => .other,"));
+    try std.testing.expect(!disqualifiesDataTable("cfg.host = \"localhost\";"));
+    try std.testing.expect(!disqualifiesDataTable("v = 8080;"));
+    try std.testing.expect(!disqualifiesDataTable("}"));
+    // Logic disqualifiers: calls, operators, control flow, indexing.
+    try std.testing.expect(disqualifiesDataTable("0x41 => upper(cp),"));
+    try std.testing.expect(disqualifiesDataTable("cfg.port = 8080 + 1;"));
+    try std.testing.expect(disqualifiesDataTable("if (x) y();"));
+    try std.testing.expect(disqualifiesDataTable("while (x) break;"));
+    try std.testing.expect(disqualifiesDataTable("v = tags[3];"));
+    try std.testing.expect(disqualifiesDataTable("try foo();"));
+    try std.testing.expect(disqualifiesDataTable("} else {"));
+    try std.testing.expect(disqualifiesDataTable("x = a == b;"));
+    try std.testing.expect(disqualifiesDataTable("x = y > 3;"));
+    try std.testing.expect(disqualifiesDataTable("x = !flag;"));
+    try std.testing.expect(disqualifiesDataTable("x = -1;"));
+    try std.testing.expect(disqualifiesDataTable("const r = self.items[i];"));
+}
+
+// ============================================================================
 // ZA303 Tests — self parameter exclusion
 // ============================================================================
 
@@ -90719,11 +91529,41 @@ test "countFnParams excludes self parameter" {
     // Method with self + 3 params = 3 semantic params (not 4)
     try std.testing.expectEqual(@as(usize, 3), countFnParams("fn query(self: *Pool, sql: []const u8, params: anytype, opts: Options) !Result"));
     // Method with self + 2 params = 2 semantic params
-    try std.testing.expectEqual(@as(usize, 2), countFnParams("fn exec(self: *Pool, sql: []const u8, params: anytype) !void"));
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countFnParams("fn exec(self: *Pool, sql: []const u8, params: anytype) !void"),
+    );
     // Free function with 3 params = 3 (no self to exclude)
-    try std.testing.expectEqual(@as(usize, 3), countFnParams("fn process(a: u32, b: u32, c: u32) void"));
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        countFnParams("fn process(a: u32, b: u32, c: u32) void"),
+    );
     // Method with just self = 0 semantic params
     try std.testing.expectEqual(@as(usize, 0), countFnParams("fn deinit(self: *Self) void"));
+}
+
+test "countFnParams masks sentinel-slice colons (EPH-I0270)" {
+    // The `:0` inside [*:0] / [:0] / [N:0] is a sentinel, not a param
+    // separator: the messenger onReady shape (3 params, pre-fix counted 5).
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        countFnParams("fn onReady(seq: [*:0]const u8, req: [*:0]const u8, arg: ?*anyopaque) callconv(.c) void"),
+    );
+    // The zig-pulse setenv/unsetenv shape: 3 params, sentinel colons masked.
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        countFnParams("fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int"),
+    );
+    // A real param colon beside a sentinel still counts: 2 params.
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countFnParams("fn pair(a: [:0]const u8, b: [8:0]const u8) void"),
+    );
+    // Nested brackets close before the separator colon.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countFnParams("fn one(m: [2][*:0]const u8) void"),
+    );
 }
 
 test "countFnParams counts across multi-line signatures" {
@@ -90908,50 +91748,56 @@ test "ZA303 exempts callconv(.Stdcall) and export declarations (EPH-I1093, EPH-I
 // ZA701 Tests — unbreakable string-literal exemption
 // ============================================================================
 
-test "visibleLengthExcludingStrings counts only quote characters of literals" {
-    // 4 spaces + quote + 113 x's + quote + comma = 120 visible, 7 excluding
+test "stringContentStats splits code from string content (EPH-I0272)" {
+    // 4 spaces + quote + 113 x's + quote + comma = 120 visible; code 5,
+    // content 113.
     const long_literal = "    \"" ++ "x" ** 113 ++ "\",";
     try std.testing.expectEqual(@as(usize, 120), calculateVisibleLength(long_literal));
-    try std.testing.expectEqual(@as(usize, 7), visibleLengthExcludingStrings(long_literal));
-    // Pure code line — nothing excluded
+    try std.testing.expectEqual(@as(usize, 5), stringContentStats(long_literal).code);
+    try std.testing.expectEqual(@as(usize, 113), stringContentStats(long_literal).content);
+    // Pure code line — no content excluded
     const pure_code = "x" ** 120;
-    try std.testing.expectEqual(@as(usize, 120), visibleLengthExcludingStrings(pure_code));
+    try std.testing.expectEqual(@as(usize, 120), stringContentStats(pure_code).code);
+    try std.testing.expectEqual(@as(usize, 0), stringContentStats(pure_code).content);
     // Escaped quote inside a literal must not terminate it
-    try std.testing.expectEqual(
-        @as(usize, 13),
-        visibleLengthExcludingStrings("const s = \"a\\\"b\";"),
-    );
+    const escaped = stringContentStats("const s = \"a\\\"b\";");
+    try std.testing.expectEqual(@as(usize, 11), escaped.code);
+    try std.testing.expectEqual(@as(usize, 4), escaped.content);
 }
 
-test "visibleLengthExcludingStrings does not treat '\"' char literal as a string" {
+test "stringContentStats does not treat '\"' char literal as a string" {
     // The '"' char literal must not mask the rest of the line as string content
     const char_line =
         "if (c == '\"') return self.handleTheStringLiteral" ++
         "WithAnExcessivelyLongFunctionName(alpha, beta, gamma);";
     try std.testing.expect(calculateVisibleLength(char_line) > 100);
-    try std.testing.expect(visibleLengthExcludingStrings(char_line) > 100);
+    try std.testing.expect(stringContentStats(char_line).code > 100);
+    try std.testing.expectEqual(@as(usize, 0), stringContentStats(char_line).content);
     // Char literals count as ordinary code, whatever their form
     try std.testing.expectEqual(
         @as(usize, 14),
-        visibleLengthExcludingStrings("const q = '\"';"),
+        stringContentStats("const q = '\"';").code,
     );
     try std.testing.expectEqual(
         @as(usize, 16),
-        visibleLengthExcludingStrings("const nl = '\\n';"),
+        stringContentStats("const nl = '\\n';").code,
     );
     try std.testing.expectEqual(
         @as(usize, 16),
-        visibleLengthExcludingStrings("const sq = '\\'';"),
+        stringContentStats("const sq = '\\'';").code,
     );
     // Apostrophe-like ' not part of a char literal is ordinary code too
     try std.testing.expectEqual(
         @as(usize, 13),
-        visibleLengthExcludingStrings("// don't stop"),
+        stringContentStats("// don't stop").code,
     );
-    // Real string overage adjacent to a char literal stays exempt
+    // Real string overage adjacent to a char literal stays exempt: the
+    // 100-column content dominates 26 columns of code.
     const mixed = "    if (c == '\"') return \"" ++ "x" ** 100 ++ "\";";
     try std.testing.expect(calculateVisibleLength(mixed) > 100);
-    try std.testing.expectEqual(@as(usize, 28), visibleLengthExcludingStrings(mixed));
+    const mixed_stats = stringContentStats(mixed);
+    try std.testing.expectEqual(@as(usize, 26), mixed_stats.code);
+    try std.testing.expectEqual(@as(usize, 100), mixed_stats.content);
 }
 
 // ============================================================================
@@ -91029,8 +91875,12 @@ test "banner tokens past the head do not mark a file generated (EPH-I1062)" {
     try std.testing.expect(!detectGeneratedHeader(string_head));
 
     // Each canonical token does fire inside a head comment.
-    try std.testing.expect(detectGeneratedHeader("// Code generated by protoc-gen-zig\nconst x = 1;\n"));
-    try std.testing.expect(detectGeneratedHeader("//" ++ "AUTO-" ++ "GENERATED FILE. DO NOT MODIFY.\nconst x = 1;\n"));
+    try std.testing.expect(
+        detectGeneratedHeader("// Code generated by protoc-gen-zig\nconst x = 1;\n"),
+    );
+    try std.testing.expect(
+        detectGeneratedHeader("//" ++ "AUTO-" ++ "GENERATED FILE. DO NOT MODIFY.\nconst x = 1;\n"),
+    );
     try std.testing.expect(detectGeneratedHeader("//! DO NOT EDIT\nconst x = 1;\n"));
     // Beyond the second non-empty line the token is inert.
     try std.testing.expect(!detectGeneratedHeader(
@@ -91079,12 +91929,52 @@ test "ZA701 exempts lines over-length solely due to string literals (EPH-I0267)"
     try std.testing.expectEqual(@as(usize, 3), flagged_lines);
 }
 
+test "ZA701 flags a long line with a short embedded string (EPH-I0272)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // The exact messenger line (peer_discovery_find_node_tests.zig:162):
+    // 104 physical columns, 93 of them code, an 11-column "127.0.0.1"
+    // string. The pre-fix walker stripped the 9 content columns and hid
+    // the line; the tail exemption must cover only string tokens that
+    // dominate their line.
+    const messenger_line =
+        "    const end = writeNode(&buf, 52, .{ .node_id = [_]u8{0xA1} ** 32, .port = 4001, .ip = \"127.0.0.1\" });";
+    try std.testing.expectEqual(@as(usize, 104), calculateVisibleLength(messenger_line));
+    const stats = stringContentStats(messenger_line);
+    try std.testing.expectEqual(@as(usize, 9), stats.content);
+    try std.testing.expect(stats.code <= 100);
+    try std.testing.expect(stats.content <= stats.code);
+    const code = messenger_line ++ "\n";
+
+    const analysis = try createTestFileAnalysis(allocator, "test_short_string.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "test_short_string.zig"), {});
+
+    var issues = try analyzeStyle(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    var flagged_lines: usize = 0;
+    for (issues.items) |issue| {
+        if (mem.eql(u8, issue.rule, RULE_LINE_TOO_LONG)) {
+            try std.testing.expectEqual(@as(usize, 1), issue.line);
+            flagged_lines += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), flagged_lines);
+}
+
 test "ZA701: multi-byte lines count codepoints, not bytes (EPH-I0248)" {
     // 60 CJK chars = 180 bytes; the byte model reported 182 columns.
     // The codepoint model counts 63 (the "// " prefix included).
     const cjk = "// " ++ "界" ** 60;
     try std.testing.expectEqual(@as(usize, 63), calculateVisibleLength(cjk));
-    try std.testing.expectEqual(@as(usize, 63), visibleLengthExcludingStrings(cjk));
+    try std.testing.expectEqual(@as(usize, 63), stringContentStats(cjk).code);
     // Emoji: 25 four-byte sequences = 100 bytes, 28 codepoints.
     const emoji = "// " ++ "🚀" ** 25;
     try std.testing.expectEqual(@as(usize, 28), calculateVisibleLength(emoji));
@@ -91366,7 +92256,9 @@ test "findCallSiteLine: comment parens cannot skip the real opener (EPH-I0794)" 
     const line = ") catch unreachable;";
     const got = findCallSiteLine(line, &prev) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("const b = riskyCall( // )", got);
-    try std.testing.expect(!isBufPrintCatchUnreachable(line, mem.indexOf(u8, line, "catch").?, &prev));
+    try std.testing.expect(
+        !isBufPrintCatchUnreachable(line, mem.indexOf(u8, line, "catch").?, &prev),
+    );
 }
 
 test "isDeferCatchMultiline: trailing comment must not hide a boundary (EPH-I0783)" {
@@ -91605,7 +92497,9 @@ test "quote-aware comment guards across the occurrence scans (EPH-I0003)" {
     // is data, not a comment start. The five mid-line `//` guards route
     // through findCommentStart, which is quote-aware.
     try std.testing.expect(hasAddressOfVar("const u = \"http://a\"; f(&x)", "x"));
-    try std.testing.expect(firstUntrackableAddressOfCol("const u = \"http://a\"; const p = &x;", "x") != null);
+    try std.testing.expect(
+        firstUntrackableAddressOfCol("const u = \"http://a\"; const p = &x;", "x") != null,
+    );
     try std.testing.expect(hasMethodCallOnVar("const u = \"http://a\"; x.clear();", "x"));
     try std.testing.expect(payloadBindingCol("const u = \"http://a\"; for (xs) |x|", "x") != null);
     try std.testing.expect(hasSlicePassToFunction("const u = \"http://a\"; send(buf[0..])", "buf"));
@@ -91659,7 +92553,9 @@ test "firstVarReadPos ignores string-data comment openers and real comments (EPH
 test "isTryAllocation ignores try prose in strings and comments (EPH-I0298)" {
     // "try " in a trailing comment faked a try allocation on a plain alloc
     // line, forcing errdefer coverage the code never owed.
-    try std.testing.expect(!isTryAllocation("const buf = allocator.alloc(u8, 10); // a try b", null));
+    try std.testing.expect(
+        !isTryAllocation("const buf = allocator.alloc(u8, 10); // a try b", null),
+    );
     try std.testing.expect(!isTryAllocation("const s = \"a try b\"; const buf = allocator.alloc(u8, 10);", null));
     // Real try allocations stay detected.
     try std.testing.expect(isTryAllocation("const buf = try allocator.alloc(u8, 10);", null));
@@ -91705,7 +92601,9 @@ test "guard detectors are code-position scans on the independent arms (EPH-I0874
     try std.testing.expect(!hasAndComparisonGuard("if (a and b) { // x > y", loc_i));
     try std.testing.expect(!hasAndComparisonGuard("if (a and b) { s = \"x > y\"; }", loc_i));
     // Real guards stay detected.
-    try std.testing.expect(hasBasicIndexGuard("if (s.endsWith(\".zig\")) { a[s.len - 1]; }", loc_s));
+    try std.testing.expect(
+        hasBasicIndexGuard("if (s.endsWith(\".zig\")) { a[s.len - 1]; }", loc_s),
+    );
     try std.testing.expect(hasBasicIndexGuard("if (i == 0 or j == 0) { a[i - 1]; }", loc_i));
     try std.testing.expect(hasBasicIndexGuard("if (i != 0 and j != 0) { a[i - 1]; }", loc_i));
     try std.testing.expect(hasAndComparisonGuard("if (i > 0 and j < n) { a[i - 1]; }", loc_i));
@@ -91719,14 +92617,30 @@ test "hasLowerBoundGuardForVar rejects or-roots that prove nothing (EPH-I0942)" 
     // Both arms now reject any or-root that proves nothing for the var;
     // an `and`-tail and a same-var or-root keep the guard.
     const limit: usize = 1000;
-    try std.testing.expect(!hasLowerBoundGuardForVar("while (y > 0 or x > 0) a[x - 1];", "x", limit));
-    try std.testing.expect(!hasLowerBoundGuardForVar("while (x > 0 or y > 0) a[x - 1];", "x", limit));
-    try std.testing.expect(!hasLowerBoundGuardForVar("while (x > 0 or y) a[x - 1];", "x", limit));
-    try std.testing.expect(!hasLowerBoundGuardForVar("while (x != 0 or y) a[x - 1];", "x", limit));
-    try std.testing.expect(!hasLowerBoundGuardForVar("while (x != 0  or y) a[x - 1];", "x", limit));
-    try std.testing.expect(hasLowerBoundGuardForVar("while (x > 0 and y) a[x - 1];", "x", limit));
-    try std.testing.expect(hasLowerBoundGuardForVar("while (x > 0 or x > 5) a[x - 1];", "x", limit));
-    try std.testing.expect(hasLowerBoundGuardForVar("while (x > 0) a[x - 1];", "x", limit));
+    try std.testing.expect(
+        !hasLowerBoundGuardForVar("while (y > 0 or x > 0) a[x - 1];", "x", limit),
+    );
+    try std.testing.expect(
+        !hasLowerBoundGuardForVar("while (x > 0 or y > 0) a[x - 1];", "x", limit),
+    );
+    try std.testing.expect(
+        !hasLowerBoundGuardForVar("while (x > 0 or y) a[x - 1];", "x", limit),
+    );
+    try std.testing.expect(
+        !hasLowerBoundGuardForVar("while (x != 0 or y) a[x - 1];", "x", limit),
+    );
+    try std.testing.expect(
+        !hasLowerBoundGuardForVar("while (x != 0  or y) a[x - 1];", "x", limit),
+    );
+    try std.testing.expect(
+        hasLowerBoundGuardForVar("while (x > 0 and y) a[x - 1];", "x", limit),
+    );
+    try std.testing.expect(
+        hasLowerBoundGuardForVar("while (x > 0 or x > 5) a[x - 1];", "x", limit),
+    );
+    try std.testing.expect(
+        hasLowerBoundGuardForVar("while (x > 0) a[x - 1];", "x", limit),
+    );
 }
 
 test "hasExitKeyword ignores exit keywords in strings and comments (EPH-I0298)" {
@@ -91770,7 +92684,10 @@ test "countLineCyclomatic counts all decision points" {
     try std.testing.expectEqual(@as(usize, 2), countLineCyclomatic("if (a or b) {"));
     // Multiple decision points on one line
     try std.testing.expectEqual(@as(usize, 2), countLineCyclomatic("if (a and b) |v| {"));
-    try std.testing.expectEqual(@as(usize, 2), countLineCyclomatic("try foo() catch |e| { return e; };"));
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countLineCyclomatic("try foo() catch |e| { return e; };"),
+    );
     // No decision points
     try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("var x: u32 = 0;"));
     try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("_ = allocator;"));
@@ -92178,7 +93095,8 @@ test "hasNullCheckExit accepts a same-line direct exit (EPH-I0861)" {
     const lookup = NullGuardLookup{ .lines = lines, .i = 1, .limit = lines.len };
     try std.testing.expect(hasNullCheckExit(lines[1], lookup, eq_pos));
     const braced = guardScanFixture(&buf, "work();", "if (x == null) { return; }", 1);
-    const braced_eq = findTagInCode(braced[1], "== null", 0) orelse return error.TestUnexpectedResult;
+    const braced_eq = findTagInCode(braced[1], "== null", 0) orelse
+        return error.TestUnexpectedResult;
     const braced_lookup = NullGuardLookup{ .lines = braced, .i = 1, .limit = braced.len };
     try std.testing.expect(hasNullCheckExit(braced[1], braced_lookup, braced_eq));
     // A continued condition keeps its exit: the condition close is the
@@ -92194,7 +93112,9 @@ test "hasSameLineGuardExit applies the depth-2 then+else rule (EPH-I0861)" {
     // A nested conditional whose then and else arms both exit dominates
     // the guard's fall-through like a direct exit: the same-line form of
     // the walk's depth-2 rule (EPH-I0861).
-    try std.testing.expect(hasSameLineGuardExit("{ if (q) { return null; } else { return null; } }"));
+    try std.testing.expect(
+        hasSameLineGuardExit("{ if (q) { return null; } else { return null; } }"),
+    );
     // Nested without an else stays rejected: the q-false path falls
     // through (EPH-I0859).
     try std.testing.expect(!hasSameLineGuardExit("{ if (q) return null; }"));
@@ -92251,7 +93171,11 @@ test "analyzeCFGMemory ZA203 fires past a same-line nested conditional exit in a
 
     try std.testing.expectEqual(
         1,
-        countRuleIssues(run.issues.items, "test_za203_sameline_nested.zig", RULE_ORELSE_UNREACHABLE),
+        countRuleIssues(
+            run.issues.items,
+            "test_za203_sameline_nested.zig",
+            RULE_ORELSE_UNREACHABLE,
+        ),
     );
 }
 
@@ -92275,7 +93199,11 @@ test "analyzeCFGMemory ZA203 silent past a same-line direct guard exit (EPH-I086
 
     try std.testing.expectEqual(
         0,
-        countRuleIssues(run.issues.items, "test_za203_sameline_direct.zig", RULE_ORELSE_UNREACHABLE),
+        countRuleIssues(
+            run.issues.items,
+            "test_za203_sameline_direct.zig",
+            RULE_ORELSE_UNREACHABLE,
+        ),
     );
 }
 
@@ -92358,15 +93286,18 @@ test "nullPredicateBinds binds deref and transparent-paren operands (EPH-I0906)"
 
 test "extractOrelseVar binds deref and paren operands (EPH-I0906)" {
     const deref = "const x = p.* orelse unreachable;";
-    const deref_col = mem.indexOf(u8, deref, "orelse unreachable") orelse return error.TestUnexpectedResult;
+    const deref_col = mem.indexOf(u8, deref, "orelse unreachable") orelse
+        return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("p.*", extractOrelseVar(deref, deref_col).?);
 
     const paren = "const x = (p) orelse unreachable;";
-    const paren_col = mem.indexOf(u8, paren, "orelse unreachable") orelse return error.TestUnexpectedResult;
+    const paren_col = mem.indexOf(u8, paren, "orelse unreachable") orelse
+        return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("p", extractOrelseVar(paren, paren_col).?);
 
     const plain = "const x = p orelse unreachable;";
-    const plain_col = mem.indexOf(u8, plain, "orelse unreachable") orelse return error.TestUnexpectedResult;
+    const plain_col = mem.indexOf(u8, plain, "orelse unreachable") orelse
+        return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("p", extractOrelseVar(plain, plain_col).?);
 }
 
@@ -92496,7 +93427,12 @@ test "guard scans stay bounded on a pathological deep function (EPH-I0225)" {
 
     // hasShortCircuitGuardOnPriorLines keys on an `x == 0 or` guard
     // (10-line window).
-    const lines_sc = guardScanFixture(&buf, "// deep filler", "if (x == 0 or x >= buf.len) return;", 0);
+    const lines_sc = guardScanFixture(
+        &buf,
+        "// deep filler",
+        "if (x == 0 or x >= buf.len) return;",
+        0,
+    );
     try std.testing.expect(!hasShortCircuitGuardOnPriorLines(lines_sc, lines_sc.len - 1, "x"));
 
     // findEnclosingIfCondition / findEnclosingIfLine key on an opener line
@@ -92622,7 +93558,9 @@ test "ZA305: 20-flat-if function triggers cyclomatic at lowered threshold" {
     for (issues.items) |issue| {
         if (mem.eql(u8, issue.rule, RULE_CYCLOMATIC)) {
             found = true;
-            try std.testing.expect(mem.containsAtLeast(u8, issue.message, 1, "cyclomatic complexity"));
+            try std.testing.expect(
+                mem.containsAtLeast(u8, issue.message, 1, "cyclomatic complexity"),
+            );
         }
     }
     try std.testing.expect(found);
@@ -92737,7 +93675,9 @@ test "ZA306: very deep nesting triggers cognitive at lowered threshold" {
     for (issues.items) |issue| {
         if (mem.eql(u8, issue.rule, RULE_COGNITIVE)) {
             found = true;
-            try std.testing.expect(mem.containsAtLeast(u8, issue.message, 1, "cognitive complexity"));
+            try std.testing.expect(
+                mem.containsAtLeast(u8, issue.message, 1, "cognitive complexity"),
+            );
         }
     }
     try std.testing.expect(found);
@@ -92822,25 +93762,33 @@ test "ZA305/ZA306: switch arms count as decision points" {
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
+    // EPH-I0276: constant-return arms are the flat-switch shape and now
+    // receive the 2x allowance (ZA305 silent at 18 vs 20). The try-armed
+    // shape counts a decision point per arm in BOTH metrics (34 cyc, 49
+    // cognitive) so both rules still fire and the pin keeps discriminating
+    // arms-counted from arms-uncounted.
     const code =
-        \\fn dispatch(x: u32) u32 {
+        \\fn helper(v: u32) !u32 {
+        \\    return v;
+        \\}
+        \\fn dispatch(x: u32) !u32 {
         \\    switch (x) {
-        \\        0 => return 0,
-        \\        1 => return 1,
-        \\        2 => return 2,
-        \\        3 => return 3,
-        \\        4 => return 4,
-        \\        5 => return 5,
-        \\        6 => return 6,
-        \\        7 => return 7,
-        \\        8 => return 8,
-        \\        9 => return 9,
-        \\        10 => return 10,
-        \\        11 => return 11,
-        \\        12 => return 12,
-        \\        13 => return 13,
-        \\        14 => return 14,
-        \\        else => return 15,
+        \\        0 => try helper(0),
+        \\        1 => try helper(1),
+        \\        2 => try helper(2),
+        \\        3 => try helper(3),
+        \\        4 => try helper(4),
+        \\        5 => try helper(5),
+        \\        6 => try helper(6),
+        \\        7 => try helper(7),
+        \\        8 => try helper(8),
+        \\        9 => try helper(9),
+        \\        10 => try helper(10),
+        \\        11 => try helper(11),
+        \\        12 => try helper(12),
+        \\        13 => try helper(13),
+        \\        14 => try helper(14),
+        \\        else => try helper(15),
         \\    }
         \\}
     ;
@@ -92848,7 +93796,9 @@ test "ZA305/ZA306: switch arms count as decision points" {
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "switch.zig"), {});
 
-    // 16 switch arms + 1 switch = 17 decision points; threshold 10 should fire ZA305
+    // 16 arms (1 each) + 16 tries (1 each) + 1 switch = 33 decision
+    // points; threshold 10 fires ZA305, and the arm+try cognitive cost
+    // fires ZA306.
     var issues = try analyzeComplexity(allocator, &graph, .{});
     defer deinitIssues(&issues, allocator);
 
@@ -96351,12 +97301,18 @@ test "ZA903: guardBoundOnVar min-combines disjunctions and gates guard position 
     try std.testing.expect(guardBoundOnVar("if (foo(n > 5) and n > 0) {", "n").? == 1);
     try std.testing.expectEqual(@as(?usize, 6), guardBoundOnVar("if (n > 0 and n > 5) {", "n"));
     try std.testing.expectEqual(@as(?usize, 6), guardBoundOnVar("if (n > 5 and q) {", "n"));
-    try std.testing.expectEqual(@as(?usize, 3), guardBoundOnVar("if (n > 5 or (m > 0 and n > 2)) {", "n"));
+    try std.testing.expectEqual(
+        @as(?usize, 3),
+        guardBoundOnVar("if (n > 5 or (m > 0 and n > 2)) {", "n"),
+    );
     try std.testing.expectEqual(@as(?usize, 6), guardBoundOnVar("if ((n > 5)) {", "n"));
     try std.testing.expectEqual(@as(?usize, 1), guardBoundOnVar("while (n > 0) {", "n"));
     // The body is not a guard source: the condition region ends at the
     // group close.
-    try std.testing.expectEqual(@as(?usize, 1), guardBoundOnVar("if (n > 0) { return n > 3; }", "n"));
+    try std.testing.expectEqual(
+        @as(?usize, 1),
+        guardBoundOnVar("if (n > 0) { return n > 3; }", "n"),
+    );
     // The `while` continue expression sits between the condition and
     // the block open (the zls `while (i != 0) : (i -= 1)` shape).
     try std.testing.expectEqual(@as(?usize, 1), guardBoundOnVar("while (n > 0) : (n -= 1) {", "n"));
@@ -98312,7 +99268,9 @@ test "ZA901: the == 0 exit must precede the candidate column (EPH-I1012)" {
     // classic exit-first shape keep the covered verdict, and a
     // decrement before the check stays unguarded.
     try std.testing.expect(!hasGuardOnLine("if (m == 0) { m -= 1; } else { return 0; }", "m", 1));
-    try std.testing.expect(!hasGuardOnLine("if (m == 0) { m -= 1; } else { return 0; }", "m", null));
+    try std.testing.expect(
+        !hasGuardOnLine("if (m == 0) { m -= 1; } else { return 0; }", "m", null),
+    );
     try std.testing.expect(hasGuardOnLine("if (m == 0) { return 0; } else { m -= 1; }", "m", 1));
     try std.testing.expect(hasGuardOnLine("if (m == 0) return; m -= 1;", "m", null));
     try std.testing.expect(!hasGuardOnLine("m -= 1; if (m == 0) return;", "m", 1));
@@ -99354,6 +100312,10 @@ test "ZA301: outer fn with local struct method is reported" {
 
     // 55 body lines + local struct with a method: the nested `fn` previously
     // reset complexity state and silently discarded the outer fn's verdict.
+    // EPH-I0277: 55 pure var rows are the data-table shape, so the [dt]
+    // 20x line allowance would silence the verdict — the fixture carries
+    // one logic line to stay outside the pattern (test evolution, not
+    // weakening: the local-struct mechanism is unchanged).
     var content: []u8 = try aa.dupe(u8, "fn outer_with_struct() void {\n");
     for (0..55) |i| {
         const line = try std.fmt.allocPrint(aa, "    var v{d}: u32 = {d};\n", .{ i, i });
@@ -99361,7 +100323,8 @@ test "ZA301: outer fn with local struct method is reported" {
     }
     content = try mem.concat(aa, u8, &.{
         content,
-        "    const S = struct {\n        fn method() void {}\n    };\n    _ = S;\n}\n",
+        "    if (v0 == 0) {}\n" ++
+            "    const S = struct {\n        fn method() void {}\n    };\n    _ = S;\n}\n",
     });
 
     var graph = ImportGraph.init(allocator, &diag);
@@ -99490,12 +100453,18 @@ test "countLineBranches: ternary if/else expression counts one branch (EPH-I0058
     try std.testing.expectEqual(@as(usize, 1), countLineBranches("const x = if (a) 4 else 6;"));
     try std.testing.expectEqual(@as(usize, 1), countLineBranches("} else if (a) return;"));
     // Block forms keep a brace on the line and keep the else count.
-    try std.testing.expectEqual(@as(usize, 2), countLineBranches("if (a) { return 1; } else return 2;"));
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countLineBranches("if (a) { return 1; } else return 2;"),
+    );
     try std.testing.expectEqual(@as(usize, 1), countLineBranches("} else {"));
     // A brace-less else without a same-line if (Allman) keeps its count.
     try std.testing.expectEqual(@as(usize, 1), countLineBranches("} else"));
     // A brace inside a char literal is not a code-position brace.
-    try std.testing.expectEqual(@as(usize, 1), countLineBranches("const x = if (c == '{') 1 else 2;"));
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countLineBranches("const x = if (c == '{') 1 else 2;"),
+    );
 }
 
 test "countLineCognitive counts unspaced control flow" {
@@ -99954,7 +100923,8 @@ test "extractStructFieldName walks from the given occurrence (EPH-I0893)" {
     // multi-field line yields every field, not just the first.
     const t = "var s = Foo{ .a = undefined, .b = undefined };";
     const first = mem.indexOf(u8, t, "= undefined") orelse return error.TestUnexpectedResult;
-    const second = mem.indexOfPos(u8, t, first + 1, "= undefined") orelse return error.TestUnexpectedResult;
+    const second = mem.indexOfPos(u8, t, first + 1, "= undefined") orelse
+        return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(
         "a",
         extractStructFieldName(t, first) orelse return error.TestUnexpectedResult,
@@ -100905,7 +101875,11 @@ test "ZA301: two block prongs plus a trailing statement measure the full fn (EPH
         \\    _ = v;
         \\}
     ;
-    try expectMeasuredFnLines(&diag, allocator, .{ .file = "prongs.zig", .code = code, .expect_lines = 56 });
+    try expectMeasuredFnLines(&diag, allocator, .{
+        .file = "prongs.zig",
+        .code = code,
+        .expect_lines = 56,
+    });
 }
 
 test "ZA301: same-line empty prong does not end the fn early (EPH-I0133)" {
@@ -100930,7 +101904,11 @@ test "ZA301: same-line empty prong does not end the fn early (EPH-I0133)" {
         \\    _ = v;
         \\}
     ;
-    try expectMeasuredFnLines(&diag, allocator, .{ .file = "i0133.zig", .code = code, .expect_lines = 61 });
+    try expectMeasuredFnLines(&diag, allocator, .{
+        .file = "i0133.zig",
+        .code = code,
+        .expect_lines = 61,
+    });
 }
 
 test "ZA301: block-prong switch with code after it measures to the fn end (EPH-I0451)" {
@@ -100968,7 +101946,11 @@ test "ZA301: block-prong switch with code after it measures to the fn end (EPH-I
         \\fn set_line() void {}
         \\fn after() void {}
     ;
-    try expectMeasuredFnLines(&diag, allocator, .{ .file = "hbe.zig", .code = code, .expect_lines = 52 });
+    try expectMeasuredFnLines(&diag, allocator, .{
+        .file = "hbe.zig",
+        .code = code,
+        .expect_lines = 52,
+    });
 }
 
 test "ZA302: poisoned arrow line does not hide a deeply nested tail" {
@@ -101100,7 +102082,9 @@ test "ZA306: else-prong second same-line brace adds no cognitive nest (EPH-I0884
             cog_findings += 1;
             // Pin the measured value: 9 is the true cognitive weight, 10
             // the leaked one (EPH-I0884).
-            try std.testing.expect(mem.indexOf(u8, issue.message, "has 9 cognitive complexity (max 8)") != null);
+            try std.testing.expect(
+                mem.indexOf(u8, issue.message, "has 9 cognitive complexity (max 8)") != null,
+            );
         }
     }
     try std.testing.expectEqual(@as(usize, 1), cog_findings);
@@ -101300,7 +102284,9 @@ test "ZA306: keyword+literal lines do not leak cognitive nesting (EPH-I0818)" {
             cog_findings += 1;
             // Pin the measured value, not just rule silence: 12 is the
             // true cognitive weight of the shape, 21 the leaked one.
-            try std.testing.expect(mem.indexOf(u8, issue.message, "has 12 cognitive complexity (max 10)") != null);
+            try std.testing.expect(
+                mem.indexOf(u8, issue.message, "has 12 cognitive complexity (max 10)") != null,
+            );
         }
         // Multi-file fixture: per-file assertion legitimate (EPH-I1147).
         if (mem.eql(u8, issue.rule, RULE_COGNITIVE) and mem.eql(u8, issue.file, "cog_ctl.zig")) {
@@ -101357,7 +102343,9 @@ test "ZA306: else-family chains measure at the if's level with no residue (EPH-I
     for (issues.items) |issue| {
         if (mem.eql(u8, issue.rule, RULE_COGNITIVE)) {
             cog_findings += 1;
-            try std.testing.expect(mem.indexOf(u8, issue.message, "has 9 cognitive complexity (max 4)") != null);
+            try std.testing.expect(
+                mem.indexOf(u8, issue.message, "has 9 cognitive complexity (max 4)") != null,
+            );
         }
     }
     try std.testing.expectEqual(@as(usize, 1), cog_findings);
@@ -101463,7 +102451,9 @@ test "ZA306: catch after a labeled block closes costs 1+0 and leaks nothing (EPH
     for (issues.items) |issue| {
         if (mem.eql(u8, issue.rule, RULE_COGNITIVE)) {
             cog_findings += 1;
-            try std.testing.expect(mem.indexOf(u8, issue.message, "has 5 cognitive complexity (max 4)") != null);
+            try std.testing.expect(
+                mem.indexOf(u8, issue.message, "has 5 cognitive complexity (max 4)") != null,
+            );
         }
     }
     try std.testing.expectEqual(@as(usize, 1), cog_findings);
@@ -101505,7 +102495,9 @@ test "ZA306: trailing-comment brace line leaks no cognitive nesting (EPH-I0452)"
     for (issues.items) |issue| {
         if (mem.eql(u8, issue.rule, RULE_COGNITIVE)) {
             cog_findings += 1;
-            try std.testing.expect(mem.indexOf(u8, issue.message, "has 4 cognitive complexity (max 3)") != null);
+            try std.testing.expect(
+                mem.indexOf(u8, issue.message, "has 4 cognitive complexity (max 3)") != null,
+            );
         }
     }
     try std.testing.expectEqual(@as(usize, 1), cog_findings);
@@ -101523,12 +102515,17 @@ test "ZA301: wrapped type-factory signature keeps the [tf] multiplier (EPH-I0457
     // 60 raw lines. Pre-fix the factory check saw only the keyword line,
     // so the wrapped `) type {` factory measured at the 50 limit and
     // fired; the [tf] 3x limit (150) keeps it silent.
+    // EPH-I0277: the discard rows alone are the data-table shape (the
+    // [dt] 20x line allowance would silence both twins), so one logic
+    // line keeps them outside the pattern — the row count stays 60 and
+    // the tf-vs-plain discriminator is unchanged (test evolution, not
+    // weakening).
     const factory =
         \\fn WrappedFactory(
         \\    comptime T: type,
         \\) type {
         \\    const S = struct { x: T };
-    ++ "\n" ++ "    _ = T;\n" ** 54 ++
+    ++ "\n" ++ "    if (T == u8) {}\n" ++ "    _ = T;\n" ** 53 ++
         \\    return S;
         \\}
     ;
@@ -101542,7 +102539,7 @@ test "ZA301: wrapped type-factory signature keeps the [tf] multiplier (EPH-I0457
         \\    comptime T: type,
         \\) void {
         \\    const S = struct { x: T };
-    ++ "\n" ++ "    _ = T;\n" ** 54 ++
+    ++ "\n" ++ "    if (T == u8) {}\n" ++ "    _ = T;\n" ** 53 ++
         \\    _ = S;
         \\}
     ;
@@ -101775,10 +102772,15 @@ test "ZA301: wrapped real fn def counts its signature lines (EPH-I0756)" {
     // 9 lines from the fn keyword to the close. The deferred open must
     // backfill the 2 signature lines, so the fn reports 9 lines at the def
     // line (cap 7) exactly as the eager open did.
+    // EPH-I0277: five discard rows alone are the data-table shape (the
+    // [dt] line allowance would silence the verdict), so one logic line
+    // keeps the fixture outside the pattern (test evolution, not
+    // weakening: the wrapped-def mechanism is unchanged).
     const code =
         \\fn wrapped(
         \\    a: u8,
         \\) void {
+        \\    if (a == 0) {}
         \\    _ = a;
         \\    _ = a;
         \\    _ = a;
@@ -101823,6 +102825,10 @@ test "detectFnStart: one-line extern decl still opens no fn state (EPH-I0756)" {
 
 // 12 raw lines, 9 processed: analyzeFileComplexity skips the 3 full-line
 // comment lines. The old eager open counted 9.
+// EPH-I0277: the discard rows alone are the data-table shape (the [dt]
+// line allowance would mask a comment-skip regression on both twins), so
+// one logic line keeps each fixture outside the pattern (test evolution,
+// not weakening: the line counts below stay exact).
 const commented_sig_i0788 =
     \\fn commented(
     \\    a: u8,
@@ -101832,7 +102838,7 @@ const commented_sig_i0788 =
     \\    // full-line comment three
     \\) void {
     \\    _ = a;
-    \\    _ = b;
+    \\    if (b == 0) {}
     \\    _ = a;
     \\    _ = b;
     \\}
@@ -101850,7 +102856,7 @@ const plain_sig_i0788 =
     \\) void {
     \\    _ = a;
     \\    _ = b;
-    \\    _ = a;
+    \\    if (a == 0) {}
     \\    _ = b;
     \\}
 ;
@@ -101868,7 +102874,11 @@ test "ZA301: full-line comments in a wrapped signature stay out of fn_lines (EPH
     // stays silent. The comment-free twin processes 12 and fires. Pre-fix
     // the fn_lines backfill subtracted raw line numbers, so the 3 skipped
     // comment lines inflated the commented twin to 12 (EPH-I0788).
-    const commented = try createTestFileAnalysis(allocator, "i0788_commented.zig", commented_sig_i0788);
+    const commented = try createTestFileAnalysis(
+        allocator,
+        "i0788_commented.zig",
+        commented_sig_i0788,
+    );
     try graph.files.put(commented.path, commented);
     try graph.reachable.put(try allocator.dupe(u8, "i0788_commented.zig"), {});
 
@@ -102007,11 +103017,16 @@ test "analyzeFileComplexity runs on a string-only marker file (EPH-I0758)" {
     const allocator = gpa.allocator();
 
     // The markers live only in string data; the over-cap fn must be measured.
+    // EPH-I0277: six discard rows alone are the data-table shape (the [dt]
+    // line allowance would silence the verdict), so one logic line keeps
+    // the fixture outside the pattern (test evolution, not weakening: the
+    // string-marker mechanism is unchanged).
     const code =
         \\const s = "@cImport and __builtin_";
         \\fn over_cap() void {
         \\    _ = 1;
         \\    _ = 2;
+        \\    if (s.len == 0) {}
         \\    _ = 3;
         \\    _ = 4;
         \\    _ = 5;
@@ -102047,7 +103062,11 @@ test "analyzeFileComplexity does not skip main.zig itself (EPH-I0758)" {
     // dogfood target, so the test only runs where the repo root is the
     // cwd. A foreign cwd skips it: a tmpDir stand-in would pin the
     // stand-in, not the real file.
-    const content = Fs.cwd(std.testing.io).readFileAlloc(allocator, "src/main.zig", max_main_bytes) catch
+    const content = Fs.cwd(std.testing.io).readFileAlloc(
+        allocator,
+        "src/main.zig",
+        max_main_bytes,
+    ) catch
         return error.SkipZigTest;
     defer allocator.free(content);
     try std.testing.expect(!isCImportFile("src/main.zig", content));
@@ -108799,7 +109818,9 @@ test "transfer predicate: expression keywords are not call evidence (EPH-I1100)"
     // current function; a fn-pointer parameter list never names a call.
     try std.testing.expect(!isFunctionArgTransfer("if (a and (name)) return;", "name"));
     try std.testing.expect(!isFunctionArgTransfer("if (a or (name)) return;", "name"));
-    try std.testing.expect(!isFunctionArgTransfer("var cb: *const fn (name) void = undefined;", "name"));
+    try std.testing.expect(
+        !isFunctionArgTransfer("var cb: *const fn (name) void = undefined;", "name"),
+    );
     try std.testing.expect(!isFunctionArgTransfer("const x = comptime (name);", "name"));
     try std.testing.expect(!isFunctionArgTransfer("const x = nosuspend (name);", "name"));
     // Positive controls: a real call argument still transfers.
@@ -109568,7 +110589,8 @@ test "ZA110: close-armed defer fires with a close-accurate message (EPH-I1117)" 
         if (!mem.eql(u8, issue.rule, RULE_MUST_RETURN_REF)) continue;
         if (issue.line == 5 and mem.indexOf(u8, issue.message, "closed by an armed defer") != null)
             opened_closed_msg = true;
-        if (issue.line == 10 and mem.indexOf(u8, issue.message, "deinited by an armed defer") != null)
+        if (issue.line == 10 and
+            mem.indexOf(u8, issue.message, "deinited by an armed defer") != null)
             deinit_msg = true;
     }
     try std.testing.expect(opened_closed_msg);
@@ -109702,7 +110724,9 @@ test "ZA110: deferPathArmsReturn resolves copy aliases (EPH-I0480)" {
     };
     try std.testing.expect(deferPathArmsReturn(deinit_arms[0..1], "out", "out", &aliases) != null);
     try std.testing.expect(deferPathArmsReturn(deinit_arms[1..2], "b", "b", &aliases) != null);
-    try std.testing.expect(deferPathArmsReturn(deinit_arms[1..2], "list", "list", &aliases) != null);
+    try std.testing.expect(
+        deferPathArmsReturn(deinit_arms[1..2], "list", "list", &aliases) != null,
+    );
     const field_arm = [_]DeferPath{.{ .path = "out.list", .kind = .deinit }};
     try std.testing.expect(deferPathArmsReturn(&field_arm, "out", "out", &aliases) != null);
     const other_arm = [_]DeferPath{.{ .path = "other", .kind = .deinit }};
@@ -110960,9 +111984,13 @@ test "ZA210: catch block whose sole statement is the payload return fires (EPH-I
 
 test "ZA210: catch block with a second statement stays silent (EPH-I0039)" {
     // A second statement after the payload return is real work.
-    try std.testing.expect(checkNoCatchReturn("foo() catch |err| { return err; return; }", "t.zig", 1) == null);
+    try std.testing.expect(
+        checkNoCatchReturn("foo() catch |err| { return err; return; }", "t.zig", 1) == null,
+    );
     // A different return payload is not the verbose-try shape.
-    try std.testing.expect(checkNoCatchReturn("foo() catch |err| { return other; }", "t.zig", 1) == null);
+    try std.testing.expect(
+        checkNoCatchReturn("foo() catch |err| { return other; }", "t.zig", 1) == null,
+    );
 }
 
 test "ZA210: try form produces no issue" {
@@ -112263,12 +113291,22 @@ test "config error_naming parses TitleCase and the PascalCase alias" {
     var diag = testDiagCtx();
     var cfg_title = testConfig();
     defer cfg_title.deinit(std.testing.allocator);
-    try parseConfigJson(&diag, std.testing.allocator, "{\"error_naming\": \"TitleCase\"}", &cfg_title);
+    try parseConfigJson(
+        &diag,
+        std.testing.allocator,
+        "{\"error_naming\": \"TitleCase\"}",
+        &cfg_title,
+    );
     try std.testing.expectEqual(ErrorNaming.title_case, cfg_title.error_naming);
 
     var cfg_pascal = testConfig();
     defer cfg_pascal.deinit(std.testing.allocator);
-    try parseConfigJson(&diag, std.testing.allocator, "{\"error_naming\": \"PascalCase\"}", &cfg_pascal);
+    try parseConfigJson(
+        &diag,
+        std.testing.allocator,
+        "{\"error_naming\": \"PascalCase\"}",
+        &cfg_pascal,
+    );
     try std.testing.expectEqual(ErrorNaming.title_case, cfg_pascal.error_naming);
 }
 
@@ -115723,6 +116761,101 @@ test "CLI empty disable/enable entry is a hard usage error (EPH-I0236)" {
     try std.testing.expectEqual(@as(usize, 0), cfg.enabled_rules.items.len);
 }
 
+test "CLI empty path/entry flag value is a hard usage error (EPH-I0289)" {
+    var diag = testDiagCtx();
+    // Regression: the flags exited 0 silently — --export= exported to the
+    // empty string and --entry= appended an empty entry.
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cli_entries = false;
+    var cli_path = false;
+    var no_more_flags = false;
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
+    };
+    try std.testing.expectError(
+        error.EmptyFlagValue,
+        parseCliArg(cli_ctx, "--entry="),
+    );
+    try std.testing.expectError(
+        error.EmptyFlagValue,
+        parseCliArg(cli_ctx, "--export="),
+    );
+    try std.testing.expectError(
+        error.EmptyFlagValue,
+        parseCliArg(cli_ctx, "--known-issues="),
+    );
+    try std.testing.expectError(
+        error.EmptyFlagValue,
+        parseCliArg(cli_ctx, "--coverage-evidence="),
+    );
+    // Fail closed: the rejected values never entered the config.
+    try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.export_path);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.known_issues_path);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.runtime_command);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.coverage_evidence_path);
+}
+
+test "CLI empty --command= value is a hard usage error in runtime scope (EPH-I0289)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    // The command-scope gate runs before the value gate, so the empty
+    // value is reachable only inside the runtime scope.
+    cfg.command = .runtime;
+    var cli_entries = false;
+    var cli_path = false;
+    var no_more_flags = false;
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
+    };
+    try std.testing.expectError(
+        error.EmptyFlagValue,
+        parseCliArg(cli_ctx, "--command="),
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.runtime_command);
+}
+
+test "CLI empty --version= value is a hard usage error in upgrade scope (EPH-I0289)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.command = .upgrade;
+    var cli_entries = false;
+    var cli_path = false;
+    var no_more_flags = false;
+    const cli_ctx: CliParseCtx = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .cli_entries = &cli_entries,
+        .cli_path = &cli_path,
+        .no_more_flags = &no_more_flags,
+    };
+    try std.testing.expectError(
+        error.EmptyFlagValue,
+        parseCliArg(cli_ctx, "--version="),
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.install_version);
+}
+
 test "config empty disable/enable entry is a hard usage error (EPH-I0236)" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -116429,7 +117562,10 @@ test "projectHasEphorDependency is code-aware and field-anchored (EPH-I1157)" {
     for (cases) |case| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig.zon", .data = case.content });
+        try tmp.dir.writeFile(std.testing.io, .{
+            .sub_path = "build.zig.zon",
+            .data = case.content,
+        });
         try std.testing.expectEqual(
             case.expect,
             projectHasEphorDependency(std.testing.io, allocator, tmp.dir),
@@ -116524,7 +117660,10 @@ test "install refuses a detected Zig below 0.16.0 before the fetch (EPH-I0239)" 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig", .data = "" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "build.zig.zon", .data = ".{ .name = .demo }\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig.zon",
+        .data = ".{ .name = .demo }\n",
+    });
     // The same fake-zig seam as the gate test: the prerequisites pass,
     // then the Zig gate refuses and maps to InstallFailed (EPH-I0235).
     const fake_path = try installFakeZig(&tmp, allocator, "#!/bin/sh\necho 0.15.2\n");
@@ -116572,7 +117711,9 @@ test "patchZonFingerprint patches code positions only (EPH-I0718)" {
         .sub_path = "build.zig.zon",
         .data = ".{ .name = .demo, .fingerprint = 0x0, .paths = .{ \"build.zig\" } }\n",
     });
-    try std.testing.expect(patchZonFingerprint(std.testing.io, allocator, tmp.dir, "0xd75e6f2a0588dd40"));
+    try std.testing.expect(
+        patchZonFingerprint(std.testing.io, allocator, tmp.dir, "0xd75e6f2a0588dd40"),
+    );
     const after = try tmp.dir.readFileAlloc(
         std.testing.io,
         "build.zig.zon",
@@ -117363,7 +118504,12 @@ test "suppression: --no-suppression never prints an off-by-default rule" {
 test "suppression: --no-suppression never waives a hard config exclude" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    var h = try initSuppressHarness(&diag, allocator, "src/sup_hard_exclude.zig", suppress_leak_source);
+    var h = try initSuppressHarness(
+        &diag,
+        allocator,
+        "src/sup_hard_exclude.zig",
+        suppress_leak_source,
+    );
     defer h.deinit(allocator);
     try std.testing.expect(h.run.issues.items.len >= 1);
 
@@ -117440,9 +118586,18 @@ test "config orphan_exclude feeds the suppression accounting (EPH-I0666)" {
     // becomes an Issue and classifyIssue counts it under orphan_exclude.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "entry.zig", .data = "pub fn f() void {}\n" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "hidden.zig", .data = "pub fn g() void {}\n" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "util_test.zig", .data = "pub fn h() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "entry.zig",
+        .data = "pub fn f() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "hidden.zig",
+        .data = "pub fn g() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "util_test.zig",
+        .data = "pub fn h() void {}\n",
+    });
     const tmp_path = try tmpDirPath(allocator, &tmp);
     defer allocator.free(tmp_path);
     const entry = try std.fmt.allocPrint(allocator, "{s}/entry.zig", .{tmp_path});
@@ -117574,7 +118729,10 @@ test "entry-discovery depth cap truncation notes once per run (EPH-I0667, F-5)" 
     const rel = deep[tmp_path.len + 1 ..];
     const buried_main = try std.fmt.allocPrint(allocator, "{s}/main.zig", .{rel});
     defer allocator.free(buried_main);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = buried_main, .data = "pub fn main() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = buried_main,
+        .data = "pub fn main() void {}\n",
+    });
 
     var cfg = testConfig();
     defer cfg.deinit(allocator);
@@ -118267,9 +119425,16 @@ test "parseFmtOutput rejects control and non-ASCII bytes" {
     const ok_path = try tmpFilePath(allocator, &tmp, "ok.zig");
     defer allocator.free(ok_path);
 
-    const source = try std.fmt.allocPrint(allocator, "{s}\x1b[2J\n{s}\x01\n{s}\xc3\xa9.zig\n{s}\n", .{
-        root, root, root, ok_path,
-    });
+    const source = try std.fmt.allocPrint(
+        allocator,
+        "{s}\x1b[2J\n{s}\x01\n{s}\xc3\xa9.zig\n{s}\n",
+        .{
+            root,
+            root,
+            root,
+            ok_path,
+        },
+    );
     defer allocator.free(source);
 
     var issues = try parseFmtOutput(&diag, allocator, source, .{
@@ -118351,8 +119516,14 @@ test "writeCodeSnippet skips out-of-root and unresolvable paths" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(std.testing.io, "sub");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "sub/inside.zig", .data = "fn i() void {}\n" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "escape.zig", .data = "fn s() void {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "sub/inside.zig",
+        .data = "fn i() void {}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "escape.zig",
+        .data = "fn s() void {}\n",
+    });
     const root = try tmpFilePath(allocator, &tmp, "sub");
     defer allocator.free(root);
     const inside = try tmpFilePath(allocator, &tmp, "sub/inside.zig");
@@ -118429,5 +119600,7 @@ test "scanRootRealpath roots a file scan at the file's directory" {
     try std.testing.expectEqualStrings(dir_path, dir_root.?);
     const file_root = scanRootRealpath(std.testing.io, file_path, &buf);
     try std.testing.expectEqualStrings(dir_path, file_root.?);
-    try std.testing.expect(scanRootRealpath(std.testing.io, "/nonexistent-ephor-test", &buf) == null);
+    try std.testing.expect(
+        scanRootRealpath(std.testing.io, "/nonexistent-ephor-test", &buf) == null,
+    );
 }

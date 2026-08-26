@@ -100,7 +100,9 @@ test "ZA111: labeled-block values fire only through a proven escape (EPH-I0046)"
     );
     defer types.deinitIssues(&issues, a);
     try std.testing.expectEqual(@as(usize, 2), issues.items.len);
-    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "returned pointer 'p'") != null);
+    try std.testing.expect(
+        mem.indexOf(u8, issues.items[0].message, "returned pointer 'p'") != null,
+    );
     try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "'v'") != null);
     try std.testing.expectEqual(@as(usize, 7), issues.items[0].line);
     try std.testing.expect(mem.indexOf(u8, issues.items[1].message, "'s'") != null);

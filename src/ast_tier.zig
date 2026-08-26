@@ -1173,10 +1173,10 @@ test "exceedsNestingBudget: two-char = tokens keep the run, bare = resets (EPH-I
     // The while-continue shape keeps its while frame live across the
     // `+=`; reading the compound token's `=` as a boundary reset the run
     // while the frames stayed on the parser stack (under-count). Nested
-    // chains pin the fix: the run reaches 2 across the `+=`, `==`, and
-    // `>=` tokens while the depth never leaves 1.
-    try std.testing.expect(exceedsNestingBudget("while (a) : (b += 1) while (c) : (d += 1) f();", 1));
-    try std.testing.expect(!exceedsNestingBudget("while (a) : (b += 1) while (c) : (d += 1) f();", 2));
+    // chains pin the fix: the run reaches 2 across `+=`, `==`, `>=`.
+    const chained = "while (a) : (b += 1) while (c) : (d += 1) f();";
+    try std.testing.expect(exceedsNestingBudget(chained, 1));
+    try std.testing.expect(!exceedsNestingBudget(chained, 2));
     // Comparison forms carry the same live frame.
     try std.testing.expect(exceedsNestingBudget("if (a == b) if (c == d) f();", 1));
     try std.testing.expect(!exceedsNestingBudget("if (a == b) if (c == d) f();", 2));
@@ -1249,7 +1249,12 @@ test "parsed counts only fully analyzed files (EPH-I0600)" {
         var issues: std.ArrayListUnmanaged(Issue) = .empty;
         defer types.deinitIssues(&issues, probe.allocator());
         var stats = Stats{};
-        try analyzeFileAstTier(probe.allocator(), .{ .issues = &issues, .stats = &stats }, "test.zig", src);
+        try analyzeFileAstTier(
+            probe.allocator(),
+            .{ .issues = &issues, .stats = &stats },
+            "test.zig",
+            src,
+        );
         try std.testing.expectEqual(@as(usize, 1), stats.parsed);
         try std.testing.expectEqual(@as(usize, 0), stats.skipped);
     }
@@ -1323,7 +1328,8 @@ test "exceedsNestingBudget: keyword and two-char prefix forms count" {
     try std.testing.expect(exceedsNestingBudget("const x = -% -% -% y;", 2));
     try std.testing.expect(exceedsNestingBudget("const x: anyframe->anyframe->u8 = undefined;", 1));
     // An arrow split across lines still completes the operator.
-    try std.testing.expect(exceedsNestingBudget("const x: anyframe\n->anyframe\n->u8 = undefined;", 1));
+    const split_arrow = "const x: anyframe\n->anyframe\n->u8 = undefined;";
+    try std.testing.expect(exceedsNestingBudget(split_arrow, 1));
     // A bare `anyframe` is a type operand, not an operator.
     try std.testing.expect(!exceedsNestingBudget("var af: anyframe = undefined;", 0));
 }

@@ -58,7 +58,9 @@ pub const Walker = struct {
     var_decls: std.ArrayListUnmanaged(NodeIndex) = .empty,
     returns: std.ArrayListUnmanaged(NodeIndex) = .empty,
     /// Labeled-block breaks with a value operand (`break :blk &x;`,
-    /// EPH-I0046): the value escapes through the block.
+    /// EPH-I0046): these records resolve the block's value; only a
+    /// consumer that provably escapes adjudicates (the block itself
+    /// never fires).
     breaks: std.ArrayListUnmanaged(NodeIndex) = .empty,
     /// Plain `=` assignments: out-param escapes and var-alias rebinds
     /// resolve through them (EPH-I0046).

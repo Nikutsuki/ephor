@@ -2160,8 +2160,10 @@ const CFGBuildCtx = struct {
         // A pending brace-less if/else opener whose next line is a
         // statement (not an Allman `{`, not a labeled block) takes that
         // line as its virtual body. A multi-line condition still open is
-        // not a body. A pending while/for is excluded: brace-less loops
-        // are out of B2 scope and degrade to pre-B2 attribution.
+        // not a body. A pending while/for is excluded here: a same-line
+        // brace-less while body takes its virtual body through
+        // virtualOkFor (EPH-I0129), while the pending next-line while
+        // form and every brace-less for keep the pre-B2 attribution.
         const next_body = self.topIsPendingIfElse() and self.paren_depth == 0 and
             classifyLineStart(code) == .statement;
         const virtual_else = self.pending_else != null and isVirtualElseLine(code);
@@ -5726,6 +5728,15 @@ fn loopIncrementSpan(
     counter: []const u8,
 ) ?usize {
     const t = mem.trim(u8, lines[loop_idx], " \t\r");
+    // Fail closed on brace-less loops: the body-end walk stops at the
+    // first standalone `}`, which for a brace-less loop is an enclosing
+    // block's close — the overextended span would hide a counter write
+    // after the real body and the suppressor would silence a read the
+    // zero-trip path reaches unfilled. Only a control `{` at the body
+    // start admits the walk; an Allman opener (brace on its own line)
+    // rides along excluded — a missed suppression, the safe direction.
+    const body_start = loopBodyStartCol(t) orelse return null;
+    if (body_start >= t.len or t[body_start] != '{') return null;
     var found_inc = lineHasIncrement(t, counter);
     var j = loop_idx + 1;
     while (j < guard_idx) : (j += 1) {
@@ -68932,6 +68943,44 @@ test "ZA607: reassigned counter keeps the zero-trip guard inert (EPH-I0131)" {
     );
 }
 
+test "ZA607: braceless loop body does not extend the zero-trip suppressor span (EPH-I0131)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The brace-less loop's body ends at its statement, but the former
+    // body-end walk ran to the first standalone `}` — the enclosing
+    // block's close — and swallowed the `count = 7` line into the loop
+    // span. The write then escaped the outside-loop check, the
+    // suppressor silenced the read, and a path with zero trips reached
+    // it unfilled. The span now admits only braced loops, so the write
+    // breaks the correlation and the read fires.
+    const content =
+        \\fn useArr(a: [4]u64) void {
+        \\    _ = a;
+        \\}
+        \\fn bracelessSpan(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var arr: [4]u64 = undefined;
+        \\    {
+        \\        while (c) : (count += 1)
+        \\            arr[count] = 1;
+        \\        count = 7;
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(arr);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_braceless.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_zt_braceless.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "ZA607: Allman switch prong fill keeps the conditional verdict (EPH-I0128)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -71970,9 +72019,11 @@ test "ZA607: braceless while body keeps pre-B2 verdict" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Brace-less loops are outside the CFG's virtual-body modeling
-    // (EPH-I0079 B2 exclusion), so the shortcut keeps its pre-B2 verdict.
-    // The FN is tracked in EPH-I0129 (inline and braceless loop bodies).
+    // The pending next-line brace-less while body stays outside the CFG's
+    // virtual-body modeling (the EPH-I0129 split: the same-line form is
+    // modeled, the pending next-line form keeps its pre-B2 attribution),
+    // so the shortcut keeps its pre-B2 verdict. The residual FN is the
+    // pending next-line form.
     const content =
         \\fn whileBraceless(n: u32) u32 {
         \\    var x: u32 = undefined;

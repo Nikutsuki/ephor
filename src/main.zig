@@ -2118,6 +2118,19 @@ const CFGBuildCtx = struct {
     /// reaches the merge without touching the arm (EPH-I0087). A
     /// jump-terminal body already wired its exit, so no fall-through edge
     /// leaves it (EPH-I0094).
+    ///
+    /// Documented residual (EPH-I1176, the EPH-I0826 pattern): the
+    /// terminal check reads is_jump_terminal but not is_return, so a
+    /// return-terminal deferred block gets a spurious sequential edge to
+    /// the merge (handleBlockEnd carries the is_return check at its own
+    /// close wiring). Under the AND-meet definite-assignment flow the
+    /// spurious edge is benign in the observed shapes — the false-path
+    /// pred's undefined state keeps the meet uncovered — but the edge
+    /// defeats the has_succ-based neighbor filter for the return block
+    /// and remains an approximation hazard in the line-based CFG model.
+    /// The pin locks the current verdicts (test "ZA607: return-terminal
+    /// deferred close keeps the spurious merge edge (EPH-I1176,
+    /// documented residual)").
     fn finishPendingElse(self: *CFGBuildCtx, line: usize) !void {
         const entry = self.pending_else orelse return;
         self.pending_else = null;
@@ -2587,6 +2600,17 @@ fn stripGroupingParens(cond: []const u8) []const u8 {
 /// (`} else return;`). The token scan is whole-word and string/comment
 /// masked: an identifier containing `else` (elsewhere) or a string literal
 /// carrying `else` before the keyword must not anchor the check (EPH-I0097).
+///
+/// Documented residual (EPH-I1176, the EPH-I0826 pattern): the scan
+/// anchors on the FIRST else token of the line. On a multi-else line
+/// (`} else if (d) { x = 2; } else return;`) the check classifies
+/// against the chain link, so the final bare else's inline return body
+/// is not classified as an inline-return else — position-blindness. The
+/// bare else then takes the plain-else model, its return is not marked,
+/// and the post-chain read over-warns on the both-false path (the
+/// fail-safe direction). The pin locks the over-warn (test "ZA607:
+/// multi-else line classifies by the chain link else (EPH-I1176,
+/// documented residual)").
 fn hasInlineElseReturn(t: []const u8) bool {
     const else_pos = realTokenPos(t, "else") orelse return false;
     const after_else = mem.trimStart(u8, t[else_pos + 4 ..], " \t");
@@ -3680,19 +3704,32 @@ const FillScan = struct {
     }
 };
 
-/// True when the fill at `fill_col` is a DIRECT assignment inside a loop
-/// line's body (past the condition's `)`, continuation, and payload) —
-/// the shape that must defer to the CFG (EPH-I0129). An element store
-/// (`arr[i] = v`, `p.* = v`), a field write, or an address-of fill keeps
-/// the documented-strictness win: an element store kills the whole
-/// variable (EPH-I0132), so the historical silent verdict stands. Null
-/// fills and multi-line headers (no `)` on the line) fall back to the
-/// header-fill verdict — the conservative pre-I0129 direction.
+/// True when the fill at `fill_col` must defer to the CFG: a fill inside
+/// a loop line's body (past the condition's `)`, continuation, and
+/// payload) or inside the continuation group. The loop may run zero
+/// trips, and the continuation runs only after a trip completes, so both
+/// positions stay conditional (EPH-I0129, EPH-I1178). A direct
+/// assignment and a fill call defer; an element store (`arr[i] = v`,
+/// `p.* = v`), a field write, or a slice keeps the documented-strictness
+/// win: an element store kills the whole variable (EPH-I0132), so the
+/// historical silent verdict stands. A condition-position fill keeps the
+/// header win — the while condition evaluates on every path through the
+/// loop, including the zero-trip one. Null fills and multi-line headers
+/// (no `)` on the line) fall back to the header-fill verdict — the
+/// conservative pre-I0129 direction.
 fn loopBodyFillAt(t: []const u8, name: []const u8, fill_col: ?usize) bool {
     const fill = fill_col orelse return false;
-    if (!isDirectAssignment(t, name, fill)) return false;
     const body_start = loopBodyStartCol(t) orelse return false;
-    return fill >= body_start;
+    if (fill >= body_start) {
+        if (isDirectAssignment(t, name, fill)) return true;
+        return findFillCallOccurrence(t, name) == fill;
+    }
+    // Between the condition's `)` and the body start only the payload and
+    // the continuation live; a fill occurrence there is a continuation
+    // fill. loopBodyStartCol returned null only when the condition does
+    // not close on this line, so the close column resolves here.
+    const cond_close = loopCondCloseCol(t) orelse return false;
+    return fill > cond_close;
 }
 
 /// Column where a loop line's body begins: past the condition's closing
@@ -3754,6 +3791,32 @@ fn skipLoopContinuation(t: []const u8, j: usize) usize {
     var after = close;
     while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
     return after;
+}
+
+/// Column range of a loop-opener line's continuation group — the span
+/// between the condition's closing `)` and the body start, where the
+/// payload capture and the `: (continuation)` live — or null when the
+/// line is not a loop opener, the condition does not close here, or the
+/// group is empty. A fill inside the group runs only after a trip
+/// completes, so it stays trip-conditional (EPH-I1178).
+const ColumnSpan = struct {
+    start: usize,
+    end: usize,
+};
+
+fn loopContinuationSpan(t: []const u8) ?ColumnSpan {
+    if (!isLoopStart(t)) return null;
+    const cond_close = loopCondCloseCol(t) orelse return null;
+    const body_start = loopBodyStartCol(t) orelse return null;
+    if (body_start <= cond_close + 1) return null;
+    return .{ .start = cond_close + 1, .end = body_start };
+}
+
+/// True when the occurrence column sits inside the continuation region
+/// (EPH-I1178).
+fn occInContinuation(cont: ?ColumnSpan, col: usize) bool {
+    const r = cont orelse return false;
+    return col >= r.start and col < r.end;
 }
 
 /// True when a whole-word `else` immediately precedes the `{` at i
@@ -4355,8 +4418,63 @@ fn nextFillCallOccurrence(t: []const u8, var_name: []const u8, s: *usize) ?usize
         }
         // Bare @memset(var / @memcpy(var destination: the `(` precedes.
         if (isBuiltinDestAt(t, pos)) return pos - 1;
+        // Fill-verdict method call on the local (`x.init(`, `x.append(`):
+        // the receiver write fills the var at the call's close
+        // (EPH-I1173). The open paren is the occurrence column, matching
+        // the call-fill shape the read-position check expects.
+        if (methodFillOpenParenAt(t, pos, var_name)) |open| return open;
     }
     return null;
+}
+
+/// Open-paren column of a fill-verdict method call on the local at
+/// `pos`: a chain rooted at the local whose last segment is `init`
+/// (`x.init(`, `env.pool.init(` — the field-init idiom), or a single-dot
+/// stdlib modifying method (`x.append(`), or null (EPH-I1173). The
+/// domains mirror the two fill-verdict detectors: hasInitCallOnVar
+/// accepts init-ended chains, hasModifyingMethodCall matches the
+/// single-dot stdlib list.
+fn methodFillOpenParenAt(t: []const u8, pos: usize, var_name: []const u8) ?usize {
+    var i = pos + var_name.len;
+    if (i >= t.len or t[i] != '.') return null;
+    var chain_len: usize = 0;
+    var last_seg: []const u8 = "";
+    while (i < t.len and t[i] == '.') {
+        chain_len += 1;
+        i += 1;
+        const seg_start = i;
+        i = skipFieldName(t, i);
+        last_seg = t[seg_start..i];
+    }
+    if (i >= t.len or t[i] != '(') return null;
+    if (mem.eql(u8, last_seg, "init")) return i;
+    if (chain_len != 1) return null;
+    for (compat.getModifyingMethodPatterns()) |pattern| {
+        if (pattern.len < 3) continue;
+        if (pattern[0] != '.' or pattern[pattern.len - 1] != '(') continue;
+        if (mem.eql(u8, pattern[1 .. pattern.len - 1], last_seg)) return i;
+    }
+    return null;
+}
+
+/// True when the line's method call on the local is one the fill-verdict
+/// layer already models as a fill at statement precision: `x.init()`
+/// (chain-rooted) or a marker call carrying `&x` (EPH-I1173). The
+/// whole-function drop covers the other method calls the fill layer
+/// cannot classify — including the stdlib modifying methods, whose
+/// loop-carried fills regressed the corpus (ghostty uucode grapheme.zig
+/// `table.set(...)` inside comptime loops: the fill read as
+/// trip-conditional and the return fired an FP). Narrowing the drop for
+/// those keeps the corpus-clean boundary; the modifying-method FN stays
+/// the accepted residual (EPH-I1173 record).
+fn isMethodFillLine(t: []const u8, var_name: []const u8) bool {
+    if (hasInitCallOnVar(t, var_name)) return true;
+    // A marker call carrying `&x` keeps the address-of fill treatment;
+    // a stdlib modifying method stays under the drop (EPH-I1173 record:
+    // the ghostty grapheme.zig corpus regression).
+    return hasMethodCallOnVar(t, var_name) and
+        !hasModifyingMethodCall(t, var_name) and
+        findFillCallOccurrence(t, var_name) != null;
 }
 
 /// Column of the open paren of the first fill-CALL targeting var_name, or
@@ -4676,6 +4794,13 @@ fn recordLineFills(
     gen_sets: *GenSets,
 ) void {
     const t = mem.trim(u8, ctx.lines[idx], " \t\r");
+    // A loop-opener line's continuation group (`while (c) : (fill) {`):
+    // the fill runs only after a trip completes, so it never covers the
+    // zero-trip path. The header block must not gen it — a gen would
+    // flow down the false edge and silence the post-loop read
+    // (EPH-I1178). The FillScan layer defers the same positions
+    // (loopBodyFillAt), so the occurrence skip here is its CFG twin.
+    const cont_region = loopContinuationSpan(t);
     var any = false;
     var scan = AssignmentScanCtx{
         .cls = LineClassifier.init(t),
@@ -4683,6 +4808,7 @@ fn recordLineFills(
     };
     var occ_s: usize = 0;
     while (nextAssignmentOccurrence(t, var_name, &occ_s, &scan)) |occ_col| {
+        if (occInContinuation(cont_region, occ_col)) continue;
         any = true;
         recordGenEffect(ctx, .{
             .idx = idx,
@@ -4692,6 +4818,7 @@ fn recordLineFills(
     }
     occ_s = 0;
     while (nextFillCallOccurrence(t, var_name, &occ_s)) |open_col| {
+        if (occInContinuation(cont_region, open_col)) continue;
         any = true;
         recordGenEffect(ctx, .{
             .idx = idx,
@@ -4715,6 +4842,7 @@ fn recordLineFills(
 fn computeGenSetForVar(
     ctx: *const DefAssignCtx,
     var_name: []const u8,
+    shadow: ?LineSpan,
 ) !GenSets {
     const gen = try ctx.allocator.alloc(bool, ctx.num_blocks);
     errdefer ctx.allocator.free(gen);
@@ -4729,21 +4857,33 @@ fn computeGenSetForVar(
         const actual_line = ctx.func_line + idx;
         const t = mem.trim(u8, line, " \t\r");
         tracker.checkForStart(t, ctx.cfg, actual_line, idx);
+        // A payload-shadow span's fills are the payload's own: they must
+        // not credit the tracked var (EPH-I1175). The loop tracker state
+        // still updates so the nesting carries across the span.
+        if (inShadowSpan(shadow, idx)) {
+            tracker.checkLoopEnd(t, idx);
+            continue;
+        }
         tracker.checkIndexedAssign(t, var_name, gen, first_effect);
         tracker.checkLoopEnd(t, idx);
 
-        // isAssignmentTarget slices at pos without verifying the name is
-        // there, so the caller must establish it (with a word boundary).
-        const is_direct_assign = mem.startsWith(u8, t, var_name) and
-            (t.len == var_name.len or !isIdent(t[var_name.len])) and
-            isAssignmentTarget(t, var_name, 0);
-        const assigns_var = is_direct_assign or
-            isFillPattern(t, var_name) or
-            hasAddressOfVar(t, var_name);
-        if (!assigns_var) continue;
+        if (!lineFillsVar(t, var_name)) continue;
         recordLineFills(ctx, idx, var_name, &gen_sets);
     }
     return gen_sets;
+}
+
+/// True when the line fills the var: a line-start direct assignment, a
+/// fill pattern, or an address-of occurrence. isAssignmentTarget slices
+/// at pos without verifying the name is there, so the caller must
+/// establish it (with a word boundary).
+fn lineFillsVar(t: []const u8, var_name: []const u8) bool {
+    const is_direct_assign = mem.startsWith(u8, t, var_name) and
+        (t.len == var_name.len or !isIdent(t[var_name.len])) and
+        isAssignmentTarget(t, var_name, 0);
+    return is_direct_assign or
+        isFillPattern(t, var_name) or
+        hasAddressOfVar(t, var_name);
 }
 
 /// Check if a line takes the address of a variable (&var_name)
@@ -4780,11 +4920,19 @@ fn hasAddressOfVar(t: []const u8, var_name: []const u8) bool {
 /// analysis. A `&var` call argument stays trackable — the call-fill
 /// heuristic covers it at statement precision (EPH-I0102).
 fn hasUntrackableAddressOf(t: []const u8, var_name: []const u8) bool {
+    return firstUntrackableAddressOfCol(t, var_name) != null;
+}
+
+/// Column of the first untrackable `&var_name` occurrence in `t`, or
+/// null: the address escapes without passing through a call argument
+/// (EPH-I1174). The column lets the read scan split a same-line read
+/// before the escape from the suppressed post-escape window.
+fn firstUntrackableAddressOfCol(t: []const u8, var_name: []const u8) ?usize {
     // One classifier walk per line (EPH-I0153): candidates ascend.
     var cls = LineClassifier.init(t);
     var search_start: usize = 0;
     while (search_start + 1 + var_name.len <= t.len) {
-        const amp_rel = mem.indexOf(u8, t[search_start..], "&") orelse return false;
+        const amp_rel = mem.indexOf(u8, t[search_start..], "&") orelse return null;
         const pos = search_start + amp_rel;
         search_start = pos + 1;
 
@@ -4800,9 +4948,9 @@ fn hasUntrackableAddressOf(t: []const u8, var_name: []const u8) bool {
         if (cls.isInsideString(pos)) continue;
         if (findCommentStart(t[0..pos]) != null) continue;
 
-        if (!isInsideCallArg(t, pos)) return true;
+        if (!isInsideCallArg(t, pos)) return pos;
     }
-    return false;
+    return null;
 }
 
 /// True when every byte of `s` is an identifier character (EPH-I0339).
@@ -5146,13 +5294,16 @@ fn analyzeDefiniteAssignment(
     defer undef_vars.deinit();
     if (undef_vars.count() == 0) return issues;
 
-    try removeAddressOfVars(allocator, &undef_vars, lines);
-    if (undef_vars.count() == 0) return issues;
+    // Address-escape tail windows (EPH-I1174) and payload-shadow spans
+    // (EPH-I1175): keys are the undef_vars keys, borrowed for the
+    // analysis's lifetime.
+    var escapes = std.StringHashMap(EscapePoint).init(allocator);
+    defer escapes.deinit();
+    var shadows = std.StringHashMap(LineSpan).init(allocator);
+    defer shadows.deinit();
+    try collectReadWindows(&undef_vars, &escapes, &shadows, lines);
 
     try removeIndirectlyInitVars(allocator, &undef_vars, lines);
-    if (undef_vars.count() == 0) return issues;
-
-    try removePayloadShadowedVars(allocator, &undef_vars, lines);
     if (undef_vars.count() == 0) return issues;
 
     const num_blocks = cfg.blocks.items.len;
@@ -5173,35 +5324,72 @@ fn analyzeDefiniteAssignment(
     while (var_iter.next()) |entry| {
         const var_name = entry.key_ptr.*;
         const var_line = entry.value_ptr.*;
-        try checkVarDefiniteAssignment(&da_ctx, var_name, var_line, &issues);
+        const win: VarReadWindows = .{
+            .name = var_name,
+            .line = var_line,
+            .suppression = .{
+                .escape = escapes.get(var_name),
+                .shadow = shadows.get(var_name),
+            },
+        };
+        try checkVarDefiniteAssignment(&da_ctx, win, &issues);
     }
 
     return issues;
 }
 
-/// Remove vars whose address escapes untracked (`const p = &x;`,
-/// `return &x;`) — writes through the escaped pointer can't be tracked.
-/// A `&var` call argument stays tracked: the call-fill heuristic covers
-/// it at statement precision (EPH-I0102).
-fn removeAddressOfVars(
-    allocator: Allocator,
-    undef_vars: *std.StringHashMap(usize),
+/// Record each var's first untrackable address escape (`const p = &x;`,
+/// `return &x;`): the body-line index and the `&` column. Writes through
+/// the escaped pointer are invisible to the fill analysis, so reads at
+/// or after the escape point stay suppressed; reads before it are
+/// analyzable (EPH-I1174 — the former whole-function drop narrowed to
+/// the post-escape window). A `&var` call argument stays tracked: the
+/// call-fill heuristic covers it at statement precision (EPH-I0102).
+const EscapePoint = struct {
+    idx: usize,
+    col: usize,
+};
+
+/// Fill both per-variable read-window maps for the still-tracked vars:
+/// the address-escape tail windows (EPH-I1174) and the payload-shadow
+/// spans (EPH-I1175). An unbounded payload shape keeps the
+/// whole-function drop inside collectPayloadShadowSpans.
+fn collectReadWindows(
+    undef_vars: *const std.StringHashMap(usize),
+    escapes: *std.StringHashMap(EscapePoint),
+    shadows: *std.StringHashMap(LineSpan),
     lines: []const []const u8,
 ) !void {
-    var remove = std.ArrayListUnmanaged([]const u8).empty;
-    defer remove.deinit(allocator);
+    try collectAddressEscapes(undef_vars, escapes, lines);
+    try collectPayloadShadowSpans(undef_vars, shadows, lines);
+}
+
+fn collectAddressEscapes(
+    undef_vars: *const std.StringHashMap(usize),
+    escapes: *std.StringHashMap(EscapePoint),
+    lines: []const []const u8,
+) !void {
     var it = undef_vars.iterator();
     while (it.next()) |entry| {
         const vn = entry.key_ptr.*;
-        for (lines) |line| {
-            const t = mem.trim(u8, line, " \t\r");
-            if (isCommentOrMultilineString(t)) continue;
-            if (!hasUntrackableAddressOf(t, vn)) continue;
-            try remove.append(allocator, vn);
-            break;
-        }
+        if (firstAddressEscape(lines, vn)) |esc|
+            try escapes.put(vn, esc);
     }
-    for (remove.items) |vn| _ = undef_vars.remove(vn);
+}
+
+/// First untrackable `&vn` occurrence: the body-line index and the `&`
+/// column, or null when none exists (EPH-I1174).
+fn firstAddressEscape(
+    lines: []const []const u8,
+    var_name: []const u8,
+) ?EscapePoint {
+    for (lines, 0..) |line, idx| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (firstUntrackableAddressOfCol(t, var_name)) |col|
+            return .{ .idx = idx, .col = col };
+    }
+    return null;
 }
 
 /// Remove vars initialized via method call, asm, or comptime field.
@@ -5226,11 +5414,18 @@ fn removeIndirectlyInitVars(
 /// Canonical (zig fmt) spacing puts spaces around bitwise-or operands, so
 /// the adjacent-pipe form is a binding, not `a | x | z`.
 fn hasPayloadBinding(t: []const u8, var_name: []const u8) bool {
+    return payloadBindingCol(t, var_name) != null;
+}
+
+/// Column of the first payload binding of var_name in `t`, or null
+/// (EPH-I1175). The binding shadows the tracked var only inside its own
+/// body scope.
+fn payloadBindingCol(t: []const u8, var_name: []const u8) ?usize {
     // One classifier walk per line (EPH-I0153): candidates ascend.
     var cls = LineClassifier.init(t);
     var s: usize = 0;
     while (s + 1 + var_name.len <= t.len) {
-        const pipe_rel = mem.indexOf(u8, t[s..], "|") orelse return false;
+        const pipe_rel = mem.indexOf(u8, t[s..], "|") orelse return null;
         const pos = s + pipe_rel;
         s = pos + 1;
         if (pos + 1 + var_name.len > t.len) continue;
@@ -5240,35 +5435,130 @@ fn hasPayloadBinding(t: []const u8, var_name: []const u8) bool {
         if (t[end] != '|' and t[end] != ',') continue;
         if (cls.isInsideString(pos)) continue;
         if (findCommentStart(t[0..pos]) != null) continue;
-        return true;
+        return pos;
     }
-    return false;
+    return null;
 }
 
-/// Remove vars whose name is also introduced by a payload binding
-/// (`for (xs) |x|`, `if (opt) |x|`): the payload shadows the tracked var,
-/// so its uses are ambiguous with the var's own — the name-keyed analysis
-/// cannot separate them (EPH-I0102). Dropping keeps the conservative
-/// direction: silence, never a false positive.
-fn removePayloadShadowedVars(
-    allocator: Allocator,
-    undef_vars: *std.StringHashMap(usize),
+/// Body-line span (inclusive) where the payload binding at bind_idx
+/// shadows var_name, or null when the shape is not confidently bounded —
+/// the caller then keeps the whole-function drop, the fail-safe
+/// direction (EPH-I1175). Only for/while/if opener lines admit the walk;
+/// an else-line binding (the post-payload chain form) falls back.
+const LineSpan = struct {
+    from_idx: usize,
+    to_idx: usize,
+};
+
+/// True when body-line idx sits inside the payload-shadow span.
+fn inShadowSpan(span: ?LineSpan, idx: usize) bool {
+    const s = span orelse return false;
+    return idx >= s.from_idx and idx <= s.to_idx;
+}
+
+fn payloadShadowEnd(lines: []const []const u8, bind_idx: usize) ?usize {
+    const t = mem.trim(u8, lines[bind_idx], " \t\r");
+    if (!isControlOpenerLineStart(t)) return null;
+    const braces = braceCountOnLine(t);
+    if (braces.opens > 0) {
+        // Braced body: one-line when the close nets the depth to zero on
+        // this line, otherwise the walk tracks depth to the close.
+        const depth = braces.opens -| braces.closes;
+        if (depth == 0) return bind_idx;
+        return braceCloseLine(lines, bind_idx + 1, depth);
+    }
+    // No brace on the binding line: an Allman opener, a brace-less
+    // one-line body, or a brace-less next-line body.
+    return payloadBracelessEnd(lines, bind_idx + 1);
+}
+
+/// Line of the `}` that brings the walk depth to zero, or null when the
+/// braces never balance (EPH-I1175).
+fn braceCloseLine(
+    lines: []const []const u8,
+    from_idx: usize,
+    initial_depth: usize,
+) ?usize {
+    var depth = initial_depth;
+    var j = from_idx;
+    while (j < lines.len) : (j += 1) {
+        const body = mem.trim(u8, lines[j], " \t\r");
+        if (isCommentOrMultilineString(body)) continue;
+        const bc = braceCountOnLine(body);
+        if (bc.opens >= bc.closes) depth += bc.opens;
+        if (bc.closes >= bc.opens) depth -|= bc.closes;
+        if (depth == 0) return j;
+    }
+    return null;
+}
+
+/// End line of a brace-less payload body: the statement on the first
+/// code line after the binding (possibly spanning lines), or an Allman
+/// brace's close — null when the shape is not bounded, the fail-safe
+/// fallback (EPH-I1175).
+fn payloadBracelessEnd(lines: []const []const u8, from_idx: usize) ?usize {
+    var j = from_idx;
+    while (j < lines.len) : (j += 1) {
+        const body = mem.trim(u8, lines[j], " \t\r");
+        if (isCommentOrMultilineString(body)) continue;
+        if (mem.startsWith(u8, body, "{"))
+            return braceCloseLine(lines, j, 0);
+        var pdepth: usize = 0;
+        var mode: QuoteMode = .none;
+        if (scanLineForStatementEnd(body, 0, &pdepth, &mode) != null) return j;
+        var k = j + 1;
+        while (k < lines.len) : (k += 1) {
+            const bk = mem.trim(u8, lines[k], " \t\r");
+            if (isCommentOrMultilineString(bk)) continue;
+            if (scanLineForStatementEnd(bk, 0, &pdepth, &mode) != null) return k;
+        }
+        return null;
+    }
+    return null;
+}
+
+/// True when the line starts a for/while/if opener (optionally inline or
+/// labeled): the payload-shadow span walk admits only these shapes
+/// (EPH-I1175). Else-line chains and other payload sites fall back to
+/// the whole-function drop. The full-line check runs before the label
+/// strip, so a continuation colon (`while (c) : (...)`) never misparses.
+fn isControlOpenerLineStart(t: []const u8) bool {
+    var rest = t;
+    if (mem.startsWith(u8, rest, "inline ")) rest = rest["inline ".len..];
+    if (isBranchOpener(rest)) return true;
+    // Labeled forms: `lbl: for (...)`.
+    const colon = mem.indexOfScalar(u8, rest, ':') orelse return false;
+    const after = mem.trimStart(u8, rest[colon + 1 ..], " \t");
+    return isBranchOpener(after);
+}
+
+/// True when the line starts a plain for/while/if opener.
+fn isBranchOpener(t: []const u8) bool {
+    return mem.startsWith(u8, t, "for ") or mem.startsWith(u8, t, "for(") or
+        mem.startsWith(u8, t, "while ") or mem.startsWith(u8, t, "while(") or
+        mem.startsWith(u8, t, "if ") or mem.startsWith(u8, t, "if(");
+}
+
+/// Record each var's payload-shadow span: the body-line range where the
+/// binding shadows the tracked name (EPH-I1175). An unbounded shape
+/// keeps the whole-function drop.
+fn collectPayloadShadowSpans(
+    undef_vars: *const std.StringHashMap(usize),
+    shadows: *std.StringHashMap(LineSpan),
     lines: []const []const u8,
 ) !void {
-    var remove = std.ArrayListUnmanaged([]const u8).empty;
-    defer remove.deinit(allocator);
     var it = undef_vars.iterator();
     while (it.next()) |entry| {
         const vn = entry.key_ptr.*;
-        for (lines) |line| {
+        for (lines, 0..) |line, idx| {
             const t = mem.trim(u8, line, " \t\r");
             if (isCommentOrMultilineString(t)) continue;
-            if (!hasPayloadBinding(t, vn)) continue;
-            try remove.append(allocator, vn);
+            if (payloadBindingCol(t, vn) == null) continue;
+            const end = payloadShadowEnd(lines, idx) orelse break;
+            try shadows.put(vn, .{ .from_idx = idx, .to_idx = end });
             break;
         }
     }
-    for (remove.items) |vn| _ = undef_vars.remove(vn);
 }
 
 /// True when the variable is initialized indirectly anywhere in the
@@ -5287,7 +5577,15 @@ fn isIndirectlyInitialized(
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        if (hasMethodCallOnVar(t, vn)) return true;
+        // A method call that the fill-verdict layer already models as a
+        // fill at statement precision (`x.init()` or a marker call
+        // carrying `&x`) keeps that treatment instead of the
+        // whole-function drop (EPH-I1173). An unknown method
+        // (`x.setup()`) and the stdlib modifying methods may still
+        // initialize through self, so the drop covers them (the
+        // modifying-method FN is the documented residual).
+        if (hasMethodCallOnVar(t, vn) and !isMethodFillLine(t, vn))
+            return true;
         if (hasAsmOutputVar(t, vn)) return true;
         if (field_scan.step(t, vn)) return true;
         if (hasSlicePassToFunction(t, vn)) return true;
@@ -5535,13 +5833,30 @@ fn readIsUncovered(sc: *const ReadScanCtx, var_name: []const u8, idx: usize) boo
     return true;
 }
 
+/// Read-window suppressions for one variable: the address-escape tail
+/// window (EPH-I1174) and the payload-shadow interior span (EPH-I1175).
+/// Reads inside either are untrackable or ambiguous, so they stay
+/// suppressed; reads outside are analyzable.
+const ReadSuppression = struct {
+    escape: ?EscapePoint = null,
+    shadow: ?LineSpan = null,
+};
+
+/// The per-variable read-scan inputs: the name, the decl line, and the
+/// suppression windows.
+const VarReadWindows = struct {
+    name: []const u8,
+    line: usize,
+    suppression: ReadSuppression = .{},
+};
+
 /// Run data flow analysis for one variable.
 fn checkVarDefiniteAssignment(
     ctx: *const DefAssignCtx,
-    var_name: []const u8,
-    var_line: usize,
+    win: VarReadWindows,
     issues: *std.StringHashMap(usize),
 ) !void {
+    const var_name = win.name;
     const def_entry = try ctx.allocator.alloc(bool, ctx.num_blocks);
     defer ctx.allocator.free(def_entry);
     const def_exit = try ctx.allocator.alloc(bool, ctx.num_blocks);
@@ -5549,7 +5864,10 @@ fn checkVarDefiniteAssignment(
     @memset(def_entry, false);
     @memset(def_exit, false);
 
-    var gen_sets = try computeGenSetForVar(ctx, var_name);
+    // A payload-shadow span suppresses both the read side (the payload's
+    // uses are ambiguous) and the gen side (a payload assignment must
+    // not credit the tracked var) — EPH-I1175.
+    var gen_sets = try computeGenSetForVar(ctx, var_name, win.suppression.shadow);
     defer gen_sets.deinit(ctx.allocator);
 
     // The early-return suppressor memo: one O(lines) build per variable
@@ -5586,13 +5904,55 @@ fn checkVarDefiniteAssignment(
         .first_effect = gen_sets.first_effect,
         .early_returns = &er_memo,
     };
+    try scanVarReads(ctx, win, &sc, issues);
+}
+
+/// Walk the body lines for the first uncovered read of the var and
+/// record it. The suppression windows bound the walk: the address-escape
+/// tail stops it, the payload-shadow span skips (EPH-I1174, EPH-I1175).
+fn scanVarReads(
+    ctx: *const DefAssignCtx,
+    win: VarReadWindows,
+    sc: *const ReadScanCtx,
+    issues: *std.StringHashMap(usize),
+) !void {
     for (ctx.lines, 0..) |_, idx| {
         const al = ctx.func_line + idx;
-        if (al <= var_line) continue;
-        if (!readIsUncovered(&sc, var_name, idx)) continue;
-        try issues.put(var_name, al);
+        if (al <= win.line) continue;
+        const wv = windowVerdict(win, ctx, idx);
+        if (wv == .stop) break;
+        if (wv == .skip) continue;
+        if (!readIsUncovered(sc, win.name, idx)) continue;
+        try issues.put(win.name, al);
         break;
     }
+}
+
+/// Read-scan verdict for one body line under the suppression windows:
+/// stop past the address-escape tail (EPH-I1174), skip inside the
+/// payload-shadow span (EPH-I1175), else scan.
+const WindowVerdict = enum { scan, skip, stop };
+
+fn windowVerdict(
+    win: VarReadWindows,
+    ctx: *const DefAssignCtx,
+    idx: usize,
+) WindowVerdict {
+    if (win.suppression.escape) |esc| {
+        // Reads at or after the escape stay suppressed — writes through
+        // the escaped pointer are invisible. A read before the `&` on
+        // the escape line stays analyzable.
+        if (idx > esc.idx) return .stop;
+        if (idx == esc.idx) {
+            const t = mem.trim(u8, ctx.lines[idx], " \t\r");
+            const read_col = firstVarReadPos(t, win.name) orelse return .stop;
+            if (read_col >= esc.col) return .stop;
+        }
+    }
+    if (win.suppression.shadow) |span| {
+        if (idx >= span.from_idx and idx <= span.to_idx) return .skip;
+    }
+    return .scan;
 }
 
 /// Check if a variable read at `read_idx` is inside an if-block whose condition
@@ -5708,7 +6068,8 @@ fn isZeroTripGuardCovered(
 }
 
 /// Span of the loop whose trip counter `counter` increments: the opener
-/// line and the line after its closing `}` (the body end).
+/// line and the first line AFTER its body (the body end is exclusive —
+/// a one-line body ends at the opener's next line).
 const CounterLoop = struct {
     loop_idx: usize,
     body_end: usize,
@@ -5744,23 +6105,102 @@ fn loopIncrementSpan(
     counter: []const u8,
 ) ?usize {
     const t = mem.trim(u8, lines[loop_idx], " \t\r");
-    // Fail closed on brace-less loops: the body-end walk stops at the
-    // first standalone `}`, which for a brace-less loop is an enclosing
-    // block's close — the overextended span would hide a counter write
-    // after the real body and the suppressor would silence a read the
-    // zero-trip path reaches unfilled. Only a control `{` at the body
-    // start admits the walk; an Allman opener (brace on its own line)
-    // rides along excluded — a missed suppression, the safe direction.
+    // Fail closed on shapes the walk cannot bound: an Allman opener
+    // (brace on its own line) and a multi-line condition (loopBodyStartCol
+    // returns null on the opener) are missed suppressions — the warning
+    // fires on a covered read, the safe direction (EPH-I1177 documents
+    // the exclusion). Only a control `{` at the body start or a
+    // brace-less single statement admits the walk. The returned end is
+    // EXCLUSIVE: the first line after the body (the fill scan's window
+    // is [loop_idx + 1, body_end) and the outside-write check starts at
+    // body_end).
     const body_start = loopBodyStartCol(t) orelse return null;
-    if (body_start >= t.len or t[body_start] != '{') return null;
     var found_inc = lineHasIncrement(t, counter);
+    const ctx: LoopWalkCtx = .{
+        .lines = lines,
+        .guard_idx = guard_idx,
+        .counter = counter,
+        .t = t,
+        .body_start = body_start,
+    };
+    if (body_start < t.len and t[body_start] == '{') {
+        // One-line braced body: the loop completes on the opener line.
+        // The former walk ran past it to the next standalone `}` — an
+        // enclosing block's close — and swallowed the post-loop lines
+        // into the span (EPH-I1177). hasOnelineLoopClose carries the
+        // quote-masked whole-line close walk (EPH-I0789).
+        if (hasOnelineLoopClose(t))
+            return endOrNull(found_inc, loop_idx + 1);
+        return bracedLoopBodyEnd(ctx, loop_idx, &found_inc);
+    }
+    return bracelessLoopBodyEnd(ctx, loop_idx, &found_inc);
+}
+
+/// The span-end verdict: the line when the increment was seen, else the
+/// fail-closed null (EPH-I1177).
+fn endOrNull(found: bool, line: usize) ?usize {
+    return if (found) line else null;
+}
+
+/// Walk inputs for the loop-body span walks (EPH-I1177).
+const LoopWalkCtx = struct {
+    lines: []const []const u8,
+    guard_idx: usize,
+    counter: []const u8,
+    t: []const u8,
+    body_start: usize,
+};
+
+/// End line (exclusive) of a braced loop body: the first standalone `}`
+/// after the opener. found_inc carries the increment-seen state
+/// (EPH-I1177).
+fn bracedLoopBodyEnd(
+    ctx: LoopWalkCtx,
+    loop_idx: usize,
+    found_inc: *bool,
+) ?usize {
     var j = loop_idx + 1;
-    while (j < guard_idx) : (j += 1) {
-        const body = mem.trim(u8, lines[j], " \t\r");
-        if (mem.eql(u8, body, "}")) return if (found_inc) j else null;
-        if (lineHasIncrement(body, counter)) found_inc = true;
+    while (j < ctx.guard_idx) : (j += 1) {
+        const body = mem.trim(u8, ctx.lines[j], " \t\r");
+        if (mem.eql(u8, body, "}")) return endOrNull(found_inc.*, j + 1);
+        if (lineHasIncrement(body, ctx.counter)) found_inc.* = true;
     }
     return null;
+}
+
+/// End line (exclusive) of a brace-less loop body: the single statement
+/// on the opener line, or on the statement line(s) that follow. The
+/// statement-end walk stops at the body's own `;`, so a write after the
+/// body stays outside the span and breaks the correlation (the B100 r1
+/// F1 shape). An Allman brace on the next line stays excluded
+/// (EPH-I1177).
+fn bracelessLoopBodyEnd(
+    ctx: LoopWalkCtx,
+    loop_idx: usize,
+    found_inc: *bool,
+) ?usize {
+    if (ctx.body_start < ctx.t.len and statementEndsOnLine(ctx.t, ctx.body_start))
+        return endOrNull(found_inc.*, loop_idx + 1);
+    var depth: usize = 0;
+    var mode: QuoteMode = .none;
+    var j = loop_idx + 1;
+    while (j < ctx.guard_idx) : (j += 1) {
+        const body = mem.trim(u8, ctx.lines[j], " \t\r");
+        if (isCommentOrMultilineString(body)) continue;
+        if (mem.startsWith(u8, body, "{")) return null;
+        if (lineHasIncrement(body, ctx.counter)) found_inc.* = true;
+        _ = scanLineForStatementEnd(body, 0, &depth, &mode) orelse continue;
+        return endOrNull(found_inc.*, j + 1);
+    }
+    return null;
+}
+
+/// True when the statement starting at `start` terminates on this line
+/// (a depth-0 `;`).
+fn statementEndsOnLine(t: []const u8, start: usize) bool {
+    var depth: usize = 0;
+    var mode: QuoteMode = .none;
+    return scanLineForStatementEnd(t, start, &depth, &mode) != null;
 }
 
 /// True when a word-bounded occurrence of `name` in `t` is a one-step
@@ -5884,14 +6324,15 @@ fn isZeroCounterDecl(t: []const u8, counter: []const u8) bool {
 
 /// True when a counter write exists outside the loop body between the
 /// loop opener and the guard: such a write breaks the guard's zero
-/// reading meaning zero trips.
+/// reading meaning zero trips. body_end is exclusive — the first line
+/// after the body.
 fn counterWrittenOutsideLoop(
     lines: []const []const u8,
     loop: CounterLoop,
     guard_idx: usize,
     counter: []const u8,
 ) bool {
-    var i = loop.body_end + 1;
+    var i = loop.body_end;
     while (i < guard_idx) : (i += 1) {
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
@@ -5915,12 +6356,20 @@ fn lineWritesName(t: []const u8, name: []const u8) bool {
     return false;
 }
 
-/// True when any line inside the loop body fills `var_name`.
+/// True when any line inside the loop body fills `var_name`. body_end
+/// is exclusive; a one-line body (body_end == loop_idx + 1) fills on
+/// the opener line itself, past the body start (EPH-I1177).
 fn loopBodyFillsVar(
     lines: []const []const u8,
     loop: CounterLoop,
     var_name: []const u8,
 ) bool {
+    if (loop.body_end == loop.loop_idx + 1) {
+        const t = mem.trim(u8, lines[loop.loop_idx], " \t\r");
+        const body_start = loopBodyStartCol(t) orelse return false;
+        if (body_start >= t.len) return false;
+        return isFillPattern(t[body_start..], var_name);
+    }
     var i = loop.loop_idx + 1;
     while (i < loop.body_end) : (i += 1) {
         const t = mem.trim(u8, lines[i], " \t\r");
@@ -7703,6 +8152,10 @@ fn isReadExemptOccurrence(
     if (i > 0 and t[i - 1] == '&') return true; // fill destination
     if (i > 0 and t[i - 1] == '(' and hasAmpBeforeChain(t, i)) return true;
     if (isBuiltinDestAt(t, i)) return true;
+    // A fill-verdict method receiver (`x.init(`, `x.append(`) is the
+    // fill's own target, not a pre-fill read (EPH-I1173). An unknown
+    // method's receiver stays a read: `x.print()` reads x's value.
+    if (methodFillOpenParenAt(t, i, var_name) != null) return true;
     return isAssignmentTarget(t, var_name, i);
 }
 
@@ -67270,7 +67723,7 @@ test "definite-assignment worklist drains beyond the 2B+1 cap (EPH-I1058)" {
         .func_line = 1,
         .num_blocks = num_blocks,
         .neighbors = &nb,
-    }, "v");
+    }, "v", null);
     defer gs.deinit(allocator);
     const gen = gs.gen;
     const def_entry = try allocator.alloc(bool, num_blocks);
@@ -70044,6 +70497,136 @@ test "ZA607: braceless while body fill does not cover the zero-trip path (EPH-I0
     );
 }
 
+test "ZA607: body-position call fill defers to the CFG (EPH-I1178)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I1178 extended the EPH-I0129 deferral to fill calls at body
+    // position: `init(&x)` inside a one-line loop body is trip-
+    // conditional like the direct-assignment twin (e7), so the CFG
+    // fires on the zero-trip path.
+    const content =
+        \\fn init(p: *u32) void {
+        \\    p.* = 1;
+        \\}
+        \\fn bodyCallFill() void {
+        \\    var x: u32 = undefined;
+        \\    var i: u32 = 0;
+        \\    while (i < 3) { init(&x); }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_loop_call_body.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_loop_call_body.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: continuation fills defer to the CFG (EPH-I1178)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A continuation (`while (c) : (fill) {}`) runs only after a trip
+    // completes — never on the zero-trip path — so both the call fill
+    // and the direct fill defer to the CFG and the read fires
+    // (EPH-I1178). The CFG twin skips the continuation gens so the
+    // header block never covers the false exit.
+    const content =
+        \\fn init(p: *u32) void {
+        \\    p.* = 1;
+        \\}
+        \\fn contCallFill(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    while (c) : (init(&x)) {}
+        \\    use(x);
+        \\}
+        \\fn contDirectFill(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    while (c) : (x = 1) {}
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_loop_cont.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        2,
+        countRuleIssues(run.issues.items, "da_loop_cont.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braceless while call fill defers to the CFG (EPH-I1178)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The brace-less call fill twins the f2 direct shape: the virtual-
+    // body CFG holds the fill on the loop's true block, so the zero-trip
+    // exit leaves the post-loop read uncovered (EPH-I1178).
+    const content =
+        \\fn init(p: *u32) void {
+        \\    p.* = 1;
+        \\}
+        \\fn bracelessCallFill(c: bool) void {
+        \\    var x: u32 = undefined;
+        \\    while (c) init(&x);
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_loop_call_braceless.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_loop_call_braceless.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braceless for call fill keeps the pre-B2 attribution (EPH-I1178, documented residual)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The brace-less FOR shape defers at the FillScan layer like its
+    // direct twin, but the CFG keeps the pre-B2 attribution for
+    // brace-less for loops (no virtual body), so both the call fill and
+    // the direct fill stay silent — the fill lands on the header block
+    // and covers the false exit. The direct twin shows the same 0, so
+    // the deferral is uniform; the CFG-model gap is the documented
+    // residual (EPH-I1178).
+    const content =
+        \\fn init(p: *u32) void {
+        \\    p.* = 1;
+        \\}
+        \\fn forCallFill(items: []const u8) void {
+        \\    var x: u32 = undefined;
+        \\    for (items) |it| init(&x);
+        \\    use(x);
+        \\}
+        \\fn forDirectFill(items: []const u8) void {
+        \\    var x: u32 = undefined;
+        \\    for (items) |it| x = 1;
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_loop_call_for.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_loop_call_for.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "ZA607: zero-trip guard after an element-fill loop covers the read (EPH-I0131)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -70153,8 +70736,9 @@ test "ZA607: braceless loop body does not extend the zero-trip suppressor span (
     // block's close — and swallowed the `count = 7` line into the loop
     // span. The write then escaped the outside-loop check, the
     // suppressor silenced the read, and a path with zero trips reached
-    // it unfilled. The span now admits only braced loops, so the write
-    // breaks the correlation and the read fires.
+    // it unfilled. The span now walks brace-less bodies to their own
+    // statement end (EPH-I1177), so the write after the body breaks the
+    // correlation and the read fires.
     const content =
         \\fn useArr(a: [4]u64) void {
         \\    _ = a;
@@ -70177,6 +70761,143 @@ test "ZA607: braceless loop body does not extend the zero-trip suppressor span (
     try std.testing.expectEqual(
         1,
         countRuleIssues(run.issues.items, "da_zt_braceless.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braceless next-line loop admits the zero-trip suppressor (EPH-I1177)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I1177 extended the body-end walk to brace-less loops with
+    // statement-end detection: the single-statement span ends at the
+    // body's own `;`, so the suppressor proves the guard covers the
+    // read and the warning goes away. The former fail-closed gate
+    // over-warned on this covered read.
+    const content =
+        \\fn useArr(a: [4]u64) void {
+        \\    _ = a;
+        \\}
+        \\fn bracelessNextLine(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var arr: [4]u64 = undefined;
+        \\    {
+        \\        while (c) : (count += 1)
+        \\            arr[count] = 1;
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(arr);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_braceless_guard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_zt_braceless_guard.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braceless one-line loop admits the zero-trip suppressor (EPH-I1177)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The one-line brace-less body spans the opener line itself, and
+    // the fill scan covers the opener's body region (EPH-I1177). The
+    // direct body fill reaches the suppressor (an element store would
+    // win earlier in the FillScan layer).
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn bracelessOneLine(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    {
+        \\        while (c) : (count += 1) x = 1;
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_braceless_oneline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_zt_braceless_oneline.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: one-line braced loop admits the zero-trip suppressor (EPH-I1177)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A braced loop whose body completes on the opener line ends its
+    // span there. The former walk ran past it to the next standalone
+    // `}` — past the guard — and the span walk returned null, so the
+    // suppressor refused and the covered read over-warned (EPH-I1177).
+    // The direct body fill reaches the suppressor (an element store
+    // would win earlier in the FillScan layer).
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn onelineBraced(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    while (c) : (count += 1) { x = 1; }
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_oneline_braced.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_zt_oneline_braced.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: Allman loop opener keeps the missed suppression (EPH-I1177, documented residual)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The Allman opener (brace on its own line) stays outside the span
+    // walk: loopBodyStartCol ends at the opener line and the walk admits
+    // no brace on a later line. The covered read over-warns — a missed
+    // suppression, the fail-safe direction documented at
+    // loopIncrementSpan (EPH-I1177).
+    const content =
+        \\fn useArr(a: [4]u64) void {
+        \\    _ = a;
+        \\}
+        \\fn allmanLoop(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var arr: [4]u64 = undefined;
+        \\    while (c)
+        \\    {
+        \\        count += 1;
+        \\        arr[count] = 1;
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(arr);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_allman.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_zt_allman.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 
@@ -77673,19 +78394,18 @@ test "ZA607: read in an earlier argument than the fill destination is detected (
     );
 }
 
-test "ZA607: init-call vars keep their dropped verdict" {
+test "ZA607: init-call fill is statement-precise (EPH-I1173)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Pinned, not fixed (EPH-I0102 scope decision): removeIndirectlyInitVars
-    // drops every var with a method call, because an unknown `x.setup(...)`
-    // may initialize x. Statement-precise `x.init()` would require narrowing
-    // that filter to known fill methods, which trades these FNs for FPs on
-    // genuine init methods the analyzer cannot know. The FN remainder is
-    // tracked in EPH-I1173 (band-T03 F3, EPH-I1101 split remainder:
-    // statement-precise init narrowing).
+    // EPH-I1173 narrowed the init-call drop: a method call the
+    // fill-verdict layer already models as a fill (`x.init()`) keeps the
+    // statement-precise fill treatment instead of the whole-function
+    // drop. The read before the call fires; the read after it observes
+    // the filled value and stays silent. The former pin (EPH-I0102) held
+    // both silent — the use-then-init FN this test now recovers.
     const content =
         \\const Box = struct {
         \\    fn init() Box {
@@ -77706,8 +78426,70 @@ test "ZA607: init-call vars keep their dropped verdict" {
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
-        0,
+        1,
         countRuleIssues(run.issues.items, "da_fc_init.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: unknown method call keeps the whole-function drop (EPH-I1173)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The narrowing covers only the init-call and marker-call set: an
+    // unknown `x.setup()` may initialize through self, so the drop still
+    // covers the var and the read stays silent (EPH-I1173).
+    const content =
+        \\const Box = struct {
+        \\    fn setup() Box {
+        \\        return .{};
+        \\    }
+        \\};
+        \\fn useThenSetup() void {
+        \\    var b: Box = undefined;
+        \\    use(b); b.setup();
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_unknown_init.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_unknown_init.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: modifying method call keeps the whole-function drop (EPH-I1173, documented residual)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The stdlib modifying methods (`x.set(`) stay under the
+    // whole-function drop: narrowing them fired a corpus FP (ghostty
+    // uucode grapheme.zig table.set(...) inside comptime loops read as
+    // trip-conditional and the return over-warned). The drop keeps the
+    // corpus-clean boundary; the use-then-set FN stays the accepted
+    // residual (EPH-I1173).
+    const content =
+        \\const Table = struct {
+        \\    fn set(self: *Table, v: u32) void {
+        \\        _ = self;
+        \\        _ = v;
+        \\    }
+        \\};
+        \\fn useThenSet() void {
+        \\    var table: Table = undefined;
+        \\    use(table); table.set(1);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_mod_method.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_mod_method.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 
@@ -77840,17 +78622,17 @@ test "ZA607: fill-call then read on later lines is silent" {
     );
 }
 
-test "ZA607: address-escape var stays dropped" {
+test "ZA607: pre-escape read fires, post-escape window suppresses (EPH-I1174)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Pinned (EPH-I0102): `const p = &x;` lets the pointer escape — writes
-    // through p are untrackable, so removeAddressOfVars still drops the
-    // var. Only `&x` call arguments (the fill-call heuristic) stay
-    // trackable. The pre-escape read FN is tracked in EPH-I1174
-    // (band-T03 F3, EPH-I1101 split remainder: pre-escape reads).
+    // EPH-I1174 narrowed the drop to the post-escape window: `const p =
+    // &x;` lets the pointer escape — writes through p are untrackable, so
+    // reads at or after the escape stay suppressed — but the read BEFORE
+    // the escape is unambiguous and now fires. Only `&x` call arguments
+    // (the fill-call heuristic) stay fully trackable.
     const content =
         \\fn addrEscapeDrops() u32 {
         \\    var x: u32 = undefined;
@@ -77864,8 +78646,35 @@ test "ZA607: address-escape var stays dropped" {
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
-        0,
+        1,
         countRuleIssues(run.issues.items, "da_fc_escape.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: post-escape reads stay suppressed (EPH-I1174)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The post-escape window keeps the fail-safe silence: a read after
+    // the `&x` may observe a write through the escaped pointer, so it
+    // stays suppressed (EPH-I1174).
+    const content =
+        \\fn postEscapeSilent() u32 {
+        \\    var x: u32 = undefined;
+        \\    const p = &x;
+        \\    use(x);
+        \\    _ = p;
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_escape_post.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_escape_post.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 
@@ -78063,6 +78872,76 @@ test "hasInlineElseReturn anchors on the real else token (EPH-I0097)" {
     try std.testing.expect(!hasInlineElseReturn("} else {"));
 }
 
+test "ZA607: multi-else line classifies by the chain link else (EPH-I1176, documented residual)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Documented residual (EPH-I1176, the EPH-I0826 pattern):
+    // hasInlineElseReturn anchors on the FIRST else token of the line.
+    // On `} else if (d) { x = 2; } else return;` the check classifies
+    // against the chain link, so the final bare else's inline return is
+    // not marked — the both-false path then looks like it falls through
+    // to the post-chain read, which over-warns. The verdict is correct
+    // (every path either fills x or returns), so the pin locks the
+    // fail-safe over-warn: a change that silences it must carry the
+    // position-aware else classification, and a change that keeps the
+    // warning keeps the site honest.
+    const content =
+        \\fn multiElseLine(c: bool, d: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        return 0;
+        \\    } else if (d) { x = 2; } else return;
+        \\    use(x);
+        \\    return 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_multi_else.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fc_multi_else.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: return-terminal deferred close keeps the spurious merge edge (EPH-I1176, documented residual)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Documented residual (EPH-I1176, the EPH-I0826 pattern):
+    // finishPendingElse checks is_jump_terminal but not is_return when
+    // wiring the deferred close, so a return-terminal body gets a
+    // spurious sequential edge to the merge (handleBlockEnd carries the
+    // is_return check at its own close wiring). Under the AND-meet
+    // definite-assignment flow the edge is benign here — the false-path
+    // pred's undefined state keeps the meet uncovered and the read
+    // fires correctly — so the pin locks the current verdict and the
+    // mechanism comment at finishPendingElse documents the hazard.
+    const content =
+        \\fn spuriousEdgeShape(c: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (c) {
+        \\        x = 1;
+        \\        return 0;
+        \\    }
+        \\    use(x);
+        \\    return 1;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_ret_deferred.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fc_ret_deferred.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "unmatchedOpenParenBefore masks parens inside strings (EPH-I0340)" {
     // `f("(", a)`: the string's unpaired `(` used to shift the backward
     // scan onto the string's paren — the call paren was missed. The
@@ -78139,20 +79018,18 @@ test "ZA607: payload capture of a filled same-name var is silent" {
     );
 }
 
-test "ZA607: payload-shadow drop trades pre-payload reads for silence" {
+test "ZA607: payload shadow suppresses only its own body scope (EPH-I1175)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Pinned FN (EPH-I0102, reviewer-accepted): `use(x)` precedes the
-    // `|x|` binding, so this occurrence is unambiguous and genuinely
-    // unassigned — but removePayloadShadowedVars drops the var for the
-    // whole function, and the read is missed. The drop is deliberate: a
-    // payload binding anywhere makes every same-name occurrence suspect,
-    // and a wrong-fire is worse than a miss. A scope-aware payload model
-    // would recover this read. Tracked in EPH-I1175 (band-T03 F3,
-    // EPH-I1101 split remainder: scope-aware payload model).
+    // EPH-I1175 narrowed the payload-shadow drop to the shadowed body
+    // scope: `use(x)` precedes the `|x|` binding, so it is unambiguous
+    // and genuinely unassigned — the read fires. The read inside the
+    // body stays suppressed (it is the payload's), and a post-body read
+    // stays analyzable. The former pin (EPH-I0102) held the whole
+    // function silent.
     const content =
         \\fn overDrop(items: []const u32) void {
         \\    var x: u32 = undefined;
@@ -78166,8 +79043,44 @@ test "ZA607: payload-shadow drop trades pre-payload reads for silence" {
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
-        0,
+        1,
         countRuleIssues(run.issues.items, "da_fc_overdrop.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: payload-body reads and post-body reads stay split (EPH-I1175)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The scope-aware span suppresses the payload's own reads inside the
+    // body, while the read after the body names the tracked var again
+    // and fires. A payload assignment inside the body must not credit
+    // the tracked var either (the gen skip) — the post-body read stays
+    // uncovered (EPH-I1175).
+    const content =
+        \\fn bodyShadow(items: []const u32) void {
+        \\    var x: u32 = undefined;
+        \\    for (items) |x| {
+        \\        x = 5;
+        \\        use(x);
+        \\    }
+        \\}
+        \\fn postBodyRead(items: []const u32) void {
+        \\    var x: u32 = undefined;
+        \\    for (items) |x| {
+        \\        use(x);
+        \\    }
+        \\    use(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_shadow_scope.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fc_shadow_scope.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

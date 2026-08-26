@@ -23,6 +23,7 @@ const walk = @import("ast_tier_za111_walk.zig");
 const Issue = types.Issue;
 const Walker = walk.Walker;
 const CaptureRecord = walk.CaptureRecord;
+const ComptimeRange = walk.ComptimeRange;
 const insideComptime = walk.insideComptime;
 const Ast = std.zig.Ast;
 const NodeIndex = Ast.Node.Index;
@@ -43,12 +44,18 @@ const OptIndex = Ast.Node.OptionalIndex;
 // Precision policy: a chained address-of is flagged only when every hop
 // provably stays inside the stack frame. A hop through a pointer/slice
 // binding or field is caller memory (safe) when hops remain behind it;
-// an unresolvable hop is SILENT. Deferred forms: runtime-known const
-// locals (needs comptime-provenance), global-var stores, field stores
-// on non-param roots, destructured-binding chains, and the no-rebind
-// var binding shapes — hard compile errors never echoed, except the
-// element-mutated var slice binding, which compiles but stays silent
-// without a rebind (EPH-I0046).
+// an unresolvable hop is SILENT. Escape policy (EPH-I0046): an
+// out-param store and a return are escapes by construction; a
+// labeled-block value fires only when a consumer provably escapes —
+// a return of the block, an out-param store of it, or an alias chain
+// from its binding to an escape — so in-function consumption (the sig
+// merlin.zig shape) and discarded-statement blocks stay silent.
+// Deferred forms: runtime-known const locals (needs
+// comptime-provenance), global-var stores, field stores on non-param
+// roots, destructured-binding chains, and the no-rebind var binding
+// shapes — hard compile errors never echoed, except the element-mutated
+// var slice binding, which compiles but stays silent without a rebind
+// (EPH-I0046).
 
 const RULE_ZA111 = types.RULE_RETURNED_STACK_REF;
 
@@ -724,6 +731,13 @@ const ScanCtx = struct {
     tidx: *const TypeIndex,
     /// The fn body under analysis: scopes TypeIndex lookups (EPH-I0592).
     body: NodeIndex,
+    /// Value-breaks recorded by the walker, for labeled-block value
+    /// resolution (EPH-I0046): the block itself never fires — only a
+    /// consumer that provably escapes adjudicates.
+    breaks: []const NodeIndex = &.{},
+    /// Comptime expression ranges: a break inside one is static-safe
+    /// and excluded from block-value resolution (EPH-I0046).
+    comptime_ranges: []const ComptimeRange = &.{},
 };
 
 /// Phase 2: pointer aliases (`const p = &x...;` and the rebound `var p`
@@ -910,17 +924,22 @@ fn peelCastBuiltin(tree: *const Ast, node: NodeIndex) ?NodeIndex {
 fn aliasTarget(sctx: ScanCtx, scan: *const FnScan, init: NodeIndex) ?[]const u8 {
     var e = unwrapGroup(sctx.tree, init);
     while (true) {
-        switch (sctx.tree.nodeTag(e)) {
-            .address_of => return aliasAddressTarget(sctx, scan, e),
-            .identifier => {
-                const name = sctx.tree.tokenSlice(sctx.tree.nodeMainToken(e));
-                return scan.aliasRoot(name);
-            },
-            else => {
-                e = peelCastBuiltin(sctx.tree, e) orelse return null;
-            },
+        const tag = sctx.tree.nodeTag(e);
+        if (tag == .address_of) return aliasAddressTarget(sctx, scan, e);
+        if (tag == .identifier) {
+            const name = sctx.tree.tokenSlice(sctx.tree.nodeMainToken(e));
+            return scan.aliasRoot(name);
         }
+        if (isLabeledBlockTag(tag)) return blockValueRoot(sctx, scan, e, true);
+        e = peelCastBuiltin(sctx.tree, e) orelse return null;
     }
+}
+
+fn isLabeledBlockTag(tag: Ast.Node.Tag) bool {
+    return switch (tag) {
+        .block_two, .block_two_semicolon => true,
+        else => false,
+    };
 }
 
 fn aliasAddressTarget(sctx: ScanCtx, scan: *const FnScan, amp: NodeIndex) ?[]const u8 {
@@ -983,9 +1002,12 @@ fn finalHopIsOwnSlot(sctx: ScanCtx, info: ChainInfo, bind: Bind) bool {
 // ============================================================================
 
 /// How the stack reference escapes the function (EPH-I0046): through a
-/// return, an out-param store, a labeled-block break value, or a
-/// payload-capture return. The form picks the emit message.
-const EscapeForm = enum { returned, out_param, block_break, capture };
+/// return, an out-param store, or a payload-capture return. Every form
+/// is a proven escape: the labeled-block break form does not exist —
+/// the block's value fires only when a consumer (return, out-param
+/// store, escaping alias chain) provably carries it out of the
+/// function.
+const EscapeForm = enum { returned, out_param, capture };
 
 const Finding = struct {
     /// Stack local or param the returned pointer/slice refers to.
@@ -1009,8 +1031,81 @@ fn classifyReturn(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Finding 
         .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => blk: {
             break :blk classifyBuiltinReturn(sctx, scan, e);
         },
+        .block_two, .block_two_semicolon => classifyBlockReturn(sctx, scan, e),
         else => null,
     };
+}
+
+/// A labeled block returned directly (EPH-I0046): `return blk: {
+/// break :blk &v.a; };` — the return IS the escape, so the block's
+/// resolved stack value fires. A bare `&v` break here is
+/// compiler-caught (probed on 0.16.0) and stays silent — the strict
+/// adjudication.
+fn classifyBlockReturn(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Finding {
+    const root = blockValueRoot(sctx, scan, node, false) orelse return null;
+    return .{
+        .name = root,
+        .via = null,
+        .is_slice = false,
+        .is_param = scan.paramByName(root) != null,
+    };
+}
+
+/// The stack root a labeled block's value provably points into, or
+/// null. The value comes from the block's value-breaks: when every
+/// break inside the block resolves to a stack root, the value is a
+/// stack pointer on every path (EPH-I0046). A break inside a comptime
+/// range is static-safe and excluded; any unresolvable break makes the
+/// whole block unresolvable (FN-only). The block itself never fires —
+/// only a consumer that provably escapes adjudicates, so the sig
+/// merlin.zig shape (a block value consumed in-function by a call) and
+/// a discarded-statement block stay silent.
+///
+/// `allow_bare` discriminates a compiler-caught shape per sink (probed
+/// on 0.16.0): a bare `&var` break operand is caught by Sema when the
+/// block feeds a direct return or an out-param store, but is the silent
+/// gap when the block feeds an alias binding the caller then returns.
+/// Direct-return and store sinks pass false; the alias machinery passes
+/// true. The field form (`&v.a`) is the silent gap at every sink.
+fn blockValueRoot(
+    sctx: ScanCtx,
+    scan: *const FnScan,
+    block: NodeIndex,
+    allow_bare: bool,
+) ?[]const u8 {
+    const block_first = sctx.tree.firstToken(block);
+    const block_last = sctx.tree.lastToken(block);
+    var found: ?[]const u8 = null;
+    for (sctx.breaks) |brk| {
+        const tok = sctx.tree.firstToken(brk);
+        if (tok < block_first or tok > block_last) continue;
+        if (insideComptime(sctx.comptime_ranges, tok)) continue;
+        const operand = sctx.tree.nodeData(brk).opt_token_and_opt_node[1].unwrap() orelse continue;
+        found = blockBreakTarget(sctx, scan, operand, allow_bare) orelse return null;
+    }
+    return found;
+}
+
+/// The stack root one labeled-block break operand points into, or null.
+/// A direct address-of operand applies the bare-&var rule for the
+/// sink's strictness; any other shape (alias identifier, nested block,
+/// cast layer) resolves through the alias machinery (EPH-I0046).
+fn blockBreakTarget(
+    sctx: ScanCtx,
+    scan: *const FnScan,
+    operand: NodeIndex,
+    allow_bare: bool,
+) ?[]const u8 {
+    const e = unwrapGroup(sctx.tree, operand);
+    if (sctx.tree.nodeTag(e) == .address_of) {
+        const info = chainInfo(sctx.tree, sctx.tree.nodeData(e).node);
+        if (info.root.len == 0) return null;
+        const bind = bindForRoot(info.root, scan) orelse return null;
+        if (info.hop_count == 0 and !allow_bare) return null;
+        if (info.hop_count > 0 and !chainIsUnsafe(sctx, info, bind)) return null;
+        return info.root;
+    }
+    return aliasTarget(sctx, scan, e);
 }
 
 /// `return @as(*u32, @ptrCast(&x));` — peel the @as/@ptrCast evasion
@@ -1234,7 +1329,7 @@ fn checkEscapeAssign(
     const root_name = assignLhsRoot(sctx.tree, lhs) orelse return;
     const param = scan.paramByName(root_name) orelse return;
     if (!param.is_pointer) return;
-    const target = aliasTarget(sctx, scan, rhs) orelse return;
+    const target = assignRhsTarget(sctx, scan, rhs) orelse return;
     try emitZa111(ctx, node, .{
         .name = target,
         .via = null,
@@ -1244,24 +1339,14 @@ fn checkEscapeAssign(
     });
 }
 
-/// Labeled-block escape (EPH-I0046): `break :blk &local;` hands a stack
-/// address to the enclosing expression as the block's value. Loop
-/// breaks carry no operand and never reach here (the walker filters).
-fn checkEscapeBreak(
-    ctx: *const Za111Ctx,
-    sctx: ScanCtx,
-    scan: *const FnScan,
-    node: NodeIndex,
-) !void {
-    const operand = sctx.tree.nodeData(node).opt_token_and_opt_node[1].unwrap() orelse return;
-    const target = aliasTarget(sctx, scan, operand) orelse return;
-    try emitZa111(ctx, node, .{
-        .name = target,
-        .via = null,
-        .is_slice = false,
-        .is_param = scan.paramByName(target) != null,
-        .escape = .block_break,
-    });
+/// The stack root an out-store rhs points into. A labeled-block rhs
+/// adjudicates strictly: a bare `&var` break feeding a store is
+/// compiler-caught (probed on 0.16.0), so only the field form and
+/// chains fire (EPH-I0046). Other shapes resolve through aliasTarget.
+fn assignRhsTarget(sctx: ScanCtx, scan: *const FnScan, rhs: NodeIndex) ?[]const u8 {
+    const e = unwrapGroup(sctx.tree, rhs);
+    if (isLabeledBlockTag(sctx.tree.nodeTag(e))) return blockValueRoot(sctx, scan, e, false);
+    return aliasTarget(sctx, scan, rhs);
 }
 
 /// Bundled inputs for the slice-binding collection (EPH-I0046): keeps
@@ -1324,7 +1409,9 @@ fn isSliceTag(tag: Ast.Node.Tag) bool {
 /// roots at the condition operand's own slot: any local or param
 /// qualifies, pointer-typed included. A for-capture roots at the
 /// input: `&arr` or a by-value provable array; slice and pointer
-/// inputs iterate caller memory.
+/// inputs iterate caller memory. Nested same-name captures resolve
+/// first-match: both roots are stack bindings, so the verdict stays
+/// true — only the named root can misattribute.
 fn collectCaptures(
     a: Allocator,
     sctx: ScanCtx,
@@ -1374,9 +1461,6 @@ fn emitZa111(ctx: *const Za111Ctx, node: NodeIndex, f: Finding) !void {
         .out_param => try std.fmt.allocPrint(ctx.a, "stored pointer to stack {s} " ++
             "'{s}' into an out parameter — its storage expires when the " ++
             "function returns", .{ what, f.name }),
-        .block_break => try std.fmt.allocPrint(ctx.a, "pointer to stack {s} " ++
-            "'{s}' escapes through a labeled block break — its storage " ++
-            "expires when the function returns", .{ what, f.name }),
         .capture => try std.fmt.allocPrint(ctx.a, "returned payload pointer refers " ++
             "to stack {s} '{s}' — its storage expires when the function " ++
             "returns", .{ what, f.name }),
@@ -1420,7 +1504,13 @@ fn analyzeOneFn(
     try walker.run(body);
     sortDeclsBySource(ctx.tree, walker.var_decls.items);
 
-    const sctx = ScanCtx{ .tree = ctx.tree, .tidx = ctx.tidx, .body = body };
+    const sctx = ScanCtx{
+        .tree = ctx.tree,
+        .tidx = ctx.tidx,
+        .body = body,
+        .breaks = walker.breaks.items,
+        .comptime_ranges = walker.comptime_ranges.items,
+    };
     var scan = FnScan{};
     defer scan.deinit(ctx.a);
     try collectParams(ctx.a, sctx, proto, &scan);
@@ -1443,10 +1533,6 @@ fn analyzeOneFn(
     for (walker.assigns.items) |asgn| {
         if (insideComptime(walker.comptime_ranges.items, ctx.tree.firstToken(asgn))) continue;
         try checkEscapeAssign(ctx, sctx, &scan, asgn);
-    }
-    for (walker.breaks.items) |brk| {
-        if (insideComptime(walker.comptime_ranges.items, ctx.tree.firstToken(brk))) continue;
-        try checkEscapeBreak(ctx, sctx, &scan, brk);
     }
 }
 

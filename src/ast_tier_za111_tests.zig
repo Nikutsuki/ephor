@@ -48,13 +48,17 @@ test "ZA111: out-param field store and by-value param stay silent (EPH-I0046)" {
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
-test "ZA111: labeled-block break escapes fire, comptime blocks stay silent (EPH-I0046)" {
+test "ZA111: labeled-block values fire only through a proven escape (EPH-I0046)" {
     const a = std.testing.allocator;
-    // The runtime break hands the stack address to the block value. The
-    // comptime block evaluates at compile time, where every local lives
-    // in constant memory — the ghostty cli/ghostty.zig shape stays
-    // silent.
+    // Sink-side adjudication: the break itself never fires — the block
+    // value must provably escape. f's binding chain escapes through the
+    // return; i returns the block directly (the field form — a bare
+    // `&v` break at a return sink is compiler-caught, probe-pinned, and
+    // never echoed). g consumes the block value in-function (the sig
+    // merlin.zig shape) and stays silent; h discards the block as a
+    // statement and stays silent; j's comptime block is static-safe.
     var issues = try runZa111(a,
+        \\const S = struct { a: u32 };
         \\fn f(x: u32) *u32 {
         \\    var v: u32 = x;
         \\    const p = blk: {
@@ -62,7 +66,29 @@ test "ZA111: labeled-block break escapes fire, comptime blocks stay silent (EPH-
         \\    };
         \\    return p;
         \\}
-        \\fn g() *u32 {
+        \\fn g(x: u32, sink: *u32) void {
+        \\    var buffer: [4]u32 = @splat(0);
+        \\    const bytes: []const u32 = switch (x) {
+        \\        0 => &[_]u32{1},
+        \\        else => b: {
+        \\            break :b &buffer;
+        \\        },
+        \\    };
+        \\    sink.* = bytes[0];
+        \\}
+        \\fn h(x: u32) void {
+        \\    var v: u32 = x;
+        \\    blk: {
+        \\        break :blk &v;
+        \\    }
+        \\}
+        \\fn i(x: u32) *u32 {
+        \\    var s = S{ .a = x };
+        \\    return blk: {
+        \\        break :blk &s.a;
+        \\    };
+        \\}
+        \\fn j() *u32 {
         \\    comptime {
         \\        var v: u32 = 42;
         \\        const p = blk: {
@@ -73,8 +99,12 @@ test "ZA111: labeled-block break escapes fire, comptime blocks stay silent (EPH-
         \\}
     );
     defer types.deinitIssues(&issues, a);
-    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
-    try expectZa111(issues.items, 4, "escapes through a labeled block break");
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "returned pointer 'p'") != null);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "'v'") != null);
+    try std.testing.expectEqual(@as(usize, 7), issues.items[0].line);
+    try std.testing.expect(mem.indexOf(u8, issues.items[1].message, "'s'") != null);
+    try std.testing.expectEqual(@as(usize, 27), issues.items[1].line);
 }
 
 test "ZA111: if payload capture return fires, local and param (EPH-I0046)" {

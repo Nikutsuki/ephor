@@ -107597,6 +107597,31 @@ test "ZA110 v2: a visible field reset silences the dual-owner return (EPH-I0038)
     ) != null);
 }
 
+test "ZA110: error-value returns stay silent (EPH-I0038 corpus guard)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // `return error.OutOfMemory;` is an error VALUE, not a field path:
+    // `error` is a reserved keyword that can never name a receiver, so
+    // the dual-owner head guard silences it (the sig corpus caught the
+    // misfire — seven fires on error-union returns).
+    const content =
+        \\const std = @import("std");
+        \\fn f() !std.ArrayList(u8) {
+        \\    return error.OutOfMemory;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "za110_errorvalue.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za110_errorvalue.zig", RULE_MUST_RETURN_REF),
+    );
+}
+
 test "ZA110: self field return with exact-path armed defer fires (EPH-I0482)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};

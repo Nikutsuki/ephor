@@ -22,6 +22,7 @@ ephor.json
 
 # Temp files
 .tmp/
+.zig-cache-scratch/
 
 # Build artifacts
 *.o

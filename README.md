@@ -1383,7 +1383,6 @@ The compat layer (`src/compat/`) provides version-specific pattern vocabularies:
 |-----------|---------|-----------------|
 | `getCleanupPatterns()` | Methods that are always void | `.free(`, `.destroy(`, `.deinit(` |
 | `getSafeMethodPatterns()` | Stdlib methods safe to discard | `.clear(`, `.next(`, `.pop(` |
-| `getVoidMethodPatterns()` | Stdlib methods returning void | `.resize(`, `.shrinkRetainingCapacity(` |
 | `getContainerOwnershipMethods()` | Methods that transfer allocation ownership | `.append(`, `.put(`, `.insert(` |
 | `getStdlibContainerInitPatterns()` | Init patterns for stdlib containers | `ArrayList(`, `StringHashMap(` |
 | `getAllInitPatterns()` | Init patterns for all stdlib types including allocators | `ArenaAllocator.init(`, `FixedBufferAllocator.init(` |

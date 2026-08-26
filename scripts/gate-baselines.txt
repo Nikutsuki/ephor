@@ -4,6 +4,7 @@
 #   (the REL-GATE-2 ratchet — monotone-decreasing, zero at the release gate).
 #   Update this line only in the commit that fixes dogfood warnings.
 # tests: the minimum test count from `zig build test --summary all`
-#   (the test ratchet). Update this line only in the commit that adds tests.
+#   (the test ratchet). Update this line only in the commit that changes
+#   the test count (tests added or legitimately deleted).
 dogfood 206
 tests 2740

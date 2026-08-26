@@ -40616,6 +40616,10 @@ fn detectPathDirFromBuildZig(diag: *DiagCtx, allocator: Allocator) []const u8 {
                 "  hint: run from project root, or: ephor check <dir>\n",
             .{err},
         );
+        // The run survives this shape: the fallback installs "." as the
+        // scan root, so the printed-error latch must not keep speaking
+        // for a later unrelated failure (EPH-I1161).
+        unlatchErrorDiag(diag);
         return dupeOrEmpty(allocator, ".");
     };
 
@@ -112602,6 +112606,34 @@ test "detectPathDirFromBuildZig reads the project build.zig through diag" {
     const dir = detectPathDirFromBuildZig(&diag, allocator);
     defer allocator.free(dir);
     try std.testing.expectEqualStrings("src", dir);
+}
+
+test "detectPathDirFromBuildZig fallback unarms the printed-error latch (EPH-I1161)" {
+    // The missing-build.zig fallback survives the run (the scan root
+    // becomes "."), so its error line must not keep the printed-error
+    // latch armed for a later unrelated failure (EPH-I1161).
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // No build.zig in the fixture: the catch prints the no-build.zig
+    // line and falls back to "." — the run survives.
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    var old_buf: [Fs.max_path_bytes]u8 = undefined;
+    const old_cwd = try Fs.cwd(std.testing.io).realpath(".", &old_buf);
+    try std.Io.Threaded.chdir(dir_path);
+    defer std.Io.Threaded.chdir(old_cwd) catch {};
+
+    const dir = detectPathDirFromBuildZig(&diag, allocator);
+    defer allocator.free(dir);
+    try std.testing.expectEqualStrings(".", dir);
+    // The diagnostic printed through cliDiag (so the latch armed), and
+    // the fallback unarmed it.
+    try std.testing.expect(mem.indexOf(u8, capture.slice(), "no build.zig found") != null);
+    try std.testing.expect(!diag.error_diag_printed);
 }
 
 test "autoDetectPath normalizes a ./-spelled root_source_file (EPH-I1041)" {

@@ -11228,10 +11228,10 @@ fn isChainContinuationHeader(cfg: *const ControlFlowGraph, bid: usize) bool {
 /// arm of the continuation frees, the path that skipped the graded arm
 /// runs a second free of its own, so the pair is definite. The prefix
 /// side (the arms before the graded arm) stays the headerOnEveryPath-
-/// OrChainArmsFree walk's job (EPH-I1142). The arm scan is var-aware
-/// (spanFreesTrackedVar, the prefix discipline); the terminal else body
-/// reuses the forward gate's freePatternAfter scan (the documented
-/// forward-direction discipline).
+/// OrChainArmsFree walk's job (EPH-I1142). Every arm scan — the
+/// continuation arm and the terminal else body alike — runs through
+/// continuationBlockSpanFrees (spanFreesTrackedVar, var-aware, the
+/// reverse-gate/prefix discipline).
 fn chainContinuationAllFrees(
     ctx: *const FreeScanCtx,
     header_bid: usize,
@@ -12748,8 +12748,9 @@ const ExitFreeSpanCtx = struct {
 };
 
 /// True when any masked line in the cycle's span carries a
-/// return/try/break/continue keyword at a code position (EPH-I0116).
-/// The body scan covers every visited body block; the header scan
+/// word-bounded return/try/break/continue keyword at a code position
+/// (EPH-I0116, EPH-I1179). The body scan covers every visited body
+/// block; the header scan
 /// covers only the CONDITION lines — the header block can hold
 /// pre-loop statements before the condition (the entry block doubles
 /// as the header when the loop opens the function body), and a `try`
@@ -12840,12 +12841,38 @@ fn conditionSpanHasExitKeyword(
     return false;
 }
 
-/// True when the masked code of one line carries a return/try/break/
-/// continue keyword (EPH-I0116).
+/// True when the masked code of one line carries a word-bounded
+/// return/try/break/continue keyword (EPH-I0116). Word-bounded on
+/// BOTH sides (EPH-I1179): hasRealKeyword guards the left side only,
+/// and its trailing-space forms miss a `try` at end of line (`if (c)
+/// try` with the operand wrapped) and a bare `return;` in a
+/// multi-statement line — the two shapes that let the exit-free
+/// relaxation suppress a genuine ZA101.
 fn maskedLineHasExitKeyword(line: []const u8, blank_buf: *[16 * 1024]u8) bool {
     const code = maskedCodeLine(line, blank_buf);
-    return hasRealKeyword(code, "return ") or hasRealKeyword(code, "try ") or
-        hasRealKeyword(code, "break") or hasRealKeyword(code, "continue");
+    return hasRealWordKeyword(code, "return") or hasRealWordKeyword(code, "try") or
+        hasRealWordKeyword(code, "break") or hasRealWordKeyword(code, "continue");
+}
+
+/// True when a word-bounded `kw` sits at a code position: identifier
+/// bytes may touch neither side, so a `try` at end of line and a bare
+/// `return;` both match while `trying`/`returning` prefixes never do.
+/// String and comment positions never match (the caller's masked code
+/// is already blanked, but the guard stays self-contained, EPH-I1179).
+fn hasRealWordKeyword(code: []const u8, kw: []const u8) bool {
+    var cls = LineClassifier.init(code);
+    const comment_start = findCommentStart(code);
+    var s: usize = 0;
+    while (mem.indexOf(u8, code[s..], kw)) |rel| {
+        const pos = s + rel;
+        s = pos + kw.len;
+        if (pos > 0 and isIdent(code[pos - 1])) continue;
+        if (s < code.len and isIdent(code[s])) continue;
+        if (cls.isInsideString(pos)) continue;
+        if (comment_start != null and pos >= comment_start.?) continue;
+        return true;
+    }
+    return false;
 }
 
 /// Propagate coverage backward through CFG
@@ -27518,18 +27545,15 @@ fn negationAfterEq(t: []const u8, pos: usize) bool {
 /// markers: a fn-pointer param TYPE (`cb: *const fn () noreturn,`) sits
 /// inside the param list and never marks the outer fn. The own-line
 /// return form (`noreturn {` on its own continuation line) counts when
-/// the line's first code word is exactly `noreturn`.
+/// the line's first code token is `noreturn` followed by the body
+/// brace — the follower gate keeps a param decl carrying the keyword
+/// as a field name (`noreturn: bool,`) inside the param list
+/// (EPH-I1180).
 fn lineHasNoreturnMarker(t: []const u8, start_depth: isize) bool {
     var lit = types.LiteralState.forLine(t) orelse return false;
     var depth = start_depth;
+    if (lineStartsNoreturnBody(t)) depth = 0;
     var i: usize = 0;
-    while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
-    if (i < t.len and mem.startsWith(u8, t[i..], "noreturn") and
-        (i + "noreturn".len >= t.len or !isIdent(t[i + "noreturn".len])))
-    {
-        depth = 0;
-    }
-    i = 0;
     while (i < t.len) : (i += 1) {
         const pos = lit.updateForChar(t, i) orelse continue;
         const c = t[pos];
@@ -27543,6 +27567,20 @@ fn lineHasNoreturnMarker(t: []const u8, start_depth: isize) bool {
         return true;
     }
     return false;
+}
+
+/// True when the line's first code token is `noreturn` followed, after
+/// optional whitespace, by the body brace: the own-line return shape
+/// (EPH-I0073). A param decl carrying the keyword as a field name
+/// (`noreturn: bool,`) must not reset the carried depth — the follower
+/// gate keeps it inside the param list (EPH-I1180).
+fn lineStartsNoreturnBody(t: []const u8) bool {
+    var i: usize = 0;
+    while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
+    if (!mem.startsWith(u8, t[i..], "noreturn")) return false;
+    var p = i + "noreturn".len;
+    while (p < t.len and (t[p] == ' ' or t[p] == '\t')) p += 1;
+    return p < t.len and t[p] == '{';
 }
 
 /// Detect function start and initialize state
@@ -52788,6 +52826,57 @@ test "ZA101: exit-free inner loop between alloc and free stays silent (EPH-I0116
     );
 }
 
+test "ZA101: end-of-line try and bare return inside the loop stay loud (EPH-I1179)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // RED direction: the trailing-space keyword forms missed both exit
+    // shapes — a `try` at end of line (the operand wrapped onto the
+    // next line) and a bare `return;` in a multi-statement arm — so
+    // the exit-free relaxation suppressed a genuine ZA101. The
+    // word-bounded scan restores both; the clean control stays silent.
+    const content =
+        \\fn eol_try(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    var j: u32 = 0;
+        \\    while (j < 3) : (j += 1) {
+        \\        if (c) try
+        \\            fail();
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn mid_return(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    var j: u32 = 0;
+        \\    while (j < 3) : (j += 1) {
+        \\        if (c) { j = 9; return; }
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn clean_control(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    var j: u32 = 0;
+        \\    while (j < 3) : (j += 1) {
+        \\        if (c) {}
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn fail() !void {
+        \\    return error.Bad;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_eol_exits_101.zig", content);
+    defer run.deinit(allocator);
+
+    // eol_try and mid_return fire; clean_control stays silent.
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countRuleIssues(run.issues.items, "test_eol_exits_101.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
 test "ZA101: defer after the only return stays silent (EPH-I0348 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -53408,6 +53497,36 @@ test "ZA101/ZA103: noreturn fn skips the leak-coverage rules (EPH-I0073)" {
     try std.testing.expectEqual(
         @as(usize, 1),
         countRuleIssues(run.issues.items, "test_ml_noreturn_101.zig", RULE_DOUBLE_FREE),
+    );
+}
+
+test "ZA101: a noreturn-named param line does not exempt the fn (EPH-I1180)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // RED direction: the own-line reset accepted any non-ident
+    // follower, so `noreturn: bool,` on a continuation line read as a
+    // noreturn return and skipped ZA101/ZA103 for a need-free fn. The
+    // follower gate (the body brace) keeps the param decl inside the
+    // param list; the fn stays need-free and its leak fires.
+    const content =
+        \\fn takes_param(
+        \\    allocator: std.mem.Allocator,
+        \\    noreturn: bool,
+        \\) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    if (noreturn) return error.Bad;
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_noreturn_param_1180.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_noreturn_param_1180.zig", RULE_ALLOC_NO_DEFER),
     );
 }
 

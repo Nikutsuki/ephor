@@ -5490,12 +5490,15 @@ fn braceCloseLine(
 /// `} } else {`): the closes run before the re-open, so the span ends
 /// when they reach the walk depth — the trailing arm is NOT shadowed
 /// (EPH-I1188). A nested block's close (depth > 1 entering) updates the
-/// depth and the walk continues inside the shadowed body.
+/// depth and the walk continues inside the shadowed body: the opens add
+/// unconditionally after the closes — the net-zero convention does not
+/// apply to a close-first line, and the sum stays above zero here
+/// (closes < depth), so the primary body keeps the walk open
+/// (EPH-I1190).
 fn closeFirstLineEnds(bc: BraceLineCount, depth: *usize) bool {
     if (bc.closes >= depth.*) return true;
-    depth.* -= bc.closes;
-    if (bc.opens >= bc.closes) depth.* += bc.opens;
-    return depth.* == 0;
+    depth.* = depth.* - bc.closes + bc.opens;
+    return false;
 }
 
 /// End line of a brace-less payload body: the statement on the first
@@ -6229,11 +6232,21 @@ fn lineHasIncrement(t: []const u8, name: []const u8) bool {
     var iter = VarOccurrenceIter{ .t = t, .name = name };
     while (iter.next()) |pos| {
         const after = mem.trimStart(u8, t[pos + name.len ..], " \t");
-        if (!mem.startsWith(u8, after, "+=") and !mem.startsWith(u8, after, "+%=")) continue;
-        const rhs = mem.trim(u8, after[2..], " \t");
+        const op_len = oneStepOpLen(after) orelse continue;
+        const rhs = mem.trim(u8, after[op_len..], " \t");
         if (rhs.len > 0 and rhs[0] == '1' and (rhs.len == 1 or !isIdent(rhs[1]))) return true;
     }
     return false;
+}
+
+/// Operator length of the one-step increment forms after the var name:
+/// `+=` is 2 bytes, `+%=` is 3 — or null. The rhs slice must start past
+/// the WHOLE operator; the former fixed 2-byte slice read `+%= 1` as
+/// `= 1` and missed the one-step form (EPH-I1189).
+fn oneStepOpLen(after: []const u8) ?usize {
+    if (mem.startsWith(u8, after, "+%=")) return 3;
+    if (mem.startsWith(u8, after, "+=")) return 2;
+    return null;
 }
 
 /// True when the line carries a counter write that is not the one-step
@@ -6246,10 +6259,8 @@ fn lineHasOtherCounterWrite(t: []const u8, name: []const u8) bool {
     var iter = VarOccurrenceIter{ .t = t, .name = name };
     while (iter.next()) |pos| {
         const after = mem.trimStart(u8, t[pos + name.len ..], " \t");
-        const compound = mem.startsWith(u8, after, "+=") or
-            mem.startsWith(u8, after, "+%=");
-        if (compound) {
-            const rhs = mem.trim(u8, after[2..], " \t");
+        if (oneStepOpLen(after)) |op_len| {
+            const rhs = mem.trim(u8, after[op_len..], " \t");
             const is_one = rhs.len > 0 and rhs[0] == '1' and
                 (rhs.len == 1 or !isIdent(rhs[1]));
             if (is_one) continue;
@@ -71043,6 +71054,72 @@ test "ZA607: braceless body statement tail write breaks the correlation (EPH-I11
     );
 }
 
+test "ZA607: one-step +%= increment admits the zero-trip suppressor (EPH-I1189)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // `count +%= 1` is the wrapped-arithmetic one-step increment the
+    // trip model accepts. The former fixed 2-byte rhs slice read the
+    // `+%= 1` rhs as `= 1`, flagged the increment as an other-write,
+    // and the one-line admission failed closed on a covered read
+    // (EPH-I1189).
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn pctOne(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    {
+        \\        while (c) : (count +%= 1) { x = 1; }
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_pct_one.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_zt_pct_one.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: non-one-step +%= increment fails closed (EPH-I1189)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // `count +%= 2` is not the one-step the trip model assumes: the
+    // correlation (zero trips reads zero) breaks, the span must not
+    // admit, and the read fires (EPH-I1189).
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn pctTwo(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    {
+        \\        while (c) : (count +%= 2) { x = 1; }
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_pct_two.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_zt_pct_two.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "ZA607: Allman switch prong fill keeps the conditional verdict (EPH-I0128)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -79285,6 +79362,46 @@ test "ZA607: else-arm fill covers the read past the payload-shadow span (EPH-I11
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_fc_shadow_else_fp.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: close-dominant close-first line keeps the span inside the body (EPH-I1190)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // `} } else {` (closes 2, opens 1) inside a depth-3 payload body:
+    // the closes run first, then the opens add unconditionally, so the
+    // walk stays at depth 2 through the nested else and ends at the
+    // primary body's close — the payload read after the nested chain
+    // stays suppressed (EPH-I1190). The former net-zero convention
+    // dropped the opens and ended the span at the nested else's close,
+    // firing the payload read.
+    const content =
+        \\fn useFn(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn nestedElse(opt: ?u32, a: bool, b: bool) u32 {
+        \\    var x: u32 = undefined;
+        \\    if (opt) |x| {
+        \\        if (a) {
+        \\            if (b) {
+        \\                useFn(x);
+        \\            } } else {
+        \\            useFn(x);
+        \\        }
+        \\        useFn(x);
+        \\    }
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_shadow_cdom.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_fc_shadow_cdom.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

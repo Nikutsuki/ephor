@@ -3,7 +3,7 @@
 # batch B66: EPH-I0631 through EPH-I0636; batch B67: EPH-I0637 through
 # EPH-I0642; batch B85: EPH-I0205; batch B86f: EPH-I1104/I1106/I1107/
 # I1110/I1111; batch B93p: EPH-I0717/I0720; batch B94: EPH-I0060/I0284;
-# batch B93a: EPH-I1159).
+# batch B93a: EPH-I1159; batch B106: EPH-I0715).
 # Runs the real installer against planted fixtures in scratch dirs under
 # .tmp/install-sh-tests. Hermetic: the fake zig on PATH answers version
 # and fetch, and the tags API is a local file, so no network is touched.
@@ -1146,6 +1146,54 @@ assert_grep "$D/err.log" 'missing one of its markers' 'no refusal warning'
 assert_not_grep "$D/out.log" 'Adding ephor build steps' 'fresh branch taken for an end-marker-only file'
 assert_unchanged "$D/build.zig" "$D/build.zig.orig" 'build.zig'
 pass "t47 end-marker-only legacy snippet refuses (EPH-I1159)"
+
+# --- t48 (EPH-I0715): the anchor scan is quote- and comment-aware. A
+# real call followed by three mention shapes must still land the block
+# after the real call: a full-line comment mention, a string-literal
+# mention on the multiline-string opener, and a `\\`-body continuation
+# line that ends in a semicolon. Pre-fix the grep picked the opener
+# line, the semicolon scan landed on the `\\ one;` body line, and the
+# block spliced into the middle of the string. The ast-check gate also
+# runs here (the fake zig answers rc 0), so the assertions below are
+# the corruption detection.
+D="$TEST_ROOT/t48"
+mkdir -p "$D"
+cat > "$D/build.zig" <<'EOF'
+const std = @import("std");
+pub fn build(b: *std.Build) !void {
+    const exe = b.addExecutable(.{
+        .name = "demo",
+        .root_module = b.createModule(.{}),
+    });
+    b.installArtifact(exe);
+    // installArtifact mention in a full-line comment below the call.
+    const usage = "installArtifact docs" ++
+        \\
+        \\ one;
+        \\ two
+    ;
+    _ = usage;
+}
+EOF
+run_installer "$D"
+assert_rc 0
+assert_empty "$D/err.log" 'stderr not empty'
+install_line=$(line_of "$D/build.zig" 'b.installArtifact(exe)')
+marker_line=$(line_of "$D/build.zig" '    // Ephor static analysis')
+[ "$marker_line" -eq "$((install_line + 2))" ] \
+    || fail "block did not land right after the real call (install $install_line, marker $marker_line)"
+[ "$(count_of "$D/build.zig" '// Ephor static analysis')" -eq 1 ] \
+    || fail "block count wrong"
+body_line=$(line_of "$D/build.zig" '\\ one;')
+[ "$body_line" -gt "$marker_line" ] \
+    || fail "string body sits above the block (body $body_line, marker $marker_line)"
+[ "$(count_of "$D/build.zig" '\\ one;')" -eq 1 ] \
+    || fail "multiline string body did not survive intact"
+[ "$(count_of "$D/build.zig" 'installArtifact docs')" -eq 1 ] \
+    || fail "string-literal mention changed"
+[ "$(count_of "$D/build.zig" 'full-line comment below the call')" -eq 1 ] \
+    || fail "comment mention changed"
+pass "t48 quote/comment-aware anchor skips mentions (EPH-I0715)"
 
 echo ""
 echo "install-sh tests: $PASS_COUNT passed"

@@ -553,12 +553,13 @@ span_has_dependency_line() {
 # mention in build.zig, or nothing when none exists (EPH-I0715). The awk
 # walk tracks string and char literals and stops at // comments and \\
 # multiline tails, so a mention inside a string or a comment cannot win
-# the insertion anchor. The first non-space char gate keeps the
-# EPH-I0626 code-line idiom: a line that opens with // or \\, or a
-# `.`-led field line, is data, not a call. The trailing-inline comment
-# limit is shared with the DEP_PROBE idiom (EPH-I1106): the .* spans
-# into the comment, and stripping it needs a Zig lexer the installer
-# does not carry.
+# the insertion anchor. A trailing inline comment after the real call
+# still anchors that call correctly: the walk breaks at // after it has
+# seen the code-position mention. The first non-space char gate keeps
+# the EPH-I0626 code-line idiom: a line that opens with // or \\, or a
+# `.`-led field line, is data, not a call. The masked-semicolon limit
+# lives in the terminator scan below, not here (EPH-I1106 shares it
+# with the DEP_PROBE idiom).
 find_install_artifact_line() {
     awk -f - build.zig <<'AWKEOF'
 {

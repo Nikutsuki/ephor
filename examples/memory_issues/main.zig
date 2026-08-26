@@ -231,22 +231,22 @@ pub fn deeplyNested(a: bool, b: bool, c: bool, d: bool, e: bool) void {
 }
 
 // =============================================================================
-// ZA303: Function has too many parameters (5)
+// ZA303: Function has too many parameters (4)
 // =============================================================================
 
 /// BAD: Too many parameters
 pub fn tooManyParams(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) i32 {
-    // 6 parameters exceeds default of 5 - ZA303 should fire
+    // 6 parameters exceeds default of 4 - ZA303 should fire
     return a + b + c + d + e + f;
 }
 
 // =============================================================================
-// ZA304: Function has too many branches (10)
+// ZA304: Function has too many branches (12)
 // =============================================================================
 
 /// BAD: Too many branches
 pub fn tooManyBranches(value: u8) []const u8 {
-    // 12 if/else branches exceeds 10 - ZA304 should fire
+    // 13 if/else branches exceeds 12 - ZA304 should fire
     if (value == 0) return "zero";
     if (value == 1) return "one";
     if (value == 2) return "two";
@@ -259,6 +259,7 @@ pub fn tooManyBranches(value: u8) []const u8 {
     if (value == 9) return "nine";
     if (value == 10) return "ten";
     if (value == 11) return "eleven";
+    if (value == 12) return "twelve";
     return "other";
 }
 

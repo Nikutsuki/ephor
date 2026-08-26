@@ -199,7 +199,7 @@ fi
 # fail_on: warning is the intended posture: the check exits 1 while
 # warnings exist. The ratchet is tracked, not green.
 #
-# Footer contract (renderResultFooter, src/main.zig:42377): the run
+# Footer shape (renderResultFooter, src/main.zig): the run
 # prints "ephor: E error(s)[, W warning(s)[, N note(s)] found]" with the
 # severity segments in that order, zero-count segments skipped, counts
 # singularized at 1, and NO footer when the run has no findings. The
@@ -207,7 +207,7 @@ fi
 # (EPH-I0740). The ratchet tracks the fail_on:warning count, which
 # includes errors (tallyIssues folds errors into warnings), so the
 # tracked number is errors + warnings. The summary TOTAL: line includes
-# notes (printCheckSummary, src/main.zig:43735), so the footer is the
+# notes (printCheckSummary, src/main.zig), so the footer is the
 # warning-count source.
 set +e
 ./zig-out/bin/ephor check src/ --summary > "$GATE_DIR/dogfood.log" 2>&1
@@ -304,7 +304,7 @@ for corpus in $CORPORA; do
     ./zig-out/bin/ephor check "$cdir" --export="$AB_DIR/current-$corpus.md" > "$txt" 2>&1
     scan_exit=$?
     set -e
-    # Scan contract (renderResultFooter, src/main.zig:42377): a clean
+    # Footer shape (renderResultFooter, src/main.zig): a clean
     # scan exits 0 (no footer when no findings); a findings scan exits 1
     # and prints one footer with the severity segments in order —
     # "ephor: E error(s)[, W warning(s)[, N note(s)] found]", zero-count

@@ -32,7 +32,7 @@ Ephor enforces **established community conventions** - not arbitrary rules we in
 - Memory safety patterns (defer after alloc, errdefer, undefined warnings)
 - Error handling (no silent catch {}, no catch unreachable)
 - Code quality metrics (complexity thresholds, unused code detection)
-- Line length (80 columns - configurable)
+- Line length (100 columns - configurable)
 - Formatting consistency (zig fmt check)
 
 **What we DON'T enforce by default** (project-dependent):
@@ -87,14 +87,14 @@ No separate modes. All checks available. Configure what you want via `ephor.json
 | **ZA205** ignored error union | Error Handling | - | Error result discarded |
 | **ZA301** function too long | Complexity | 50 lines | Complexity indicator |
 | **ZA302** nesting too deep | Complexity | 3 levels | Complexity indicator |
-| **ZA303** too many params | Complexity | 5 params | API smell indicator |
-| **ZA304** too many branches | Complexity | 10 branches | Complexity indicator |
+| **ZA303** too many params | Complexity | 4 params | API smell indicator |
+| **ZA304** too many branches | Complexity | 12 branches | Complexity indicator |
 | **ZA401** unused import | Unused Code | - | Dead code indicator |
 | **ZA402** unused const | Unused Code | - | Feedback before build |
 | **ZA403** unused var | Unused Code | - | Feedback before build |
 | **ZA501** orphan file | Structure | - | Dead code indicator |
 | **ZA601** needs zig fmt | Formatting | - | Consistency with std library |
-| **ZA701** line too long | Style | 80 columns | Readability |
+| **ZA701** line too long | Style | 100 columns | Readability |
 | **ZA703** naming conventions | Style | - | Community standard enforcement |
 | **ZA801** optional deref unchecked | Null Safety | - | Will panic on null |
 | **ZA802** .? without null check | Null Safety | - | Will panic on null |
@@ -180,8 +180,8 @@ All checks are fast enough for regular development. No need for separate modes.
 **Threshold Rationale**:
 - 50 lines: Fits on one screen, comprehensible at a glance
 - 3 nesting: Beyond this, extract helper functions
-- 5 params: Consider a config struct
-- 10 branches: Consider lookup tables or state machines
+- 4 params: Consider a config struct
+- 12 branches: Consider lookup tables or state machines
 
 ### ZA4xx Unused Code
 
@@ -209,7 +209,7 @@ All checks are fast enough for regular development. No need for separate modes.
 
 | Rule | Default | Threshold | Description |
 |------|---------|-----------|-------------|
-| ZA701 | ON | 80 columns | Line too long |
+| ZA701 | ON | 100 columns | Line too long |
 | ZA702 | OFF | configurable | File too large (set `max_file_bytes` to enable) |
 | ZA703 | ON | - | Naming convention violations |
 
@@ -285,9 +285,9 @@ This helps developers decide if upgrading is a quick task or a major undertaking
   "thresholds": {
     "max_function_lines": 50,
     "max_nesting_depth": 3,
-    "max_params": 5,
-    "max_branches": 10,
-    "max_line_length": 80,
+    "max_params": 4,
+    "max_branches": 12,
+    "max_line_length": 100,
     "max_file_bytes": null
   },
 
@@ -685,9 +685,9 @@ The linter focuses on **single-function analysis** with simple state tracking. T
 
 ### 2. ZA701 (line length)
 
-**Decision**: ON by default (80 columns)
+**Decision**: ON by default (100 columns)
 
-80 columns is a widely-used industry standard for readability. Users can adjust the threshold:
+A 100-column limit matches major Zig project style guides (TigerBeetle, Bun) and accommodates Zig's 4-space indentation. Users can adjust the threshold:
 ```json
 { "thresholds": { "max_line_length": 120 } }
 ```

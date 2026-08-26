@@ -260,7 +260,12 @@ zig build ephor -- init   # Via build system
 ephor init                # Standalone CLI
 ```
 
-Example config:
+Example config. The `init` and `install` writers emit this shape:
+`version`, `path_dir`, `entries`, `exclude`, `orphan_exclude`,
+`enable` (`ZA305`, `ZA306`), and `fail_on` (EPH-I1146). The example
+below adds `strict`, `error_naming`, and `thresholds` as schema
+reference only: each stays an optional manual override, and the
+built-in threshold defaults apply when the thresholds block is absent.
 
 ```json
 {
@@ -269,8 +274,9 @@ Example config:
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
   "orphan_exclude": ["_test.zig", "/test/", "/tests/"],
-  "disable": ["ZA301"],
-  "enable": ["ZA702"],
+  "enable": ["ZA305", "ZA306"],
+  "strict": true,
+  "fail_on": "warning",
   "error_naming": "TitleCase",
   "thresholds": {
     "max_lines": 50,

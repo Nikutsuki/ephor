@@ -292,7 +292,7 @@ Example config:
 | `version` | Pinned ephor version (set by `install`/`upgrade`) |
 | `path_dir` | Directory to analyze (also accepts `code`, `src`, or `root` as aliases). Must resolve inside the config's own directory |
 | `entries` | Entry points for orphan detection. An entry outside the scan root joins the import graph only: findings print only for files inside the scan root |
-| `exclude` | Paths to exclude from all checks (substring match). Empty is a hard error. Ephor ignores the over-broad patterns `/`, `.zig`, `.`, `zig`, and the scan root's first path component with a warning |
+| `exclude` | Paths to exclude from all checks. Component-wise match: pattern components (split on `/`) match path components in order (a subsequence); the final pattern component also covers its dot-extended file form, so `vendor` matches `src/vendor/x.zig` and `src/vendor.zig` but never `src/vendored/`. Empty is a hard error. Ephor ignores the over-broad patterns `/`, `.zig`, `.`, `zig`, and the scan root's first path component with a warning |
 | `orphan_exclude` | Patterns to exclude from orphan detection only |
 | `disable` | Rule IDs to disable (prefix matching: `ZA3` disables all) |
 | `enable` | Rule IDs to enable (overrides disable) |
@@ -1429,6 +1429,15 @@ flagged as members (EPH-I0274).
 `callconv(.c)`/`callconv(.C)`/`callconv(.Stdcall)` declarations are exempt
 from parameter counting — a pinned ABI fixes the parameter list
 (EPH-I1059, EPH-I1093, EPH-I1096).
+
+**Changed (exclude matching):** The `exclude` config key now matches
+component-wise, not by substring: pattern components (split on `/`) match
+path components in order (a subsequence), and the final pattern component
+also covers its dot-extended file form. `vendor` matches `src/vendor/` and
+`src/vendor.zig` but never `src/vendored/` — the old substring form
+silently applied a cwd config's exclude list to foreign-target code whose
+paths merely contained a pattern (EPH-I0076, EPH-I1182). A dual-load note
+now prints when the cwd config and a target-side config both load.
 
 **Changed (migration required):** Inline-ignore directives are now anchored —
 only plain `//` comments whose first token is `ephor:ignore`,

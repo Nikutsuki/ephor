@@ -297,6 +297,9 @@ const DiagCtx = struct {
     /// "trusting config at" notes printed (RED3-4, EPH-I0209). One per
     /// trusted config file whose directory covers the scan target.
     trusted_config_note_count: usize = 0,
+    /// "two configs loaded" notes printed (EPH-I0076). One per run, when
+    /// the cwd config and a target-side config both loaded.
+    dual_config_note_count: usize = 0,
     /// "honoring N entries ... as reachability hints" notes printed
     /// (RED3-10, EPH-I0170). One per untrusted config file that contributed
     /// surviving entries.
@@ -11160,7 +11163,25 @@ fn elseBodyArmFrees(ctx: *const FreeScanCtx, arm: SiblingArm) !bool {
     // else-claim mark closes the class: handleElse sets it on the claimed
     // entry's else body, finishPendingElse and handleBlockEnd never do
     // (EPH-I1032).
-    if (!block.is_else_body) return false;
+    // EPH-I1145: an else-if CONTINUATION header (the `} else if (c) {`
+    // block) carries no else-claim mark, but its chain can still prove
+    // the pair definite — when every arm of the continuation chain frees,
+    // the skip path runs a second free of its own. The continuation
+    // walk applies to a chain INTERMEDIATE only: the graded arm's header
+    // must have a chain predecessor. The chain's head arm keeps its
+    // conditional grade even though its sibling is the same continuation
+    // header — the EPH-I1142 pin locks the head-arm warning (the I1142
+    // test own_then_warning), and the head-arm upgrade sits outside
+    // I1145's intermediate scope as a named conservative-FN residual.
+    // The prefix side keeps the same walk the terminal path runs
+    // (EPH-I1142): every chain prefix arm frees and the chain root
+    // dominates.
+    if (!block.is_else_body) {
+        if (chainPredecessorHeader(ctx.cfg, arm.header) == null) return false;
+        if (!isChainContinuationHeader(ctx.cfg, arm.sibling)) return false;
+        if (!try headerOnEveryPathOrChainArmsFree(ctx, arm.header)) return false;
+        return try chainContinuationAllFrees(ctx, arm.sibling, 0);
+    }
     // The upgrade reads definite only when every path that continues past
     // the construct runs it, mirroring the reverse gate (EPH-I1141), with
     // the chain-aware refinement (EPH-I1142): an else-if chain's
@@ -11177,6 +11198,73 @@ fn elseBodyArmFrees(ctx: *const FreeScanCtx, arm: SiblingArm) !bool {
         if (freePatternAfter(lines[idx], 0)) return true;
     }
     return false;
+}
+
+/// Bound on the else-if continuation recursion of chainContinuationAllFrees
+/// (EPH-I1145): longer chains stay at the conditional grade, the safe
+/// direction.
+const max_chain_continuation_depth: usize = 8;
+
+/// True when the block at `bid` is an else-if continuation header: a
+/// branch-false exit (the chain fall-through) plus a branch_true arm
+/// (openElseIfBranch wires exactly that pair for `} else if (c) {`).
+/// A merge block wires neither, a plain if/else header's false exit is a
+/// merge too — the pair test is the discriminator (EPH-I1145).
+fn isChainContinuationHeader(cfg: *const ControlFlowGraph, bid: usize) bool {
+    var has_true = false;
+    var has_false = false;
+    for (cfg.edges.items) |edge| {
+        if (edge.from != bid) continue;
+        if (edge.kind == .branch_true) has_true = true;
+        if (edge.kind == .branch_false) has_false = true;
+    }
+    return has_true and has_false;
+}
+
+/// The continuation-side chain walk (EPH-I1145): from an else-if
+/// continuation header, its branch_true arm must free the tracked var
+/// and its branch_false target must either be a genuine else body that
+/// frees or another continuation header (recursed, bounded). When every
+/// arm of the continuation frees, the path that skipped the graded arm
+/// runs a second free of its own, so the pair is definite. The prefix
+/// side (the arms before the graded arm) stays the headerOnEveryPath-
+/// OrChainArmsFree walk's job (EPH-I1142). The arm scan is var-aware
+/// (spanFreesTrackedVar, the prefix discipline); the terminal else body
+/// reuses the forward gate's freePatternAfter scan (the documented
+/// forward-direction discipline).
+fn chainContinuationAllFrees(
+    ctx: *const FreeScanCtx,
+    header_bid: usize,
+    depth: usize,
+) !bool {
+    if (depth >= max_chain_continuation_depth) return false;
+    var arm_bid: ?usize = null;
+    var false_bid: ?usize = null;
+    for (ctx.cfg.edges.items) |edge| {
+        if (edge.from != header_bid) continue;
+        if (edge.kind == .branch_true) arm_bid = edge.to;
+        if (edge.kind == .branch_false) false_bid = edge.to;
+    }
+    const arm = arm_bid orelse return false;
+    const fall = false_bid orelse return false;
+    if (!continuationBlockSpanFrees(ctx, arm)) return false;
+    const fall_block = ctx.cfg.blocks.items[fall];
+    if (fall_block.is_else_body) return continuationBlockSpanFrees(ctx, fall);
+    if (!isChainContinuationHeader(ctx.cfg, fall)) return false;
+    return try chainContinuationAllFrees(ctx, fall, depth + 1);
+}
+
+/// One arm's span free scan for the continuation walk (EPH-I1145): the
+/// block's line extent must hold a free of the tracked var. The start
+/// and extent gates mirror spanFreesTrackedVar's callers.
+fn continuationBlockSpanFrees(ctx: *const FreeScanCtx, bid: usize) bool {
+    const block = ctx.cfg.blocks.items[bid];
+    if (block.start_line == 0 or block.end_line < block.start_line) return false;
+    if (block.start_line < ctx.scan.func_line) return false;
+    const first_idx = block.start_line - ctx.scan.func_line;
+    if (first_idx >= ctx.scan.lines.len) return false;
+    const last_idx = @min(block.end_line - ctx.scan.func_line, ctx.scan.lines.len - 1);
+    return spanFreesTrackedVar(ctx, first_idx, last_idx);
 }
 
 /// The reverse-direction sibling test (EPH-I1086): the second free sits
@@ -12342,8 +12430,19 @@ fn analyzeCFGDeferCoverage(
     const num_blocks = ctx.cfg.blocks.items.len;
     if (num_blocks == 0) return issues;
 
+    // EPH-I0116: exit-free loop cycles are covered-through for the
+    // backward fixpoint — the cycle always completes, so the post-loop
+    // free dominates every path through it.
+    var exit_free = try collectExitFreeLoops(
+        allocator,
+        ctx.cfg,
+        ctx.body.lines,
+        ctx.body.func_line,
+    );
+    defer exit_free.deinit(allocator);
+
     // Phase 2-3: Check defer coverage for each allocation
-    try checkDeferCoverageLoop(&ctx, allocs.items, &issues);
+    try checkDeferCoverageLoop(&ctx, allocs.items, &issues, &exit_free);
 
     return issues;
 }
@@ -12354,9 +12453,10 @@ fn checkDeferCoverageLoop(
     ctx: *const DeferCoverageCtx,
     allocs: []const CFGAlloc,
     issues: *std.ArrayListUnmanaged(Issue),
+    exit_free: *const ExitFreeLoopInfo,
 ) !void {
     for (allocs) |alloc| {
-        const issue = try checkDeferCoverageForAlloc(ctx, alloc);
+        const issue = try checkDeferCoverageForAlloc(ctx, alloc, exit_free);
         if (issue) |iss| {
             try issues.append(ctx.allocator, iss);
         }
@@ -12517,13 +12617,245 @@ fn scanSingleBlock(
     if (freed and return_after) state.free_and_return[bid] = true;
 }
 
+/// Per-block exit-free-loop marks for the defer-coverage fixpoint
+/// (EPH-I0116): `header[bid]` marks an exit-free loop header and
+/// `member[bid]` marks every other block inside its cycle. When the
+/// header's successor is a member, the successor's coverage flows
+/// through the cycle (the loop always completes), so the backward AND
+/// skips it — the pre-fix deadlock read the cycle as uncovered and
+/// fired ZA101 on an alloc whose post-loop free always runs.
+const ExitFreeLoopInfo = struct {
+    header: []bool,
+    member: []bool,
+
+    fn deinit(self: *ExitFreeLoopInfo, allocator: Allocator) void {
+        allocator.free(self.header);
+        allocator.free(self.member);
+    }
+};
+
+/// Mark the loops whose bodies hold no early exit (EPH-I0116). For each
+/// loop_back edge, walk the body blocks forward from the header's
+/// body-side edges. A body that can exit before the post-loop code
+/// keeps the FP-lean deadlock verdict (EPH-I0682, F6a); a cycle without
+/// early exits always completes, so the post-loop free dominates every
+/// path through it. The per-cycle proof lives in CycleWalk.
+fn collectExitFreeLoops(
+    allocator: Allocator,
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+) !ExitFreeLoopInfo {
+    const num_blocks = cfg.blocks.items.len;
+    var info = ExitFreeLoopInfo{
+        .header = &.{},
+        .member = &.{},
+    };
+    errdefer info.deinit(allocator);
+    info.header = try allocator.alloc(bool, num_blocks);
+    info.member = try allocator.alloc(bool, num_blocks);
+    @memset(info.header, false);
+    @memset(info.member, false);
+    var visited = try std.DynamicBitSetUnmanaged.initEmpty(allocator, num_blocks);
+    defer visited.deinit(allocator);
+    var walk = CycleWalk{
+        .cfg = cfg,
+        .allocator = allocator,
+        .stack = .empty,
+        .num_blocks = num_blocks,
+    };
+    defer walk.stack.deinit(allocator);
+
+    for (cfg.edges.items) |edge| {
+        if (edge.kind != .loop_back) continue;
+        const header_bid = edge.to;
+        if (header_bid >= num_blocks or info.header[header_bid]) continue;
+        visited.setRangeValue(.{ .start = 0, .end = num_blocks }, false);
+        if (!try walk.cycleIsExitFree(header_bid, &visited)) continue;
+        if (exitFreeSpanHasExitKeyword(.{
+            .cfg = cfg,
+            .lines = lines,
+            .func_line = func_line,
+        }, header_bid, &visited)) continue;
+        info.header[header_bid] = true;
+        var it = visited.iterator(.{});
+        while (it.next()) |m| info.member[m] = true;
+    }
+    return info;
+}
+
+/// Walk state for one exit-free cycle proof (EPH-I0116): the CFG, the
+/// allocator for the block stack, and the block count bound.
+const CycleWalk = struct {
+    cfg: *ControlFlowGraph,
+    allocator: Allocator,
+    stack: std.ArrayListUnmanaged(usize),
+    num_blocks: usize,
+
+    /// True when the cycle behind the loop_back edge into `header_bid`
+    /// holds no early exit: no return block, no break/continue
+    /// jump-terminal block, and no break/error edge leaving the cycle.
+    /// The walk seeds from the header's body-side out-edges (every edge
+    /// except the false exit) and never follows edges back into the
+    /// header, so the header itself is never a source. `visited`
+    /// receives the cycle's body blocks.
+    fn cycleIsExitFree(
+        self: *CycleWalk,
+        header_bid: usize,
+        visited: *std.DynamicBitSetUnmanaged,
+    ) !bool {
+        // The stack is shared across the file's loops: a walk that
+        // returns false early leaves stale blocks behind, so every
+        // walk starts from an empty stack.
+        self.stack.clearRetainingCapacity();
+        for (self.cfg.edges.items) |e2| {
+            if (e2.from != header_bid or e2.kind == .branch_false) continue;
+            try self.stack.append(self.allocator, e2.to);
+        }
+        while (self.stack.pop()) |cur| {
+            if (cur >= self.num_blocks) return false;
+            if (visited.isSet(cur)) continue;
+            visited.set(cur);
+            const block = self.cfg.blocks.items[cur];
+            if (block.is_return or block.is_jump_terminal) return false;
+            if (self.blockLeavesCycle(header_bid, cur)) return false;
+        }
+        return true;
+    }
+
+    /// False when no out-edge of `cur` is an early exit of the cycle,
+    /// pushing every other out-edge (the in-cycle continuations) onto
+    /// the stack. Back edges into the header are the cycle's own
+    /// loop-backs and are never followed. An OOM during the push reads
+    /// as an early exit: the cycle stays FP-lean, the safe direction.
+    fn blockLeavesCycle(self: *CycleWalk, header_bid: usize, cur: usize) bool {
+        for (self.cfg.edges.items) |e3| {
+            if (e3.from != cur) continue;
+            if (e3.kind == .break_jump or e3.kind == .error_path) return true;
+            if (e3.to == header_bid) continue;
+            self.stack.append(self.allocator, e3.to) catch return true;
+        }
+        return false;
+    }
+};
+
+/// Span inputs for the exit-free keyword scan (EPH-I0116): the CFG for
+/// block extents, the function lines, and the function's file line.
+const ExitFreeSpanCtx = struct {
+    cfg: *ControlFlowGraph,
+    lines: []const []const u8,
+    func_line: usize,
+};
+
+/// True when any masked line in the cycle's span carries a
+/// return/try/break/continue keyword at a code position (EPH-I0116).
+/// The body scan covers every visited body block; the header scan
+/// covers only the CONDITION lines — the header block can hold
+/// pre-loop statements before the condition (the entry block doubles
+/// as the header when the loop opens the function body), and a `try`
+/// there is the alloc's own, not an exit of the loop. The condition
+/// starts at the header's first line carrying a word-bounded
+/// while/for keyword (a pre-loop statement cannot carry one — a
+/// nested loop would split the block). A try in the condition
+/// propagates on every iteration and bypasses the post-loop free, so
+/// it blocks the relaxation. The keyword scan catches the exits the
+/// CFG edges do not model: `try` has no edge of its own, and a
+/// mid-block return/break never flips a block flag. Conservative
+/// bounds: a break/continue belonging to a NESTED loop still blocks
+/// the relaxation (the scan cannot tell the loops apart), and a
+/// line-span over the 16 KiB mask falls back raw — both keep the
+/// warning direction.
+fn exitFreeSpanHasExitKeyword(
+    ctx: ExitFreeSpanCtx,
+    header_bid: usize,
+    visited: *const std.DynamicBitSetUnmanaged,
+) bool {
+    var min_line: usize = 0;
+    var max_line: usize = 0;
+    var first = true;
+    var it = visited.iterator(.{});
+    while (it.next()) |m| {
+        const b = ctx.cfg.blocks.items[m];
+        if (b.start_line == 0 or b.end_line < b.start_line) continue;
+        if (first or b.start_line < min_line) min_line = b.start_line;
+        if (first or b.end_line > max_line) max_line = b.end_line;
+        first = false;
+    }
+    if (!first and spanHasExitKeyword(ctx.lines, ctx.func_line, min_line, max_line)) return true;
+    const hb = ctx.cfg.blocks.items[header_bid];
+    if (hb.start_line == 0 or hb.end_line < hb.start_line) return false;
+    return conditionSpanHasExitKeyword(ctx.lines, ctx.func_line, hb.start_line, hb.end_line);
+}
+
+/// True when a masked line in `min_line..max_line` (inclusive) carries
+/// an exit keyword (EPH-I0116). Lines shorter than the mask buffer are
+/// blanked code; longer lines fall back raw (documented bound).
+fn spanHasExitKeyword(
+    lines: []const []const u8,
+    func_line: usize,
+    min_line: usize,
+    max_line: usize,
+) bool {
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var line_num = min_line;
+    while (line_num <= max_line) : (line_num += 1) {
+        if (line_num < func_line) continue;
+        const idx = line_num - func_line;
+        if (idx >= lines.len) break;
+        if (maskedLineHasExitKeyword(lines[idx], &blank_buf)) return true;
+    }
+    return false;
+}
+
+/// True when a masked line in the header's CONDITION range carries an
+/// exit keyword (EPH-I0116). The condition starts at the first line
+/// with a word-bounded while/for keyword; when none appears, only the
+/// header's last line is scanned.
+fn conditionSpanHasExitKeyword(
+    lines: []const []const u8,
+    func_line: usize,
+    start_line: usize,
+    end_line: usize,
+) bool {
+    var cond_start = end_line;
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var line_num = start_line;
+    while (line_num <= end_line) : (line_num += 1) {
+        if (line_num < func_line) continue;
+        const idx = line_num - func_line;
+        if (idx >= lines.len) break;
+        const code = maskedCodeLine(lines[idx], &blank_buf);
+        if (hasRealKeyword(code, "while") or hasRealKeyword(code, "for")) {
+            cond_start = line_num;
+            break;
+        }
+    }
+    line_num = cond_start;
+    while (line_num <= end_line) : (line_num += 1) {
+        if (line_num < func_line) continue;
+        const idx = line_num - func_line;
+        if (idx >= lines.len) break;
+        if (maskedLineHasExitKeyword(lines[idx], &blank_buf)) return true;
+    }
+    return false;
+}
+
+/// True when the masked code of one line carries a return/try/break/
+/// continue keyword (EPH-I0116).
+fn maskedLineHasExitKeyword(line: []const u8, blank_buf: *[16 * 1024]u8) bool {
+    const code = maskedCodeLine(line, blank_buf);
+    return hasRealKeyword(code, "return ") or hasRealKeyword(code, "try ") or
+        hasRealKeyword(code, "break") or hasRealKeyword(code, "continue");
+}
+
 /// Propagate coverage backward through CFG
 fn propagateCoverageBackward(
     allocator: Allocator,
     cfg: *ControlFlowGraph,
     state: BlockCoverageState,
-    num_blocks: usize,
+    exit_free: *const ExitFreeLoopInfo,
 ) ![]bool {
+    const num_blocks = state.has_defer.len;
     var covered = try allocator.alloc(bool, num_blocks);
     @memset(covered, false);
 
@@ -12539,7 +12871,7 @@ fn propagateCoverageBackward(
         changed = false;
         for (0..num_blocks) |bid| {
             if (covered[bid]) continue;
-            if (!tryPropagateCoverage(cfg, covered, bid)) continue;
+            if (!tryPropagateCoverage(cfg, covered, bid, exit_free)) continue;
             covered[bid] = true;
             changed = true;
         }
@@ -12556,10 +12888,20 @@ fn propagateCoverageBackward(
 /// return inside the body bypasses a post-loop direct free, so the cycle
 /// verdict cannot be relaxed for non-defer coverage without per-exit-kind
 /// analysis. The linear fallback hasDeferFreeInFunction masks the FP for
-/// defers at the alloc's indent or shallower.
-fn tryPropagateCoverage(cfg: *ControlFlowGraph, covered: []bool, bid: usize) bool {
+/// defers at the alloc's indent or shallower. EPH-I0116 relaxes the bound
+/// for the one provably safe cycle: an exit-free loop header skips its
+/// member successors in the AND — the cycle always completes, so the
+/// post-loop coverage flows through it (collectExitFreeLoops proves the
+/// body holds no return/try/break/continue).
+fn tryPropagateCoverage(
+    cfg: *ControlFlowGraph,
+    covered: []bool,
+    bid: usize,
+    exit_free: *const ExitFreeLoopInfo,
+) bool {
     var all_succs_covered = true;
     var has_succ = false;
+    const skip_cycle = exit_free.header[bid];
     for (cfg.edges.items) |edge| {
         if (edge.from != bid) continue;
         // A return block's outgoing edge is phantom: the close-brace
@@ -12569,6 +12911,7 @@ fn tryPropagateCoverage(cfg: *ControlFlowGraph, covered: []bool, bid: usize) boo
         // covered by a post-return defer — the EPH-I0348 leak shape.
         // (The UAF lattice skips is_return preds for the same reason.)
         if (cfg.blocks.items[bid].is_return) continue;
+        if (skip_cycle and exit_free.member[edge.to]) continue;
         has_succ = true;
         if (!covered[edge.to]) {
             all_succs_covered = false;
@@ -12628,6 +12971,7 @@ fn buildMissingDeferIssue(file_path: []const u8, alloc: CFGAlloc) Issue {
 fn checkDeferCoverageForAlloc(
     ctx: *const DeferCoverageCtx,
     alloc: CFGAlloc,
+    exit_free: *const ExitFreeLoopInfo,
 ) !?Issue {
     const allocator = ctx.allocator;
     var owner_vars = try trackOwnerVariables(ctx, alloc.name);
@@ -12647,7 +12991,7 @@ fn checkDeferCoverageForAlloc(
     }, num_blocks);
     defer state.deinit(allocator);
 
-    const covered = try propagateCoverageBackward(allocator, ctx.cfg, state, num_blocks);
+    const covered = try propagateCoverageBackward(allocator, ctx.cfg, state, exit_free);
     defer allocator.free(covered);
 
     const alloc_block_covered = covered[alloc.block];
@@ -12998,6 +13342,53 @@ fn isUncoveredErrorExit(t: []const u8, name: []const u8) bool {
     if (hasRealKeyword(code, "return error.")) return true;
     if (isConditionalReturnTransfer(code, name)) return false;
     return hasBareIdentReturn(code);
+}
+
+/// True when the line carries the canonical single-line error-propagation
+/// form `catch |X| return X;` (EPH-I0069): the catch captures the error
+/// and returns it, so the line is an error-path exit a later transfer
+/// cannot cover. Word-bounded and literal-masked on the anchor; the
+/// capture name and the returned name must be the same identifier. The
+/// block form (`catch |X| { return X; }`) stays outside this detector —
+/// its return line stops the ownership scan via hasBareIdentReturn, and
+/// the ZA103 trigger gap for it is a documented residual of this fix.
+fn hasErrorPropagationCatch(t: []const u8) bool {
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (t[pos] != 'c' or !mem.startsWith(u8, t[pos..], "catch")) continue;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (propagationCatchAt(t, pos)) return true;
+        i = pos + 1;
+    }
+    return false;
+}
+
+/// True when the canonical single-line propagation form starts at the
+/// word-bounded `catch` at `pos`: `catch |X| return X;` (EPH-I0069).
+/// The capture name and the returned name must be the same identifier,
+/// and the statement must end with `;` right after the returned name.
+fn propagationCatchAt(t: []const u8, pos: usize) bool {
+    var p = types.skipWhitespace(t, pos + "catch".len);
+    if (p >= t.len or t[p] != '|') return false;
+    p = types.skipWhitespace(t, p + 1);
+    const name_start = p;
+    while (p < t.len and isIdent(t[p])) p += 1;
+    if (p == name_start) return false;
+    const err_name = t[name_start..p];
+    p = types.skipWhitespace(t, p);
+    if (p >= t.len or t[p] != '|') return false;
+    p = types.skipWhitespace(t, p + 1);
+    if (!mem.startsWith(u8, t[p..], "return")) return false;
+    var q = p + "return".len;
+    if (q < t.len and isIdent(t[q])) return false;
+    q = types.skipWhitespace(t, q);
+    if (!mem.startsWith(u8, t[q..], err_name)) return false;
+    const r = q + err_name.len;
+    if (r < t.len and isIdent(t[r])) return false;
+    const end = types.skipWhitespace(t, r);
+    return end < t.len and t[end] == ';';
 }
 
 /// Check ownership transfer for errdefer analysis. A transfer covers the
@@ -13825,7 +14216,10 @@ fn scanErrdeferLine(ctx: *const ErrdeferLineCtx, line: []const u8, idx: usize) !
     // @panic("Retry transaction not found") is not a gap trigger.
     const has_try = hasRealKeyword(t, "try ") or
         (split_joined != null and hasRealKeyword(joined, "try "));
-    if (hasRealKeyword(t, "return error."))
+    // The canonical propagation form `catch |e| return e;` is an
+    // error-path exit like `return error.X` (EPH-I0069): the captured
+    // error leaves the fn, so an uncovered alloc leaks on that path.
+    if (hasRealKeyword(t, "return error.") or hasErrorPropagationCatch(t))
         try ctx.error_returns.append(ctx.allocator, actual_line);
     if (has_try and isTryAllocation(joined, ctx.collect_ctx.alloc_names)) {
         // Standalone/multiline first-arg allocator checks (no-free set or arena)
@@ -15510,6 +15904,20 @@ fn trackNoFreeTypeInit(
 /// const X = Y.allocator() / const X = Y.get() where Y (or the last
 /// field of a dotted Y) is a tracked no-free variable or file-level field
 /// (EPH-I0831).
+///
+/// DOCUMENTED RESIDUAL (EPH-I0067): an allocator alias returned by an
+/// arbitrary METHOD call cannot be type-resolved line-wise, and a
+/// name-based fallback ("arenaAlloc contains arena") is forbidden by
+/// the type-based mandate. The ghostty class — `const config_alloc =
+/// config.arenaAlloc(); try config_alloc.dupe(...)` beside `defer
+/// config.deinit()` — fires ZA101/ZA103 although the deferred owner
+/// deinit bulk-frees the arena. Proving the alias is arena-backed
+/// needs cross-file return-type resolution: arenaAlloc's body returns
+/// `self._arena.?.allocator()` on an ArenaAllocator field, and the
+/// call site usually sits in another file. That symbol-resolving pass
+/// is out of scope here; until it lands, the class stays flagged (the
+/// safe direction — a method named arenaAlloc could still return a
+/// need-free allocator) and is pinned by the EPH-I0067 test.
 fn trackAllocatorAlias(
     a: Allocator,
     rhs: []const u8,
@@ -26987,6 +27395,10 @@ const CFGFuncCtx = struct {
     start: usize,
     lines: []const []const u8,
     fn_returns_error: bool,
+    /// The fn is noreturn: every exit terminates the program, so the
+    /// leak-coverage rules (ZA101/ZA103) skip it. ZA105/ZA106 stay live —
+    /// a double free before the panic is still a real bug (EPH-I0073).
+    fn_is_noreturn: bool,
     in_test: bool,
     no_free_param_fns: ?*const std.StringHashMapUnmanaged(void),
     no_free_fields: ?*const std.StringHashMapUnmanaged(void),
@@ -27006,26 +27418,131 @@ const CFGScanCtx = struct {
     func_lines: *std.ArrayListUnmanaged([]const u8),
 };
 
-/// Error-return markers for signature lines (EPH-I0072): the pattern set
-/// historically checked on the fn-keyword line in detectCFGFuncStart, now
-/// shared with the multi-line signature scan in trackCFGBraces. Substring
-/// matches — `!bool` also matches value-position negation (`= !bool_val`);
-/// accepted parity trap, do not "fix" one site without the other.
-const error_return_markers = [_][]const u8{ ") !", "!void", "!bool", "!usize", "!*", "![" };
+/// Error-return word markers for signature lines (EPH-I0072, EPH-I0075).
+/// Word-bounded: `!bool` must not match the value-position negation
+/// `!bool_flag` — the marker counts only when the byte after it is not an
+/// identifier byte. `!*` and `![` are type prefixes with no value-position
+/// form in Zig, so the depth walk handles them literally.
+const error_return_word_markers = [_][]const u8{ "!void", "!bool", "!usize" };
 
-/// True when a signature line carries an error-return marker.
-fn lineHasErrorReturnMarker(t: []const u8) bool {
-    for (error_return_markers) |marker| {
-        if (mem.indexOf(u8, t, marker) != null) return true;
+/// True when a signature line carries an error-return marker at return
+/// position (EPH-I0075). `start_depth` is the carried paren depth at the
+/// line start: the outer signature parens stay open on a continuation
+/// line. The walk is literal-masked (LiteralState), so markers inside
+/// string defaults, char literals, or comment text are prose. A marker
+/// counts only at paren depth 0 — inside the param list it is a param
+/// TYPE (`cb: *const fn () !void,`), never the fn's return. A `!` after
+/// `=` is value-position negation. The one own-line exception: a return
+/// type on its own continuation line starts the line with `!` (the
+/// EPH-I0072 shape) and counts regardless of the carried depth.
+fn lineHasErrorReturnMarker(t: []const u8, start_depth: isize) bool {
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var depth = start_depth;
+    if (lineStartsWithBang(t)) depth = 0;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        if (markerStepAt(t, pos, &depth) == .hit) return true;
     }
     return false;
 }
 
-/// True when a signature line declares a noreturn function. Same substring
-/// trap class as the error-return markers (matches identifiers containing
-/// "noreturn"); fn_is_noreturn is currently write-only (EPH-I0073).
-fn lineHasNoreturnMarker(t: []const u8) bool {
-    return mem.indexOf(u8, t, "noreturn") != null;
+/// One step of the return-position walk (EPH-I0075): advance the depth
+/// over the code char at `pos` and report a marker hit at depth 0.
+const MarkerStep = enum { none, hit };
+
+fn markerStepAt(t: []const u8, pos: usize, depth: *isize) MarkerStep {
+    const c = t[pos];
+    if (c == '(') {
+        depth.* += 1;
+        return .none;
+    }
+    if (c == ')') {
+        if (depth.* > 0) depth.* -= 1;
+        if (depth.* == 0 and errorReturnAfterParen(t, pos)) return .hit;
+        return .none;
+    }
+    if (c == '!' and depth.* == 0 and errorBangMarkerAt(t, pos)) return .hit;
+    return .none;
+}
+
+/// True when the line's first code char is `!`: the own-line return
+/// shape (EPH-I0072), where the carried paren depth does not apply.
+fn lineStartsWithBang(t: []const u8) bool {
+    var i: usize = 0;
+    while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
+    return i < t.len and t[i] == '!';
+}
+
+/// True when the `!` at `pos` is a return marker at depth 0: a payload
+/// marker follows and no `=` precedes (EPH-I0075).
+fn errorBangMarkerAt(t: []const u8, pos: usize) bool {
+    if (negationAfterEq(t, pos)) return false;
+    return errorMarkerAt(t, pos);
+}
+
+/// True when the `)` at `pos` sits at depth 0 and a ` !` follows it:
+/// the return-position error-union prefix for a named payload type
+/// (`) !u8 {`, `) !SomeType {`), EPH-I0075.
+fn errorReturnAfterParen(t: []const u8, pos: usize) bool {
+    return pos + 2 < t.len and t[pos + 1] == ' ' and t[pos + 2] == '!';
+}
+
+/// True when the `!` at `pos` carries a payload marker in return
+/// position (EPH-I0075): the `!*`/`![` type prefixes, or a
+/// word-bounded `!void`/`!bool`/`!usize`.
+fn errorMarkerAt(t: []const u8, pos: usize) bool {
+    if (pos + 1 >= t.len) return false;
+    if (t[pos + 1] == '*' or t[pos + 1] == '[') return true;
+    for (error_return_word_markers) |marker| {
+        if (!mem.startsWith(u8, t[pos..], marker)) continue;
+        const after = pos + marker.len;
+        if (after >= t.len or !isIdent(t[after])) return true;
+    }
+    return false;
+}
+
+/// True when the code byte before the `!` at `pos` is `=`: value
+/// negation, never a return marker (EPH-I0075). No signature form
+/// puts a depth-0 `!` after `=`, so the gate never drops a real
+/// marker.
+fn negationAfterEq(t: []const u8, pos: usize) bool {
+    var p = pos;
+    while (p > 0 and (t[p - 1] == ' ' or t[p - 1] == '\t')) p -= 1;
+    return p > 0 and t[p - 1] == '=';
+}
+
+/// True when a signature line declares a noreturn RETURN at return
+/// position (EPH-I0073). Word-bounded on both sides: identifiers
+/// containing "noreturn" never match. Depth-gated like the error-return
+/// markers: a fn-pointer param TYPE (`cb: *const fn () noreturn,`) sits
+/// inside the param list and never marks the outer fn. The own-line
+/// return form (`noreturn {` on its own continuation line) counts when
+/// the line's first code word is exactly `noreturn`.
+fn lineHasNoreturnMarker(t: []const u8, start_depth: isize) bool {
+    var lit = types.LiteralState.forLine(t) orelse return false;
+    var depth = start_depth;
+    var i: usize = 0;
+    while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
+    if (i < t.len and mem.startsWith(u8, t[i..], "noreturn") and
+        (i + "noreturn".len >= t.len or !isIdent(t[i + "noreturn".len])))
+    {
+        depth = 0;
+    }
+    i = 0;
+    while (i < t.len) : (i += 1) {
+        const pos = lit.updateForChar(t, i) orelse continue;
+        const c = t[pos];
+        if (c == '(') depth += 1;
+        if (c == ')' and depth > 0) depth -= 1;
+        if (depth != 0 or c != 'n') continue;
+        if (pos > 0 and isIdent(t[pos - 1])) continue;
+        if (!mem.startsWith(u8, t[pos..], "noreturn")) continue;
+        const after = pos + "noreturn".len;
+        if (after < t.len and isIdent(t[after])) continue;
+        return true;
+    }
+    return false;
 }
 
 /// Detect function start and initialize state
@@ -27061,11 +27578,15 @@ fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
     state.sig_in_str = false;
     // Detect if function returns errors: ) ! or !void, !bool, etc.
     // (shared marker set — continuation signature lines are OR-ed in by
-    // trackCFGBraces while the body has not started, EPH-I0072)
-    state.fn_returns_error = lineHasErrorReturnMarker(t);
+    // trackCFGBraces while the body has not started, EPH-I0072; the
+    // depth-0 return-position gate is EPH-I0075)
+    state.fn_returns_error = lineHasErrorReturnMarker(t, 0);
 
-    // Detect noreturn functions - memory leaks don't matter in noreturn
-    state.fn_is_noreturn = lineHasNoreturnMarker(t);
+    // Detect noreturn functions: memory leaks don't matter in noreturn
+    // fns, so the leak-coverage rules (ZA101/ZA103) skip them
+    // (EPH-I0073; the word-bounded depth-gated marker is the same
+    // helper's twin).
+    state.fn_is_noreturn = lineHasNoreturnMarker(t, 0);
 
     return was_in_func; // True if we interrupted another function
 }
@@ -27086,8 +27607,12 @@ fn trackCFGBraces(t: []const u8, state: *CFGState) bool {
         // EPH-I0072: return-type markers may sit on any signature line, not
         // just the fn-keyword line — OR each pre-body line into the flags so
         // multi-line signatures reach ZA103's analyzeCFGErrdeferCoverage.
-        state.fn_returns_error = state.fn_returns_error or lineHasErrorReturnMarker(t);
-        state.fn_is_noreturn = state.fn_is_noreturn or lineHasNoreturnMarker(t);
+        // The carried paren depth gates the return-position match
+        // (EPH-I0075): a marker inside the param list is a param type.
+        state.fn_returns_error = state.fn_returns_error or
+            lineHasErrorReturnMarker(t, state.paren_depth);
+        state.fn_is_noreturn = state.fn_is_noreturn or
+            lineHasNoreturnMarker(t, state.paren_depth);
         body_offset = scanCFGSignatureLine(t, state);
         if (!state.body_started) return false;
     }
@@ -27392,6 +27917,10 @@ fn runDeferredTailAnalyses(run: CFGRunCtx, is_no_free_recipient: bool) !void {
         .fstart = run.func.start,
         .fp = run.file.file_path,
     });
+    // The ZA103 leak class cannot fire in a noreturn fn (EPH-I0073):
+    // every exit terminates the program, so an errdefer gap leaks
+    // nothing. ZA110 above and r1's ZA105/ZA106 stay live.
+    if (run.func.fn_is_noreturn) return;
     // The line cap bounds the ZA103 tail too: its per-allocation transfer
     // walk rescans the body for each try-alloc (O(M x N)), so an over-cap
     // function keeps the band-B02 F11 hang class alive through the tail
@@ -27467,7 +27996,10 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
     errdefer if (r1_owns_payloads) deinitIssuePayloads(r1.items, a);
     try out.appendSlice(a, r1.items);
     r1_owns_payloads = false;
-    var r2 = if (over_line_cap or is_no_free_recipient)
+    // ZA101's leak class cannot fire in a noreturn fn: every exit
+    // terminates the program, so a missing defer leaks nothing the OS
+    // does not reclaim (EPH-I0073). ZA105/ZA106 in r1 stay live.
+    var r2 = if (over_line_cap or is_no_free_recipient or run.func.fn_is_noreturn)
         std.ArrayListUnmanaged(Issue).empty
     else
         try analyzeCFGDeferCoverage(.{
@@ -28325,6 +28857,7 @@ fn finishCFGFunction(file: CFGFileCtx, scan: CFGScanCtx) !void {
         .start = state.func_start,
         .lines = scan.func_lines.items,
         .fn_returns_error = state.fn_returns_error,
+        .fn_is_noreturn = state.fn_is_noreturn,
         .in_test = in_test,
         .no_free_param_fns = state.no_free_param_fns,
         .no_free_fields = state.no_free_fields,
@@ -28367,6 +28900,9 @@ fn handleCFGFuncDetection(
             .start = prev.start,
             .lines = scan.func_lines.items,
             .fn_returns_error = false,
+            // The nested fn's own detect overwrote the flags, so the outer
+            // fn gets the conservative false (same rule as fn_returns_error).
+            .fn_is_noreturn = false,
             .in_test = prev.in_test,
             .no_free_param_fns = state.no_free_param_fns,
             .no_free_fields = state.no_free_fields,
@@ -37434,6 +37970,11 @@ const Config = struct {
     // trust note fires from the check handler, after the CLI path and the
     // target-config load settle the final scan root.
     cwd_config_loaded: bool = false,
+    // A target-side config (target dir or parent fallback) parsed
+    // successfully (EPH-I0076). When this and cwd_config_loaded both
+    // hold, the check handler notes that two configs merged: the cwd
+    // config's exclude and rule lists apply to the target scan.
+    target_config_loaded: bool = false,
     // --trust-target-config: honor suppression and CI-gate keys from a
     // scanned target's ephor.json. Default: untrusted configs set only
     // entries and path_dir (see isConfigDirTrusted).
@@ -37525,11 +38066,65 @@ const Config = struct {
 
     fn isPathExcluded(self: *const Config, path: []const u8) bool {
         for (self.exclude.items) |pattern| {
-            if (mem.indexOf(u8, path, pattern) != null) return true;
+            if (excludePatternMatchesPath(path, pattern)) return true;
         }
         return false;
     }
 };
+
+/// Component-wise exclude matching (EPH-I0076): each component of
+/// `pattern` matches a consecutive component of `path` in order, where
+/// component boundaries sit on '/'. The substring form this replaces
+/// silently applied a cwd config's exclude list to foreign targets —
+/// "vendor" matched tigerbeetle's src/stdx/vendored/ and hid its
+/// ZA202/ZA209 findings. The final pattern component also matches a
+/// path component that extends it with a dot, so the bare component
+/// name covers its file form ("sup_cfg" matches "sup_cfg.zig" and
+/// "vendor" matches "vendor.zig"). Empty pattern components (a leading
+/// or doubled '/') are skipped: "/test/" matches a component named
+/// "test" anywhere. Component-order matching, not anchoring: "a/b"
+/// matches "x/a/y/b" (subsequence, never substring).
+fn excludePatternMatchesPath(path: []const u8, pattern: []const u8) bool {
+    var comp_it = mem.splitScalar(u8, pattern, '/');
+    var path_pos: usize = 0;
+    var comp = comp_it.next();
+    while (comp) |pat_comp| : (comp = comp_it.next()) {
+        const is_last = comp_it.peek() == null;
+        if (pat_comp.len == 0) continue;
+        if (!nextPathComponentMatches(path, &path_pos, pat_comp, is_last)) return false;
+    }
+    return true;
+}
+
+/// Advance `*path_pos` to the next path component matching `pat_comp`
+/// (exact, or dot-extended when `is_last`). False when no later
+/// component matches (EPH-I0076).
+fn nextPathComponentMatches(
+    path: []const u8,
+    path_pos: *usize,
+    pat_comp: []const u8,
+    is_last: bool,
+) bool {
+    while (path_pos.* <= path.len) {
+        var comp_end = path_pos.*;
+        while (comp_end < path.len and path[comp_end] != '/') comp_end += 1;
+        const matched = excludeComponentMatches(path[path_pos.*..comp_end], pat_comp, is_last);
+        path_pos.* = comp_end + 1;
+        if (matched) return true;
+        if (comp_end >= path.len) break;
+    }
+    return false;
+}
+
+/// One component of excludePatternMatchesPath (EPH-I0076): exact
+/// equality always matches; the final pattern component also matches a
+/// component that extends it with a dot.
+fn excludeComponentMatches(path_comp: []const u8, pat_comp: []const u8, is_last: bool) bool {
+    if (mem.eql(u8, path_comp, pat_comp)) return true;
+    if (!is_last) return false;
+    return mem.startsWith(u8, path_comp, pat_comp) and
+        path_comp.len > pat_comp.len and path_comp[pat_comp.len] == '.';
+}
 
 const CONFIG_FILENAME = "ephor.json";
 
@@ -37915,6 +38510,10 @@ fn tryLoadConfigFromDir(
         .saved_path = saved_path,
         .entries_before = list_snapshot.entries,
     });
+    // A successful target-side load joins whatever the cwd config already
+    // contributed; the dual-load note fires from the check handler
+    // (EPH-I0076).
+    cfg.target_config_loaded = true;
     return true;
 }
 
@@ -37932,6 +38531,25 @@ fn noteSuppressionKeysIgnored(diag: *DiagCtx, allocator: Allocator, config_path:
         "note: ignoring suppression/gate keys from untrusted {s} " ++
             "(use --trust-target-config to honor)\n",
         .{safe_config.slice},
+    );
+}
+
+/// Print the dual-load disclosure note (EPH-I0076): the cwd config and a
+/// target-side config both loaded, so the cwd config's exclude and rule
+/// lists apply to the target scan. The dir bytes come from the scanned
+/// tree, so they cross the terminal sanitizer.
+fn noteDualConfigLoad(diag: *DiagCtx, allocator: Allocator, target_dir: []const u8) !void {
+    var safe_dir = try types.sanitizeTerminal(allocator, target_dir);
+    defer safe_dir.deinit(allocator);
+    // Count only after the fallible sanitize succeeded — an OOM before
+    // the note prints must not count it (the B13-21 discipline).
+    diag.dual_config_note_count += 1;
+    cliDiag(
+        diag,
+        "note: two configs loaded: the cwd ephor.json and {s}/ephor.json. " ++
+            "The cwd config's exclude and rule lists apply to the target scan. " ++
+            "Run from a neutral cwd to scan with the target's config alone.\n",
+        .{safe_dir.slice},
     );
 }
 
@@ -45197,6 +45815,7 @@ fn notePostLoadTrust(diag: *DiagCtx, allocator: Allocator, cfg: *const Config) !
     // decision whenever its directory covers the scan target.
     if (cfg.cwd_config_loaded and configDirCoversScanRoot(diag.io, ".", cfg.path))
         try noteTrustedConfig(diag, allocator, CONFIG_FILENAME);
+    try noteDualLoadIfAny(diag, allocator, cfg);
     // A non-default error-naming convention that comes from a config at
     // or inside the scanned tree.
     if (cfg.error_naming != .title_case) {
@@ -45205,6 +45824,17 @@ fn notePostLoadTrust(diag: *DiagCtx, allocator: Allocator, cfg: *const Config) !
                 try noteErrorNamingSource(diag, allocator, src, cfg.error_naming);
         }
     }
+}
+
+/// The dual-load note (EPH-I0076): when a target-side config also
+/// loaded, the cwd config's exclude and rule lists apply to the target
+/// scan. Skipped when the last committed config came from the cwd
+/// itself — `ephor check .` loads the same file twice.
+fn noteDualLoadIfAny(diag: *DiagCtx, allocator: Allocator, cfg: *const Config) !void {
+    if (!cfg.cwd_config_loaded or !cfg.target_config_loaded) return;
+    const dir = cfg.config_dir orelse return;
+    if (mem.eql(u8, dir, ".")) return;
+    try noteDualConfigLoad(diag, allocator, dir);
 }
 
 /// `check` command: run every analyzer over the import graph and print the
@@ -52099,6 +52729,65 @@ test "ZA101: far early return still warns, loop with post-loop defer stays silen
     ) == 1);
 }
 
+test "ZA101: exit-free inner loop between alloc and free stays silent (EPH-I0116)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The F6a loop deadlock read an exit-free inner loop as uncovered:
+    // the alloc always reaches the post-loop free, so the ZA101 was an
+    // FP. Pre-fix nested_no_break fired; post-fix only the exit
+    // shapes fire (break/return/try can bypass the free, so their
+    // verdict stays FP-lean).
+    const content =
+        \\fn nested_no_break(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    var j: u32 = 0;
+        \\    while (j < 3) : (j += 1) {
+        \\        if (c) {}
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn nested_break(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    var j: u32 = 0;
+        \\    while (j < 3) : (j += 1) {
+        \\        if (c) break;
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn nested_return(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    var j: u32 = 0;
+        \\    while (j < 3) : (j += 1) {
+        \\        if (c) return;
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn nested_try(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    var j: u32 = 0;
+        \\    while (j < 3) : (j += 1) {
+        \\        if (c) try fail();
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn fail() !void {
+        \\    return error.Bad;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_exit_free_loop.zig", content);
+    defer run.deinit(allocator);
+
+    // nested_break, nested_return, nested_try fire; nested_no_break stays
+    // silent.
+    try std.testing.expectEqual(
+        @as(usize, 3),
+        countRuleIssues(run.issues.items, "test_exit_free_loop.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
 test "ZA101: defer after the only return stays silent (EPH-I0348 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -52613,17 +53302,17 @@ test "ZA103: negation default on signature line does not fake error return" {
     );
 }
 
-test "ZA103: !bool negation on signature line trips the substring trap (pinned)" {
+test "ZA103: !bool negation on signature line stays silent (EPH-I0075)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // ACCEPTED TRAP (EPH-I0072, parity with the pre-existing detect-line
-    // trap): `!bool_flag` substring-matches the `!bool` marker, so the
-    // widened scan reads this plain-void fn as error-returning and ZA103
-    // fires. Pins current behavior; making the markers smarter is explicitly
-    // out of scope for this unit.
+    // Former ACCEPTED TRAP (EPH-I0072), fixed by the EPH-I0075
+    // return-position gate: `!bool_flag` is value-position negation and
+    // matches no marker now (word boundary — the byte after `!bool` is
+    // an identifier byte). The plain-void fn stays unchecked, so ZA103
+    // must not fire. Pre-fix this shape fired exactly once.
     const content =
         \\fn leaky(
         \\    allocator: std.mem.Allocator,
@@ -52639,22 +53328,51 @@ test "ZA103: !bool negation on signature line trips the substring trap (pinned)"
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
-        @as(usize, 1),
+        @as(usize, 0),
         countRuleIssues(run.issues.items, "test_ml_negtrap_103.zig", RULE_ALLOC_NO_ERRDEFER),
     );
 }
 
-test "ZA101: multi-line noreturn signature pins current no-gate behavior" {
+test "ZA103: fn-pointer param error type no longer fakes the fn's error return (EPH-I0075)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // PIN, not endorsement: fn_is_noreturn is vestigial (write-only — probed
-    // at HEAD 1a3593f: ZA101 fires on noreturn fns in every shape, single-
-    // and multi-line alike), so noreturn currently gets NO memory-check
-    // exemption and this ZA101 keeps firing. EPH-I0073 tracks wiring (or
-    // deleting) the gate; update this pin when that lands.
+    // The return-position gate (EPH-I0075): `!bool` inside the param
+    // list is a param TYPE, so the fn is plain-void and ZA103 must not
+    // run. Pre-fix the widened scan read the param type as the fn's
+    // error return.
+    const content =
+        \\fn leaky(
+        \\    allocator: std.mem.Allocator,
+        \\    cb: *const fn (u8) !bool,
+        \\    x: u8,
+        \\) void {
+        \\    const buf = try allocator.alloc(u8, 100);
+        \\    _ = buf;
+        \\    if (x > 0) return error.bad;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_ml_fnptr_103.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "test_ml_fnptr_103.zig", RULE_ALLOC_NO_ERRDEFER),
+    );
+}
+
+test "ZA101/ZA103: noreturn fn skips the leak-coverage rules (EPH-I0073)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Former PIN-not-endorsement, now the wired gate: fn_is_noreturn
+    // skips ZA101 and ZA103 (the leak classes) while ZA106 still fires
+    // (a double free before the panic is a real bug). The multi-line
+    // signature exercises the depth-gated marker.
     const content =
         \\fn die(
         \\    allocator: std.mem.Allocator,
@@ -52663,43 +53381,220 @@ test "ZA101: multi-line noreturn signature pins current no-gate behavior" {
         \\    _ = buf;
         \\    @panic("dead");
         \\}
+        \\fn die_single(allocator: std.mem.Allocator) noreturn {
+        \\    const b2 = allocator.alloc(u8, 10) catch unreachable;
+        \\    _ = b2;
+        \\    std.process.exit(1);
+        \\}
+        \\fn die_double(allocator: std.mem.Allocator) noreturn {
+        \\    const b3 = allocator.alloc(u8, 10) catch unreachable;
+        \\    allocator.free(b3);
+        \\    allocator.free(b3);
+        \\    @panic("dead");
+        \\}
     ;
     var run = try runCFGMemoryTest(&diag, allocator, "test_ml_noreturn_101.zig", content);
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
-        @as(usize, 1),
+        @as(usize, 0),
         countRuleIssues(run.issues.items, "test_ml_noreturn_101.zig", RULE_ALLOC_NO_DEFER),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "test_ml_noreturn_101.zig", RULE_ALLOC_NO_ERRDEFER),
+    );
+    // The ZA106 double-free in die_double stays loud.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_ml_noreturn_101.zig", RULE_DOUBLE_FREE),
+    );
+}
+
+test "ZA101: fn-pointer param of noreturn type does not exempt the outer fn (EPH-I0073)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The word-bounded depth-gated noreturn marker: the param TYPE
+    // carries the keyword, not the outer fn's return, so the outer fn
+    // stays need-free and its leak fires ZA101.
+    const content =
+        \\fn takes_cb(
+        \\    allocator: std.mem.Allocator,
+        \\    cb: *const fn () noreturn,
+        \\) void {
+        \\    const buf = allocator.alloc(u8, 100) catch unreachable;
+        \\    _ = buf;
+        \\    cb();
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_noreturn_param_101.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_noreturn_param_101.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
+test "ZA103: catch |e| return e; propagation is an error-exit trigger (EPH-I0069)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The canonical propagation form was in neither try_lines nor
+    // error_returns, so the alloc before it leaked silently. Pre-fix
+    // this shape fired no ZA103; post-fix the trigger fires once. The
+    // errdefer control stays silent, and a success-path bare return
+    // never fakes a trigger. The block form stays a documented
+    // residual (see hasErrorPropagationCatch).
+    const content =
+        \\fn with_prop(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    const v = maybe(c) catch |e| return e;
+        \\    use(buf, v);
+        \\}
+        \\fn with_errdefer(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    errdefer allocator.free(buf);
+        \\    const v = maybe(c) catch |e| return e;
+        \\    use(buf, v);
+        \\}
+        \\fn success_return(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    return use3(buf);
+        \\}
+        \\fn maybe(c: bool) !u8 {
+        \\    if (c) return error.Bad;
+        \\    return 1;
+        \\}
+        \\fn use(a: []u8, b: u8) void {
+        \\    _ = a;
+        \\    _ = b;
+        \\}
+        \\fn use3(a: []u8) void {
+        \\    _ = a;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_prop_catch_103.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_prop_catch_103.zig", RULE_ALLOC_NO_ERRDEFER),
+    );
+}
+
+test "ZA103: try inside the alloc's own argument list never triggers the outer alloc (EPH-I0074)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The tigerbeetle ci.zig:109 shape (EPH-I0074, closed by the
+    // EPH-I0675 statement-span machinery — this test pins it against
+    // regression): the outer alloc's only next-try sits inside its own
+    // argument list, so no error path can leak the outer result. The
+    // multi-line and single-line forms must stay silent; the
+    // later-try control fires (the machinery stays live).
+    const content =
+        \\fn read_shape(gpa: std.mem.Allocator, sh: *Shell, c: bool) !void {
+        \\    const wheel_local = try sh.cwd.readFileAlloc(
+        \\        gpa,
+        \\        try sh.fmt("zig-out/dist/python/{s}", .{"wheel.whl"}),
+        \\        1024,
+        \\    );
+        \\    defer gpa.free(wheel_local);
+        \\}
+        \\fn read_single(gpa: std.mem.Allocator, sh: *Shell, c: bool) !void {
+        \\    const x = try sh.cwd.readFileAlloc(gpa, try sh.fmt("x", .{}), 10);
+        \\    defer gpa.free(x);
+        \\}
+        \\fn later_try(gpa: std.mem.Allocator, sh: *Shell, c: bool) !void {
+        \\    const x = try gpa.alloc(u8, 10);
+        \\    const y = try sh.fmt("y", .{c});
+        \\    _ = y;
+        \\    _ = x;
+        \\}
+        \\const Shell = struct {
+        \\    cwd: Dir,
+        \\    fn fmt(self: *Shell, comptime f: []const u8, args: anytype) ![]u8 {
+        \\        _ = self;
+        \\        _ = f;
+        \\        _ = args;
+        \\        return error.Bad;
+        \\    }
+        \\};
+        \\const Dir = struct {
+        \\    fn readFileAlloc(self: Dir, a: std.mem.Allocator, p: []const u8, n: usize) ![]u8 {
+        \\        _ = self;
+        \\        _ = a;
+        \\        _ = p;
+        \\        _ = n;
+        \\        return error.Bad;
+        \\    }
+        \\};
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_arg_try_103.zig", content);
+    defer run.deinit(allocator);
+
+    // Only later_try fires: one ZA103 for the genuine gap.
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "test_arg_try_103.zig", RULE_ALLOC_NO_ERRDEFER),
     );
 }
 
 test "signature return-marker helpers match the shared pattern set" {
     // Branch probe for the EPH-I0072 shared helpers: every marker of the
     // detect-line set is recognized, plain-void and non-matching negation
-    // lines are not, and noreturn is tracked by its own helper.
-    try std.testing.expect(lineHasErrorReturnMarker(") !void {"));
-    try std.testing.expect(lineHasErrorReturnMarker(") !bool {"));
-    try std.testing.expect(lineHasErrorReturnMarker(") !usize {"));
-    try std.testing.expect(lineHasErrorReturnMarker(") !*Node {"));
-    try std.testing.expect(lineHasErrorReturnMarker(") ![]u8 {"));
-    try std.testing.expect(lineHasErrorReturnMarker("    error{OutOfMemory}!void"));
-    try std.testing.expect(!lineHasErrorReturnMarker(") void {"));
-    try std.testing.expect(!lineHasErrorReturnMarker("    flag: bool = !flag_default,"));
-    try std.testing.expect(lineHasNoreturnMarker(") noreturn {"));
-    try std.testing.expect(!lineHasNoreturnMarker(") void {"));
+    // lines are not, and noreturn is tracked by its own helper. The
+    // second arg is the carried paren depth at line start (EPH-I0075).
+    try std.testing.expect(lineHasErrorReturnMarker(") !void {", 0));
+    try std.testing.expect(lineHasErrorReturnMarker(") !bool {", 0));
+    try std.testing.expect(lineHasErrorReturnMarker(") !usize {", 0));
+    try std.testing.expect(lineHasErrorReturnMarker(") !*Node {", 0));
+    try std.testing.expect(lineHasErrorReturnMarker(") ![]u8 {", 0));
+    try std.testing.expect(lineHasErrorReturnMarker("    error{OutOfMemory}!void", 0));
+    try std.testing.expect(!lineHasErrorReturnMarker(") void {", 0));
+    try std.testing.expect(!lineHasErrorReturnMarker("    flag: bool = !flag_default,", 1));
+    try std.testing.expect(lineHasNoreturnMarker(") noreturn {", 0));
+    try std.testing.expect(!lineHasNoreturnMarker(") void {", 0));
 }
 
 test "signature return-marker helpers: own-line shapes pin each marker" {
     // Review F2 (EPH-I0072): every ") !"-prefixed positive above also matches
-    // the ") !" marker, so deleting "!bool"/"!usize"/"!*"/"![" from
-    // error_return_markers passed the full suite — those markers were
+    // the ") !" marker, so deleting "!bool"/"!usize"/"!*"/"![" from the
+    // marker table passed the full suite — those markers were
     // unpinned. No-prefix own-line shapes (the multi-line-signature myopia
     // targets: return type on its own continuation line) pin each marker
-    // individually.
-    try std.testing.expect(lineHasErrorReturnMarker("    !bool {"));
-    try std.testing.expect(lineHasErrorReturnMarker("    !usize {"));
-    try std.testing.expect(lineHasErrorReturnMarker("    !*Node {"));
-    try std.testing.expect(lineHasErrorReturnMarker("    ![]u8 {"));
+    // individually. The line-start `!` resets the carried depth, so the
+    // own-line shapes count from a depth of 1 (EPH-I0075).
+    try std.testing.expect(lineHasErrorReturnMarker("    !bool {", 1));
+    try std.testing.expect(lineHasErrorReturnMarker("    !usize {", 1));
+    try std.testing.expect(lineHasErrorReturnMarker("    !*Node {", 1));
+    try std.testing.expect(lineHasErrorReturnMarker("    ![]u8 {", 1));
+}
+
+test "signature return-marker helpers: param-type and negation traps stay silent (EPH-I0075)" {
+    // The depth gate: a marker inside the param list is a param TYPE, and
+    // a value-position negation never fakes an error return.
+    try std.testing.expect(!lineHasErrorReturnMarker("    cb: *const fn () !void,", 1));
+    try std.testing.expect(!lineHasErrorReturnMarker("    flag: bool = !bool_flag,", 1));
+    try std.testing.expect(!lineHasErrorReturnMarker("    flag: bool = !bool,", 1));
+    // Comment text is prose, never a marker.
+    try std.testing.expect(!lineHasErrorReturnMarker("    // returns !void on failure", 0));
+    try std.testing.expect(!lineHasErrorReturnMarker("    // ) !void {", 0));
+    // The noreturn twin: word-bounded, never inside a param type or an
+    // identifier.
+    try std.testing.expect(!lineHasNoreturnMarker("    cb: *const fn () noreturn,", 1));
+    try std.testing.expect(!lineHasNoreturnMarker("    fn die(cb: *const fn () noreturn) void {", 0));
+    try std.testing.expect(!lineHasNoreturnMarker("    my_noreturn_helper()", 0));
+    try std.testing.expect(lineHasNoreturnMarker("fn die() noreturn {", 0));
+    try std.testing.expect(lineHasNoreturnMarker("    noreturn {", 1));
 }
 
 test "ZA105: free through alias then use root" {
@@ -53610,6 +54505,82 @@ test "ZA106: all-arms chain intermediate grades err, skip paths stay conditional
     try std.testing.expect(nested_intermediate_warning);
     try std.testing.expect(prefix_intermediate_warning);
     try std.testing.expect(loop_intermediate_warning);
+}
+
+test "ZA106: 3-link all-arms chain grades the shallower intermediate err (EPH-I1145)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The EPH-I1142 walk capped the shallower intermediates of a
+    // 3+-link all-arms chain at the conditional warning: their pair
+    // partner is an else-if continuation header, never a marked else
+    // body. The EPH-I1145 continuation walk proves the pair definite
+    // when every arm of the continuation chain frees — the graded
+    // arm's skip path then runs a second free of its own. Pre-fix the
+    // shallower intermediate of chain3_own graded warning; post-fix
+    // it grades err like the last intermediate. The chain HEAD arm
+    // stays warning by the EPH-I1142 lock — the walk applies to
+    // intermediates only, and the head-arm upgrade is the named
+    // conservative-FN residual (gate kick-back B101 r1).
+    const content =
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+        \\fn chain3_own(allocator: std.mem.Allocator, a: bool, b: bool, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (a) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    else if (b) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    else if (c) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    else {
+        \\        allocator.free(buf);
+        \\    }
+        \\    use(buf);
+        \\}
+        \\fn chain3_gap(allocator: std.mem.Allocator, a: bool, b: bool, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    allocator.free(buf);
+        \\    if (a) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    else if (b) {
+        \\        allocator.free(buf);
+        \\    }
+        \\    else if (c) {
+        \\        _ = buf;
+        \\    }
+        \\    else {
+        \\        allocator.free(buf);
+        \\    }
+        \\    use(buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_chain3_all_arms.zig", content);
+    defer run.deinit(allocator);
+
+    var own_head_warning = false;
+    var own_first_intermediate_err = false;
+    var own_second_intermediate_err = false;
+    var gap_first_intermediate_warning = false;
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        if (issue.line == 8) own_head_warning = issue.severity == .warning;
+        if (issue.line == 11) own_first_intermediate_err = issue.severity == .err;
+        if (issue.line == 14) own_second_intermediate_err = issue.severity == .err;
+        if (issue.line == 28) gap_first_intermediate_warning = issue.severity == .warning;
+    }
+    try std.testing.expect(own_head_warning);
+    try std.testing.expect(own_first_intermediate_err);
+    try std.testing.expect(own_second_intermediate_err);
+    try std.testing.expect(gap_first_intermediate_warning);
 }
 
 test "ZA106: loop-else both-arms free grades err, plain loop twin stays conditional (EPH-I1017 F1)" {
@@ -59036,8 +60007,10 @@ test "ZA103: bare error return without a trigger stays silent (EPH-I0005 lock)" 
 
     // Same shape minus the `try validate` line: the bare `return err;` stops
     // the ownership scan, but emission still requires a real trigger (try or
-    // `return error.`) — a bare-err return is not itself a trigger (that
-    // expansion is EPH-I0069's scope). The exit-stop only un-suppresses.
+    // `return error.`) — a bare-err return is not itself a trigger. The
+    // EPH-I0069 expansion landed the single-line canonical form
+    // (`catch |X| return X;`); the catch-BLOCK bare return here stays
+    // outside it. The exit-stop only un-suppresses.
     const content =
         \\fn bareErrLock(allocator: std.mem.Allocator, state: *State, s: []const u8) !void {
         \\    const buf = try allocator.dupe(u8, s);
@@ -84331,6 +85304,63 @@ test "no FP for allocPrint with arena alias from ArenaAllocator (ZA101)" {
         try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_DEFER));
         try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
+}
+
+test "ZA101/ZA103: method-call arena alias stays flagged — documented residual (EPH-I0067)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // DOCUMENTED RESIDUAL (EPH-I0067): `config.arenaAlloc()` returns
+    // the arena allocator (the method body derives it from an
+    // ArenaAllocator field) and `defer config.deinit()` bulk-frees
+    // every allocation made through it. Proving that needs cross-file
+    // return-type resolution, which stays out of scope — until it
+    // lands the class stays flagged in the safe direction. This test
+    // pins the residual: the FP shape still fires, the plain-gpa
+    // control still fires (the rules stay live).
+    const content =
+        \\const std = @import("std");
+        \\const Config = struct {
+        \\    _arena: ?std.heap.ArenaAllocator,
+        \\    pub fn init(a: std.mem.Allocator) Config {
+        \\        return .{ ._arena = std.heap.ArenaAllocator.init(a) };
+        \\    }
+        \\    pub fn deinit(self: *Config) void {
+        \\        if (self._arena) |*ar| ar.deinit();
+        \\    }
+        \\    pub fn arenaAlloc(self: *Config) std.mem.Allocator {
+        \\        return self._arena.?.allocator();
+        \\    }
+        \\};
+        \\fn do_work(c: bool) !void {
+        \\    var config = Config.init(std.heap.page_allocator);
+        \\    defer config.deinit();
+        \\    const config_alloc = config.arenaAlloc();
+        \\    const buf = try config_alloc.dupe(u8, "payload");
+        \\    if (c) return error.Bad;
+        \\    _ = buf;
+        \\}
+        \\fn plain_leak(gpa: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try gpa.alloc(u8, 10);
+        \\    if (c) return error.Bad;
+        \\    _ = buf;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_method_arena_alias.zig", content);
+    defer run.deinit(allocator);
+
+    // Both fns fire both rules: the residual keeps the FP, the control
+    // keeps the true positive.
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countRuleIssues(run.issues.items, "test_method_arena_alias.zig", RULE_ALLOC_NO_DEFER),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countRuleIssues(run.issues.items, "test_method_arena_alias.zig", RULE_ALLOC_NO_ERRDEFER),
+    );
 }
 
 test "no FP for local arena alias from struct field access (ZA101)" {
@@ -110122,6 +111152,80 @@ test "trusted config keeps full control of suppression and gates" {
     try std.testing.expectEqualStrings("Z", cfg.disabled_rules.items[0]);
     try std.testing.expectEqual(FailOn.never, cfg.fail_on);
     try std.testing.expectEqual(FailOnSource.fail_on_key, cfg.fail_on_source);
+}
+
+test "exclude matching is component-wise, never substring (EPH-I0076)" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try cfg.exclude.append(allocator, try allocator.dupe(u8, "vendor"));
+    try cfg.exclude.append(allocator, try allocator.dupe(u8, "sup_cfg"));
+
+    // The live bug: substring matching applied a cwd config's exclude
+    // list to a foreign target — "vendor" matched tigerbeetle's
+    // src/stdx/vendored/ and hid its findings. Component matching
+    // fixes it.
+    try std.testing.expect(cfg.isPathExcluded("src/vendor/x.zig"));
+    try std.testing.expect(cfg.isPathExcluded("src/stdx/vendor/lib.zig"));
+    try std.testing.expect(cfg.isPathExcluded("src/vendor.zig"));
+    try std.testing.expect(!cfg.isPathExcluded("src/stdx/vendored/x.zig"));
+    try std.testing.expect(!cfg.isPathExcluded("src/vendored/x.zig"));
+    try std.testing.expect(!cfg.isPathExcluded("src/testing/x.zig"));
+    try std.testing.expect(!cfg.isPathExcluded("src/third_party/x.zig"));
+    // The bare component name still covers its file form (the pinned
+    // suppression tests rely on it).
+    try std.testing.expect(cfg.isPathExcluded("src/sup_cfg.zig"));
+    try std.testing.expect(!cfg.isPathExcluded("src/sup_cfg2.zig"));
+    // Absolute paths match the same way.
+    try std.testing.expect(cfg.isPathExcluded("/home/u/proj/src/vendor/x.zig"));
+}
+
+test "exclude multi-component patterns match component sequences (EPH-I0076)" {
+    const allocator = std.testing.allocator;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    try cfg.exclude.append(allocator, try allocator.dupe(u8, "test/fixtures"));
+
+    try std.testing.expect(cfg.isPathExcluded("src/test/fixtures/a.zig"));
+    try std.testing.expect(cfg.isPathExcluded("test/fixtures.zig"));
+    try std.testing.expect(!cfg.isPathExcluded("src/fixtures/test/a.zig"));
+    // Sequence order matters, subsequence does not cross.
+    try std.testing.expect(!cfg.isPathExcluded("src/fixtures/x/test.zig"));
+    // A leading-slash pattern's empty components are skipped.
+    try cfg.exclude.append(allocator, try allocator.dupe(u8, "/gen/"));
+    try std.testing.expect(cfg.isPathExcluded("src/gen/a.zig"));
+}
+
+test "dual config load marks both channels and the note fires (EPH-I0076)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    try writeTestConfig(dir_path, "{\"disable\": [\"ZA501\"]}");
+
+    diag.cli_diagnostics_enabled = false;
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.cwd_config_loaded = true;
+    try loadConfigFromTargetPath(&diag, allocator, &cfg, dir_path);
+    try std.testing.expect(cfg.target_config_loaded);
+    // The dual-load note fires: the target config's dir differs from
+    // the cwd.
+    try notePostLoadTrust(&diag, allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), diag.dual_config_note_count);
+    // The note does not fire for a same-dir load (`ephor check .`
+    // reads the same file twice).
+    var diag2 = testDiagCtx();
+    diag2.cli_diagnostics_enabled = false;
+    var cfg2 = testConfig();
+    defer cfg2.deinit(allocator);
+    cfg2.cwd_config_loaded = true;
+    cfg2.target_config_loaded = true;
+    cfg2.config_dir = try allocator.dupe(u8, ".");
+    try notePostLoadTrust(&diag2, allocator, &cfg2);
+    try std.testing.expectEqual(@as(usize, 0), diag2.dual_config_note_count);
 }
 
 test "untrusted target fail_on:never cannot lower a trusted gate (RED3-4)" {

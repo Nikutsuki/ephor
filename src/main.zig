@@ -25947,14 +25947,16 @@ fn isFlatChain(state: *const ComplexityState) bool {
 
 /// Flat switch dispatcher: arms at one level with trivial bodies
 /// (EPH-I0276). The arm cost skews the flat-chain ratio — the switch's own
-/// brace opens a cognitive scope, so each arm costs 1+cog_nest cognitive
-/// (2 at the top level) but only 1 cyclomatic. A dispatcher then exceeds
-/// the 1.5 ratio even with zero logic. The allowance holds when the
-/// cognitive excess over cyclomatic is at most the arm count — exactly
-/// the nest-scaling each top-level arm adds — and the fn nests at most 3
-/// (fn, one guard, switch). Arms with real logic (embedded branches,
-/// try/catch, else blocks) blow the excess bound and stay out; so does a
-/// two-arm switch whose arms carry ifs (the EPH-I0884 probe).
+/// brace opens a cognitive scope, so each top-level arm costs 2 cognitive
+/// (1+cog_nest) but only 1 cyclomatic. A dispatcher then exceeds the 1.5
+/// ratio even with zero logic. The allowance holds when the cognitive
+/// excess over cyclomatic is at most the arm count — exactly the
+/// nest-scaling the switch scope adds per arm — and the fn nests at most
+/// 3. The qualifying shape is the TOP-LEVEL dispatcher (fn > switch, arms
+/// directly in the switch scope): a guard-wrapped switch costs 2 excess
+/// per arm and falls outside the bound. Arms with real logic (embedded
+/// branches, try/catch, else blocks) blow the excess bound and stay out;
+/// so does a two-arm switch whose arms carry ifs (the EPH-I0884 probe).
 fn isFlatSwitch(state: *const ComplexityState) bool {
     return state.switch_arms > 0 and
         state.cognitive <= state.cyclomatic + state.switch_arms and
@@ -26007,6 +26009,9 @@ fn identTokenStart(t: []const u8, pos: usize) ?usize {
 /// True when `ident` is a control/declaration keyword whose parens are a
 /// header, not a call (EPH-I0277). The list is conservative: an identifier
 /// absent here disqualifies the data-table candidate, never grants it.
+/// Only real Zig keywords sit in the list — a bare type or receiver name
+/// (`Vector(`, `Self(`, `this(`) is a call and must disqualify
+/// (review F4, cycle 2).
 fn isControlHeaderIdent(ident: []const u8) bool {
     inline for (.{
         "switch",   "return",      "defer",          "comptime",  "inline",      "fn",
@@ -26015,8 +26020,7 @@ fn isControlHeaderIdent(ident: []const u8) bool {
         "if",       "while",       "for",            "catch",     "break",       "continue",
         "struct",   "enum",        "union",          "error",     "orelse",      "packed",
         "volatile", "atomic",      "noalias",        "async",     "await",       "resume",
-        "suspend",  "anyframe",    "usingnamespace", "addrspace", "threadlocal", "Vector",
-        "Self",     "this",
+        "suspend",  "anyframe",    "usingnamespace", "addrspace", "threadlocal",
     }) |kw| {
         if (mem.eql(u8, ident, kw)) return true;
     }
@@ -26111,6 +26115,26 @@ const ReportCtx = struct {
     path: []const u8,
 };
 
+/// True when the [dt] tag governs `rule`: the data-table 20x multiplier
+/// applies to the line/branch/cyclomatic/cognitive checks only (EPH-I0277).
+/// A tag on any other rule would claim a wrong cause for the finding.
+fn dtTagApplies(rule: []const u8) bool {
+    return mem.eql(u8, rule, RULE_FUNC_TOO_LONG) or
+        mem.eql(u8, rule, RULE_TOO_MANY_BRANCHES) or
+        mem.eql(u8, rule, RULE_CYCLOMATIC) or
+        mem.eql(u8, rule, RULE_COGNITIVE);
+}
+
+/// True when a flat tag governs `rule`: ZA305/ZA306 carry both flat forms,
+/// and ZA304 carries the flat-switch arm only (branchLimit grants no
+/// flat-chain allowance — EPH-I0276). No other rule has a flat multiplier.
+fn flatTagApplies(rule: []const u8, state: *const ComplexityState) bool {
+    if (mem.eql(u8, rule, RULE_CYCLOMATIC) or mem.eql(u8, rule, RULE_COGNITIVE))
+        return isFlatChain(state) or isFlatSwitch(state);
+    if (mem.eql(u8, rule, RULE_TOO_MANY_BRANCHES)) return isFlatSwitch(state);
+    return false;
+}
+
 /// Report a single complexity issue
 fn reportSingleComplexity(
     ctx: ReportCtx,
@@ -26119,13 +26143,16 @@ fn reportSingleComplexity(
 ) !void {
     if (check_def.actual <= check_def.limit) return;
     // EPH-I0277: [dt] first — a data table outranks every other pattern.
-    const suffix: []const u8 = if (state.is_data_table)
+    // The dt and flat tags are rule-gated: they name the multiplier that
+    // governed THIS check, so a rule the pattern does not govern (ZA302
+    // nesting, ZA303 params) carries no tag (review F1, cycle 2).
+    const suffix: []const u8 = if (state.is_data_table and dtTagApplies(check_def.rule))
         " [dt]"
     else if (state.is_type_factory)
         " [tf]"
     else if (state.is_data_dispatch)
         " [dd]"
-    else if (isFlatChain(state) or isFlatSwitch(state))
+    else if (flatTagApplies(check_def.rule, state))
         " [flat]"
     else
         "";
@@ -91216,6 +91243,78 @@ test "branchLimit applies the pattern multipliers" {
     try std.testing.expectEqual(@as(usize, 240), branchLimit(12, &dt));
 }
 
+test "dt and flat tags are rule-gated (EPH-I0276, EPH-I0277)" {
+    // The tags name the multiplier that governed the finding. A rule the
+    // pattern does not govern (ZA302 nesting, ZA303 params) carries no
+    // tag — a wrong-cause claim in the product output (review F1).
+    try std.testing.expect(dtTagApplies(RULE_FUNC_TOO_LONG));
+    try std.testing.expect(dtTagApplies(RULE_TOO_MANY_BRANCHES));
+    try std.testing.expect(dtTagApplies(RULE_CYCLOMATIC));
+    try std.testing.expect(dtTagApplies(RULE_COGNITIVE));
+    try std.testing.expect(!dtTagApplies(RULE_TOO_MANY_PARAMS));
+    try std.testing.expect(!dtTagApplies(RULE_NESTING_TOO_DEEP));
+
+    const flat_switch = ComplexityState{
+        .cognitive = 10,
+        .cyclomatic = 10,
+        .switch_arms = 8,
+        .max_nest = 2,
+    };
+    try std.testing.expect(flatTagApplies(RULE_CYCLOMATIC, &flat_switch));
+    try std.testing.expect(flatTagApplies(RULE_COGNITIVE, &flat_switch));
+    try std.testing.expect(flatTagApplies(RULE_TOO_MANY_BRANCHES, &flat_switch));
+    try std.testing.expect(!flatTagApplies(RULE_TOO_MANY_PARAMS, &flat_switch));
+    try std.testing.expect(!flatTagApplies(RULE_NESTING_TOO_DEEP, &flat_switch));
+    try std.testing.expect(!flatTagApplies(RULE_FUNC_TOO_LONG, &flat_switch));
+
+    // branchLimit grants no flat-chain allowance: a flat if-chain tags
+    // ZA305/306 but never ZA304.
+    const flat_chain = ComplexityState{ .cognitive = 10, .cyclomatic = 10, .max_nest = 2 };
+    try std.testing.expect(flatTagApplies(RULE_CYCLOMATIC, &flat_chain));
+    try std.testing.expect(!flatTagApplies(RULE_TOO_MANY_BRANCHES, &flat_chain));
+}
+
+test "pattern tags stay off param findings (EPH-I0276, EPH-I0277)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+
+    // A 5-param fn whose body is pure discard rows: [dt]-classified and
+    // flat-chain-shaped, so every pattern is present — but the param
+    // finding must carry no tag (the patterns govern other rules).
+    const code =
+        \\fn add(a: u32, b: u32, c: u32, d: u32, e: u32) u32 {
+        \\    _ = a;
+        \\    _ = b;
+        \\    _ = c;
+        \\    _ = d;
+        \\    _ = e;
+        \\    return 0;
+        \\}
+    ;
+
+    const analysis = try createTestFileAnalysis(allocator, "tag_gate.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "tag_gate.zig"), {});
+
+    var issues = try analyzeComplexity(allocator, &graph, .{});
+    defer deinitIssues(&issues, allocator);
+
+    var param_findings: usize = 0;
+    for (issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_TOO_MANY_PARAMS)) continue;
+        param_findings += 1;
+        try std.testing.expect(mem.indexOf(u8, issue.message, "has 5 parameters (max 4)") != null);
+        try std.testing.expect(mem.indexOf(u8, issue.message, "[dt]") == null);
+        try std.testing.expect(mem.indexOf(u8, issue.message, "[flat]") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), param_findings);
+}
+
 test "ZA304 suppressed for fromJson with many branches" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -102769,9 +102868,12 @@ test "ZA301: wrapped real fn def counts its signature lines (EPH-I0756)" {
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // 9 lines from the fn keyword to the close. The deferred open must
-    // backfill the 2 signature lines, so the fn reports 9 lines at the def
-    // line (cap 7) exactly as the eager open did.
+    // 10 lines from the fn keyword to the close. The deferred open must
+    // backfill the 2 signature lines, so the fn reports 10 lines at the
+    // def line (cap 8) — without the backfill only the 8 body lines
+    // count, which stays silent at the same cap. The cap-8 discriminator
+    // pins the backfill (review F3, cycle 2: the cap sat at 7 with 9
+    // lines pre-E0277-logic-line, where a no-backfill count also fired).
     // EPH-I0277: five discard rows alone are the data-table shape (the
     // [dt] line allowance would silence the verdict), so one logic line
     // keeps the fixture outside the pattern (test evolution, not
@@ -102793,7 +102895,7 @@ test "ZA301: wrapped real fn def counts its signature lines (EPH-I0756)" {
     try graph.files.put(analysis.path, analysis);
     try graph.reachable.put(try allocator.dupe(u8, "wrapped_def.zig"), {});
 
-    const th = Thresholds{ .max_function_lines = 7 };
+    const th = Thresholds{ .max_function_lines = 8 };
     var issues = try analyzeComplexity(allocator, &graph, th);
     defer deinitIssues(&issues, allocator);
 

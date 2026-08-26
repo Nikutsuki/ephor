@@ -438,16 +438,16 @@ An override that is not absolute or does not resolve prints a warning and falls 
 
 | Rule | Severity | Default | Description |
 |------|----------|---------|-------------|
-| **ZA301** | warning | ON | Function exceeds max lines (default: 50; type factories get 3x) |
+| **ZA301** | warning | ON | Function exceeds max lines (default: 50; type factories get 3x, data tables get 20x) |
 | **ZA302** | warning | ON | Function exceeds max nesting depth (default: 3; type factories get 2x) |
 | **ZA303** | warning | ON | Function has too many parameters (default: 4; counted across multi-line signatures). Exempt: `extern`, `export`, and `callconv(.c)`/`callconv(.C)`/`callconv(.Stdcall)` declarations — a pinned ABI fixes the parameter list (EPH-I1059, EPH-I1093, EPH-I1096) |
-| **ZA304** | warning | ON | Function has too many branches (default: 12; type factories get 3x) |
+| **ZA304** | warning | ON | Function has too many branches (default: 12; type factories get 3x, data tables get 20x, flat switch dispatchers get 2x) |
 | **ZA305** | warning | OFF | Function has high cyclomatic complexity — McCabe CCN (default: 10) |
 | **ZA306** | warning | OFF | Function has high cognitive complexity — Sonar-style weighted nesting (default: 15) |
 
 **Note:** Functions returning `type` (comptime type factories like `fn Bind(T: type) type`) automatically get relaxed limits since they're metaprogramming constructs that build types at compile time. `inline for/while` loops are not counted as branches since they're compile-time unrolled.
 
-**Data-dispatch functions** (parse/deserialize/serialize/config loaders — one branch per field) get an 8x limit on ZA304, ZA305, and ZA306. **Flat-chain functions** (routers/dispatchers where cognitive <= cyclomatic x 1.5 and max nesting <= 2) get a 2x limit on ZA305 and ZA306.
+**Data-dispatch functions** (parse/deserialize/serialize/config loaders — one branch per field) get an 8x limit on ZA304, ZA305, and ZA306. **Flat-chain functions** (routers/dispatchers where cognitive <= cyclomatic x 1.5 and max nesting <= 2) get a 2x limit on ZA305 and ZA306. **Flat switch dispatchers** (a top-level switch whose arms sit at one level with trivial bodies — the cognitive excess over cyclomatic is at most the arm count, the switch scope's per-arm scaling) get a 2x limit on ZA304, ZA305, and ZA306. **Data tables** (structurally detected pure data mapping — constant arms, literal-assignment rows, no calls or control flow) get a 20x limit on ZA301, ZA304, ZA305, and ZA306.
 
 ### Cyclomatic Complexity (ZA305)
 

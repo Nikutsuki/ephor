@@ -35,11 +35,11 @@ const OptIndex = Ast.Node.OptionalIndex;
 // Compiler-gap evidence (zig 0.16.0, build-obj -fno-emit-bin probes):
 //   CAUGHT: return &var_local;  MISSED: &var.field, &var[i], var[lo..hi],
 //   &param, &param.field, &var.slice_field, &var.ptr_field, &opt.?,
-//   const p = &var; return p.  SAFE: comptime consts, comptime params,
-//   comptime var (the comptime string-builder idiom).
-// ZA111 covers exactly the MISSED forms; the bare-var form is skipped so
-// ephor never duplicates a hard compile error. (Slot-address rows
-// re-verified 2026-08-23, EPH-I0590.)
+//   const p = &var; return p, and the bare &var store.  SAFE:
+//   comptime consts, comptime params, comptime var (string-builder idiom).
+// ZA111 covers exactly the MISSED forms; the bare-var return form is
+// skipped so ephor never duplicates a hard compile error. (Slot-address
+// rows re-verified 2026-08-23, EPH-I0590.)
 //
 // Precision policy: a chained address-of is flagged only when every hop
 // provably stays inside the stack frame. A hop through a pointer/slice
@@ -965,7 +965,7 @@ fn switchValueRoot(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?[]const
 
 fn isLabeledBlockTag(tag: Ast.Node.Tag) bool {
     return switch (tag) {
-        .block_two, .block_two_semicolon => true,
+        .block, .block_semicolon, .block_two, .block_two_semicolon => true,
         else => false,
     };
 }
@@ -982,8 +982,8 @@ fn aliasAddressTarget(sctx: ScanCtx, scan: *const FnScan, amp: NodeIndex) ?[]con
 const Bind = struct {
     is_pointer: bool,
     type_node: OptIndex,
-    /// Bare `&param` is missed by Sema (flag); bare `&var` is a hard
-    /// compile error (never echo).
+    /// Bare `&param` is missed by Sema (flag). Bare `&var` is a hard
+    /// compile error only at the return sink (store: silent, EPH-I1210).
     is_param: bool,
 };
 
@@ -1059,6 +1059,7 @@ fn classifyReturn(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Finding 
         .builtin_call, .builtin_call_comma, .builtin_call_two, .builtin_call_two_comma => blk: {
             break :blk classifyBuiltinReturn(sctx, scan, e);
         },
+        .block, .block_semicolon => classifyBlockReturn(sctx, scan, e),
         .block_two, .block_two_semicolon => classifyBlockReturn(sctx, scan, e),
         else => null,
     };
@@ -1092,9 +1093,9 @@ fn classifyBlockReturn(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Fin
 ///
 /// `allow_bare`: a bare `&var` break feeding a direct return is
 /// compiler-caught (probed 0.16.0) — the return sink passes false, the
-/// alias machinery passes true. The store sink is Sema-silent for the
-/// block-value form (probe-pinned, EPH-I1210) and keeps false as a
-/// documented FN. The field form (`&v.a`) is silent at every sink.
+/// alias machinery and the store sink pass true (Sema-silent,
+/// probe-pinned, EPH-I1210). The field form (`&v.a`) is Sema-silent
+/// everywhere and fires.
 fn blockValueRoot(
     sctx: ScanCtx,
     scan: *const FnScan,
@@ -1383,13 +1384,13 @@ fn checkEscapeAssign(
 }
 
 /// The stack root an out-store rhs points into. A labeled-block rhs
-/// adjudicates strictly: the 0.16.0 probe shows Sema stays silent on a
-/// bare `&var` break feeding a store, so `allow_bare=false` here is a
-/// documented FN tracked by EPH-I1210 — only the field form and chains
-/// fire (EPH-I0046). Other shapes resolve through aliasTarget.
+/// uses the alias posture (allow_bare=true): the 0.16.0 probe shows
+/// Sema stays silent on a bare `&var` break feeding a store, so the
+/// bare form fires here (EPH-I1210) beside the field form and chains
+/// (EPH-I0046). Other shapes resolve via aliasTarget.
 fn assignRhsTarget(sctx: ScanCtx, scan: *const FnScan, rhs: NodeIndex) ?[]const u8 {
     const e = unwrapGroup(sctx.tree, rhs);
-    if (isLabeledBlockTag(sctx.tree.nodeTag(e))) return blockValueRoot(sctx, scan, e, false);
+    if (isLabeledBlockTag(sctx.tree.nodeTag(e))) return blockValueRoot(sctx, scan, e, true);
     return aliasTarget(sctx, scan, rhs);
 }
 

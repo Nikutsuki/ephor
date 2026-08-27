@@ -623,21 +623,35 @@ const QuoteMode = enum { none, str, char, mline };
 fn stepQuoteMode(mode: *QuoteMode, line: []const u8, i: *usize) void {
     const c = line[i.*];
     switch (mode.*) {
-        .char => {
-            if (c == '\\') i.* += 1;
-            if (c == '\'') mode.* = .none;
-        },
-        .str => {
-            if (c == '\\') i.* += 1;
-            if (c == '"') mode.* = .none;
-        },
+        .char => stepInsideQuote(mode, c, '\'', i),
+        .str => stepInsideQuote(mode, c, '"', i),
         .mline => {},
-        .none => {
-            if (isMultilineOpenerAt(line, i.*)) mode.* = .mline;
-            if (c == '\'') mode.* = .char;
-            if (c == '"') mode.* = .str;
-        },
+        .none => stepFromCode(mode, line, i, c),
     }
+}
+
+/// One step inside a literal: a backslash skips the escaped char, and the
+/// mode's closing quote returns to code (EPH-I0104).
+fn stepInsideQuote(mode: *QuoteMode, c: u8, closer: u8, i: *usize) void {
+    if (c == '\\') {
+        i.* += 1;
+        return;
+    }
+    if (c == closer) mode.* = .none;
+}
+
+/// One step in code: a `\\` opener starts a multiline tail (EPH-I0671),
+/// and a quote opens its literal.
+fn stepFromCode(mode: *QuoteMode, line: []const u8, i: *usize, c: u8) void {
+    if (isMultilineOpenerAt(line, i.*)) {
+        mode.* = .mline;
+        return;
+    }
+    if (c == '\'') {
+        mode.* = .char;
+        return;
+    }
+    if (c == '"') mode.* = .str;
 }
 
 /// Check if position `col` is inside a string literal. Escape handling: an

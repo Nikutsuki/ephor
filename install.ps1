@@ -460,24 +460,61 @@ error: no build.zig found in current directory
     # byte cap (EPH-I0207; install.sh fetch_bounded parity). The bounded
     # read mirrors the tags-API fetch: TimeoutSec bounds duration, the
     # cap bounds bytes, and an over-cap download warns and fails, so the
-    # caller fails closed. The non-http arm keeps the operator-picked
-    # test channel: Invoke-WebRequest serves file:// URLs, and the
-    # bytes are local.
+    # caller fails closed.
+    # EPH-I1216 (qa-gate B112+M-1): the redirect and cap policy matches
+    # install.sh fetch_bounded. An https origin follows redirects
+    # clamped to https (install.sh --proto-redir =https): an
+    # https-to-https hop is followed, and a hop that leaves https fails
+    # the download closed. The hop loop runs because
+    # MaxAutomaticRedirections clamps the count but not the scheme, and
+    # the automatic downgrade protection differs across PowerShell
+    # versions. The non-http arm (the operator-picked file:// test
+    # channel) copies through the same bounded read as the network arm,
+    # so the cap applies to every scheme (install.sh --max-filesize).
     function Get-BoundedFile {
         param([string]$Url, [string]$OutPath, [long]$MaxBytes)
         if ($Url.StartsWith("https://") -or $Url.StartsWith("http://")) {
             $handler = [System.Net.Http.HttpClientHandler]::new()
-            if ($Url.StartsWith("https://")) { $handler.MaxAutomaticRedirections = 0 }
+            $handler.AllowAutoRedirect = $false
             $client = [System.Net.Http.HttpClient]::new($handler)
             $response = $null
             $stream = $null
             $fileStream = $null
             try {
                 $client.Timeout = [TimeSpan]::FromSeconds(30)
-                $response = $client.GetAsync(
-                    $Url,
-                    [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
-                ).GetAwaiter().GetResult()
+                $currentUrl = $Url
+                $httpsOrigin = $Url.StartsWith("https://")
+                # EPH-I1216: follow up to ten hops. Real CDN chains use
+                # one to three hops; the bound only stops a
+                # self-redirect loop. An https origin refuses every hop
+                # whose target is not https (install.sh --proto-redir
+                # =https). An exhausted hop budget or a hop without a
+                # Location header fails the download closed.
+                for ($hop = 0; $hop -le 10; $hop++) {
+                    $response = $client.GetAsync(
+                        $currentUrl,
+                        [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+                    ).GetAwaiter().GetResult()
+                    $statusCode = [int]$response.StatusCode
+                    if ($statusCode -ge 300 -and $statusCode -lt 400) {
+                        $location = $response.Headers.Location
+                        $response.Dispose()
+                        $response = $null
+                        if ($null -eq $location) { return $false }
+                        if (-not $location.IsAbsoluteUri) {
+                            $location = [System.Uri]::new(
+                                [System.Uri]$currentUrl, $location)
+                        }
+                        if ($httpsOrigin -and ($location.Scheme -ne "https")) {
+                            Write-Stderr "warning: the download redirects away from https."
+                            return $false
+                        }
+                        $currentUrl = $location.AbsoluteUri
+                        continue
+                    }
+                    break
+                }
+                if ($null -eq $response) { return $false }
                 $response.EnsureSuccessStatusCode()
                 $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
                 $bytes = New-Object byte[] 8192
@@ -504,8 +541,41 @@ error: no build.zig found in current directory
                 $client.Dispose()
             }
         }
-        Invoke-WebRequest -Uri $Url -OutFile $OutPath -TimeoutSec 30
-        return $true
+        # EPH-I1216: the non-http arm (a file:// URL or a bare path)
+        # applies the same byte cap as the network arm, so the
+        # operator-picked test channel stays bounded (install.sh
+        # --max-filesize on every scheme). A local copy reads
+        # MaxBytes plus one probe byte at most, even when the file
+        # grows during the copy.
+        $source = $null
+        $fileStream = $null
+        try {
+            $filePath = $Url
+            if ($Url.StartsWith("file://")) {
+                $filePath = [System.Uri]::new($Url).LocalPath
+            }
+            $source = [System.IO.File]::OpenRead($filePath)
+            $fileStream = [System.IO.File]::Create($OutPath)
+            $bytes = New-Object byte[] 8192
+            $total = [long]0
+            while ($total -lt $MaxBytes) {
+                $remaining = [int][Math]::Min([long]$bytes.Length, $MaxBytes - $total)
+                $n = $source.Read($bytes, 0, $remaining)
+                if ($n -le 0) { break }
+                $fileStream.Write($bytes, 0, $n)
+                $total += $n
+            }
+            if ($total -ge $MaxBytes -and $source.ReadByte() -ne -1) {
+                Write-Stderr "warning: the download exceeds the $MaxBytes byte cap."
+                return $false
+            }
+            return $true
+        } catch {
+            return $false
+        } finally {
+            if ($null -ne $fileStream) { $fileStream.Dispose() }
+            if ($null -ne $source) { $source.Dispose() }
+        }
     }
 
     # EPH-I0287 (WP-6.5): download the release tarball and its minisign
@@ -707,6 +777,64 @@ error: could not repair the fingerprint in build.zig.zon
         Write-Stderr "Update them manually (see the ephor README)."
     }
 
+    # Find the index of the last code-position installArtifact mention
+    # in $Lines, or -1 when none exists (EPH-I1202; install.sh
+    # find_install_artifact_line parity, the EPH-I0715 awk-walk port).
+    # The walk tracks string and char literals and stops at // comments
+    # and \\ multiline tails, so a mention inside a string or a comment
+    # cannot win the insertion anchor. A trailing inline comment after
+    # the real call still anchors that call correctly: the walk breaks
+    # at // after it has seen the code-position mention. The first
+    # non-space char gate keeps the EPH-I0626 code-line idiom: a line
+    # that opens with // or \\, or a .-led field line, is data, not a
+    # call. The masked-semicolon limit lives in the terminator scan
+    # below, not here (EPH-I1106 shares it with the action probe).
+    function Find-LastInstallArtifactLine {
+        param([string[]]$Lines)
+        $lastIndex = -1
+        for ($i = 0; $i -lt $Lines.Count; $i++) {
+            $line = $Lines[$i]
+            if (-not $line.Contains("installArtifact")) { continue }
+            $pos = 0
+            while ($pos -lt $line.Length -and $line[$pos] -eq ' ') { $pos++ }
+            while ($pos -lt $line.Length -and $line[$pos] -eq "`t") { $pos++ }
+            if ($pos -ge $line.Length) { continue }
+            $firstChar = $line[$pos]
+            if ($firstChar -eq '/' -or $firstChar -eq '\' -or $firstChar -eq '.') {
+                continue
+            }
+            $inString = $false
+            $inChar = $false
+            while ($pos -lt $line.Length) {
+                $c = $line[$pos]
+                if ($inString) {
+                    if ($c -eq '\') { $pos++ } elseif ($c -eq '"') { $inString = $false }
+                    $pos++
+                    continue
+                }
+                if ($inChar) {
+                    if ($c -eq '\') { $pos++ } elseif ($c -eq "'") { $inChar = $false }
+                    $pos++
+                    continue
+                }
+                if ($c -eq '"') { $inString = $true; $pos++; continue }
+                if ($c -eq "'") { $inChar = $true; $pos++; continue }
+                if ($c -eq '/' -and ($pos + 1) -lt $line.Length -and
+                    $line[$pos + 1] -eq '/') { break }
+                if ($c -eq '\' -and ($pos + 1) -lt $line.Length -and
+                    $line[$pos + 1] -eq '\') { break }
+                if (($pos + 15) -le $line.Length -and
+                    $line.Substring($pos, 15) -eq 'installArtifact') {
+                    $lastIndex = $i
+                    $pos += 15
+                    continue
+                }
+                $pos++
+            }
+        }
+        return $lastIndex
+    }
+
     # The anchored marker patterns (install.sh parity, EPH-I0285 port).
     # Each start marker requires the canonical four-space indent, and
     # each end marker must sit at line start in code context: a line
@@ -850,28 +978,27 @@ error: could not repair the fingerprint in build.zig.zon
         Warn-BlockLayout "ephor dependency found but build steps have non-standard layout"
     } else {
         # Fresh install - add the block after the last installArtifact
-        # statement (EPH-I1158; install.sh EPH-I0626 parity). The probe
-        # anchors to code lines with the same idiom as the action probe
-        # above, so a comment that mentions installArtifact cannot win
-        # the anchor. The insert extends forward to the first line that
-        # ends with the statement terminator (a semicolon plus
-        # whitespace), so a multi-line b.installArtifact(exe, .{ ... });
-        # statement is not split mid-statement. A statement that never
-        # reaches a terminator refuses with a manual-edit message
-        # instead of writing a broken build.zig. A trailing line
-        # comment after the terminator masks the semicolon match
+        # statement (EPH-I1158; install.sh EPH-I0626 parity).
+        # EPH-I1202 (install.sh EPH-I0715 parity): the anchor scan is
+        # quote- and comment-aware (Find-LastInstallArtifactLine), so a
+        # mention inside a string or a comment cannot win the anchor.
+        # The composed file must also pass zig ast-check before it
+        # replaces the live one - the same gate install.sh runs - so an
+        # anchor shape that still corrupts the file fails the install
+        # instead of writing a broken build.zig. The insert extends
+        # forward to the first line that ends with the statement
+        # terminator (a semicolon plus whitespace), so a multi-line
+        # b.installArtifact(exe, .{ ... }); statement is not split
+        # mid-statement. A statement that never reaches a terminator
+        # refuses with a manual-edit message instead of writing a
+        # broken build.zig. A trailing line comment after the
+        # terminator masks the semicolon match
         # (b.installArtifact(exe); // note): the block then lands after
         # the next terminator line, which is still valid Zig, or the
         # install refuses when no terminator line follows.
         Write-Host "Adding ephor build steps to build.zig..."
 
-        $installArtifactProbe = '^\s*[^/.\s\\].*installArtifact'
-        $lastInstallLine = -1
-        for ($i = 0; $i -lt $buildLines.Count; $i++) {
-            if ($buildLines[$i] -cmatch $installArtifactProbe) {
-                $lastInstallLine = $i
-            }
-        }
+        $lastInstallLine = Find-LastInstallArtifactLine $buildLines
 
         if ($lastInstallLine -eq -1) {
             # EPH-I0635 parity: the dependency landed but the build steps
@@ -906,7 +1033,38 @@ error: could not repair the fingerprint in build.zig.zon
         if ($terminatorLine + 1 -lt $buildLines.Count) {
             $newLines += $buildLines[($terminatorLine + 1)..($buildLines.Count - 1)]
         }
-        Set-ContentNoFollow -Path "build.zig" -Value $newLines
+        # EPH-I1202 (install.sh EPH-I0715 second arm parity): the
+        # composed file must pass zig ast-check before it replaces the
+        # live one. ast-check resolves names too, so the gate also
+        # proves the block's target name stays in scope (EPH-I0512).
+        # The gate needs the composed content on disk, so the temp
+        # write and the rename run here instead of inside
+        # Set-ContentNoFollow. The rename keeps the EPH-I0280
+        # no-follow property: it replaces a planted symlink itself and
+        # never touches its target. On failure the finally block
+        # removes the temp file and the original stays untouched.
+        $tempBuildPath = "build.zig.$([System.IO.Path]::GetRandomFileName())"
+        try {
+            Set-Content -Path $tempBuildPath -Value $newLines -Encoding UTF8
+            # EPH-I0645: capture the exit code under "Continue" like the
+            # fetch steps. Under "Stop", PowerShell 7.4+ throws before
+            # this code reads $LASTEXITCODE.
+            $prevEAP = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            $null = (zig ast-check $tempBuildPath 2>&1 | Out-String)
+            $astCheckRc = $LASTEXITCODE
+            $ErrorActionPreference = $prevEAP
+            if ($null -eq $astCheckRc) { $astCheckRc = 1 }
+            if ($astCheckRc -ne 0) {
+                Write-Stderr "warning: the composed build.zig failed zig ast-check."
+                Write-Stderr "The ephor build steps were not added."
+                Write-Stderr "Add them manually (see README)."
+                return 1
+            }
+            Move-Item -Force -Path $tempBuildPath -Destination "build.zig"
+        } finally {
+            if (Test-Path $tempBuildPath) { Remove-Item $tempBuildPath -Force }
+        }
     }
 
     Write-Host ""

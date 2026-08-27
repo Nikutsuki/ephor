@@ -161,38 +161,68 @@ pub const Walker = struct {
         });
     }
 
-    /// Composite statement constructs, via the tree's typed helpers.
+    /// Composite statement constructs, via the tree's typed helpers. Each
+    /// family helper handles its tag set and returns false otherwise.
     fn pushCompositeStmt(self: *Walker, node: NodeIndex) !bool {
-        const tree = self.tree;
-        switch (tree.nodeTag(node)) {
-            .local_var_decl, .simple_var_decl, .aligned_var_decl => {
-                const vd = tree.fullVarDecl(node) orelse return true;
-                try self.pushOpt(vd.ast.type_node);
-                try self.pushOpt(vd.ast.init_node);
-            },
+        if (try self.pushVarDeclStmt(node)) return true;
+        if (try self.pushLoopStmt(node)) return true;
+        if (try self.pushSwitchStmt(node)) return true;
+        if (try self.pushSwitchCaseStmt(node)) return true;
+        if (try self.pushBlockStmt(node)) return true;
+        return false;
+    }
+
+    /// Var-decl statements: the type and init nodes push as children.
+    fn pushVarDeclStmt(self: *Walker, node: NodeIndex) !bool {
+        const tag = self.tree.nodeTag(node);
+        if (tag != .local_var_decl and tag != .simple_var_decl and
+            tag != .aligned_var_decl) return false;
+        const vd = self.tree.fullVarDecl(node) orelse return true;
+        try self.pushOpt(vd.ast.type_node);
+        try self.pushOpt(vd.ast.init_node);
+        return true;
+    }
+
+    /// The if/while/for family: each arm records its payload capture
+    /// (EPH-I0046) and pushes condition, body, and the optional else.
+    fn pushLoopStmt(self: *Walker, node: NodeIndex) !bool {
+        switch (self.tree.nodeTag(node)) {
             .if_simple, .@"if" => try self.pushIf(node),
             .while_simple, .while_cont, .@"while" => try self.pushWhile(node),
             .for_simple, .@"for" => try self.pushFor(node),
-            .@"switch", .switch_comma => {
-                const s = tree.fullSwitch(node) orelse return true;
-                try self.push(s.ast.condition);
-                try self.pushAll(s.ast.cases);
-            },
-            .switch_case_one,
-            .switch_case,
-            .switch_case_inline_one,
-            .switch_case_inline,
-            => {
-                const c = tree.fullSwitchCase(node) orelse return true;
-                try self.pushAll(c.ast.values);
-                try self.push(c.ast.target_expr);
-            },
-            .block, .block_semicolon, .block_two, .block_two_semicolon => {
-                var buf: [2]NodeIndex = undefined;
-                try self.pushAll(tree.blockStatements(&buf, node) orelse return true);
-            },
             else => return false,
         }
+        return true;
+    }
+
+    /// Switch statements: the condition and the case nodes push.
+    fn pushSwitchStmt(self: *Walker, node: NodeIndex) !bool {
+        const tag = self.tree.nodeTag(node);
+        if (tag != .@"switch" and tag != .switch_comma) return false;
+        const s = self.tree.fullSwitch(node) orelse return true;
+        try self.push(s.ast.condition);
+        try self.pushAll(s.ast.cases);
+        return true;
+    }
+
+    /// Switch-case statements: the values and the target expression push.
+    fn pushSwitchCaseStmt(self: *Walker, node: NodeIndex) !bool {
+        const tag = self.tree.nodeTag(node);
+        if (tag != .switch_case_one and tag != .switch_case and
+            tag != .switch_case_inline_one and tag != .switch_case_inline) return false;
+        const c = self.tree.fullSwitchCase(node) orelse return true;
+        try self.pushAll(c.ast.values);
+        try self.push(c.ast.target_expr);
+        return true;
+    }
+
+    /// Block statements: the block's statements push as children.
+    fn pushBlockStmt(self: *Walker, node: NodeIndex) !bool {
+        const tag = self.tree.nodeTag(node);
+        if (tag != .block and tag != .block_semicolon and
+            tag != .block_two and tag != .block_two_semicolon) return false;
+        var buf: [2]NodeIndex = undefined;
+        try self.pushAll(self.tree.blockStatements(&buf, node) orelse return true);
         return true;
     }
 
@@ -330,11 +360,26 @@ pub const Walker = struct {
     /// data shape. Unlisted tags are leaves for this walk's purposes.
     fn pushShaped(self: *Walker, node: NodeIndex) !void {
         if (try self.pushShapedBinary(node)) return;
-        const data = self.tree.nodeData(node);
+        if (try self.pushShapedAccess(node)) return;
+        if (try self.pushShapedUnary(node)) return;
+        if (try self.pushShapedControl(node)) return;
+        if (try self.pushShapedJump(node)) return;
+        if (try self.pushShapedPtr(node)) return;
+    }
+
+    /// Access-shaped children (field access, unwrap, grouping): one child
+    /// in node_and_token[0].
+    fn pushShapedAccess(self: *Walker, node: NodeIndex) !bool {
+        const tag = self.tree.nodeTag(node);
+        if (tag != .field_access and tag != .unwrap_optional and
+            tag != .grouped_expression) return false;
+        try self.push(self.tree.nodeData(node).node_and_token[0]);
+        return true;
+    }
+
+    /// Unary-prefix children: one child in data.node.
+    fn pushShapedUnary(self: *Walker, node: NodeIndex) !bool {
         switch (self.tree.nodeTag(node)) {
-            .field_access, .unwrap_optional, .grouped_expression => {
-                try self.push(data.node_and_token[0]);
-            },
             .address_of,
             .deref,
             .bool_not,
@@ -348,13 +393,39 @@ pub const Walker = struct {
             .@"suspend",
             .@"resume",
             .@"nosuspend",
-            => try self.push(data.node),
+            => try self.push(self.tree.nodeData(node).node),
+            else => return false,
+        }
+        return true;
+    }
+
+    /// Control-shaped children: return pushes its optional operand,
+    /// errdefer and anyframe_type their token-and-node slot.
+    fn pushShapedControl(self: *Walker, node: NodeIndex) !bool {
+        const data = self.tree.nodeData(node);
+        switch (self.tree.nodeTag(node)) {
             .@"return" => try self.pushOpt(data.opt_node),
             .@"errdefer" => try self.push(data.opt_token_and_node[1]),
             .anyframe_type => try self.push(data.token_and_node[1]),
-            .@"break", .@"continue" => {
-                try self.pushOpt(data.opt_token_and_opt_node[1]);
-            },
+            else => return false,
+        }
+        return true;
+    }
+
+    /// Jump children: break/continue carry an optional operand.
+    fn pushShapedJump(self: *Walker, node: NodeIndex) !bool {
+        const tag = self.tree.nodeTag(node);
+        if (tag != .@"break" and tag != .@"continue") return false;
+        try self.pushOpt(self.tree.nodeData(node).opt_token_and_opt_node[1]);
+        return true;
+    }
+
+    /// Pointer-type and destructure children (extra_and_node shapes):
+    /// aligned/sentinel push the optional align/sentinel plus the elem;
+    /// plain/sized/destructure push their tail (EPH-I0596).
+    fn pushShapedPtr(self: *Walker, node: NodeIndex) !bool {
+        const data = self.tree.nodeData(node);
+        switch (self.tree.nodeTag(node)) {
             .ptr_type_aligned, .ptr_type_sentinel => {
                 const opt, const elem = data.opt_node_and_node;
                 try self.pushOpt(opt);
@@ -363,8 +434,9 @@ pub const Walker = struct {
             .ptr_type, .ptr_type_bit_range, .assign_destructure => {
                 try self.pushShapedTail(node);
             },
-            else => {},
+            else => return false,
         }
+        return true;
     }
 
     /// Binary operators, assignments, ranges, catch/orelse, error unions —

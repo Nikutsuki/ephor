@@ -256,15 +256,12 @@ const NestingScan = struct {
 ///   break/return (expression prefix)
 ///   await                              no keyword        identifier
 ///                                      (async removed in 0.15; verified
-///                                      absent from the 0.16.0 stdlib:
-///                                      no tokenizer keyword, no
-///                                      Parse.zig production, no Ast
-///                                      tag — EPH-I0591)
+///                                      absent from the 0.16.0 stdlib —
+///                                      EPH-I0591)
 ///   suspend payloads                   statement prefix  not counted
-///                                      (KEYWORD_suspend
-///                                      BlockExprStatement — one frame
-///                                      per keyword, `;` resets, cannot
-///                                      chain; the defer/errdefer class)
+///                                      (BlockExprStatement — one frame
+///                                      per keyword, `;` resets; the
+///                                      defer/errdefer class)
 ///   if/while/for bodies                right-recursive   run
 ///   fn-type chains `fn() fn() void`    right-recursive   run (fn + `(`,
 ///                                      the paren may sit on a later
@@ -275,7 +272,6 @@ const NestingScan = struct {
 ///   fn declarations `fn name(`         container loop    not counted
 ///   statement boundary `;` `,` or a    frames return     resets run
 ///   bare `=` (two-char `=` tokens      (EPH-I0269)
-///   — `+=`, `==`, `=>`, `<=`, ... —
 ///   are not boundaries: the while-
 ///   continue shape keeps its frame
 ///   live across `+=`)
@@ -303,10 +299,9 @@ fn lineCrossesBudget(line: []const u8, scan: *NestingScan, budget: usize) bool {
     return false;
 }
 
-/// Resolve a `fn` split from its `(` across a line break (EPH-I0598).
-/// A `(` counts the type form; any other non-blank char is the
-/// declaration form or garbage. Blank chars keep the watch alive across
-/// blank lines, matching the same-line lookahead's whitespace skip.
+/// Resolve a `fn` split from its `(` across a line break (EPH-I0598):
+/// a `(` counts the type form, any other non-blank char is the
+/// declaration form, and blank chars keep the watch alive.
 fn resolvePendingFn(scan: *NestingScan, c: u8) void {
     if (c == ' ' or c == '\t' or c == '\r') return;
     scan.pending_fn = false;
@@ -318,51 +313,63 @@ fn resolvePendingFn(scan: *NestingScan, c: u8) void {
 /// double-count.
 fn scanCodeChar(line: []const u8, i: *usize, scan: *NestingScan) void {
     const c = line[i.*];
-    if (scan.arrow_run) |saved| {
-        if (c == '>') {
-            scan.run = saved + 1;
-            scan.arrow_run = null;
-            return;
-        }
-        // Whitespace and the arrow's `-` keep the watch alive.
-        if (c == '-' or c == ' ' or c == '\t' or c == '\r') return;
-        scan.arrow_run = null;
-        // The frames parked before the bare `anyframe` operand stay
-        // live after the operand completes: restore them instead of
-        // discarding them (EPH-I0599).
-        scan.run = saved;
-        // Fall through: the char that broke the arrow still counts.
-    }
+    if (scanArrowWatchChar(c, scan)) return;
     switch (c) {
         '(', '{' => scan.depth += 1,
+        ')', ']', '}' => scan.depth -|= 1,
+        ' ', '\t', '\r' => {},
+        else => scanOtherChar(line, i, scan, c),
+    }
+}
+
+/// The anyframe arrow watch (EPH-I0599): true while `c` stays inside
+/// the watch (the completing `>` or a keeper). A break restores the
+/// parked frames and returns false so the char still counts.
+fn scanArrowWatchChar(c: u8, scan: *NestingScan) bool {
+    const saved = scan.arrow_run orelse return false;
+    if (c == '>') {
+        scan.run = saved + 1;
+        scan.arrow_run = null;
+        return true;
+    }
+    // Whitespace and the arrow's `-` keep the watch alive.
+    if (c == '-' or c == ' ' or c == '\t' or c == '\r') return true;
+    scan.arrow_run = null;
+    // Frames parked before the bare `anyframe` operand stay live after
+    // the operand completes: restore them (EPH-I0599).
+    scan.run = saved;
+    return false;
+}
+
+/// The run-incrementing chars: `[`, the unary markers, and `-` (with
+/// its `-%` wrapping form). Any other char routes to the word scan.
+fn scanOtherChar(line: []const u8, i: *usize, scan: *NestingScan, c: u8) void {
+    switch (c) {
         '[' => {
             scan.depth += 1;
             // Sequential slice/array types (`[][]u8`) recurse per level
-            // while their brackets balance within the level, invisible
-            // to depth alone (audit table row 2). Index chains
-            // over-count here. Over-counting skips. An under-count is
-            // absorbed by the byte cap and the parse stack (EPH-I0268).
+            // with brackets balancing within one level, invisible to
+            // depth alone (audit table row 2). Over-counting skips; an
+            // under-count is absorbed by the cap and parse stack
+            // (EPH-I0268).
             scan.run += 1;
         },
-        ')', ']', '}' => scan.depth -|= 1,
         '!', '~', '&', '?', '*' => scan.run += 1,
         '-' => {
-            // `-%` is one wrapping-negation token. Count it once.
+            // `-%` is one wrapping-negation token.
             scan.run += 1;
             if (i.* + 1 < line.len and line[i.* + 1] == '%') i.* += 1;
         },
-        ' ', '\t', '\r' => {},
         else => scanWordOrReset(line, i, scan),
     }
 }
 
 /// Identifiers keep the run: error-union chains interleave operands with
-/// `!`, and infix `- & *` sequences must over-count toward a safe skip.
-/// Only statement boundaries (`;`, `,`, a bare `=`) reset: every other
-/// non-word char can sit inside an operand (`.` `@` `:` in types) where
-/// parent operator frames are still live (audit table, hole A). Two-char
-/// `=` tokens keep the run (EPH-I0269). Right-recursive keywords
-/// increment. `anyframe` arms the arrow watch.
+/// `!`, and infix `- & *` sequences over-count toward a safe skip. Only
+/// statement boundaries (`;`, `,`, a bare `=`) reset: other non-word
+/// chars can sit inside an operand where parent frames are still live
+/// (audit table, hole A). Two-char `=` tokens keep the run (EPH-I0269).
+/// Right-recursive keywords increment. `anyframe` arms the arrow watch.
 fn scanWordOrReset(line: []const u8, i: *usize, scan: *NestingScan) void {
     if (!types.isIdent(line[i.*])) {
         if (isRunBoundary(line, i.*)) scan.run = 0;
@@ -392,11 +399,10 @@ fn scanWordOrReset(line: []const u8, i: *usize, scan: *NestingScan) void {
     }
 }
 
-/// True when the char at `i` ends the current prefix chain: `;`, `,`, or
-/// a bare assignment `=`. Two-char `=` tokens are not boundaries
-/// (EPH-I0269): the while-continue shape `while (c) : (i += 1)` keeps its
-/// while frame live across the `+=`, and an early reset there under-counts
-/// the frames the parser still holds.
+/// True when the char at `i` ends the prefix chain: `;`, `,`, or a bare
+/// `=`. Two-char `=` tokens are not boundaries (EPH-I0269): the
+/// while-continue shape `while (c) : (i += 1)` keeps its while frame
+/// live across the `+=` (an early reset under-counts the frames).
 fn isRunBoundary(line: []const u8, i: usize) bool {
     const c = line[i];
     if (c == ';' or c == ',') return true;
@@ -405,10 +411,9 @@ fn isRunBoundary(line: []const u8, i: usize) bool {
 }
 
 /// True when the `=` at `i` belongs to a two-char token: a compound
-/// assignment (`+=`, `<<=`, ...), a comparison (`==`, `!=`, `<=`, `>=`),
-/// or the switch-prong arrow `=>`. The token's other half sits
-/// immediately before the `=` (or after it, for `==` and `=>`), so the
-/// neighbor byte marks it (EPH-I0269).
+/// assignment (`+=`), a comparison (`==`), or the switch-prong arrow
+/// `=>`. The token's other half sits immediately before the `=` (after
+/// it, for `==` and `=>`), so the neighbor byte marks it (EPH-I0269).
 fn isEqPartOfTwoCharToken(line: []const u8, i: usize) bool {
     const compound_prev = "+-*/%&|^!<>==";
     const compound_next = "=>";
@@ -426,11 +431,9 @@ fn nextNonSpaceIsParen(line: []const u8, i: usize) bool {
 
 /// Keywords whose productions recurse into the following expression or
 /// type without a delimiter (grammar-audit table, EPH-I0268). `fn` is
-/// handled apart: only its type form recurses. `await` is absent by
-/// design: async was removed in 0.15 and the 0.16.0 stdlib has no await
-/// keyword (EPH-I0591). `suspend` is a statement-level production with a
-/// BlockExprStatement operand — the defer/errdefer class, not a chain
-/// (EPH-I0591).
+/// handled apart: only its type form recurses. `await` is absent (async
+/// removed in 0.15; the 0.16.0 stdlib has no await keyword, EPH-I0591).
+/// `suspend` is statement-level — the defer/errdefer class, not a chain.
 fn isRightRecursiveKeyword(word: []const u8) bool {
     const keywords = [_][]const u8{
         "try",    "comptime", "nosuspend", "resume", "break",

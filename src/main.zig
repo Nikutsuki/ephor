@@ -37086,27 +37086,32 @@ fn allmanGuardConditionSpan(t: []const u8) ?GuardSpan {
 /// The next code-position `if` or `while` keyword at a word boundary
 /// at or after `from`, or null. The earlier of the two keywords wins.
 fn nextGuardKeywordPos(t: []const u8, from: usize) ?usize {
-    // One classifier walk plus one comment-start walk (EPH-I0153).
-    var cls = LineClassifier.init(t);
+    // Each keyword loop restarts from `from` and walks its own
+    // classifier: the monotonic-query contract holds per walk, so the
+    // `while` loop's lower positions never query a classifier the `if`
+    // loop already scanned past (EPH-I1218). The one-shared-walk form
+    // was the EPH-I0153 optimization and the crash source.
     const comment_start = findCommentStart(t);
+    var if_cls = LineClassifier.init(t);
     var if_pos: ?usize = null;
     var i = from;
     while (mem.indexOfPos(u8, t, i, "if")) |pos| {
         i = pos + 2;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
         if (pos + 2 < t.len and isIdent(t[pos + 2])) continue;
-        if (cls.isInsideString(pos)) continue;
+        if (if_cls.isInsideString(pos)) continue;
         if (comment_start != null and pos >= comment_start.?) break;
         if_pos = pos;
         break;
     }
+    var while_cls = LineClassifier.init(t);
     var while_pos: ?usize = null;
     var j = from;
     while (mem.indexOfPos(u8, t, j, "while")) |pos| {
         j = pos + 5;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
         if (pos + 5 < t.len and isIdent(t[pos + 5])) continue;
-        if (cls.isInsideString(pos)) continue;
+        if (while_cls.isInsideString(pos)) continue;
         if (comment_start != null and pos >= comment_start.?) break;
         while_pos = pos;
         break;
@@ -38117,9 +38122,10 @@ fn hasEndsWithGuardForIndex(t: []const u8, expr: IndexExprLoc) bool {
     if (!mem.endsWith(u8, expr.var_name, ".len")) return false;
     const base = expr.var_name[0 .. expr.var_name.len - ".len".len];
     if (base.len == 0) return false;
-    // One classifier walk plus one comment-start walk serve both call
-    // names (EPH-I0153).
-    var cls = LineClassifier.init(t);
+    // Each call-name scan walks its own classifier: callGuardScanHolds
+    // restarts from 0 per call, so the monotonic-query contract holds
+    // per walk (EPH-I1218). The one-shared-walk form was the EPH-I0153
+    // optimization and the crash source.
     const comment_start = findCommentStart(t);
     const calls = [_][]const u8{ "endsWith(", "startsWith(" };
     for (calls) |call| {
@@ -38128,7 +38134,7 @@ fn hasEndsWithGuardForIndex(t: []const u8, expr: IndexExprLoc) bool {
             .call = call,
             .base = base,
             .bracket_pos = expr.bracket_pos,
-        }, &cls, comment_start)) return true;
+        }, comment_start)) return true;
     }
     return false;
 }
@@ -38147,9 +38153,11 @@ const CallGuardScanQuery = struct {
 /// is data (band-B12 F17, EPH-I0506).
 fn callGuardScanHolds(
     q: CallGuardScanQuery,
-    cls: *LineClassifier,
     comment_start: ?usize,
 ) bool {
+    // One classifier walk per scan: the scan restarts from 0 per call
+    // name, so the monotonic-query contract holds per walk (EPH-I1218).
+    var cls = LineClassifier.init(q.t);
     var from: usize = 0;
     while (mem.indexOfPos(u8, q.t, from, q.call)) |pos| {
         from = pos + q.call.len;
@@ -38242,9 +38250,11 @@ fn hasIfExprGuard(t: []const u8, expr: IndexExprLoc) bool {
 /// EPH-I0506).
 fn hasElseArmZeroExclusion(t: []const u8, var_name: []const u8, else_pos: usize) bool {
     const pats = [_][]const u8{ "== 0)", "<= 0", "< 1" };
-    // One classifier walk plus one comment-start walk serve every
-    // pattern (EPH-I0153).
-    var cls = LineClassifier.init(t);
+    // Each pattern scan walks its own classifier:
+    // zeroExclusionPatternHolds restarts from 0 per pattern, so the
+    // monotonic-query contract holds per walk (EPH-I1218). The
+    // one-shared-walk form was the EPH-I0153 optimization and the crash
+    // source.
     const comment_start = findCommentStart(t);
     for (pats) |pat| {
         if (zeroExclusionPatternHolds(.{
@@ -38252,7 +38262,7 @@ fn hasElseArmZeroExclusion(t: []const u8, var_name: []const u8, else_pos: usize)
             .var_name = var_name,
             .else_pos = else_pos,
             .pat = pat,
-        }, &cls, comment_start)) return true;
+        }, comment_start)) return true;
     }
     return false;
 }
@@ -38272,9 +38282,12 @@ const ZeroExclusionScanQuery = struct {
 /// a comparison on the candidate var (band-B12 F17, EPH-I0506).
 fn zeroExclusionPatternHolds(
     q: ZeroExclusionScanQuery,
-    cls: *LineClassifier,
     comment_start: ?usize,
 ) bool {
+    // One classifier walk per scan: the scan restarts from 0 per
+    // pattern, so the monotonic-query contract holds per walk
+    // (EPH-I1218).
+    var cls = LineClassifier.init(q.t);
     var from: usize = 0;
     while (mem.indexOfPos(u8, q.t[0..q.else_pos], from, q.pat)) |pos| {
         from = pos + q.pat.len;
@@ -101448,6 +101461,102 @@ test "ZA903: != 0 with an or-tail does not suppress (EPH-I0506)" {
         "test_za903_neq_tail.zig",
         RULE_INDEX_ARITHMETIC,
     ) == 1);
+}
+
+test "Site-1 probe: the endsWith/startsWith backward-query shape scans clean (EPH-I1218)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I1218: one classifier shared across the two call-name scans
+    // panicked on the backward-query assert. The endsWith( loop queries
+    // at the later call, the startsWith( loop restarts from 0 and
+    // queries backward. The calls guard `o`, not `s`, so the
+    // subtraction stays unguarded and fires once.
+    const content =
+        \\fn probe(s: []const u8, o: []const u8) ?u8 {
+        \\const z = o.startsWith("a") and std.mem.endsWith(o, ".zig") and s[s.len - 1]=='z';
+        \\    if (z) return 1;
+        \\    return null;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_b122a_site1.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_b122a_site1.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "Site-2 probe: zero-exclusion scan completes on the backward-query shape (EPH-I1218)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I1218: the "== 0)" loop queries at `x == 0)`, then the
+    // "<= 0" loop restarts from 0 and queries backward at `i <= 0`. The
+    // zero-exclusion holds (the else arm runs only at i >= 1), so the
+    // subtraction stays silent. The control line proves the unguarded
+    // shape still fires.
+    const content =
+        \\fn probe(i: usize, x: usize, a: []const u8) usize {
+        \\    if (i <= 0 or x == 0) return 0 else return a[i - 1];
+        \\    return 0;
+        \\}
+        \\fn control(i: usize, x: usize, a: []const u8) usize {
+        \\    if (x == 0) return 0 else return a[i - 1];
+        \\    return 0;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_b122a_site2.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_b122a_site2.zig",
+        RULE_INDEX_ARITHMETIC,
+    ) == 1);
+}
+
+test "Site-3 probe: the guard keyword scan completes on the while-left-of-if shape (EPH-I1218)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // EPH-I1218: the `if` loop queries at the later `if` keyword, then
+    // the `while` loop restarts from 0 and queries backward. The lower-
+    // bound guard holds (x > 0 proves x >= 1), so the decrement stays
+    // silent.
+    const content =
+        \\fn probe(x: usize, a: bool) usize {
+        \\    while (x > 0) if (a) x -= 1;
+        \\    return x;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_b122a_site3.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_b122a_site3.zig",
+        RULE_DECREMENT_WITHOUT_CHECK,
+    ) == 0);
+}
+
+test "nextGuardKeywordPos walks per-loop classifiers on both keyword orders (EPH-I1218)" {
+    // The while keyword left of the if keyword used to query the shared
+    // classifier backward; each loop now walks its own classifier, and
+    // the earlier of the two keywords still wins.
+    try std.testing.expect(nextGuardKeywordPos("while (a) if (b) {", 0) == 0);
+    try std.testing.expect(nextGuardKeywordPos("if (b) while (a) {", 0) == 0);
+    // "x = 1; " is 7 bytes, so the `if` sits at 7 and the `while` at 14;
+    // the earlier keyword wins (verified live: harness run returns 7).
+    try std.testing.expect(nextGuardKeywordPos("x = 1; if (b) while (a) {", 0) == 7);
 }
 
 test "ZA903: or-tails do not suppress on the > arm or whitespace variants (EPH-I0942)" {

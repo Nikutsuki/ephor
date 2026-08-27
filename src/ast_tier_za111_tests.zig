@@ -409,3 +409,86 @@ test "ZA111: switch-wrapped labeled-block binding resolves (EPH-I1185)" {
     try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "'s'") != null);
     try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "'arr'") != null);
 }
+
+test "ZA111: 3+ statement labeled-block returns resolve (EPH-I1205)" {
+    const a = std.testing.allocator;
+    // A 3+ statement block parses as .block/.block_semicolon (Parse.zig
+    // parseBlock: >2 statements; a trailing-semicolon break picks the
+    // _semicolon tag, a switch-prong break picks the plain tag). Both
+    // now resolve to the block's value root; the discarded block
+    // statement stays silent (no proven escape).
+    var issues = try runZa111(a,
+        \\const S = struct { a: u32 };
+        \\fn f(x: u32) *u32 {
+        \\    var s = S{ .a = x };
+        \\    return outer: {
+        \\        s.a += 1;
+        \\        s.a += 2;
+        \\        break :outer &s.a;
+        \\    };
+        \\}
+        \\fn g(x: u32) *u32 {
+        \\    var s = S{ .a = x };
+        \\    return outer: {
+        \\        s.a += 1;
+        \\        s.a += 2;
+        \\        switch (x) {
+        \\            else => break :outer &s.a,
+        \\        }
+        \\    };
+        \\}
+        \\fn h(x: u32) void {
+        \\    var s = S{ .a = x };
+        \\    outer: {
+        \\        s.a += 1;
+        \\        s.a += 2;
+        \\        break :outer &s.a;
+        \\    }
+        \\}
+    );
+    defer types.deinitIssues(&issues, a);
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "'s'") != null);
+    try std.testing.expect(mem.indexOf(u8, issues.items[1].message, "'s'") != null);
+}
+
+test "ZA111: bare &var break at the out-param store sink fires (EPH-I1210)" {
+    const a = std.testing.allocator;
+    // The 0.16.0 probe shows Sema stays silent on a bare `&var` break
+    // feeding an out-param store (the direct store is silent too), so
+    // the store sink adjudicates with the alias posture now. The
+    // 3-statement forms ride the I1205 tag extension. The bare form at
+    // a return sink stays silent — Sema catches it there — and carries
+    // no fixture because the shape cannot compile.
+    var issues = try runZa111(a,
+        \\const S = struct { a: u32 };
+        \\fn a(out: **u32, x: u32) void {
+        \\    var v: u32 = x;
+        \\    out.* = b: {
+        \\        break :b &v;
+        \\    };
+        \\}
+        \\fn b(out: **u32, x: u32) void {
+        \\    var v: u32 = x;
+        \\    out.* = b: {
+        \\        v += 1;
+        \\        v += 2;
+        \\        break :b &v;
+        \\    };
+        \\}
+        \\fn c(out: **u32, x: u32) void {
+        \\    var s = S{ .a = x };
+        \\    out.* = b: {
+        \\        s.a += 1;
+        \\        s.a += 2;
+        \\        break :b &s.a;
+        \\    };
+        \\}
+    );
+    defer types.deinitIssues(&issues, a);
+    try std.testing.expectEqual(@as(usize, 3), issues.items.len);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "'v'") != null);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "out parameter") != null);
+    try std.testing.expect(mem.indexOf(u8, issues.items[1].message, "'v'") != null);
+    try std.testing.expect(mem.indexOf(u8, issues.items[2].message, "'s'") != null);
+}

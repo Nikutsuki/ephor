@@ -19599,7 +19599,13 @@ const TestBlockState = struct {
 /// Track test block boundaries. Braces in string/char literals and
 /// comments are data: they neither open a test block nor close one
 /// (EPH-I0883). The carried block walk is the shared code-position
-/// brace tracker (trackBraceBlock): the same mask, the same close rule.
+/// brace tracker (trackBraceBlock) with one recorded divergence
+/// (EPH-I1217): a code-position `}` at depth 0 on a test-opener line
+/// (invalid Zig, like `test "x" } {`) used to close the block while
+/// the depth kept counting, so in_test and depth disagreed. The shared
+/// tracker checks depth > 0 before it closes, so the state now stays
+/// consistent (in_test and depth agree). The shape is invalid Zig and
+/// absent from the corpus (the A/B stayed byte-identical).
 fn trackTestBlock(
     t: []const u8,
     in_test: bool,
@@ -102706,6 +102712,18 @@ test "trackTestBlock ignores braces inside strings and comments (EPH-I0883)" {
     const inside = trackTestBlock("const s = \"}\";", true, 3);
     try std.testing.expect(inside.in_test);
     try std.testing.expectEqual(@as(usize, 3), inside.depth);
+}
+
+test "trackTestBlock zero-depth close keeps state consistent (EPH-I1217)" {
+    // The recorded divergence from the pre-consolidation walk (EPH-I1217):
+    // the old loop closed the block on a code-position `}` at depth 0 —
+    // base behavior in_test=false, depth=1 after the trailing `{` — so
+    // in_test and depth disagreed. The shared tracker checks depth > 0
+    // before it closes, so the state now stays consistent. The input is
+    // invalid Zig; the pin records the contract.
+    const r = trackTestBlock("test \"x\" } {", false, 0);
+    try std.testing.expect(r.in_test);
+    try std.testing.expectEqual(@as(usize, 1), r.depth);
 }
 
 test "trackStructBraces ignores braces inside strings (EPH-I0883)" {

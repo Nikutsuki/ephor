@@ -35937,29 +35937,46 @@ fn hasInitWitness(
     reassign_end: usize,
 ) bool {
     const check_start = if (current_idx > 20) current_idx - 20 else 0;
-    for (lines[check_start..current_idx], check_start..) |line, init_idx| {
-        const ctx = mem.trim(u8, line, " \t\r");
-        if (isCommentOrMultilineString(ctx)) continue;
-        // A nested fn signature inside the window is a scope boundary;
-        // the walk must not descend into it. The callers pass the
-        // function's own lines, so the outer signature always sits at
-        // index 0 and is the one exemption (EPH-I0499). At a deeper
-        // window (check_start > 0) the first window line is an
-        // arbitrary mid-function line: a signature there is a boundary
-        // like any other (batch 24 review F-A).
-        if (init_idx > 0 and isFuncBoundary(ctx)) return false;
-
-        const has_var = mem.indexOf(u8, ctx, "var ") != null;
-        const has_const = mem.indexOf(u8, ctx, "const ") != null;
-        const has_decl = has_var or has_const;
-        if (!has_decl) continue;
-        if (!mentionsIdent(ctx, info.idx_var)) continue;
-        if (mem.indexOf(u8, ctx, "= ") == null) continue;
-        if (!initValueExceedsSubtrahend(ctx, info.subtrahend)) continue;
-        if (indexVarReassignedAfter(lines, init_idx + 1, reassign_end, info.idx_var)) continue;
-        return true;
+    for (lines[check_start..current_idx], check_start..) |_, init_idx| {
+        switch (initWitnessLineVerdict(lines, init_idx, info, reassign_end)) {
+            .skip => continue,
+            .boundary => return false,
+            .witnessed => return true,
+        }
     }
     return false;
+}
+
+/// One window line's answer to the init-witness scan (hasInitWitness):
+/// `skip` — the line holds no qualifying declaration; `boundary` — a
+/// nested fn signature stops the scan; `witnessed` — the line declares
+/// and initializes the index var above the subtrahend with no
+/// reassignment after (EPH-I0497, EPH-I0499, EPH-I0934).
+const InitWitnessVerdict = enum { skip, boundary, witnessed };
+
+fn initWitnessLineVerdict(
+    lines: []const []const u8,
+    init_idx: usize,
+    info: IdxSub,
+    reassign_end: usize,
+) InitWitnessVerdict {
+    const ctx = mem.trim(u8, lines[init_idx], " \t\r");
+    if (isCommentOrMultilineString(ctx)) return .skip;
+    // A nested fn signature inside the window is a scope boundary;
+    // the walk must not descend into it. The callers pass the
+    // function's own lines, so the outer signature always sits at
+    // index 0 and is the one exemption (EPH-I0499). At a deeper
+    // window (check_start > 0) the first window line is an arbitrary
+    // mid-function line: a signature there is a boundary like any
+    // other (batch 24 review F-A).
+    if (init_idx > 0 and isFuncBoundary(ctx)) return .boundary;
+    if (mem.indexOf(u8, ctx, "var ") == null and mem.indexOf(u8, ctx, "const ") == null)
+        return .skip;
+    if (!mentionsIdent(ctx, info.idx_var)) return .skip;
+    if (mem.indexOf(u8, ctx, "= ") == null) return .skip;
+    if (!initValueExceedsSubtrahend(ctx, info.subtrahend)) return .skip;
+    if (indexVarReassignedAfter(lines, init_idx + 1, reassign_end, info.idx_var)) return .skip;
+    return .witnessed;
 }
 
 /// A numeric literal token and its value: the token's end (exclusive)
@@ -36162,17 +36179,11 @@ fn hasRangeEndInitGuard(
 }
 
 /// True when every subtraction-bearing bracket AFTER the line's first
-/// one carries its own witness or scope guard. The witness guards bind
-/// per bracket: `buf[0 .. n - 1][i - 1]` with a witnessed `n` still
-/// fires when `i` has no witness, so the range witness cannot silence
-/// a later unwitnessed subtraction (batch 24 review F-B). A range-end
-/// body needs its own init witness or a zero-check-exit backstop; an
-/// index body needs an init witness, an enclosing scope guard, or the
-/// backstop; an unclassifiable body stays a finding — no witness can
-/// prove it safe (EPH-I0935, EPH-I0939). The backstop and the scope
-/// guard prove a BOUND: the `== 0` exit proves var >= 1 (subtrahends
-/// <= 1 only) and the enclosing guard must show var >= the body's own
-/// subtrahend (EPH-I0959).
+/// one carries its own witness or scope guard (EPH-I0935, EPH-I0939,
+/// EPH-I0959). The witness guards bind per bracket: `buf[0 .. n - 1][i - 1]`
+/// with a witnessed `n` still fires when `i` has no witness, so the
+/// range witness cannot silence a later unwitnessed subtraction
+/// (batch 24 review F-B).
 fn everyLaterBracketWitnessed(
     lines: []const []const u8,
     current_idx: usize,
@@ -36194,19 +36205,37 @@ fn everyLaterBracketWitnessed(
             i = end;
             continue;
         }
-        if (rangeEndSubOf(inside)) |rinfo| {
-            const witnessed = hasInitWitness(lines, current_idx, rinfo, scan_end) or
-                hasBreakGuardOnPriorLines(lines, current_idx, rinfo.idx_var, rinfo.subtrahend);
-            if (!witnessed) return false;
-        } else if (indexSubOf(inside)) |iinfo| {
-            const witnessed = hasInitWitness(lines, current_idx, iinfo, scan_end) or
-                hasEnclosingBoundForVar(lines, current_idx, iinfo.idx_var, iinfo.subtrahend) or
-                hasBreakGuardOnPriorLines(lines, current_idx, iinfo.idx_var, iinfo.subtrahend);
-            if (!witnessed) return false;
-        } else return false;
+        if (!laterBracketWitnessed(lines, current_idx, inside, scan_end)) return false;
         i = end;
     }
     return true;
+}
+
+/// True when one subtraction-bearing bracket body carries its own
+/// witness or scope guard (everyLaterBracketWitnessed): a range-end
+/// body needs its own init witness or a zero-check-exit backstop; an
+/// index body needs an init witness, an enclosing scope guard, or the
+/// backstop; an unclassifiable body stays a finding — no witness can
+/// prove it safe (EPH-I0935, EPH-I0939). The backstop and the scope
+/// guard prove a BOUND: the `== 0` exit proves var >= 1 (subtrahends
+/// <= 1 only) and the enclosing guard must show var >= the body's own
+/// subtrahend (EPH-I0959).
+fn laterBracketWitnessed(
+    lines: []const []const u8,
+    current_idx: usize,
+    inside: []const u8,
+    scan_end: usize,
+) bool {
+    if (rangeEndSubOf(inside)) |rinfo| {
+        return hasInitWitness(lines, current_idx, rinfo, scan_end) or
+            hasBreakGuardOnPriorLines(lines, current_idx, rinfo.idx_var, rinfo.subtrahend);
+    }
+    if (indexSubOf(inside)) |iinfo| {
+        return hasInitWitness(lines, current_idx, iinfo, scan_end) or
+            hasEnclosingBoundForVar(lines, current_idx, iinfo.idx_var, iinfo.subtrahend) or
+            hasBreakGuardOnPriorLines(lines, current_idx, iinfo.idx_var, iinfo.subtrahend);
+    }
+    return false;
 }
 
 /// The innermost loop whose body contains `current_idx`: the header
@@ -36705,51 +36734,103 @@ fn hasEnclosingGuardForVar(
         .var_name = var_name,
         .amount = amount,
     };
-    var brace_depth: i32 = 0;
-    var skip_antecedent = false;
+    var state = EnclosingWalkState{};
     var i = current_idx;
     while (i > stop) {
         i -= 1;
         const ctx = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(ctx)) continue;
-        const line_balance = countCurlyBalance(ctx);
-        const depth_before = brace_depth;
-        brace_depth = trackBraceDepthBackward(ctx, brace_depth);
-        // The else-open flag is computed before the opener check: on an
-        // else-open line the condition before the `else` keyword is the
-        // antecedent, negated for the arm below, so the opener check
-        // judges only the arm's own region after the `else`. A line
-        // like `} else { if (q) {` still credits the arm's own
-        // condition (EPH-I0965).
-        const kind = if (depth_before == 0 and line_balance >= 0) elseOpenKind(ctx) else null;
-        if (brace_depth < 0) {
-            if (judgeGuardDepthNegativeCrossing(gctx, i, ctx, skip_antecedent)) return true;
-            skip_antecedent = false;
-            brace_depth = 0;
+        switch (judgeEnclosingGuardWalkLine(gctx, i, ctx, &state)) {
+            .skip => continue,
+            .found => return true,
+            .boundary => return false,
         }
-        // The else-open is the arm's opener only when the walk crosses
-        // it at depth 0 — the arm's `{` then opens the candidate's own
-        // container. A crossing at depth > 0 sits below a closed arm
-        // (its close `}` was crossed first): the arm's condition does
-        // not guard the candidate. A closed same-line arm (`} else {
-        // x(); }`) nets -1, so line_balance < 0 rejects it: the
-        // crossing is the arm's close, no antecedent skip applies.
-        if (kind) |k| {
-            if (!skip_antecedent and k == .chain and
-                hasConditionalGuardForVar(elseArmRegion(ctx), var_name) and
-                guardRegionCovers(lines, i, var_name, amount)) return true;
-            // Only a CLASSIC else-open (`} else {`) has its antecedent
-            // on a line above: the next opener crossed is that
-            // antecedent and must be skipped. A mid-line else-open
-            // carries its antecedent on the same line, already excluded
-            // through the arm region — the next opener above is an
-            // outer guard that still dominates the candidate
-            // (EPH-I0965 review r1 finding 1).
-            if (isClassicElseOpen(ctx)) skip_antecedent = true;
-        }
-        if (isFuncBoundary(ctx)) return false;
     }
     return false;
+}
+
+/// One line's answer to the enclosing-guard backward walk
+/// (hasEnclosingGuardForVar): `skip` — the walk resumes at the line
+/// above; `found` — a covering guard; `boundary` — a function boundary
+/// stops the walk.
+const EnclosingWalkVerdict = enum { skip, found, boundary };
+
+/// Mutable state carried across the enclosing-guard/bound walk lines:
+/// the backward brace depth and the antecedent-skip flag (EPH-I0963).
+const EnclosingWalkState = struct {
+    brace_depth: i32 = 0,
+    skip_antecedent: bool = false,
+};
+
+/// One walk line's else-open judgment inputs (hasEnclosingGuardForVar).
+const EnclosingElseOpenLine = struct {
+    gctx: GuardCrossingCtx,
+    i: usize,
+    ctx: []const u8,
+    kind: ?ElseOpenKind,
+};
+
+/// Judge one trimmed line of the ZA901 enclosing-guard walk: fold the
+/// line's brace balance into the walk depth, judge a depth-negative
+/// crossing, then judge the line's else-open kind against the
+/// candidate's own arm (EPH-I0963, EPH-I0965, EPH-I0995).
+fn judgeEnclosingGuardWalkLine(
+    gctx: GuardCrossingCtx,
+    i: usize,
+    ctx: []const u8,
+    state: *EnclosingWalkState,
+) EnclosingWalkVerdict {
+    if (isCommentOrMultilineString(ctx)) return .skip;
+    const line_balance = countCurlyBalance(ctx);
+    const depth_before = state.brace_depth;
+    state.brace_depth = trackBraceDepthBackward(ctx, state.brace_depth);
+    // The else-open flag is computed before the opener check: on an
+    // else-open line the condition before the `else` keyword is the
+    // antecedent, negated for the arm below, so the opener check judges
+    // only the arm's own region after the `else`. A line like
+    // `} else { if (q) {` still credits the arm's own condition
+    // (EPH-I0965).
+    const kind = if (depth_before == 0 and line_balance >= 0) elseOpenKind(ctx) else null;
+    if (state.brace_depth < 0) {
+        if (judgeGuardDepthNegativeCrossing(gctx, i, ctx, state.skip_antecedent)) return .found;
+        state.skip_antecedent = false;
+        state.brace_depth = 0;
+    }
+    return judgeEnclosingGuardElseOpen(.{
+        .gctx = gctx,
+        .i = i,
+        .ctx = ctx,
+        .kind = kind,
+    }, state);
+}
+
+/// Judge the else-open kind of one walk line (hasEnclosingGuardForVar):
+/// the chain arm's own condition covers the candidate, and the line's
+/// boundary verdict closes the walk. The else-open is the arm's opener
+/// only when the walk crosses it at depth 0 — the arm's `{` then opens
+/// the candidate's own container. A crossing at depth > 0 sits below a
+/// closed arm (its close `}` was crossed first): the arm's condition
+/// does not guard the candidate. A closed same-line arm
+/// (`} else { x(); }`) nets -1, so line_balance < 0 rejects it: the
+/// crossing is the arm's close, no antecedent skip applies. Only a
+/// CLASSIC else-open (`} else {`) has its antecedent on a line above:
+/// the next opener crossed is that antecedent and must be skipped. A
+/// mid-line else-open carries its antecedent on the same line, already
+/// excluded through the arm region — the next opener above is an outer
+/// guard that still dominates the candidate (EPH-I0965 review r1
+/// finding 1).
+fn judgeEnclosingGuardElseOpen(
+    line: EnclosingElseOpenLine,
+    state: *EnclosingWalkState,
+) EnclosingWalkVerdict {
+    if (line.kind) |k| {
+        if (!state.skip_antecedent and k == .chain and
+            hasConditionalGuardForVar(elseArmRegion(line.ctx), line.gctx.var_name) and
+            guardRegionCovers(line.gctx.lines, line.i, line.gctx.var_name, line.gctx.amount))
+            return .found;
+        if (isClassicElseOpen(line.ctx)) state.skip_antecedent = true;
+    }
+    if (isFuncBoundary(line.ctx)) return .boundary;
+    return .skip;
 }
 
 /// The ZA901 depth-crossing judge's fixed context: the function slice,
@@ -36901,26 +36982,55 @@ const max_guard_expr_depth = 512;
 fn guardConditionSpan(t: []const u8) ?GuardSpan {
     var from: usize = 0;
     while (nextGuardKeywordPos(t, from)) |kw| {
-        const kw_len: usize = if (t[kw] == 'w') 5 else 2;
-        var j = kw + kw_len;
-        while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
-        if (j >= t.len or t[j] != '(') {
-            from = kw + kw_len;
-            continue;
+        switch (judgeGuardKeyword(t, kw)) {
+            .skip => |next| from = next,
+            .abort => return null,
+            .found => |span| return span,
         }
-        const close = matchingCloseParenOnLine(t, j) orelse return null;
-        if (t[kw] == 'w') return .{ .start = j + 1, .end = close };
-        var k = close + 1;
-        while (k < t.len and (t[k] == ' ' or t[k] == '\t')) k += 1;
-        if (k < t.len and t[k] == '{') return .{ .start = j + 1, .end = close };
-        // A brace-less body (`if (a > 0) a -= 1;`) is still the
-        // opener's condition; only the ternary-if exclusion (an `else`
-        // branch between the group and the statement end) rejects the
-        // group (EPH-I0995).
-        if (braceLessIfBodyEndsBeforeElse(t, close)) return .{ .start = j + 1, .end = close };
-        from = close + 1;
     }
     return null;
+}
+
+/// The first index at or after `from` whose byte is not a space or tab,
+/// or t.len when the rest of the line is horizontal whitespace.
+fn skipHorizontalSpace(t: []const u8, from: usize) usize {
+    var j = from;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    return j;
+}
+
+/// The per-keyword judgment of guardConditionSpan: `skip` resumes the
+/// keyword walk at the given offset (a keyword with no paren group, or
+/// a rejected if-group); `abort` ends the search with null (a group
+/// that never closes on the line); `found` carries the guard
+/// condition's paren-group span.
+const GuardKeywordVerdict = union(enum) {
+    skip: usize,
+    abort,
+    found: GuardSpan,
+};
+
+/// Judge one `if`/`while` keyword occurrence (guardConditionSpan): a
+/// `while` group is always the condition; an `if` group needs the block
+/// open `{` after it (the ternary-if exclusion) or a brace-less body
+/// with no `else` branch between the group and the statement end —
+/// `x = if (a) 1 else 2; if (n > 0) {` keeps only the second group
+/// (EPH-I0961, EPH-I0995).
+fn judgeGuardKeyword(t: []const u8, kw: usize) GuardKeywordVerdict {
+    const kw_len: usize = if (t[kw] == 'w') 5 else 2;
+    const j = skipHorizontalSpace(t, kw + kw_len);
+    if (j >= t.len or t[j] != '(') return .{ .skip = kw + kw_len };
+    const close = matchingCloseParenOnLine(t, j) orelse return .abort;
+    if (t[kw] == 'w') return .{ .found = .{ .start = j + 1, .end = close } };
+    const k = skipHorizontalSpace(t, close + 1);
+    if (k < t.len and t[k] == '{') return .{ .found = .{ .start = j + 1, .end = close } };
+    // A brace-less body (`if (a > 0) a -= 1;`) is still the opener's
+    // condition; only the ternary-if exclusion (an `else` branch
+    // between the group and the statement end) rejects the group
+    // (EPH-I0995).
+    if (braceLessIfBodyEndsBeforeElse(t, close))
+        return .{ .found = .{ .start = j + 1, .end = close } };
+    return .{ .skip = close + 1 };
 }
 
 /// True when the text after the if-group's close at `close` carries a
@@ -37080,32 +37190,93 @@ fn topLevelKeywordPos(
     start: usize,
     end: usize,
 ) ?usize {
-    var cls = LineClassifier.init(t);
-    const comment_start = findCommentStart(t);
-    var depth: usize = 0;
+    var state = TopLevelScanState{
+        .cls = LineClassifier.init(t),
+        .comment_start = findCommentStart(t),
+    };
+    const q = TopLevelKeywordQuery{ .t = t, .needle = needle, .end = end };
     var i = start;
     while (i < end) : (i += 1) {
-        const c = t[i];
-        if (c == '(') {
-            depth += 1;
-            continue;
+        switch (topLevelKeywordStep(q, &state, i)) {
+            .skip => continue,
+            .abort => return null,
+            .found => return i,
         }
-        if (c == ')') {
-            if (depth == 0) return null; // unbalanced region
-            depth -= 1;
-            continue;
-        }
-        if (depth != 0) continue;
-        if (c != needle[0]) continue;
-        if (i + needle.len > end) continue;
-        if (!mem.startsWith(u8, t[i..end], needle)) continue;
-        if (i > 0 and isIdent(t[i - 1])) continue;
-        if (i + needle.len < t.len and isIdent(t[i + needle.len])) continue;
-        if (cls.isInsideString(i)) continue;
-        if (comment_start != null and i >= comment_start.?) return null;
-        return i;
     }
     return null;
+}
+
+/// State carried across a top-level scan: the position-tracked string
+/// classifier and the comment-start column, shared by the keyword and
+/// comparison scans (EPH-I0153).
+const TopLevelScanState = struct {
+    cls: LineClassifier,
+    comment_start: ?usize,
+    depth: usize = 0,
+};
+
+/// The keyword scan's per-position answer (topLevelKeywordPos): `skip`
+/// — no needle token starts at `i`; `abort` — the region cannot hold
+/// the needle (an unbalanced close, or the position sits past the
+/// comment start); `found` — the needle is a code-position token at
+/// `i`.
+const TopLevelScanVerdict = enum { skip, abort, found };
+
+/// The keyword scan's fixed inputs: the line, the needle, and the scan
+/// region's end (topLevelKeywordPos).
+const TopLevelKeywordQuery = struct {
+    t: []const u8,
+    needle: []const u8,
+    end: usize,
+};
+
+/// Track the paren depth and judge the needle for one byte of the
+/// top-level keyword scan. Brackets are not tracked: the keyword scan
+/// treats `[`-group bytes as top level (EPH-I0153, EPH-I0298).
+fn topLevelKeywordStep(
+    q: TopLevelKeywordQuery,
+    state: *TopLevelScanState,
+    i: usize,
+) TopLevelScanVerdict {
+    const c = q.t[i];
+    if (c == '(') {
+        state.depth += 1;
+        return .skip;
+    }
+    if (c == ')') {
+        if (state.depth == 0) return .abort; // unbalanced region
+        state.depth -= 1;
+        return .skip;
+    }
+    if (state.depth != 0) return .skip;
+    if (c != q.needle[0]) return .skip;
+    return topLevelKeywordTokenVerdict(q, state, i);
+}
+
+/// Judge the needle match at one top-level position: the full word must
+/// fit inside the scan region, word boundaries must hold on both
+/// sides, and the position must sit outside string literals. A comment
+/// start at or before the position answers `abort` (EPH-I0153,
+/// EPH-I0298).
+fn topLevelKeywordTokenVerdict(
+    q: TopLevelKeywordQuery,
+    state: *TopLevelScanState,
+    i: usize,
+) TopLevelScanVerdict {
+    if (i + q.needle.len > q.end) return .skip;
+    if (!mem.startsWith(u8, q.t[i..q.end], q.needle)) return .skip;
+    if (i > 0 and isIdent(q.t[i - 1])) return .skip;
+    if (i + q.needle.len < q.t.len and isIdent(q.t[i + q.needle.len])) return .skip;
+    if (state.cls.isInsideString(i)) return .skip;
+    if (pastCommentStart(state.comment_start, i)) return .abort;
+    return .found;
+}
+
+/// True when `i` sits at or past a code comment's start column: no code
+/// token can follow, so a scan that reaches it must stop.
+fn pastCommentStart(comment_start: ?usize, i: usize) bool {
+    if (comment_start == null) return false;
+    return i >= comment_start.?;
 }
 
 /// The bound one conjunct term proves for `var_name`, or null. A term
@@ -37169,28 +37340,58 @@ fn parenGroupClose(t: []const u8, s: usize, e: usize) ?usize {
 /// inside t[s..e), or null. The scan skips nested groups: a comparison
 /// inside a call's argument list is not a guard (EPH-I0961).
 fn topLevelComparisonOp(t: []const u8, s: usize, e: usize) ?usize {
-    var cls = LineClassifier.init(t);
-    const comment_start = findCommentStart(t);
-    var depth: usize = 0;
+    var state = TopLevelScanState{
+        .cls = LineClassifier.init(t),
+        .comment_start = findCommentStart(t),
+    };
     var i = s;
     while (i < e) : (i += 1) {
-        const c = t[i];
-        if (c == '(' or c == '[') {
-            depth += 1;
-            continue;
+        switch (comparisonOpStep(t, &state, i)) {
+            .skip => continue,
+            .abort => return null,
+            .found => return i,
         }
-        if (c == ')' or c == ']') {
-            if (depth == 0) return null;
-            depth -= 1;
-            continue;
-        }
-        if (depth != 0) continue;
-        if (cls.isInsideString(i)) continue;
-        if (comment_start != null and i >= comment_start.?) return null;
-        if (c == '>' and isGtComparisonAt(t, i)) return i;
-        if (c == '!' and neqZeroEndAt(t, i) != null) return i;
     }
     return null;
+}
+
+/// Track the paren and bracket depth and judge the operator for one
+/// byte of the top-level comparison scan. Unlike the keyword scan,
+/// brackets open a nested group too: a comparison inside `a[i > 0]` is
+/// not at the top level (EPH-I0961).
+fn comparisonOpStep(
+    t: []const u8,
+    state: *TopLevelScanState,
+    i: usize,
+) TopLevelScanVerdict {
+    const c = t[i];
+    if (c == '(' or c == '[') {
+        state.depth += 1;
+        return .skip;
+    }
+    if (c == ')' or c == ']') {
+        if (state.depth == 0) return .abort;
+        state.depth -= 1;
+        return .skip;
+    }
+    if (state.depth != 0) return .skip;
+    return comparisonOpTokenVerdict(t, state, i);
+}
+
+/// Judge the comparison operator at one top-level position
+/// (topLevelComparisonOp): `>` in comparison position and `!= 0` start
+/// an operator; a position inside a string or past the comment start
+/// skips or ends the scan (EPH-I0961).
+fn comparisonOpTokenVerdict(
+    t: []const u8,
+    state: *TopLevelScanState,
+    i: usize,
+) TopLevelScanVerdict {
+    if (state.cls.isInsideString(i)) return .skip;
+    if (pastCommentStart(state.comment_start, i)) return .abort;
+    if (t[i] == '>' and isGtComparisonAt(t, i)) return .found;
+    if (t[i] == '!' and neqZeroEndAt(t, i) != null) return .found;
+    return .skip;
 }
 
 /// The literal bound on the right of the comparison at `op_pos` when
@@ -37294,50 +37495,83 @@ fn hasEnclosingBoundForVar(
         .var_name = var_name,
         .min_bound = min_bound,
     };
-    var brace_depth: i32 = 0;
-    var skip_antecedent = false;
+    var state = EnclosingWalkState{};
     var i = current_idx;
     while (i > stop) {
         i -= 1;
         const ctx = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(ctx)) continue;
-        const line_balance = countCurlyBalance(ctx);
-        const depth_before = brace_depth;
-        brace_depth = trackBraceDepthBackward(ctx, brace_depth);
-        // The else-open flag is computed before the opener check: on an
-        // else-open line the condition before the `else` keyword is the
-        // antecedent, negated for the arm below, so the opener check
-        // judges only the arm's own region after the `else`. A line
-        // like `} else { if (q) {` still credits the arm's own
-        // condition (EPH-I0965).
-        const kind = if (depth_before == 0 and line_balance >= 0) elseOpenKind(ctx) else null;
-        if (brace_depth < 0) {
-            if (judgeBoundDepthNegativeCrossing(bctx, i, ctx, skip_antecedent)) return true;
-            skip_antecedent = false;
-            brace_depth = 0;
+        switch (judgeEnclosingBoundWalkLine(bctx, i, ctx, &state)) {
+            .skip => continue,
+            .found => return true,
+            .boundary => return false,
         }
-        // The else-open is the arm's opener only when the walk crosses
-        // it at depth 0 — the arm's `{` then opens the candidate's own
-        // container. A crossing at depth > 0 sits below a closed arm
-        // (its close `}` was crossed first): the arm's condition does
-        // not guard the candidate. A closed same-line arm (`} else {
-        // x(); }`) nets -1, so line_balance < 0 rejects it: the
-        // crossing is the arm's close, no antecedent skip applies.
-        if (kind) |k| {
-            if (!skip_antecedent and k == .chain and
-                openerCoversBound(bctx, i)) return true;
-            // Only a CLASSIC else-open (`} else {`) has its antecedent
-            // on a line above: the next opener crossed is that
-            // antecedent and must be skipped. A mid-line else-open
-            // carries its antecedent on the same line, already excluded
-            // through the arm region — the next opener above is an
-            // outer guard that still dominates the candidate
-            // (EPH-I0965 review r1 finding 1).
-            if (isClassicElseOpen(ctx)) skip_antecedent = true;
-        }
-        if (isFuncBoundary(ctx)) return false;
     }
     return false;
+}
+
+/// One walk line's else-open judgment inputs (hasEnclosingBoundForVar).
+const EnclosingBoundElseOpenLine = struct {
+    bctx: EnclosingBoundCtx,
+    i: usize,
+    ctx: []const u8,
+    kind: ?ElseOpenKind,
+};
+
+/// Judge one trimmed line of the ZA903 enclosing-bound walk: the
+/// amount-aware twin of judgeEnclosingGuardWalkLine — fold the line's
+/// brace balance into the walk depth, judge a depth-negative crossing,
+/// then judge the line's else-open kind (EPH-I0963, EPH-I0965,
+/// EPH-I0959).
+fn judgeEnclosingBoundWalkLine(
+    bctx: EnclosingBoundCtx,
+    i: usize,
+    ctx: []const u8,
+    state: *EnclosingWalkState,
+) EnclosingWalkVerdict {
+    if (isCommentOrMultilineString(ctx)) return .skip;
+    const line_balance = countCurlyBalance(ctx);
+    const depth_before = state.brace_depth;
+    state.brace_depth = trackBraceDepthBackward(ctx, state.brace_depth);
+    // The else-open flag is computed before the opener check: on an
+    // else-open line the condition before the `else` keyword is the
+    // antecedent, negated for the arm below, so the opener check judges
+    // only the arm's own region after the `else`. A line like
+    // `} else { if (q) {` still credits the arm's own condition
+    // (EPH-I0965).
+    const kind = if (depth_before == 0 and line_balance >= 0) elseOpenKind(ctx) else null;
+    if (state.brace_depth < 0) {
+        if (judgeBoundDepthNegativeCrossing(bctx, i, ctx, state.skip_antecedent)) return .found;
+        state.skip_antecedent = false;
+        state.brace_depth = 0;
+    }
+    return judgeEnclosingBoundElseOpen(.{
+        .bctx = bctx,
+        .i = i,
+        .ctx = ctx,
+        .kind = kind,
+    }, state);
+}
+
+/// Judge the else-open kind of one enclosing-bound walk line: the
+/// amount-aware twin of judgeEnclosingGuardElseOpen — the chain arm's
+/// own condition proves the candidate's bound, and the line's boundary
+/// verdict closes the walk (EPH-I0963, EPH-I0965). Only a CLASSIC
+/// else-open (`} else {`) has its antecedent on a line above: the next
+/// opener crossed is that antecedent and must be skipped. A mid-line
+/// else-open carries its antecedent on the same line, already excluded
+/// through the arm region — the next opener above is an outer guard
+/// that still dominates the candidate (EPH-I0965 review r1 finding 1).
+fn judgeEnclosingBoundElseOpen(
+    line: EnclosingBoundElseOpenLine,
+    state: *EnclosingWalkState,
+) EnclosingWalkVerdict {
+    if (line.kind) |k| {
+        if (!state.skip_antecedent and k == .chain and openerCoversBound(line.bctx, line.i))
+            return .found;
+        if (isClassicElseOpen(line.ctx)) state.skip_antecedent = true;
+    }
+    if (isFuncBoundary(line.ctx)) return .boundary;
+    return .skip;
 }
 
 /// Judge the depth-negative crossing of the enclosing-bound walk: the
@@ -37883,19 +38117,46 @@ fn hasEndsWithGuardForIndex(t: []const u8, expr: IndexExprLoc) bool {
     if (!mem.endsWith(u8, expr.var_name, ".len")) return false;
     const base = expr.var_name[0 .. expr.var_name.len - ".len".len];
     if (base.len == 0) return false;
-    // One classifier walk plus one comment-start walk (EPH-I0153).
+    // One classifier walk plus one comment-start walk serve both call
+    // names (EPH-I0153).
     var cls = LineClassifier.init(t);
     const comment_start = findCommentStart(t);
     const calls = [_][]const u8{ "endsWith(", "startsWith(" };
     for (calls) |call| {
-        var from: usize = 0;
-        while (mem.indexOfPos(u8, t, from, call)) |pos| {
-            from = pos + call.len;
-            if (pos >= expr.bracket_pos) break;
-            if (cls.isInsideString(pos)) continue;
-            if (comment_start != null and pos >= comment_start.?) continue;
-            if (endsWithCallGuardsBase(t, pos, call, base)) return true;
-        }
+        if (callGuardScanHolds(.{
+            .t = t,
+            .call = call,
+            .base = base,
+            .bracket_pos = expr.bracket_pos,
+        }, &cls, comment_start)) return true;
+    }
+    return false;
+}
+
+/// One call-name scan's fixed inputs (hasEndsWithGuardForIndex).
+const CallGuardScanQuery = struct {
+    t: []const u8,
+    call: []const u8,
+    base: []const u8,
+    bracket_pos: usize,
+};
+
+/// True when an occurrence of the call name left of the index guards
+/// the base (hasEndsWithGuardForIndex): a call right of the index
+/// stops the scan for that name, and a call inside a string or comment
+/// is data (band-B12 F17, EPH-I0506).
+fn callGuardScanHolds(
+    q: CallGuardScanQuery,
+    cls: *LineClassifier,
+    comment_start: ?usize,
+) bool {
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, q.t, from, q.call)) |pos| {
+        from = pos + q.call.len;
+        if (pos >= q.bracket_pos) break;
+        if (cls.isInsideString(pos)) continue;
+        if (pastCommentStart(comment_start, pos)) continue;
+        if (endsWithCallGuardsBase(q.t, pos, q.call, q.base)) return true;
     }
     return false;
 }
@@ -37981,20 +38242,48 @@ fn hasIfExprGuard(t: []const u8, expr: IndexExprLoc) bool {
 /// EPH-I0506).
 fn hasElseArmZeroExclusion(t: []const u8, var_name: []const u8, else_pos: usize) bool {
     const pats = [_][]const u8{ "== 0)", "<= 0", "< 1" };
-    // One classifier walk plus one comment-start walk (EPH-I0153).
+    // One classifier walk plus one comment-start walk serve every
+    // pattern (EPH-I0153).
     var cls = LineClassifier.init(t);
     const comment_start = findCommentStart(t);
     for (pats) |pat| {
-        var from: usize = 0;
-        while (mem.indexOfPos(u8, t[0..else_pos], from, pat)) |pos| {
-            from = pos + pat.len;
-            const after = pos + pat.len;
-            if (after < t.len and isIdent(t[after])) continue;
-            if (mem.startsWith(u8, t[after..], " and")) continue;
-            if (cls.isInsideString(pos)) continue;
-            if (comment_start != null and pos >= comment_start.?) continue;
-            if (comparisonLhsIsVar(t, pos, var_name)) return true;
-        }
+        if (zeroExclusionPatternHolds(.{
+            .t = t,
+            .var_name = var_name,
+            .else_pos = else_pos,
+            .pat = pat,
+        }, &cls, comment_start)) return true;
+    }
+    return false;
+}
+
+/// One pattern scan's fixed inputs (hasElseArmZeroExclusion).
+const ZeroExclusionScanQuery = struct {
+    t: []const u8,
+    var_name: []const u8,
+    else_pos: usize,
+    pat: []const u8,
+};
+
+/// True when one `pat` occurrence before the else keyword is the
+/// zero-exclusion on the var (hasElseArmZeroExclusion): an identifier
+/// tail, an `and`-tail, a string-literal position, and a comment
+/// position all disqualify; the surviving occurrence must sit left of
+/// a comparison on the candidate var (band-B12 F17, EPH-I0506).
+fn zeroExclusionPatternHolds(
+    q: ZeroExclusionScanQuery,
+    cls: *LineClassifier,
+    comment_start: ?usize,
+) bool {
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, q.t[0..q.else_pos], from, q.pat)) |pos| {
+        from = pos + q.pat.len;
+        const after = pos + q.pat.len;
+        if (after < q.t.len and isIdent(q.t[after])) continue;
+        if (mem.startsWith(u8, q.t[after..], " and")) continue;
+        if (cls.isInsideString(pos)) continue;
+        if (pastCommentStart(comment_start, pos)) continue;
+        if (comparisonLhsIsVar(q.t, pos, q.var_name)) return true;
     }
     return false;
 }
@@ -38297,21 +38586,32 @@ fn isClampAssignment(t: []const u8, ident: []const u8) bool {
 fn statementCarriesClamp(t: []const u8, eq: usize) bool {
     var end = eq + 1;
     while (end < t.len and t[end] != ';') end += 1;
-    var rhs = mem.trim(u8, t[eq + 1 .. end], " \t");
-    // Strip balanced wrapping parens: `(@min(x, 255))` is still the call.
-    while (rhs.len >= 2 and rhs[0] == '(' and rhs[rhs.len - 1] == ')') {
-        const inner = rhs[1 .. rhs.len - 1];
-        if (parenBalance(inner) != 0) break;
-        rhs = mem.trim(u8, inner, " \t");
-    }
+    const rhs = stripWrappingParens(mem.trim(u8, t[eq + 1 .. end], " \t"));
     const name = if (mem.startsWith(u8, rhs, "@min("))
         "@min("
     else if (mem.startsWith(u8, rhs, "@max("))
         "@max("
     else
         return false;
-    // The call's close paren must end the rhs — `@min(x, 255) + 1`
-    // assigns more than the clamp result.
+    return clampCallClosesRhs(rhs, name);
+}
+
+/// The rhs modulo balanced wrapping parens: `(@min(x, 255))` is still
+/// the clamp call (statementCarriesClamp).
+fn stripWrappingParens(rhs_in: []const u8) []const u8 {
+    var rhs = rhs_in;
+    while (rhs.len >= 2 and rhs[0] == '(' and rhs[rhs.len - 1] == ')') {
+        const inner = rhs[1 .. rhs.len - 1];
+        if (parenBalance(inner) != 0) break;
+        rhs = mem.trim(u8, inner, " \t");
+    }
+    return rhs;
+}
+
+/// True when the clamp call's close paren ends the rhs exactly
+/// (statementCarriesClamp): `@min(x, 255) + 1` assigns more than the
+/// clamp result and proves nothing (EPH-I0970).
+fn clampCallClosesRhs(rhs: []const u8, name: []const u8) bool {
     var mode: QuoteMode = .none;
     var i = name.len;
     var depth: usize = 1;

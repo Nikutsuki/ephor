@@ -47,7 +47,6 @@ Ephor enforces **established community conventions** - not arbitrary rules we in
 - Do not like a rule? Disable it: `"disable": ["ZA703"]`
 - Want stricter checks? Enable them: `"enable": ["ZA204", "ZA701"]`
 - Different thresholds? Set them: `"thresholds": { "max_function_lines": 100 }`
-- Project-wide settings? Use profiles: `"profiles": ["security"]`
 
 ### 2. Do Not Duplicate Existing Tools
 
@@ -273,25 +272,34 @@ This helps developers decide if upgrading is a quick task or a major undertaking
 
 ### Config File: `ephor.json`
 
+The example shows the standard shape the `init` and `install` writers emit:
+`version`, `path_dir`, `entries`, `exclude`, `orphan_exclude`, `enable`
+(`ZA305`, `ZA306`), and `fail_on` (EPH-I1146). The `strict`,
+`error_naming`, and `thresholds` keys are schema reference only: each stays
+an optional manual override, and the built-in threshold defaults apply when
+the `thresholds` block is absent.
+
 ```json
 {
-  "src": "src",
+  "version": "0.14.3",
+  "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["vendor", "third_party"],
-
-  "disable": [],
-  "enable": [],
-
+  "orphan_exclude": ["_test.zig", "/test/", "/tests/"],
+  "enable": ["ZA305", "ZA306"],
+  "strict": true,
+  "fail_on": "warning",
+  "error_naming": "TitleCase",
   "thresholds": {
-    "max_function_lines": 50,
-    "max_nesting_depth": 3,
+    "max_lines": 50,
+    "max_nesting": 3,
     "max_params": 4,
     "max_branches": 12,
     "max_line_length": 100,
-    "max_file_bytes": null
-  },
-
-  "profiles": []
+    "max_cyclomatic": 10,
+    "max_cognitive": 15,
+    "max_file_bytes": 50000
+  }
 }
 ```
 
@@ -312,68 +320,6 @@ Or enable all ZA9xx:
   "enable": ["ZA9"]
 }
 ```
-
-### Profiles (Presets)
-
-Profiles are named collections of rule configurations for common use cases.
-
-```json
-{
-  "profiles": ["security"]
-}
-```
-
-#### Available Profiles
-
-| Profile | Description | Changes from Default |
-|---------|-------------|----------------------|
-| `strict` | Maximum strictness | Lower thresholds, enables ZA702, ZA9xx |
-| `security` | Security-focused | Enables ZA9xx lifetime checks |
-| `minimal` | CI-friendly minimum | Disables complexity/style, keeps safety checks |
-| `llm-friendly` | Optimized for AI code review | Enables ZA702 with 25KB limit |
-
-#### Profile: `strict`
-
-```json
-{
-  "enable": ["ZA702", "ZA9"],
-  "thresholds": {
-    "max_function_lines": 30,
-    "max_line_length": 100,
-    "max_file_bytes": 50000
-  }
-}
-```
-
-#### Profile: `security`
-
-```json
-{
-  "enable": ["ZA9"]
-}
-```
-Enables all lifetime/resource tracking checks.
-
-#### Profile: `minimal`
-
-```json
-{
-  "disable": ["ZA3", "ZA7"]
-}
-```
-Keeps safety checks (ZA1, ZA2, ZA8), disables complexity and style rules.
-
-#### Profile: `llm-friendly`
-
-```json
-{
-  "enable": ["ZA702"],
-  "thresholds": {
-    "max_file_bytes": 25000
-  }
-}
-```
-Flags large files that may exceed AI context windows.
 
 ---
 
@@ -404,7 +350,6 @@ ephor version-check [path] --from=0.15.2 --to=0.16.0
 ```bash
 --entry=<file>           Entry point for orphan detection
 --format=text|json       Output format (default: text)
---profile=<name>         Apply named profile
 --disable=<rule>         Disable rule (prefix matching: ZA1 disables ZA1xx)
 --enable=<rule>          Enable rule (overrides disable)
 
@@ -418,7 +363,6 @@ ephor version-check [path] --from=0.15.2 --to=0.16.0
 
 # Output control
 -V, --verbose            Verbose output
--q, --quiet              Suppress summary (IDE mode)
 ```
 
 ### Exit Codes
@@ -455,7 +399,7 @@ fn veryLongFunction() void {  // No warning on this line
 - ZA103 (errdefer) implemented as pattern matching (limited accuracy)
 
 ### Phase 2: Core Improvements (v0.6) ✓
-- [x] Add profiles system (strict, security, minimal, llm-friendly)
+- [ ] Add profiles system — never shipped. The section was removed (EPH-I1186)
 - [x] Add `enable` config option (overrides disable)
 - [x] Add ZA402, ZA403 (unused const/var)
 - [ ] Improve inline disable parsing (deferred to v0.7)
@@ -711,13 +655,7 @@ Zig's compiler does not enforce naming, but the community has clear documented s
 
 **Status**: Not yet implemented.
 
-### 4. Profile Application Order
-
-**Decision**: Profile first, then config overrides
-
-Profiles provide sensible defaults for a use case. Explicit config represents intentional customization and takes precedence.
-
-### 5. Auto-Fix
+### 4. Auto-Fix
 
 **Decision**: No auto-fix
 
@@ -728,7 +666,7 @@ Rationale:
 - Auto-fixing code changes can introduce bugs
 - Keep the tool simple and focused on detection
 
-### 6. No Separate Modes
+### 5. No Separate Modes
 
 **Decision**: Single mode, no `--deep` flag
 
@@ -739,7 +677,7 @@ Rationale:
 - All checks are fast enough to run together
 - Configuration handles opt-in/opt-out
 
-### 7. ZA9xx Lifetime Checks
+### 6. ZA9xx Lifetime Checks
 
 **Decision**: OFF by default, easily enabled
 

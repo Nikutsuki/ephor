@@ -302,3 +302,107 @@ test "ZA111: slice of array field and array param fire (EPH-I0046)" {
     try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "'holder'") != null);
     try std.testing.expect(mem.indexOf(u8, issues.items[1].message, "'a'") != null);
 }
+
+test "ZA111: label-aware block breaks keep nested inner breaks out (EPH-I1183)" {
+    const a = std.testing.allocator;
+    // f: the outer break escapes and must fire — the inner break names
+    // the nested block (an unresolvable call operand) and previously
+    // silenced the outer through the all-breaks sweep (the FN). g: the
+    // void-returned outer block must stay silent — the inner break's
+    // stack root is the inner block's value, never the outer's (the
+    // contrived FP).
+    var issues = try runZa111(a,
+        \\const S = struct { a: u32 };
+        \\fn make() *u32 {
+        \\    return @ptrFromInt(0x1000);
+        \\}
+        \\fn f(x: u32) *u32 {
+        \\    var v = S{ .a = x };
+        \\    return outer: {
+        \\        _ = inner: { break :inner make(); };
+        \\        break :outer &v.a;
+        \\    };
+        \\}
+        \\fn g() void {
+        \\    var v = S{ .a = 7 };
+        \\    return outer: {
+        \\        const p = inner: { break :inner &v.a; };
+        \\        _ = p;
+        \\    };
+        \\}
+    );
+    defer types.deinitIssues(&issues, a);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "'v'") != null);
+}
+
+test "ZA111: while payload capture return fires, by-value stays silent (EPH-I1184)" {
+    const a = std.testing.allocator;
+    // The pointer capture binds into the condition operand's own slot —
+    // the same stack-escape class the if/for capture pins cover. A
+    // by-value capture returns a copy and stays silent. A param
+    // condition roots at the param slot and fires too.
+    var issues = try runZa111(a,
+        \\fn f(x: u32) ?*u32 {
+        \\    var o: ?u32 = x;
+        \\    while (o) |*p| return p;
+        \\    return null;
+        \\}
+        \\fn g(opt: ?u32) ?*u32 {
+        \\    while (opt) |*p| return p;
+        \\    return null;
+        \\}
+        \\fn h(x: u32) ?u32 {
+        \\    const o: ?u32 = x;
+        \\    while (o) |v| return v;
+        \\    return null;
+        \\}
+    );
+    defer types.deinitIssues(&issues, a);
+    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "'o'") != null);
+    try std.testing.expect(mem.indexOf(u8, issues.items[1].message, "'opt'") != null);
+}
+
+test "ZA111: switch-wrapped labeled-block binding resolves (EPH-I1185)" {
+    const a = std.testing.allocator;
+    // s's init is a switch whose only prong is a labeled block rooted
+    // in the stack array: the binding carries the block's value and the
+    // return escapes it. g consumes the binding in-function (the sig
+    // merlin.zig shape) and stays silent. h's mixed prong (a non-block
+    // value) keeps the switch unresolvable (FN-only).
+    var issues = try runZa111(a,
+        \\fn f(x: u32) *u32 {
+        \\    var arr: [4]u32 = .{ 1, 2, 3, x };
+        \\    const s = switch (x) {
+        \\        else => b: {
+        \\            break :b &arr[x % 4];
+        \\        },
+        \\    };
+        \\    return s;
+        \\}
+        \\fn g(x: u32, sink: *u32) void {
+        \\    var arr: [4]u32 = .{ 1, 2, 3, x };
+        \\    const s = switch (x) {
+        \\        else => b: {
+        \\            break :b &arr[x % 4];
+        \\        },
+        \\    };
+        \\    sink.* = s[0];
+        \\}
+        \\fn h(x: u32) *u32 {
+        \\    var arr: [4]u32 = .{ 1, 2, 3, x };
+        \\    const s = switch (x) {
+        \\        0 => @as(*u32, @ptrFromInt(0x1000)),
+        \\        else => b: {
+        \\            break :b &arr[x % 4];
+        \\        },
+        \\    };
+        \\    return s;
+        \\}
+    );
+    defer types.deinitIssues(&issues, a);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "'s'") != null);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "'arr'") != null);
+}

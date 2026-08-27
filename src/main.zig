@@ -5445,8 +5445,9 @@ const EscapePoint = struct {
 
 /// Fill both per-variable read-window maps for the still-tracked vars:
 /// the address-escape tail windows (EPH-I1174) and the payload-shadow
-/// spans (EPH-I1175). An unbounded payload shape keeps the
-/// whole-function drop inside collectPayloadShadowSpans.
+/// spans (EPH-I1175). An unbounded payload shape records no span inside
+/// collectPayloadShadowSpans — there is no whole-function drop anymore —
+/// and the var's reads fire toward warning (EPH-I1192).
 fn collectReadWindows(
     undef_vars: *const std.StringHashMap(usize),
     escapes: *std.StringHashMap(EscapePoint),
@@ -5530,9 +5531,10 @@ fn payloadBindingCol(t: []const u8, var_name: []const u8) ?usize {
 
 /// Body-line span (inclusive) where the payload binding at bind_idx
 /// shadows var_name, or null when the shape is not confidently bounded —
-/// the caller then keeps the whole-function drop, the fail-safe
-/// direction (EPH-I1175). Only for/while/if opener lines admit the walk;
-/// an else-line binding (the post-payload chain form) falls back.
+/// the caller then records no span and the reads fire toward warning,
+/// the fail-safe direction (EPH-I1175, EPH-I1192). Only for/while/if
+/// opener lines admit the walk; an else-line binding (the post-payload
+/// chain form) falls back to the null arm.
 const LineSpan = struct {
     from_idx: usize,
     to_idx: usize,
@@ -5630,9 +5632,10 @@ fn payloadBracelessEnd(lines: []const []const u8, from_idx: usize) ?usize {
 
 /// True when the line starts a for/while/if opener (optionally inline or
 /// labeled): the payload-shadow span walk admits only these shapes
-/// (EPH-I1175). Else-line chains and other payload sites fall back to
-/// the whole-function drop. The full-line check runs before the label
-/// strip, so a continuation colon (`while (c) : (...)`) never misparses.
+/// (EPH-I1175). Else-line chains and other payload sites record no span
+/// and the reads fire toward warning (EPH-I1192). The full-line check
+/// runs before the label strip, so a continuation colon (`while (c) :
+/// (...)`) never misparses.
 fn isControlOpenerLineStart(t: []const u8) bool {
     var rest = t;
     if (mem.startsWith(u8, rest, "inline ")) rest = rest["inline ".len..];
@@ -5651,8 +5654,16 @@ fn isBranchOpener(t: []const u8) bool {
 }
 
 /// Record each var's payload-shadow span: the body-line range where the
-/// binding shadows the tracked name (EPH-I1175). An unbounded shape
-/// keeps the whole-function drop.
+/// binding shadows the tracked name (EPH-I1175). Only the FIRST bounded
+/// binding's body spans: a later same-name binding's body sits outside
+/// the span, and its payload reads fire toward warning. An unbounded
+/// binding (an else-line chain head) records NO span — the
+/// whole-function drop this doc used to claim was deleted with
+/// removePayloadShadowedVars (dfaf0f3) — and the reads fire the same
+/// way. Firing is the documented residual for shadow text, which is a
+/// 0.15+ compile error (a payload capture shadowing an outer local,
+/// adjudicated at EPH-I1188; zero corpus instances) — the EPH-I0826
+/// documented-residual arm, EPH-I1192.
 fn collectPayloadShadowSpans(
     undef_vars: *const std.StringHashMap(usize),
     shadows: *std.StringHashMap(LineSpan),
@@ -6267,21 +6278,91 @@ const LoopWalkCtx = struct {
     body_start: usize,
 };
 
-/// End line (exclusive) of a braced loop body: the first standalone `}`
-/// after the opener. found_inc carries the increment-seen state
+/// End line (exclusive) of a braced loop body: the close-first line whose
+/// leading closes bring the body depth to zero. A tail after the close
+/// sits outside the body; a counter write there breaks the guard's
+/// zero-reading correlation, so the walk fails closed (EPH-I1191) — the
+/// exact-equality walk missed the close on a tail-carrying line and
+/// swallowed the write into the span. Nested blocks keep the walk open:
+/// a close that does not reach the body depth updates the depth and
+/// continues, with the opens adding unconditionally after the closes
+/// (the EPH-I1190 convention). Non-close-first lines count with the
+/// net-zero convention, so one-line blocks and struct literals leave the
+/// depth unchanged. found_inc carries the increment-seen state
 /// (EPH-I1177).
 fn bracedLoopBodyEnd(
     ctx: LoopWalkCtx,
     loop_idx: usize,
     found_inc: *bool,
 ) ?usize {
+    var depth: usize = 1;
     var j = loop_idx + 1;
     while (j < ctx.guard_idx) : (j += 1) {
         const body = mem.trim(u8, ctx.lines[j], " \t\r");
-        if (mem.eql(u8, body, "}")) return endOrNull(found_inc.*, j + 1);
+        if (isCommentOrMultilineString(body)) continue;
         if (lineHasIncrement(body, ctx.counter)) found_inc.* = true;
+        if (body.len == 0 or body[0] != '}') {
+            depth = foldNonCloseLine(body, depth);
+            continue;
+        }
+        const run = leadingCloseRun(body);
+        if (run.closes >= depth) {
+            // The loop body closes on this line; the tail is outside
+            // the loop and a counter write there breaks the
+            // correlation (EPH-I1191).
+            if (tailWritesCounter(body[run.len..], ctx.counter)) return null;
+            return endOrNull(found_inc.*, j + 1);
+        }
+        const bc = braceCountOnLine(body);
+        depth = (depth -| bc.closes) + bc.opens;
     }
     return null;
+}
+
+/// Fold one non-close-first line into the walk depth with the net-zero
+/// convention (EPH-I1191): a balanced line leaves the depth unchanged,
+/// opens add, closes subtract (saturating).
+fn foldNonCloseLine(t: []const u8, depth: usize) usize {
+    const bc = braceCountOnLine(t);
+    var d = depth;
+    if (bc.opens >= bc.closes) d += bc.opens;
+    if (bc.closes >= bc.opens) d -|= bc.closes;
+    return d;
+}
+
+/// Leading `}` run of a close-first line: the count of close braces
+/// before the first non-close code token, plus the byte length of the
+/// run (whitespace included). The run needs no quote masking — the
+/// trimmed line starts with `}`, and only `}`, space, and tab can join
+/// the run. Trailing closes inside a one-line tail block are not
+/// leading and stay out (EPH-I1191).
+const CloseRun = struct {
+    closes: usize,
+    len: usize,
+};
+
+fn leadingCloseRun(t: []const u8) CloseRun {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        if (t[i] == '}') {
+            n += 1;
+            continue;
+        }
+        if (t[i] == ' ' or t[i] == '\t' or t[i] == '\r') continue;
+        break;
+    }
+    return .{ .closes = n, .len = i };
+}
+
+/// True when the close-line tail (the text past the loop body's close)
+/// carries a counter write (EPH-I1191). A comment-only tail cannot
+/// write. Quote content shares the word-boundary blindness of
+/// lineWritesName, the family's documented convention.
+fn tailWritesCounter(tail: []const u8, counter: []const u8) bool {
+    const t = mem.trimStart(u8, tail, " \t\r");
+    if (t.len >= 2 and t[0] == '/' and t[1] == '/') return false;
+    return lineWritesName(t, counter);
 }
 
 /// End line (exclusive) of a brace-less loop body: the single statement
@@ -8459,7 +8540,21 @@ fn analyzeOneAllocSafety(
     try detectUseAfterFree(&scan_ctx);
     try detectDoubleFree(&scan_ctx);
     // One pairing context serves both deferred-pair detectors (EPH-I0006).
-    const pair_ctx: DeferPairCtx = .{
+    const pair_ctx = buildDeferPairCtx(ctx, alloc_info, capture_shadowed);
+    try detectDeferDoubleFree(ctx.allocator, &pair_ctx, issues);
+    try detectErrdeferDirectFree(ctx.allocator, &pair_ctx, issues);
+}
+
+/// Build the deferred-pairing context for one tracked allocation
+/// (EPH-I0006). The capture-shadow map is the caller's: the fn-side
+/// pipeline computes it once and shares it with the block scan, while the
+/// test-block pass computes its own (EPH-I1200).
+fn buildDeferPairCtx(
+    ctx: *const AllocSafetyCtx,
+    alloc_info: *CFGAllocation,
+    capture_shadowed: []const bool,
+) DeferPairCtx {
+    return .{
         .lines = ctx.lines,
         .func_line = ctx.func_line,
         .file_path = ctx.file_path,
@@ -8469,8 +8564,6 @@ fn analyzeOneAllocSafety(
         .capture_shadowed = capture_shadowed,
         .aliases = ctx.aliases,
     };
-    try detectDeferDoubleFree(ctx.allocator, &pair_ctx, issues);
-    try detectErrdeferDirectFree(ctx.allocator, &pair_ctx, issues);
 }
 
 /// Source identity of one function body under analysis: its lines, the file
@@ -26910,30 +27003,59 @@ fn analyzeComplexity(
     return issues;
 }
 
+/// Optional per-file observation channels for the AST tier driver: the
+/// parse-error sink (one ZA503 per file the host parser rejects,
+/// EPH-I0742) and the skip-path recorder (EPH-I1197). A null pointer
+/// skips observation — the analysis-only callers pass none.
+const AstTierObs = struct {
+    parse: ?*std.ArrayListUnmanaged(Issue) = null,
+    skips: ?*SkipPathLog = null,
+};
+
 /// AST tier driver: parse each file with the host std.Ast and run the
 /// AST-native rules (currently ZA111). Files with parse errors are skipped
 /// inside the tier; the line tier still covers them. A non-null
-/// `parse_sink` receives one ZA503 warning per file the host parser
+/// `obs.parse` receives one ZA503 warning per file the host parser
 /// rejects (EPH-I0742) — the check pipeline routes those to the
-/// structure report; commands without that report pass null.
+/// structure report; commands without that report pass null. `obs.skips`
+/// records the path of every skipped file, observed from the tier's own
+/// per-file skip counter (EPH-I1197), so the skip note can name the
+/// files.
 fn analyzeAstTier(
     allocator: Allocator,
     graph: *ImportGraph,
     stats: ?*ast_tier.Stats,
-    parse_sink: ?*std.ArrayListUnmanaged(Issue),
+    obs: ?*AstTierObs,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     errdefer deinitIssues(&issues, allocator);
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
         const fa = entry.value_ptr.*;
+        const skipped_before = if (stats) |s| s.skipped else 0;
         try ast_tier.analyzeFileAstTier(allocator, .{
             .issues = &issues,
             .stats = stats,
-            .parse_issues = parse_sink,
+            .parse_issues = if (obs) |o| o.parse else null,
         }, fa.path, fa.content);
+        recordSkipPath(stats, skipped_before, obs, fa.path);
     }
     return issues;
+}
+
+/// Record the path when the tier's skip counter advanced for the file
+/// just analyzed: the tier increments it exactly once per skipped file,
+/// so the delta names this file's skip verdict (EPH-I1197).
+fn recordSkipPath(
+    stats: ?*ast_tier.Stats,
+    skipped_before: usize,
+    obs: ?*AstTierObs,
+    path: []const u8,
+) void {
+    if (stats) |s| {
+        if (s.skipped <= skipped_before) return;
+        if (obs) |o| if (o.skips) |log| log.record(path);
+    }
 }
 
 // ============================================================================
@@ -28268,6 +28390,9 @@ const CFGState = struct {
     // Test block context tracking
     in_test_block: bool = false,
     test_brace_depth: usize = 0,
+    // Line number of the open test block's opener, for the errdefer
+    // pairing pass (EPH-I1200).
+    test_start: usize = 0,
     // Whether current function started inside a test block
     func_in_test: bool = false,
     // File-level: functions that receive no-free allocators at call sites
@@ -28312,6 +28437,11 @@ const CFGScanCtx = struct {
     state: *CFGState,
     prev: *CFGPrevFunc,
     func_lines: *std.ArrayListUnmanaged([]const u8),
+    /// Open test block's body lines, collected for the errdefer pairing
+    /// pass (EPH-I1200). Mirrors func_lines: every line of the block,
+    /// including comments and blank lines, keeps the line-number
+    /// arithmetic (func_line + idx) exact.
+    test_lines: *std.ArrayListUnmanaged([]const u8),
 };
 
 /// Error-return word markers for signature lines (EPH-I0072, EPH-I0075).
@@ -29768,7 +29898,7 @@ fn buildCFGFilePrescan(allocator: Allocator, content: []const u8) !CFGFilePresca
     return .{ .no_free_fns = no_free_fns, .no_free_fields = no_free_fields };
 }
 
-/// Analyze a single file for CFG memory issues. 49 physical lines; 44
+/// Analyze a single file for CFG memory issues. 48 physical lines; 43
 /// code lines under ephor's own ZA301 counting (blank and comment lines
 /// excluded, EPH-I0788) — under the 50-line ceiling, and ZA301 is not in
 /// the gate's enabled set (band-B11 F13-adjacent, EPH-I0484).
@@ -29789,6 +29919,8 @@ fn analyzeCFGFile(
     var line_iter = mem.splitScalar(u8, content, '\n');
     var func_lines = std.ArrayListUnmanaged([]const u8).empty;
     defer func_lines.deinit(allocator);
+    var test_lines = std.ArrayListUnmanaged([]const u8).empty;
+    defer test_lines.deinit(allocator);
     var prev = CFGPrevFunc{};
     const file: CFGFileCtx = .{
         .allocator = allocator,
@@ -29799,6 +29931,7 @@ fn analyzeCFGFile(
         .state = &state,
         .prev = &prev,
         .func_lines = &func_lines,
+        .test_lines = &test_lines,
     };
 
     while (line_iter.next()) |line| {
@@ -29806,12 +29939,8 @@ fn analyzeCFGFile(
         const t = mem.trim(u8, line, " \t\r");
         const is_comment = isCommentOrMultilineString(t);
 
-        if (!is_comment) {
-            const ts = trackTestBlock(t, state.in_test_block, state.test_brace_depth);
-            state.in_test_block = ts.in_test;
-            state.test_brace_depth = ts.depth;
-            try handleCFGFuncDetection(file, scan, t, line_num);
-        }
+        try handleCFGTestLine(file, scan, t, line_num);
+        if (!is_comment) try handleCFGFuncDetection(file, scan, t, line_num);
         if (!state.in_func) continue;
         try func_lines.append(allocator, line);
 
@@ -29832,9 +29961,11 @@ fn finishCFGFunction(file: CFGFileCtx, scan: CFGScanCtx) !void {
     // every test-context suppression in the tool: fixture helpers in test
     // files are exempt from ZA103's errdefer gate regardless of block
     // tracking (EPH-I0363). ZA101/ZA102/ZA105/ZA106 ignore this flag
-    // entirely — they run on every function — and test-block BODIES are
-    // never analyzed at all (test blocks are not fn-shaped, so the family
-    // never sees their lines; pinned by the EPH-I0363 tests).
+    // entirely — they run on every function — and test-block BODIES get
+    // only the errdefer/direct-free pairing (EPH-I1200): test blocks are
+    // not fn-shaped, so the block-level scans never see their lines, but
+    // the pairing detector is line-model and runs on the collected block
+    // (pinned by the EPH-I0363 tests and the EPH-I1200 pairing pin).
     const in_test = state.func_in_test or isInTestContext(file.file_path, false);
     const func: CFGFuncCtx = .{
         .name = state.func_name,
@@ -29849,6 +29980,94 @@ fn finishCFGFunction(file: CFGFileCtx, scan: CFGScanCtx) !void {
     try processFunction(file, func);
     state.in_func = false;
     scan.func_lines.clearRetainingCapacity();
+}
+
+/// Per-line test-block tracking for the CFG file pass (EPH-I1200): record
+/// the opener's line number while the block is open, collect the block's
+/// lines, and run the errdefer/direct-free pairing when it closes. Every
+/// line of the block joins the collection — comments and blank lines
+/// included — so the detectors' line-number arithmetic (func_line + idx)
+/// stays exact. A nested fn's body stays out: the fn pass owns those
+/// lines.
+fn handleCFGTestLine(
+    file: CFGFileCtx,
+    scan: CFGScanCtx,
+    t: []const u8,
+    line_num: usize,
+) !void {
+    const state = scan.state;
+    if (!isCommentOrMultilineString(t)) {
+        const was_in_test = state.in_test_block;
+        const ts = trackTestBlock(t, state.in_test_block, state.test_brace_depth);
+        state.in_test_block = ts.in_test;
+        state.test_brace_depth = ts.depth;
+        if (!was_in_test and state.in_test_block) state.test_start = line_num;
+        if (was_in_test and !state.in_test_block) {
+            try analyzeTestBlockErrdeferPairs(
+                file,
+                scan.test_lines.items,
+                state.test_start,
+                state.no_free_fields,
+            );
+            scan.test_lines.clearRetainingCapacity();
+        }
+    }
+    if (state.in_test_block) try scan.test_lines.append(file.allocator, t);
+}
+
+/// True when the test-block pairing pass must skip: an over-cap line
+/// count or an empty/over-cap allocation set (EPH-I1200). The skip is
+/// silent — silence is the block's pre-existing state, and the cap notes
+/// exist to signal regressions in previously-analyzed functions.
+fn testBlockPairingSkipped(lines: []const []const u8, alloc_count: usize) bool {
+    if (lines.len > max_mem_family_lines) return true;
+    if (alloc_count == 0) return true;
+    return alloc_count > max_mem_family_allocs;
+}
+
+/// Run the errdefer/direct-free pairing over one finished test block
+/// (EPH-I1200). Test blocks are not fn-shaped, so the CFG memory family's
+/// block-level scans never see their lines (the EPH-I0363 boundary); the
+/// B105 qa-gate double-free lived exactly in that gap. The pairing
+/// detector is line-model, so the block gets it alone. The
+/// defer/direct-free pairing stays out of scope: the errdefer class is
+/// the named one.
+fn analyzeTestBlockErrdeferPairs(
+    file: CFGFileCtx,
+    lines: []const []const u8,
+    start: usize,
+    no_free_fields: ?*const std.StringHashMapUnmanaged(void),
+) !void {
+    const a = file.allocator;
+    var allocs = try collectMemSafetyAllocs(a, lines, start, no_free_fields);
+    defer allocs.deinit();
+    if (testBlockPairingSkipped(lines, allocs.count())) return;
+    var cfg = try buildCFG(a, "test block", start, lines);
+    defer cfg.deinit();
+    var aliases = try collectAliases(a, lines, &allocs);
+    defer aliases.deinit(a);
+    const markers = try markDeferAndErrdeferBlocks(a, lines);
+    defer a.free(markers.in_defer);
+    defer a.free(markers.in_errdefer);
+    const safety_ctx: AllocSafetyCtx = .{
+        .allocator = a,
+        .cfg = &cfg,
+        .lines = lines,
+        .func_line = start,
+        .file_path = file.file_path,
+        .in_defer = markers.in_defer,
+        .in_errdefer = markers.in_errdefer,
+        .num_blocks = cfg.blocks.items.len,
+        .aliases = &aliases,
+    };
+    var alloc_iter = allocs.iterator();
+    while (alloc_iter.next()) |entry| {
+        const capture_shadowed =
+            try computeCaptureShadowedLines(a, &safety_ctx, entry.value_ptr.name);
+        defer a.free(capture_shadowed);
+        const pair_ctx = buildDeferPairCtx(&safety_ctx, entry.value_ptr, capture_shadowed);
+        try detectErrdeferDirectFree(a, &pair_ctx, file.issues);
+    }
 }
 
 /// Saved state for the previous function during CFG file analysis
@@ -46349,19 +46568,84 @@ fn printSummaryText(counts: IssueCounts, s: ProjectStats) void {
     std.debug.print("{s}", .{text});
 }
 
+/// Bounded record of the files the AST tier skipped (EPH-I1197): the
+/// note that reports the skip count names the first few paths so a skip
+/// is diagnosable without debug instrumentation. The slices borrow the
+/// graph's owned paths, which stay alive through the check run.
+const SkipPathLog = struct {
+    paths: [max_logged_skip_paths][]const u8 = undefined,
+    count: usize = 0,
+
+    fn record(self: *SkipPathLog, path: []const u8) void {
+        if (self.count >= self.paths.len) return;
+        self.paths[self.count] = path;
+        self.count += 1;
+    }
+};
+
+/// Paths named per skip note before the cap suffix (EPH-I1197).
+const max_logged_skip_paths: usize = 8;
+/// Per-path byte cap in the skip note: a longer path truncates with an
+/// ellipsis so the note stays one bounded line (EPH-I1197).
+const skip_note_path_bytes: usize = 96;
+/// Fixed render buffer for the skip note's path segment: eight capped
+/// paths plus the separators and the cap suffix fit with room to spare
+/// (EPH-I1197).
+const skip_note_path_buf_bytes: usize = 1024;
+
+/// Render the skip note's path segment into `buf`: "a.zig, b.zig", or
+/// "a.zig, ..., h.zig, ... (12 total)" when the log capped. Empty when
+/// no paths were recorded (EPH-I1197).
+fn formatSkipPaths(buf: []u8, log: SkipPathLog, skipped: usize) []const u8 {
+    if (log.count == 0) return "";
+    var w: std.Io.Writer = .fixed(buf);
+    writeSkipPaths(&w, log, skipped) catch return w.buffered();
+    return w.buffered();
+}
+
+/// Writer half of formatSkipPaths: the fixed buffer cannot overflow the
+/// proven bounds, and on the impossible overflow the partial render
+/// stays (the note keeps its head) (EPH-I1197).
+fn writeSkipPaths(w: *std.Io.Writer, log: SkipPathLog, skipped: usize) !void {
+    for (log.paths[0..log.count], 0..) |p, i| {
+        if (i > 0) try w.writeAll(", ");
+        if (p.len > skip_note_path_bytes) {
+            try w.writeAll(p[0..skip_note_path_bytes]);
+            try w.writeAll("...");
+        } else {
+            try w.writeAll(p);
+        }
+    }
+    if (skipped > log.count) try w.print(", ... ({d} total)", .{skipped});
+}
+
 /// Surface partial AST-tier coverage (EPH-I0200): a version-skew or
 /// over-cap file loses ZA111 coverage, and the line tier has no equivalent
-/// signal. Fires whenever the tier skipped at least one file. JSON mode
-/// skips the note so the machine stream stays pure (EPH-I0213); with
-/// --summary the ast_skipped member carries the same fact.
-fn noteAstTierSkips(diag: *DiagCtx, stats: ast_tier.Stats) void {
+/// signal. Fires whenever the tier skipped at least one file, and names
+/// the skipped paths (capped) so the skip is diagnosable without debug
+/// instrumentation (EPH-I1197). JSON mode skips the note so the machine
+/// stream stays pure (EPH-I0213); with --summary the ast_skipped member
+/// carries the same fact.
+fn noteAstTierSkips(diag: *DiagCtx, stats: ast_tier.Stats, log: SkipPathLog) void {
     if (stats.skipped == 0 or diag.json_stream) return;
     diag.ast_skip_note_count += 1;
+    var buf: [skip_note_path_buf_bytes]u8 = undefined;
+    const paths = formatSkipPaths(&buf, log, stats.skipped);
+    const plural = if (stats.skipped == 1) @as([]const u8, "") else "s";
+    if (paths.len == 0) {
+        cliDiag(
+            diag,
+            "note: {d} file{s} skipped by the AST tier (parse errors, byte " ++
+                "cap, or grammar pre-scan). ZA111 coverage is partial for those files.\n",
+            .{ stats.skipped, plural },
+        );
+        return;
+    }
     cliDiag(
         diag,
         "note: {d} file{s} skipped by the AST tier (parse errors, byte " ++
-            "cap, or grammar pre-scan). ZA111 coverage is partial for those files.\n",
-        .{ stats.skipped, if (stats.skipped == 1) @as([]const u8, "") else "s" },
+            "cap, or grammar pre-scan): {s}. ZA111 coverage is partial for those files.\n",
+        .{ stats.skipped, plural, paths },
     );
 }
 
@@ -47242,9 +47526,10 @@ fn collectCheckFindings(ctx: *const RunCtx, g: *ImportGraph) !CheckFindings {
     try mergeIntCastIssues(alloc, g, &cfg_mem_issues);
     // AST tier: ZA111 findings join the memory list, ZA503 parse
     // findings join the structure list before its sort so the merged
-    // list stays file-ordered (EPH-I0742).
+    // list stays file-ordered (EPH-I0742). The returned skip log names
+    // the skipped paths in the skip note (EPH-I1197).
     var ast_stats = ast_tier.Stats{};
-    try mergeAstTierIssues(alloc, g, &ast_stats, .{
+    const skip_log = try mergeAstTierIssues(alloc, g, &ast_stats, .{
         .cfg = &cfg_mem_issues,
         .structure = &orphan_issues,
     });
@@ -47266,7 +47551,7 @@ fn collectCheckFindings(ctx: *const RunCtx, g: *ImportGraph) !CheckFindings {
     errdefer deinitIssues(&test_issues, alloc);
     var conc_issues = try analyzeConcurrency(alloc, g);
     errdefer deinitIssues(&conc_issues, alloc);
-    noteAstTierSkips(ctx.diag, ast_stats);
+    noteAstTierSkips(ctx.diag, ast_stats, skip_log);
     var ignored_err_issues = try analyzeIgnoredErrors(alloc, g);
     errdefer deinitIssues(&ignored_err_issues, alloc);
     return .{
@@ -47317,18 +47602,23 @@ const AstTierMergeSinks = struct {
 /// the atomic moveIssues transfer (EPH-I0690, F-2), so the tier list
 /// frees only its array on the success path; an OOM keeps the owned
 /// payloads with the list for the errdefer. The parse findings append
-/// directly into `sinks.structure`, whose own errdefer covers them.
+/// directly into `sinks.structure`, whose own errdefer covers them. The
+/// returned skip log records the skipped paths for the skip note
+/// (EPH-I1197).
 fn mergeAstTierIssues(
     alloc: Allocator,
     g: *ImportGraph,
     stats: *ast_tier.Stats,
     sinks: AstTierMergeSinks,
-) !void {
-    var ast_issues = try analyzeAstTier(alloc, g, stats, sinks.structure);
+) !SkipPathLog {
+    var skip_log = SkipPathLog{};
+    var obs = AstTierObs{ .parse = sinks.structure, .skips = &skip_log };
+    var ast_issues = try analyzeAstTier(alloc, g, stats, &obs);
     errdefer deinitIssues(&ast_issues, alloc);
     try moveIssues(alloc, sinks.cfg, &ast_issues);
     ast_issues.deinit(alloc);
     ast_issues = .empty;
+    return skip_log;
 }
 
 /// Print every category's findings, the suppression note, the optional
@@ -49071,17 +49361,62 @@ test "stats scanner ignores comptime-concatenated marker spellings (EPH-I0538)" 
 test "AST skip note fires only when files were skipped" {
     var diag = testDiagCtx();
     diag.cli_diagnostics_enabled = false;
-    noteAstTierSkips(&diag, .{ .parsed = 3, .skipped = 0 });
+    noteAstTierSkips(&diag, .{ .parsed = 3, .skipped = 0 }, .{});
     try std.testing.expectEqual(@as(usize, 0), diag.ast_skip_note_count);
-    noteAstTierSkips(&diag, .{ .parsed = 3, .skipped = 2 });
+    noteAstTierSkips(&diag, .{ .parsed = 3, .skipped = 2 }, .{});
     try std.testing.expectEqual(@as(usize, 1), diag.ast_skip_note_count);
 }
 
 test "AST skip note stays off the JSON machine stream (EPH-I0213)" {
     var diag = testDiagCtx();
     diag.json_stream = true;
-    noteAstTierSkips(&diag, .{ .parsed = 3, .skipped = 2 });
+    noteAstTierSkips(&diag, .{ .parsed = 3, .skipped = 2 }, .{});
     try std.testing.expectEqual(@as(usize, 0), diag.ast_skip_note_count);
+}
+
+test "AST skip note names the skipped paths (EPH-I1197)" {
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    var log = SkipPathLog{};
+    log.record("src/main.zig");
+    log.record("src/compat/v0_16.zig");
+    noteAstTierSkips(&diag, .{ .parsed = 1, .skipped = 2 }, log);
+    try std.testing.expectEqual(@as(usize, 1), diag.ast_skip_note_count);
+    try std.testing.expectEqualStrings(
+        "note: 2 files skipped by the AST tier (parse errors, byte cap, or grammar pre-scan): " ++
+            "src/main.zig, src/compat/v0_16.zig. ZA111 coverage is partial for those files.\n",
+        capture.slice(),
+    );
+    try std.testing.expect(!capture.truncated);
+}
+
+test "AST skip note caps the path list with a count suffix (EPH-I1197)" {
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    var log = SkipPathLog{};
+    var i: usize = 0;
+    while (i < max_logged_skip_paths) : (i += 1) {
+        log.record("p.zig");
+    }
+    noteAstTierSkips(&diag, .{ .parsed = 1, .skipped = 12 }, log);
+    try std.testing.expectEqual(@as(usize, 1), diag.ast_skip_note_count);
+    try std.testing.expect(mem.indexOf(u8, capture.slice(), ", ... (12 total). ZA111") != null);
+    try std.testing.expect(!capture.truncated);
+}
+
+test "AST skip note with no recorded paths keeps the bare form (EPH-I1197)" {
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    noteAstTierSkips(&diag, .{ .parsed = 1, .skipped = 2 }, .{});
+    try std.testing.expectEqual(@as(usize, 1), diag.ast_skip_note_count);
+    try std.testing.expectEqualStrings(
+        "note: 2 files skipped by the AST tier (parse errors, byte cap, or grammar pre-scan). " ++
+            "ZA111 coverage is partial for those files.\n",
+        capture.slice(),
+    );
 }
 
 test "check ZA2 ownership: every dropped CFG ZA2 has an errors twin (EPH-I0174)" {
@@ -60585,6 +60920,76 @@ test "ZA106: errdefer free plus direct free with a later try is a warning (EPH-I
         if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
         try std.testing.expect(issue.severity == .warning);
     }
+}
+
+test "ZA106: test-block errdefer free plus direct free with a later try fires (EPH-I1200)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The B105 qa-gate double-free lived inside a test block, where the
+    // CFG memory family never ran: test blocks are not fn-shaped, so the
+    // block-level scans stay fn-only (the EPH-I0363 boundary). The
+    // errdefer/direct-free pairing detector is line-model, so the closed
+    // test block now gets it alone (EPH-I1200): the direct free runs on
+    // the success path, and the later `try` can error, so the errdefer
+    // double-frees the buffer.
+    const content =
+        \\test "errdefer in a test block" {
+        \\    const allocator = std.testing.allocator;
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer allocator.free(buf);
+        \\    use(buf);
+        \\    allocator.free(buf);
+        \\    try write(buf);
+        \\}
+        \\fn use(d: []u8) void {
+        \\    _ = d;
+        \\}
+        \\fn write(l: []const u8) !void {
+        \\    _ = l;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_eb_errdefer.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_eb_errdefer.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 1);
+    for (run.issues.items) |issue| {
+        if (!mem.eql(u8, issue.rule, RULE_DOUBLE_FREE)) continue;
+        try std.testing.expect(issue.severity == .warning);
+    }
+}
+
+test "ZA106: test-block errdefer plus transfer stays silent (EPH-I1200 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The canonical error/success split inside a test block: the
+    // errdefer covers the append's error path, and the append takes
+    // ownership on success. No direct free exists, so the pairing must
+    // stay silent (EPH-I1200 lock side).
+    const content =
+        \\fn appendTo(l: *std.ArrayList(u8), d: []const u8) !void {
+        \\    try l.appendSlice(d);
+        \\}
+        \\test "errdefer transfer in a test block" {
+        \\    const allocator = std.testing.allocator;
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer allocator.free(buf);
+        \\    var list = std.ArrayList(u8).empty;
+        \\    defer list.deinit();
+        \\    try appendTo(&list, buf);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_eb_transfer.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_eb_transfer.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
 }
 
 test "ZA106: errdefer free plus last-statement direct free stays silent (EPH-I0006)" {
@@ -72156,6 +72561,118 @@ test "ZA607: braceless body statement tail write breaks the correlation (EPH-I11
     );
 }
 
+test "ZA607: multi-line braced close-line tail write breaks the correlation (EPH-I1191)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The EPH-I1187 class in multi-line form: the body close carries a
+    // tail write (`} count = 7;`). The exact-equality walk missed that
+    // close, over-extended to the enclosing block's `}`, and swallowed
+    // the write into the span, so the suppressor silenced a read the
+    // zero-trip path reaches unfilled. The walk now reads the
+    // close-first line as the close even with a tail, and the tail
+    // write breaks the correlation (EPH-I1191).
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn bracedCloselineTail(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    {
+        \\        while (c) : (count += 1) {
+        \\            x = 1;
+        \\        } count = 7;
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_braced_tail.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_zt_braced_tail.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: multi-line braced loop admits the zero-trip suppressor (EPH-I1191 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The tail-free twin: the close-first walk ends the span at the
+    // loop's own close, and the guard proves the fill covers the read
+    // (EPH-I1191 lock side).
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn bracedCloselineClean(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    {
+        \\        while (c) : (count += 1) {
+        \\            x = 1;
+        \\        }
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_braced_clean.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_zt_braced_clean.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: nested else inside a braced loop keeps the span walk open (EPH-I1191)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The depth-tracked walk must not read a nested block's close-first
+    // line (`} else {`) as the loop close: the closes stay under the
+    // body depth, the walk continues, and the fill still covers the
+    // read (EPH-I1191). The exact-equality walk ended at the nested
+    // standalone `}` — both read the same covered verdict, so this pin
+    // guards the depth tracking.
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn bracedNestedElse(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    while (c) : (count += 1) {
+        \\        x = 1;
+        \\        if (count > 1) {
+        \\            x = 2;
+        \\        } else {
+        \\            x = 3;
+        \\        }
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_braced_nested.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_zt_braced_nested.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
 test "ZA607: one-step +%= increment admits the zero-trip suppressor (EPH-I1189)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -80516,6 +81033,67 @@ test "ZA607: close-dominant close-first line keeps the span inside the body (EPH
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_fc_shadow_cdom.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: later same-name payload binding fires toward warning (EPH-I1192, documented residual)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Only the first bounded binding's body spans. A later same-name
+    // binding's body sits outside the span, so its payload read fires
+    // toward warning — the accepted residual for shadow text, which is a
+    // 0.15+ compile error (a payload capture shadowing an outer local,
+    // EPH-I1188; zero corpus instances). The first arm's own read stays
+    // suppressed. The EPH-I0826 documented-residual arm, EPH-I1192.
+    const content =
+        \\fn rebind(opt: ?u32, opt2: ?u32) void {
+        \\    var x: u32 = undefined;
+        \\    if (opt) |x| {
+        \\        use(x);
+        \\    } else if (opt2) |x| {
+        \\        use(x);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_shadow_rebind.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fc_shadow_rebind.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: else-line first payload binding fires toward warning (EPH-I1192)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // An unbounded first binding (the else-line chain head — the `}`-led
+    // line is no control opener) records NO span: the whole-function
+    // drop this surface used to claim was deleted with
+    // removePayloadShadowedVars (dfaf0f3), and the payload read fires
+    // toward warning. The doc states the true boundary (EPH-I1192).
+    const content =
+        \\fn elseLineFirstBinding(a: bool, opt: ?u32) void {
+        \\    var x: u32 = undefined;
+        \\    if (a) {
+        \\        use(0);
+        \\    } else if (opt) |x| {
+        \\        use(x);
+        \\    }
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_fc_shadow_elseline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_fc_shadow_elseline.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 
@@ -119884,6 +120462,26 @@ test "EPH-I0191: analyzeAstTier parses within-budget nesting" {
     defer deinitIssues(&issues, a);
     try std.testing.expectEqual(@as(usize, 1), stats.parsed);
     try std.testing.expectEqual(@as(usize, 0), stats.skipped);
+}
+
+test "EPH-I1197: analyzeAstTier records the skipped path in the log" {
+    var diag = testDiagCtx();
+    const a = std.testing.allocator;
+    const src = try buildNestedParensSource(a, ast_tier.max_nesting_depth + 1);
+    defer a.free(src);
+    var graph = try buildOneFileGraph(&diag, a, "deep.zig", src);
+    defer graph.deinit();
+    var stats = ast_tier.Stats{};
+    var log = SkipPathLog{};
+    var obs = AstTierObs{ .skips = &log };
+    var issues = try analyzeAstTier(a, &graph, &stats, &obs);
+    defer deinitIssues(&issues, a);
+    // The delta observation names the skipped file: the tier's own
+    // per-file counter moves once, and the log borrows the graph's path
+    // (EPH-I1197).
+    try std.testing.expectEqual(@as(usize, 1), stats.skipped);
+    try std.testing.expectEqual(@as(usize, 1), log.count);
+    try std.testing.expectEqualStrings("deep.zig", log.paths[0]);
 }
 
 // ============================================================================

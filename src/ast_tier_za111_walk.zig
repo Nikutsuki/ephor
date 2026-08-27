@@ -65,7 +65,8 @@ pub const Walker = struct {
     /// Plain `=` assignments: out-param escapes and var-alias rebinds
     /// resolve through them (EPH-I0046).
     assigns: std.ArrayListUnmanaged(NodeIndex) = .empty,
-    /// Payload captures (`if (o) |*p|`, `for (&a) |*p|` — EPH-I0046).
+    /// Payload captures (`if (o) |*p|`, `for (&a) |*p|`,
+    /// `while (o) |*p|` — EPH-I0046, EPH-I1184).
     captures: std.ArrayListUnmanaged(CaptureRecord) = .empty,
     /// `comptime` expression token ranges (EPH-I0046): escape checks
     /// skip anchors inside one — comptime addresses are static-safe.
@@ -131,10 +132,11 @@ pub const Walker = struct {
         try self.pushShaped(node);
     }
 
-    /// Record a payload capture from an if/for (EPH-I0046). A pointer
-    /// capture binds a pointer INTO the capture root's storage (the
-    /// optional's or array's slot). The body token range scopes the
-    /// name so a same-named outer binding stays resolvable.
+    /// Record a payload capture from an if/for/while (EPH-I0046,
+    /// EPH-I1184). A pointer capture binds a pointer INTO the capture
+    /// root's storage (the optional's or array's slot). The body token
+    /// range scopes the name so a same-named outer binding stays
+    /// resolvable.
     fn recordCapture(
         self: *Walker,
         payload_token: ?Ast.TokenIndex,
@@ -169,13 +171,7 @@ pub const Walker = struct {
                 try self.pushOpt(vd.ast.init_node);
             },
             .if_simple, .@"if" => try self.pushIf(node),
-            .while_simple, .while_cont, .@"while" => {
-                const w = tree.fullWhile(node) orelse return true;
-                try self.push(w.ast.cond_expr);
-                try self.pushOpt(w.ast.cont_expr);
-                try self.push(w.ast.then_expr);
-                try self.pushOpt(w.ast.else_expr);
-            },
+            .while_simple, .while_cont, .@"while" => try self.pushWhile(node),
             .for_simple, .@"for" => try self.pushFor(node),
             .@"switch", .switch_comma => {
                 const s = tree.fullSwitch(node) orelse return true;
@@ -220,6 +216,18 @@ pub const Walker = struct {
         try self.pushAll(f.ast.inputs);
         try self.push(f.ast.then_expr);
         try self.pushOpt(f.ast.else_expr);
+    }
+
+    /// The while arm: records the payload capture with the if-capture
+    /// rooting rule — the pointer binds into the condition operand's own
+    /// slot (EPH-I1184) — then pushes condition, continue, body, else.
+    fn pushWhile(self: *Walker, node: NodeIndex) !void {
+        const w = self.tree.fullWhile(node) orelse return;
+        try self.recordCapture(w.payload_token, w.ast.cond_expr, false, w.ast.then_expr);
+        try self.push(w.ast.cond_expr);
+        try self.pushOpt(w.ast.cont_expr);
+        try self.push(w.ast.then_expr);
+        try self.pushOpt(w.ast.else_expr);
     }
 
     /// Composite expression constructs, via the tree's typed helpers.

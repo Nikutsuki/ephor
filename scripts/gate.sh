@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ephor Layer-1 gate (EPH-I1074; serves REL-GATE-2 and REL-AB-5).
 #
-# Steps: fmt, ReleaseSafe build, test ratchet, per-test capture + discovery
-# cross-check, dogfood ratchet (fail_on: warning posture), coverage gate,
-# corpus A/B (zls/ghostty/sig/tigerbeetle).
+# Steps: fmt, installer tag resolution, ReleaseSafe build, test ratchet,
+# per-test capture + discovery cross-check, dogfood ratchet (fail_on:
+# warning posture), coverage gate, corpus A/B (zls/ghostty/sig/tigerbeetle).
 #
 # Shape rules (core-rules gate lessons):
 # - Every step writes its command output to a named file under .tmp/gate/.
@@ -93,6 +93,33 @@ if zig fmt --check build.zig src/ > "$GATE_DIR/fmt.log" 2>&1; then
 else
     fail "fmt (see $GATE_DIR/fmt.log)"
 fi
+
+# --- 1b. installer tag resolution (EPH-I1194; REL-ZERO-1, REL-RELEASE-6) ----
+# The installer surface changes often (tag clamp, 1 MiB body cap, fallback
+# pairing), and the harness drives the real shipped functions with a fake
+# curl and file:// fixtures in seconds. A regression must not land
+# gate-green. No ps1 leg exists: pwsh is absent on the dev machine, so the
+# install.ps1 bounded-read arm (EPH-I0207) stays manual — the recorded
+# limitation.
+ITR_EXIT=0
+sh "$SCRIPT_DIR/test-install-tag-resolution.sh" > "$GATE_DIR/install-tag.log" 2>&1 || ITR_EXIT=$?
+# The tally line is the harness's own verdict ("N tests, M failed"). Its
+# absence means the harness aborted before the verdict (a set -u trip or a
+# missing install.sh function), which is a leg failure, not a pass.
+ITR_RUN="$(sed -nE 's/^([0-9]+) tests, ([0-9]+) failed$/\1/p' "$GATE_DIR/install-tag.log" | tail -1 || true)"
+ITR_FAILED="$(sed -nE 's/^([0-9]+) tests, ([0-9]+) failed$/\2/p' "$GATE_DIR/install-tag.log" | tail -1 || true)"
+case "$ITR_RUN" in
+    '' | *[!0-9]*)
+        fail "installer tag resolution (no tally line; see $GATE_DIR/install-tag.log)"
+        ;;
+    *)
+        if [ "$ITR_EXIT" -ne 0 ] || [ "$ITR_FAILED" != "0" ]; then
+            fail "installer tag resolution ($ITR_RUN tests, $ITR_FAILED failed, exit $ITR_EXIT; see $GATE_DIR/install-tag.log)"
+        else
+            ok "installer tag resolution ($ITR_RUN tests, 0 failed)"
+        fi
+        ;;
+esac
 
 # --- 2. build (ReleaseSafe) ------------------------------------------------
 # Fail-fast: every later leg runs the freshly built binary. A failed build

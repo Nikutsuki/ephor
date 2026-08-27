@@ -919,8 +919,8 @@ fn peelCastBuiltin(tree: *const Ast, node: NodeIndex) ?NodeIndex {
 
 /// The stack local or param an alias initializer points into, if
 /// provable. A chained address resolved safe/unknown does not point
-/// into the stack frame — no alias. @as/@ptrCast layers peel
-/// (EPH-I0046).
+/// into the stack frame — no alias. @as/@ptrCast layers peel; a
+/// labeled-block switch resolves too (EPH-I0046, EPH-I1185).
 fn aliasTarget(sctx: ScanCtx, scan: *const FnScan, init: NodeIndex) ?[]const u8 {
     var e = unwrapGroup(sctx.tree, init);
     while (true) {
@@ -931,8 +931,34 @@ fn aliasTarget(sctx: ScanCtx, scan: *const FnScan, init: NodeIndex) ?[]const u8 
             return scan.aliasRoot(name);
         }
         if (isLabeledBlockTag(tag)) return blockValueRoot(sctx, scan, e, true);
+        if (tag == .@"switch" or tag == .switch_comma) return switchValueRoot(sctx, scan, e);
         e = peelCastBuiltin(sctx.tree, e) orelse return null;
     }
+}
+
+/// The stack root a switch expression's value provably points into
+/// (EPH-I1185): every prong must be a labeled block (group and
+/// @as/@ptrCast layers allowed) resolving to the same root; else the
+/// switch stays unresolvable (FN-only). Direct returns of wrapped
+/// blocks stay silent — only binding-path consumers resolve.
+fn switchValueRoot(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?[]const u8 {
+    const sw = sctx.tree.fullSwitch(node) orelse return null;
+    var found: ?[]const u8 = null;
+    for (sw.ast.cases) |case_node| {
+        const c = sctx.tree.fullSwitchCase(case_node) orelse return null;
+        // Peel groups and @as/@ptrCast layers down to the block.
+        var e = unwrapGroup(sctx.tree, c.ast.target_expr);
+        while (!isLabeledBlockTag(sctx.tree.nodeTag(e))) {
+            e = peelCastBuiltin(sctx.tree, e) orelse return null;
+        }
+        const target = blockValueRoot(sctx, scan, e, true) orelse return null;
+        if (found == null) {
+            found = target;
+            continue;
+        }
+        if (!mem.eql(u8, found.?, target)) return null;
+    }
+    return found;
 }
 
 fn isLabeledBlockTag(tag: Ast.Node.Tag) bool {
@@ -1059,14 +1085,14 @@ fn classifyBlockReturn(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Fin
 /// whole block unresolvable (FN-only). The block itself never fires —
 /// only a consumer that provably escapes adjudicates, so the sig
 /// merlin.zig shape (a block value consumed in-function by a call) and
-/// a discarded-statement block stay silent.
+/// a discarded-statement block stay silent. Label-aware (EPH-I1183):
+/// only breaks naming this block's label set its value; same-text
+/// shadowing folds innermost (only the named root can misattribute).
 ///
-/// `allow_bare` discriminates a compiler-caught shape per sink (probed
-/// on 0.16.0): a bare `&var` break operand is caught by Sema when the
-/// block feeds a direct return or an out-param store, but is the silent
-/// gap when the block feeds an alias binding the caller then returns.
-/// Direct-return and store sinks pass false; the alias machinery passes
-/// true. The field form (`&v.a`) is the silent gap at every sink.
+/// `allow_bare`: a bare `&var` break feeding a direct return or an
+/// out-param store is compiler-caught (probed 0.16.0) — those sinks
+/// pass false, the alias machinery passes true. The field form (`&v.a`)
+/// is the silent gap at every sink.
 fn blockValueRoot(
     sctx: ScanCtx,
     scan: *const FnScan,
@@ -1075,15 +1101,31 @@ fn blockValueRoot(
 ) ?[]const u8 {
     const block_first = sctx.tree.firstToken(block);
     const block_last = sctx.tree.lastToken(block);
+    // Unlabeled blocks carry no value-breaks (EPH-I1183).
+    const label_tok = blockLabelToken(sctx.tree, block) orelse return null;
+    const label_name = sctx.tree.tokenSlice(label_tok);
     var found: ?[]const u8 = null;
     for (sctx.breaks) |brk| {
         const tok = sctx.tree.firstToken(brk);
         if (tok < block_first or tok > block_last) continue;
         if (insideComptime(sctx.comptime_ranges, tok)) continue;
+        // Inner-block and unlabeled value-breaks stay out (EPH-I1183).
+        const brk_label =
+            sctx.tree.nodeData(brk).opt_token_and_opt_node[0].unwrap() orelse continue;
+        if (!mem.eql(u8, sctx.tree.tokenSlice(brk_label), label_name)) continue;
         const operand = sctx.tree.nodeData(brk).opt_token_and_opt_node[1].unwrap() orelse continue;
         found = blockBreakTarget(sctx, scan, operand, allow_bare) orelse return null;
     }
     return found;
+}
+
+/// The label token naming a block (`blk:`), or null when unlabeled
+/// (EPH-I1183): the pair before the lbrace, the probe Ast.firstToken
+/// uses to widen a block's range.
+fn blockLabelToken(tree: *const Ast, block: NodeIndex) ?Ast.TokenIndex {
+    const lbrace = tree.nodeMainToken(block);
+    if (!tree.isTokenPrecededByTags(lbrace, &.{ .identifier, .colon })) return null;
+    return lbrace - 2;
 }
 
 /// The stack root one labeled-block break operand points into, or null.

@@ -78,6 +78,12 @@ zig fetch records the content hash of that download in `build.zig.zon`. This
 model is trust on first use (TOFU). The download channel is the only check
 on the first fetch.
 
+Both installers cap the tags-API response at 1 MiB (EPH-I0207). The 30 s
+timeout bounds duration only. A fast network-path attacker can stream
+gigabytes inside that window. The 1 MiB cap stops the stream. An over-cap
+response fails the resolution, and the installer uses the pinned fallback
+tag.
+
 - Ephor prints the recorded hash after every fetch. Compare it across
   upgrades to catch a changed artifact.
 - Upgrades refuse to move below the running binary's version. Pass
@@ -393,6 +399,8 @@ export EPHOR_CURL_PATH=/usr/bin/curl
 ```
 
 An override that is not absolute or does not resolve prints a warning and falls back to `PATH`. The fallback keeps a typo from blocking the run. The threat is a hostile environment, and the operator controls the overrides.
+
+The subprocess boundary is fixed. The `check` and `fmt-check` commands spawn one child process per run: `zig fmt --check` on the scanned path. The child is read-only: no build, no test, and no execution of scanned code. Its output is capped at 10 MB, and its paths gate on the scan root. Ephor resolves the `zig` binary to an absolute path at startup, so the spawned binary is fixed before any scan input is read.
 
 ## Rule IDs
 
@@ -809,6 +817,12 @@ Options:
                        Without it, a config outside the working
                        directory and its ancestors sets only
                        "entries". The rest is ignored with a note.
+  --include-parent    Include the scan path's parent directory in
+                      the build-reference search (the parent
+                      build.zig and the parent module-directory
+                      root). Off by default for a parent outside
+                      the working directory. The reachability marks
+                      still stay inside the scan root.
   --no-suppression     Audit mode: inline directives and the
                        known-issues list no longer hide findings.
                        The findings print, and the suppression note

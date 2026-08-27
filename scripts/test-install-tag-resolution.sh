@@ -1,10 +1,13 @@
 #!/bin/sh
 # Regression tests for the tag resolution in install.sh.
 # Run from anywhere: sh scripts/test-install-tag-resolution.sh
-# Not wired into any hook. Run it after changing latest_ephor_tag,
-# resolve_ephor_tag, max_stable_tag, version_older, TAGS_API, or
-# EPHOR_FALLBACK_TAG in install.sh, or max_stable_version in
+# Wired into scripts/gate.sh (EPH-I1194). Run it directly after changing
+# latest_ephor_tag, resolve_ephor_tag, max_stable_tag, version_older,
+# TAGS_API, or EPHOR_FALLBACK_TAG in install.sh, or max_stable_version in
 # scripts/check-version.sh.
+# install.ps1 has no companion suite: pwsh is absent on the dev machine,
+# so its bounded-read arm (EPH-I0207) stays manual — the recorded
+# limitation (EPH-I1194).
 #
 # set -u only: the cases assert on nonzero function exits, so set -e would
 # abort the runner on the first expected failure.

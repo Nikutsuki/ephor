@@ -33318,6 +33318,21 @@ fn extractVarFromNullCheck(after_paren: []const u8, pos: usize) ?[]const u8 {
 /// residual, EPH-I0858).
 const max_braced_guard_body_lines = 4;
 
+/// Fold one code-position brace into `depth` and report whether the
+/// char was a brace. Literal braces never reach the call: the quote
+/// scan consumes them first.
+fn trackBraceChar(depth: *i32, c: u8) bool {
+    if (c == '{') {
+        depth.* += 1;
+        return true;
+    }
+    if (c == '}') {
+        depth.* -= 1;
+        return true;
+    }
+    return false;
+}
+
 /// True when the guard line's same-line tail exits unconditionally at the
 /// guard's own depth, mirroring the following-block walk's depth-1 rule
 /// (EPH-I0488): the tail is `return...;` / `break...;` / `continue...;`
@@ -33351,23 +33366,7 @@ const max_braced_guard_body_lines = 4;
 /// null; }` / `}`) since EPH-I0868; the unbraced-then multi-line gap
 /// below remains.
 fn hasSameLineGuardExit(tail: []const u8) bool {
-    var stmt = mem.trim(u8, stripLineComment(tail), " \t\r");
-    if (stmt.len == 0) return false;
-    // A trailing statement after the guard's braced body (`} extra();`) is
-    // not part of the body: it cannot rescue a non-exiting body, and it is
-    // not the body's exit, so the verdict comes from the leading block
-    // alone. Cut the statement sequence at the leading block's close and
-    // judge the block as the whole-tail form (EPH-I0867).
-    if (stmt[0] == '{' and stmt[stmt.len - 1] != '}') {
-        const block_end = leadingBracedEnd(stmt) orelse return false;
-        stmt = stmt[0..block_end];
-    }
-    // A whole-tail braced block: judge its own body as the statement
-    // sequence, mirroring the walk's depth-1 rule for the block's lines.
-    if (stmt[0] == '{') {
-        if (stmt[stmt.len - 1] != '}') return false;
-        stmt = stmt[1 .. stmt.len - 1];
-    }
+    const stmt = guardExitScanStmt(tail) orelse return false;
     var depth: i32 = 0;
     var mode: QuoteMode = .none;
     var start: usize = 0;
@@ -33378,25 +33377,9 @@ fn hasSameLineGuardExit(tail: []const u8) bool {
             i += skip;
             continue;
         }
-        if (c == '{') {
-            depth += 1;
-            continue;
-        }
-        if (c == '}') {
-            depth -= 1;
-            continue;
-        }
+        if (trackBraceChar(&depth, c)) continue;
         if (c == ';' and depth == 0) {
-            const piece = stmt[start .. i + 1];
-            if (isUnconditionalExitLine(piece)) return true;
-            if (nestedBothArmsExit(piece)) return true;
-            // A semicolon-terminated unbraced then arm splits at its own
-            // `;`, so the piece carries no else and nestedBothArmsExit
-            // rejects it alone. When the next fragment opens with the
-            // word `else`, the split cut a then+else conditional in
-            // half: re-judge the joined statement (EPH-I0861).
-            if (startsWithElseWord(stmt[i + 1 ..]) and nestedBothArmsExit(stmt[start..]))
-                return true;
+            if (sameLinePieceExit(stmt, start, i)) return true;
             start = i + 1;
         }
     }
@@ -33405,6 +33388,43 @@ fn hasSameLineGuardExit(tail: []const u8) bool {
     // the trailing fragment: judge it under the depth-2 rule only
     // (EPH-I0861).
     return nestedBothArmsExit(mem.trim(u8, stmt[start..], " \t\r"));
+}
+
+/// The statement sequence the same-line exit judge walks: the
+/// comment-stripped tail, cut at a leading block's close and stripped
+/// of a whole-tail braced block's braces, or null when the tail holds
+/// no judgeable statement. A trailing statement after the guard's
+/// braced body (`} extra();`) is not part of the body — it cannot
+/// rescue a non-exiting body, and it is not the body's exit — so the
+/// verdict comes from the leading block alone (EPH-I0867).
+fn guardExitScanStmt(tail: []const u8) ?[]const u8 {
+    var stmt = mem.trim(u8, stripLineComment(tail), " \t\r");
+    if (stmt.len == 0) return null;
+    if (stmt[0] == '{' and stmt[stmt.len - 1] != '}') {
+        const block_end = leadingBracedEnd(stmt) orelse return null;
+        stmt = stmt[0..block_end];
+    }
+    // A whole-tail braced block: judge its own body as the statement
+    // sequence, mirroring the walk's depth-1 rule for the block's lines.
+    if (stmt[0] == '{') {
+        if (stmt[stmt.len - 1] != '}') return null;
+        stmt = stmt[1 .. stmt.len - 1];
+    }
+    return stmt;
+}
+
+/// True when the depth-0 statement piece ending at `end` (the `;`
+/// included), or the joined else-split form, carries an exit. A
+/// semicolon-terminated unbraced then arm splits at its own `;`, so the
+/// piece carries no else and nestedBothArmsExit rejects it alone. When
+/// the next fragment opens with the word `else`, the split cut a
+/// then+else conditional in half: re-judge the joined statement
+/// (EPH-I0861).
+fn sameLinePieceExit(stmt: []const u8, start: usize, end: usize) bool {
+    const piece = stmt[start .. end + 1];
+    if (isUnconditionalExitLine(piece)) return true;
+    if (nestedBothArmsExit(piece)) return true;
+    return startsWithElseWord(stmt[end + 1 ..]) and nestedBothArmsExit(stmt[start..]);
 }
 
 /// End offset of a leading braced block (one past its matching close), or
@@ -33497,27 +33517,29 @@ fn unbracedArmExitEnd(arm: []const u8) ?usize {
             i += skip;
             continue;
         }
-        if (c == '{') {
-            depth += 1;
-            continue;
-        }
-        if (c == '}') {
-            depth -= 1;
-            continue;
-        }
-        if (c == ';' and depth == 0) {
-            if (isUnconditionalExitLine(arm[0 .. i + 1])) return i + 1;
-            return null;
-        }
-        // The else-terminated arm: `return null else { ... }` — the `;`
-        // sits inside the else block, past the arm end, so the scan
-        // never finds it at depth 0. The else keyword ends the arm; the
-        // arm text up to it must be a direct exit statement.
-        if (c == 'e' and depth == 0 and wordIsElseAt(arm, i)) {
-            if (isExitStatementStart(arm[0..i])) return i;
-            return null;
-        }
+        if (trackBraceChar(&depth, c)) continue;
+        if (c == ';' and depth == 0) return semicolonArmExitEnd(arm, i);
+        if (c == 'e' and depth == 0 and wordIsElseAt(arm, i)) return elseKeywordArmExitEnd(arm, i);
     }
+    return null;
+}
+
+/// Exit end at a depth-0 semicolon: the arm ends one past the `;` when
+/// the arm text is a direct exit statement, otherwise the arm is not a
+/// direct exit (EPH-I0861).
+fn semicolonArmExitEnd(arm: []const u8, semicolon_idx: usize) ?usize {
+    if (isUnconditionalExitLine(arm[0 .. semicolon_idx + 1])) return semicolon_idx + 1;
+    return null;
+}
+
+/// Exit end at a depth-0 else keyword: the arm ends at the keyword when
+/// the arm text is a direct exit statement start. The else-terminated
+/// arm (`return null else { ... }`) carries no `;` at the arm end: the
+/// else keyword terminates the arm, and the `;` sits inside the else
+/// block, past the arm end, so the scan never finds it at depth 0
+/// (EPH-I0861).
+fn elseKeywordArmExitEnd(arm: []const u8, else_idx: usize) ?usize {
+    if (isExitStatementStart(arm[0..else_idx])) return else_idx;
     return null;
 }
 
@@ -33678,20 +33700,32 @@ fn extractUnwrappedVar(t: []const u8, dot_q_pos: usize) ?[]const u8 {
 fn hasNullEqualityCheck(ctx: []const u8, var_name: []const u8) ?usize {
     var from: usize = 0;
     while (nextBoundaryIdent(ctx, var_name, &from)) |var_pos| {
-        var after = var_pos + var_name.len;
-        while (after < ctx.len and (ctx[after] == ' ' or ctx[after] == '\t')) after += 1;
-        if (after + "== null".len > ctx.len) continue;
-        if (!mem.startsWith(u8, ctx[after..], "== null")) continue;
-        const tail = after + "== null".len;
-        if (tail >= ctx.len) continue;
-        if (ctx[tail] == ')') return after;
-        if ((ctx[tail] == ' ' or ctx[tail] == '\t') and
-            tail + 1 < ctx.len and ctx[tail + 1] == ')')
-        {
-            return after;
-        }
+        if (nullCheckEqAt(ctx, var_name, var_pos)) |eq_pos| return eq_pos;
     }
     return null;
+}
+
+/// The `==` position when the `== null)` predicate binds at the
+/// occurrence starting `var_pos`: the `== null` text plus a `)` closer,
+/// or whitespace then `)`, on the occurrence's tail. Null when the
+/// occurrence is not that guard shape (EPH-I0892).
+fn nullCheckEqAt(ctx: []const u8, var_name: []const u8, var_pos: usize) ?usize {
+    var after = var_pos + var_name.len;
+    while (after < ctx.len and (ctx[after] == ' ' or ctx[after] == '\t')) after += 1;
+    if (after + "== null".len > ctx.len) return null;
+    if (!mem.startsWith(u8, ctx[after..], "== null")) return null;
+    const tail = after + "== null".len;
+    if (tail >= ctx.len) return null;
+    if (closesNullPredicate(ctx, tail)) return after;
+    return null;
+}
+
+/// True when the char at `tail` closes the `== null` predicate group: a
+/// `)` directly, or whitespace followed by `)` (EPH-I0892).
+fn closesNullPredicate(ctx: []const u8, tail: usize) bool {
+    if (ctx[tail] == ')') return true;
+    return (ctx[tail] == ' ' or ctx[tail] == '\t') and
+        tail + 1 < ctx.len and ctx[tail + 1] == ')';
 }
 
 /// Max following-block lines the early-return null-guard scan accepts
@@ -34916,14 +34950,27 @@ fn hasShortCircuitGuardForVar(t: []const u8, var_name: []const u8, limit: usize)
         while (mem.indexOfPos(u8, t, from, pat)) |pos| {
             from = pos + pat.len;
             if (pos >= limit) break;
-            if (cls.isInsideString(pos)) continue;
             if (comment_start != null and pos >= comment_start.?) continue;
-            const lhs_start = identStartBefore(t, pos) orelse continue;
-            const lhs = mem.trim(u8, t[lhs_start..pos], " \t");
-            if (mem.eql(u8, lhs, var_name)) return true;
+            if (shortCircuitLhsBindsVar(t, var_name, pos, &cls)) return true;
         }
     }
     return false;
+}
+
+/// True when the short-circuit pattern occurrence at `pos` guards
+/// `var_name`: a code position whose comparison left side is the var.
+/// A pattern whose operand is another var, or the pattern right of the
+/// index expression, proves nothing (band-B12 F17, EPH-I0506).
+fn shortCircuitLhsBindsVar(
+    t: []const u8,
+    var_name: []const u8,
+    pos: usize,
+    cls: *LineClassifier,
+) bool {
+    if (cls.isInsideString(pos)) return false;
+    const lhs_start = identStartBefore(t, pos) orelse return false;
+    const lhs = mem.trim(u8, t[lhs_start..pos], " \t");
+    return mem.eql(u8, lhs, var_name);
 }
 
 /// True when `ctx` carries a function-signature shape: a code-position
@@ -35011,20 +35058,21 @@ fn hasEndsWithStartsWithGuard(lines: []const []const u8, current_idx: usize) boo
         // candidate still engages. A signature deeper in the window is
         // a scope boundary (EPH-I0931).
         if (i > 0 and isFuncBoundary(ctx)) return false;
-
-        // Check for endsWith or startsWith patterns in assert
-        // Pattern: assert(mem.endsWith(...)) or std.debug.assert(std.mem.endsWith(...))
-        if (mem.indexOf(u8, ctx, "endsWith(") != null or
-            mem.indexOf(u8, ctx, "startsWith(") != null)
-        {
-            // If there is an assert on this line, it is a guard
-            if (mem.indexOf(u8, ctx, "assert(") != null) return true;
-            if (mem.indexOf(u8, ctx, "assert (") != null) return true;
-            // Also check for conditional early exits: if (!endsWith) return;
-            if (hasExitStatement(ctx)) return true;
-        }
+        if (lineGuardsEndsWithStartsWith(ctx)) return true;
     }
     return false;
+}
+
+/// True when the line guards on endsWith/startsWith: the pattern plus
+/// an assert on the line (`assert(mem.endsWith(...))` with either
+/// spelling), or a conditional early exit (`if (!endsWith) return;`,
+/// EPH-I0932).
+fn lineGuardsEndsWithStartsWith(ctx: []const u8) bool {
+    if (mem.indexOf(u8, ctx, "endsWith(") == null and
+        mem.indexOf(u8, ctx, "startsWith(") == null) return false;
+    if (mem.indexOf(u8, ctx, "assert(") != null) return true;
+    if (mem.indexOf(u8, ctx, "assert (") != null) return true;
+    return hasExitStatement(ctx);
 }
 
 /// Check if a line has an exit statement (break/continue/return) after a
@@ -35232,6 +35280,23 @@ fn zeroGuardDominates(pctx: PriorGuardCtx, guard_idx: usize) bool {
     return !indexVarReassignedAfter(pctx.lines, guard_idx + 1, pctx.current_idx, pctx.var_name);
 }
 
+/// True when the line carries a zero-check guard on the context's var
+/// that dominates the candidate: the guard fires and its proven bound
+/// covers the subtrahend with no intervening reassignment (EPH-I0959,
+/// EPH-I0960). The zctx construction is the shared judge shape of the
+/// backward walks (hasBreakGuardOnPriorLines, crossClosedBlock,
+/// judgeClosedBlockSpan).
+fn lineCarriesDominatingGuard(pctx: PriorGuardCtx, ctx: []const u8, i: usize) bool {
+    const zctx: ZeroGuardCtx = .{
+        .t = ctx,
+        .var_name = pctx.var_name,
+        .lines = pctx.lines,
+        .line_idx = i,
+        .current_idx = pctx.current_idx,
+    };
+    return isZeroCheckGuard(zctx) and zeroGuardDominates(pctx, i);
+}
+
 /// True when a zero-check break/continue/return guard on a prior line
 /// dominates the candidate. The 10-line window stops at a function
 /// boundary and at any enclosing loop opener: a guard above a loop
@@ -35280,38 +35345,58 @@ fn hasBreakGuardOnPriorLines(
         const ctx = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
         if (isFuncBoundary(ctx)) return false;
-        if (isLoopOpenerLine(ctx)) {
-            // The enclosing check uses the loop's own body close: a
-            // closed sibling loop is not on the candidate's control-flow
-            // path as a gate, so the walk passes it (EPH-I0941). A
-            // brace-less next-line body closes at the body's first
-            // line; when that line is the candidate, the loop still
-            // encloses it, so `>=` stops the walk on the candidate's
-            // own line and a guard above the opener never dominates an
-            // access inside its body (EPH-I0936 review F1).
-            if (loopBodyCloseLine(lines, i) >= current_idx) return false;
-            continue;
-        }
-        const balance = countCurlyBalance(ctx);
-        if (balance >= 0) {
-            depth -= balance;
-            const zctx: ZeroGuardCtx = .{
-                .t = ctx,
-                .var_name = var_name,
-                .lines = lines,
-                .line_idx = i,
-                .current_idx = current_idx,
-            };
-            if (isZeroCheckGuard(zctx) and zeroGuardDominates(pctx, i)) return true;
-            continue;
-        }
-        switch (crossClosedBlock(pctx, i, check_start, &depth)) {
-            .found => return true,
-            .exhausted => return false,
-            .passed => |open| i = open,
-        }
+        if (priorLineWalkVerdict(judgeBreakGuardPriorLine(pctx, ctx, i, &depth), &i)) |verdict|
+            return verdict;
     }
     return false;
+}
+
+/// The walk's answer for a judged-line verdict (judgeBreakGuardPriorLine):
+/// true — a dominating guard was found; false — the walk exhausted;
+/// null — the walk resumes at the passed line.
+fn priorLineWalkVerdict(outcome: ClosedBlockOutcome, i: *usize) ?bool {
+    switch (outcome) {
+        .found => return true,
+        .exhausted => return false,
+        .passed => |open| i.* = open,
+    }
+    return null;
+}
+
+/// Judge one non-comment, non-boundary line of the backward walk and
+/// report how the walk continues (hasBreakGuardOnPriorLines): `found` —
+/// a dominating zero-check guard; `exhausted` — an enclosing loop
+/// stopped the walk (a guard above a loop opener never dominates an
+/// access inside its body, EPH-I0498); `passed` — the walk resumes at
+/// the given line, the loop opener of a closed sibling (EPH-I0941), or
+/// the line itself when it holds no guard. A positive-balance line
+/// folds its balance into the caller's depth before the guard judge; a
+/// closed block crosses to its open (EPH-I0936, EPH-I0959).
+fn judgeBreakGuardPriorLine(
+    pctx: PriorGuardCtx,
+    ctx: []const u8,
+    i: usize,
+    depth: *i32,
+) ClosedBlockOutcome {
+    if (isLoopOpenerLine(ctx)) {
+        // The enclosing check uses the loop's own body close: a closed
+        // sibling loop is not on the candidate's control-flow path as a
+        // gate, so the walk passes it (EPH-I0941). A brace-less
+        // next-line body closes at the body's first line; when that
+        // line is the candidate, the loop still encloses it, so `>=`
+        // stops the walk on the candidate's own line and a guard above
+        // the opener never dominates an access inside its body
+        // (EPH-I0936 review F1).
+        if (loopBodyCloseLine(pctx.lines, i) >= pctx.current_idx) return .exhausted;
+        return .{ .passed = i };
+    }
+    const balance = countCurlyBalance(ctx);
+    if (balance >= 0) {
+        depth.* -= balance;
+        if (lineCarriesDominatingGuard(pctx, ctx, i)) return .found;
+        return .{ .passed = i };
+    }
+    return crossClosedBlock(pctx, i, pctx.current_idx -| 10, depth);
 }
 
 /// How the prior-line walk continues after crossing a closed block.
@@ -35352,43 +35437,58 @@ fn crossClosedBlock(
         if (isFuncBoundary(ctx)) return .exhausted;
         depth.* -= countCurlyBalance(ctx);
         if (depth.* != target) continue;
-        if (isLoopOpenerLine(ctx)) return .{ .passed = i };
-        // An Allman body open is the bare `{` line under the loop
-        // header, so the depth-returning line is not itself a loop
-        // opener: look up past comment lines for the header and pass
-        // the body like the K&R shape (EPH-I0951). The header must not
-        // carry its own `{` (a K&R or same-line body opens elsewhere)
-        // nor a same-line brace-less body (`while (y) stmt;`), which
-        // would make the `{` line a separate block to judge.
-        var k = i;
-        while (k > check_start) {
-            k -= 1;
-            const above = mem.trim(u8, pctx.lines[k], " \t\r");
-            if (isCommentOrMultilineString(above)) continue;
-            if (isLoopOpenerLine(above) and
-                !lineCarriesOpenBrace(above) and
-                !lineCarriesStatementEnd(above)) return .{ .passed = i };
-            break;
-        }
-        // The open line itself can carry the guard: `if (m == 0) {`
-        // with the exit in the body dominates the candidate like any
-        // prior guard line (EPH-I0941). A guard whose proven bound
-        // misses the subtrahend, or whose exclusion a later
-        // reassignment breaks, does not dominate: the walk falls
-        // through to judge the block body, then passes the block
-        // (EPH-I0959).
-        const zctx: ZeroGuardCtx = .{
-            .t = ctx,
-            .var_name = pctx.var_name,
-            .lines = pctx.lines,
-            .line_idx = i,
-            .current_idx = pctx.current_idx,
-        };
-        if (isZeroCheckGuard(zctx) and zeroGuardDominates(pctx, i)) return .found;
-        if (judgeClosedBlockSpan(pctx, i + 1, close_idx)) return .found;
-        return .{ .passed = i };
+        return judgeClosedBlockOpenLine(pctx, ctx, i, close_idx);
     }
     return .exhausted;
+}
+
+/// Judge the matching open line of a closed block (crossClosedBlock)
+/// and return the walk's continuation: a loop opener passes its body
+/// open; an Allman body open passes like the K&R shape (EPH-I0951); a
+/// non-loop block's open line and body are judged for dominating
+/// guards (EPH-I0941, EPH-I0959). The open line always decides the
+/// walk: no path falls through to further scanning.
+fn judgeClosedBlockOpenLine(
+    pctx: PriorGuardCtx,
+    ctx: []const u8,
+    i: usize,
+    close_idx: usize,
+) ClosedBlockOutcome {
+    if (isLoopOpenerLine(ctx)) return .{ .passed = i };
+    if (allmanOpenUnderHeader(pctx, i)) return .{ .passed = i };
+    if (closedBlockBodyHasGuard(pctx, ctx, i, close_idx)) return .found;
+    return .{ .passed = i };
+}
+
+/// True when the depth-returning line is the body open of an Allman
+/// loop: the nearest preceding non-comment line is a loop opener with
+/// no `{` of its own and no same-line statement end — a K&R or
+/// same-line body opens elsewhere (EPH-I0951).
+fn allmanOpenUnderHeader(pctx: PriorGuardCtx, body_open_idx: usize) bool {
+    const check_start = pctx.current_idx -| 10;
+    var k = body_open_idx;
+    while (k > check_start) {
+        k -= 1;
+        const above = mem.trim(u8, pctx.lines[k], " \t\r");
+        if (isCommentOrMultilineString(above)) continue;
+        return isLoopOpenerLine(above) and
+            !lineCarriesOpenBrace(above) and
+            !lineCarriesStatementEnd(above);
+    }
+    return false;
+}
+
+/// True when the closed non-loop block dominates the candidate through
+/// its open line's own guard (`if (m == 0) {` with the exit in the
+/// body, EPH-I0941) or a guard inside its body (judgeClosedBlockSpan).
+fn closedBlockBodyHasGuard(
+    pctx: PriorGuardCtx,
+    ctx: []const u8,
+    open_idx: usize,
+    close_idx: usize,
+) bool {
+    if (lineCarriesDominatingGuard(pctx, ctx, open_idx)) return true;
+    return judgeClosedBlockSpan(pctx, open_idx + 1, close_idx);
 }
 
 /// Judge the body lines of a closed NON-loop block (EPH-I0941): the
@@ -35408,14 +35508,7 @@ fn judgeClosedBlockSpan(
         if (isCommentOrMultilineString(inner)) continue;
         if (isFuncBoundary(inner)) return false;
         if (isLoopOpenerLine(inner)) continue;
-        const zctx: ZeroGuardCtx = .{
-            .t = inner,
-            .var_name = ctx.var_name,
-            .lines = ctx.lines,
-            .line_idx = j,
-            .current_idx = ctx.current_idx,
-        };
-        if (isZeroCheckGuard(zctx) and zeroGuardDominates(ctx, j)) return true;
+        if (lineCarriesDominatingGuard(ctx, inner, j)) return true;
     }
     return false;
 }
@@ -35470,23 +35563,50 @@ fn parseNumericBound(t: []const u8) ?usize {
 /// comparisons never bind `var_name` is not this var's guard
 /// (not_binding — EPH-I0493, EPH-I0495).
 fn judgeAssertBound(ctx: []const u8, var_name: []const u8, amount: usize) AssertBoundVerdict {
+    const j: AssertBoundJudge = .{ .var_name = var_name, .amount = amount };
     const ops = [_][]const u8{ ">=", "> " };
     var saw_binding = false;
     for (ops) |op| {
         var search: usize = 0;
         while (mem.indexOfPos(u8, ctx, search, op)) |pos| {
             search = pos + op.len;
-            const operand_start = identStartBefore(ctx, pos) orelse continue;
-            const operand = mem.trim(u8, ctx[operand_start..pos], " \t");
-            if (!mem.eql(u8, operand, var_name)) continue;
-            saw_binding = true;
-            const rhs = mem.trimStart(u8, ctx[pos + op.len ..], " \t");
-            const bound = parseNumericBound(rhs) orelse return .covered;
-            const floor = if (mem.eql(u8, op, ">=")) bound else bound +| 1;
-            if (floor >= amount) return .covered;
+            const verdict = judgeBoundOccurrence(ctx, op, pos, j);
+            if (verdict == .covered) return .covered;
+            if (verdict == .below) saw_binding = true;
         }
     }
     return if (saw_binding) .uncovered else .not_binding;
+}
+
+/// Fixed inputs of one assertion-bound judge (judgeAssertBound): the
+/// guarded var and the decrement amount.
+const AssertBoundJudge = struct {
+    var_name: []const u8,
+    amount: usize,
+};
+
+/// Verdict for one `>=`/`> ` comparison occurrence: covered — its
+/// literal bound is at least the amount, or the bound is not a literal
+/// and the shape-only heuristic holds; below — the bound binds the var
+/// but stays under the amount; not_binding — the comparison's operand
+/// is not the var (EPH-I0493, EPH-I0495).
+const BoundOccurrenceVerdict = enum { covered, below, not_binding };
+
+/// Judge one comparison occurrence against the decrement amount
+/// (judgeAssertBound).
+fn judgeBoundOccurrence(
+    ctx: []const u8,
+    op: []const u8,
+    pos: usize,
+    j: AssertBoundJudge,
+) BoundOccurrenceVerdict {
+    const operand_start = identStartBefore(ctx, pos) orelse return .not_binding;
+    const operand = mem.trim(u8, ctx[operand_start..pos], " \t");
+    if (!mem.eql(u8, operand, j.var_name)) return .not_binding;
+    const rhs = mem.trimStart(u8, ctx[pos + op.len ..], " \t");
+    const bound = parseNumericBound(rhs) orelse return .covered;
+    const floor = if (mem.eql(u8, op, ">=")) bound else bound +| 1;
+    return if (floor >= j.amount) .covered else .below;
 }
 
 /// True when the assert line's bound covers the decrement: the
@@ -35569,13 +35689,26 @@ fn hasEarlyReturnLengthGuard(
         // candidate still engages. A signature deeper in the window is
         // a scope boundary (EPH-I0931).
         if (i > 0 and isFuncBoundary(ctx)) return false;
-        if (!isLenGuardLine(ctx)) continue;
-        if (!lenGuardMatchesBase(ctx, base)) continue;
-        if (hasExitStatement(ctx)) return true;
-        const block_end = if (i + 6 < current_idx) i + 6 else current_idx;
-        if (hasExitInFollowingBlock(lines, i + 1, block_end)) return true;
+        if (lenGuardLineCoversBase(lines, current_idx, base, i)) return true;
     }
     return false;
+}
+
+/// True when the candidate's base is length-guarded on line `i`: a
+/// `.len` guard line whose base matches the candidate's, with a
+/// same-line exit or a following-block exit (EPH-I0496).
+fn lenGuardLineCoversBase(
+    lines: []const []const u8,
+    current_idx: usize,
+    base: []const u8,
+    i: usize,
+) bool {
+    const ctx = mem.trim(u8, lines[i], " \t\r");
+    if (!isLenGuardLine(ctx)) return false;
+    if (!lenGuardMatchesBase(ctx, base)) return false;
+    if (hasExitStatement(ctx)) return true;
+    const block_end = if (i + 6 < current_idx) i + 6 else current_idx;
+    return hasExitInFollowingBlock(lines, i + 1, block_end);
 }
 
 /// Array base of the index expression that subtracts on `t`: the
@@ -35654,29 +35787,48 @@ fn extractIndexSubtraction(line: []const u8) ?IdxSub {
             i = end;
             continue;
         };
-        // A `[0 .. x - N]` slice-end form is not an `[VAR - N]` index
-        // subtraction: the var sits after the `..`, and parsing it here
-        // would yield a garbage var name ("0 .. x") that could read a
-        // witness it does not own (EPH-I0499). The slice-end form has
-        // its own witness guard, hasRangeEndInitGuard. A subtraction
-        // BEFORE the `..` is the range START (`buf[x - 1 .. y]`), a
-        // real `[VAR - N]` bracket that keeps parsing (batch 24
-        // review F2).
-        if (mem.indexOf(u8, inside, "..")) |range_pos| {
-            if (sub > range_pos) return null;
-        }
-        const idx_var = mem.trim(u8, inside[0..sub], " \t");
-        if (idx_var.len == 0 or !isIdent(idx_var[0])) return null;
-        // Parse the numeric subtrahend after the '-', skipping
-        // whitespace. The literal parser covers the base prefixes and
-        // the underline separators, or the witness binds a wrong
-        // amount (`0x1` as 0, `1_0` as 1 — EPH-I0977).
-        var dpos = i + 1 + sub + 1;
-        while (dpos < line.len and (line[dpos] == ' ' or line[dpos] == '\t')) dpos += 1;
-        const lit = parseNumericLiteral(line, dpos) orelse return null;
-        return .{ .idx_var = idx_var, .subtrahend = lit.value };
+        if (bracketIndexSubtraction(line, i, inside, sub)) |idx_sub| return idx_sub;
     }
     return null;
+}
+
+/// The `VAR - N` index subtraction for one bracket: the var before the
+/// `-` and the literal subtrahend after it. Null when the bracket is
+/// the slice-end form, the var is not an identifier, or the subtrahend
+/// is not a literal (EPH-I0499, EPH-I0977).
+fn bracketIndexSubtraction(
+    line: []const u8,
+    open: usize,
+    inside: []const u8,
+    sub: usize,
+) ?IdxSub {
+    if (subAfterRangeDot(inside, sub)) return null;
+    const idx_var = mem.trim(u8, inside[0..sub], " \t");
+    if (idx_var.len == 0 or !isIdent(idx_var[0])) return null;
+    const value = subtrahendLiteral(line, open + 1 + sub) orelse return null;
+    return .{ .idx_var = idx_var, .subtrahend = value };
+}
+
+/// True when the subtraction sits right of the `..` in the bracket
+/// content: the `[0 .. x - N]` slice-end form is not an `[VAR - N]`
+/// index — the var after the `..` is not the subtraction's operand,
+/// and parsing it here would yield a garbage var name (`0 .. x`) that
+/// could read a witness it does not own (EPH-I0499). A subtraction
+/// BEFORE the `..` is the range START (`buf[x - 1 .. y]`), a real
+/// `[VAR - N]` bracket that keeps parsing (batch 24 review F2).
+fn subAfterRangeDot(inside: []const u8, sub: usize) bool {
+    const range_pos = mem.indexOf(u8, inside, "..") orelse return false;
+    return sub > range_pos;
+}
+
+/// The literal subtrahend after the `-` at absolute position `dash`,
+/// whitespace skipped. The literal parser covers the base prefixes and
+/// the underline separators, or the witness binds a wrong amount (`0x1`
+/// as 0, `1_0` as 1 — EPH-I0977).
+fn subtrahendLiteral(line: []const u8, dash: usize) ?usize {
+    var dpos = dash + 1;
+    while (dpos < line.len and (line[dpos] == ' ' or line[dpos] == '\t')) dpos += 1;
+    return (parseNumericLiteral(line, dpos) orelse return null).value;
 }
 
 /// Check if init value after = is >= subtrahend (direct or via + offset)

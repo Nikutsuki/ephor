@@ -1383,9 +1383,10 @@ fn checkEscapeAssign(
 }
 
 /// The stack root an out-store rhs points into. A labeled-block rhs
-/// adjudicates strictly: a bare `&var` break feeding a store is
-/// compiler-caught (probed on 0.16.0), so only the field form and
-/// chains fire (EPH-I0046). Other shapes resolve through aliasTarget.
+/// adjudicates strictly: the 0.16.0 probe shows Sema stays silent on a
+/// bare `&var` break feeding a store, so `allow_bare=false` here is a
+/// documented FN tracked by EPH-I1210 — only the field form and chains
+/// fire (EPH-I0046). Other shapes resolve through aliasTarget.
 fn assignRhsTarget(sctx: ScanCtx, scan: *const FnScan, rhs: NodeIndex) ?[]const u8 {
     const e = unwrapGroup(sctx.tree, rhs);
     if (isLabeledBlockTag(sctx.tree.nodeTag(e))) return blockValueRoot(sctx, scan, e, false);

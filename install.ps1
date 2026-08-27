@@ -823,8 +823,12 @@ error: could not repair the fingerprint in build.zig.zon
                     $line[$pos + 1] -eq '/') { break }
                 if ($c -eq '\' -and ($pos + 1) -lt $line.Length -and
                     $line[$pos + 1] -eq '\') { break }
+                # -ceq keeps the awk == case semantics (EPH-I1202 review
+                # r1): -eq is case-insensitive in PowerShell, and a
+                # case-variant identifier in code position is not the
+                # real call.
                 if (($pos + 15) -le $line.Length -and
-                    $line.Substring($pos, 15) -eq 'installArtifact') {
+                    $line.Substring($pos, 15) -ceq 'installArtifact') {
                     $lastIndex = $i
                     $pos += 15
                     continue

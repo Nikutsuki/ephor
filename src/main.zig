@@ -29013,28 +29013,52 @@ fn errorSetBodyStart(t: []const u8) usize {
 fn skipErrorSetTrivia(t: []const u8, start: usize, depth: *usize) ?usize {
     var i = start;
     while (i < t.len) {
-        while (i < t.len and (t[i] == ' ' or t[i] == '\t')) i += 1;
+        i = skipErrorSetWhitespace(t, i);
         if (i >= t.len) return null;
-        if (t[i] == '/' and i + 1 < t.len and t[i + 1] == '/') return null;
-        if (t[i] == '|' and i + 1 < t.len and t[i + 1] == '|') return null;
-        if (t[i] == '"') {
-            i = skipStringLiteral(t, i);
-            continue;
+        switch (stepErrorSetTrivia(t, &i, depth)) {
+            .continue_scan => continue,
+            .stop => return null,
+            .member => return i,
         }
-        if (t[i] == '{') {
-            depth.* += 1;
-            i += 1;
-            continue;
-        }
-        if (t[i] == '}') {
-            depth.* -= 1;
-            i += 1;
-            if (depth.* == 0) return null;
-            continue;
-        }
-        return i;
     }
     return null;
+}
+
+/// Advance past the whitespace before the next error-set member.
+fn skipErrorSetWhitespace(t: []const u8, i: usize) usize {
+    var j = i;
+    while (j < t.len and (t[j] == ' ' or t[j] == '\t')) j += 1;
+    return j;
+}
+
+/// Verdict of one error-set trivia byte (skipErrorSetTrivia): keep
+/// scanning (the byte was consumed), stop the walk (a comment opener,
+/// `||`, or the set's closing `}`), or the byte is a member start.
+const ErrorSetTriviaVerdict = enum { continue_scan, stop, member };
+
+/// Classify one error-set trivia byte at `i` (skipErrorSetTrivia): a
+/// comment opener or `||` stops the walk, a string literal and a brace
+/// step the scan forward, and anything else is a member start. `{`
+/// deepens and `}` shallows the caller's set depth; the `}` that closes
+/// the set stops the walk too.
+fn stepErrorSetTrivia(t: []const u8, i: *usize, depth: *usize) ErrorSetTriviaVerdict {
+    const c = t[i.*];
+    if ((c == '/' or c == '|') and i.* + 1 < t.len and t[i.* + 1] == c) return .stop;
+    if (c == '"') {
+        i.* = skipStringLiteral(t, i.*);
+        return .continue_scan;
+    }
+    if (c == '{') {
+        depth.* += 1;
+        i.* += 1;
+        return .continue_scan;
+    }
+    if (c == '}') {
+        depth.* -= 1;
+        i.* += 1;
+        return if (depth.* == 0) .stop else .continue_scan;
+    }
+    return .member;
 }
 
 /// Check error set members on this line against the configured convention
@@ -29125,24 +29149,48 @@ fn lineOpensErrorBlock(t: []const u8) bool {
 fn trackErrorBlockDepth(t: []const u8, depth: *usize) void {
     var mode: QuoteMode = .none;
     var i: usize = 0;
-    while (i < t.len) : (i += 1) {
-        const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
+    while (i < t.len) {
+        switch (stepErrorBlockDepth(t, &i, &mode, depth)) {
+            .continue_scan => continue,
+            .stop => break,
         }
-        // A `\\` opener's tail is string data (EPH-I0751).
-        if (types.isMultilineOpenerAt(t, i)) break;
-        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
-        if (matchesErrorSetOpen(t, i)) |after_open| {
-            depth.* += 1;
-            i = after_open - 1;
-            continue;
-        }
-        if (depth.* == 0) continue;
-        if (c == '{') depth.* += 1;
-        if (c == '}') depth.* -= 1;
     }
+}
+
+/// Verdict of one error-block depth-track step (trackErrorBlockDepth):
+/// keep scanning, or stop — a `\\` multiline tail or a line comment
+/// ends the walk; their braces and `error{` text are data, not syntax.
+const ErrorBlockDepthVerdict = enum { continue_scan, stop };
+
+/// Advance one char of the error-block depth track
+/// (trackErrorBlockDepth) and apply its effect: quote-skipped content
+/// steps the scan forward, a `\\` multiline tail or a line comment
+/// stops it, an `error{` opener deepens and jumps past its `{`, and
+/// inside a set `{` deepens while `}` shallows.
+fn stepErrorBlockDepth(
+    t: []const u8,
+    i: *usize,
+    mode: *QuoteMode,
+    depth: *usize,
+) ErrorBlockDepthVerdict {
+    const c = t[i.*];
+    i.* += 1;
+    if (scanQuoteStep(mode, c)) |skip| {
+        i.* += skip;
+        return .continue_scan;
+    }
+    // A `\\` opener's tail is string data (EPH-I0751).
+    if (types.isMultilineOpenerAt(t, i.* - 1)) return .stop;
+    if (c == '/' and i.* < t.len and t[i.*] == '/') return .stop;
+    if (matchesErrorSetOpen(t, i.* - 1)) |after_open| {
+        depth.* += 1;
+        i.* = after_open;
+        return .continue_scan;
+    }
+    if (depth.* == 0) return .continue_scan;
+    if (c == '{') depth.* += 1;
+    if (c == '}') depth.* -= 1;
+    return .continue_scan;
 }
 
 fn analyzeNaming(
@@ -29187,38 +29235,51 @@ fn analyzeNamingFile(
     while (line_start <= content.len) {
         const newline = mem.indexOfScalarPos(u8, content, line_start, '\n') orelse content.len;
         const line = content[line_start..newline];
-        // Compute trimmed slice's offset within content (for multi-line lookahead).
-        const lead = skipLeadingWhitespace(line);
-        const t = mem.trim(u8, line, " \t\r");
-        const t_start = line_start + lead;
-        naming_ctx.t = t;
+        naming_ctx.t = mem.trim(u8, line, " \t\r");
         naming_ctx.line_num = line_num;
-
-        // Determine if this line is inside an error block.
-        // We are inside if we were already inside one, OR if this line opens one.
-        const is_trivia = isCommentOrMultilineString(t);
-        const has_error_open = !is_trivia and lineOpensErrorBlock(t);
-        const in_error_block = error_block_depth > 0 or has_error_open;
-
-        if (!is_trivia) {
-            // Whole-line search with ident boundaries (realTokenPos): a
-            // declaration after a prefix (`pub`, `threadlocal`), in a
-            // one-line block, or behind non-canonical spacing is still a
-            // declaration (EPH-I0466/68/69).
-            if (realTokenPos(t, "const") != null)
-                try checkConstNaming(naming_ctx, content, t_start);
-            if (realTokenPos(t, "var") != null)
-                try checkVarNaming(naming_ctx);
-            if (realTokenPos(t, "fn") != null)
-                try checkFnNaming(naming_ctx);
-            try checkErrorNaming(naming_ctx, in_error_block);
-            trackErrorBlockDepth(t, &error_block_depth);
-        }
+        // t_start is the trimmed slice's offset within content (for
+        // multi-line lookahead in checkConstNaming).
+        try analyzeNamingLine(
+            naming_ctx,
+            content,
+            line_start + skipLeadingWhitespace(line),
+            &error_block_depth,
+        );
 
         if (newline == content.len) break;
         line_start = newline + 1;
         line_num += 1;
     }
+}
+
+/// Run the per-line naming checks for one file line (analyzeNamingFile):
+/// the declaration checks, then the error-set member check gated on
+/// block membership, then the depth track. Trivia lines (comments and
+/// multiline-string tails) carry no code and skip every check.
+fn analyzeNamingLine(
+    naming_ctx: NamingLineCtx,
+    content: []const u8,
+    t_start: usize,
+    error_block_depth: *usize,
+) !void {
+    const t = naming_ctx.t;
+    const is_trivia = isCommentOrMultilineString(t);
+    const has_error_open = !is_trivia and lineOpensErrorBlock(t);
+    const in_error_block = error_block_depth.* > 0 or has_error_open;
+
+    if (is_trivia) return;
+    // Whole-line search with ident boundaries (realTokenPos): a
+    // declaration after a prefix (`pub`, `threadlocal`), in a
+    // one-line block, or behind non-canonical spacing is still a
+    // declaration (EPH-I0466/68/69).
+    if (realTokenPos(t, "const") != null)
+        try checkConstNaming(naming_ctx, content, t_start);
+    if (realTokenPos(t, "var") != null)
+        try checkVarNaming(naming_ctx);
+    if (realTokenPos(t, "fn") != null)
+        try checkFnNaming(naming_ctx);
+    try checkErrorNaming(naming_ctx, in_error_block);
+    trackErrorBlockDepth(t, error_block_depth);
 }
 
 /// Check if name is TitleCase (PascalCase): starts with uppercase, no underscores
@@ -29370,26 +29431,44 @@ fn isClosureWrappingType(content: []const u8, kw_end: usize) bool {
     var scan: ClosureBodyScan = .{};
     var i = body_start;
     while (i < content.len) : (i += 1) {
-        if (scanSwallowComment(&scan, content[i])) continue;
-        if (scanSkipQuoted(&scan, content, i)) |extra| {
-            i += extra;
-            continue;
+        switch (stepClosureChar(&scan, content, &i)) {
+            .continue_scan => continue,
+            .unbalanced_close => return false,
+            .balanced_close => return nextNonWsIsDot(content, i + 1),
         }
-        if (scanStartComment(&scan, content, i)) |extra| {
-            i += extra;
-            continue;
-        }
-        const c = content[i];
-        if (c == '{') {
-            scan.depth += 1;
-            continue;
-        }
-        if (c != '}') continue;
-        if (scan.depth == 0) return false;
-        scan.depth -= 1;
-        if (scan.depth == 0) return nextNonWsIsDot(content, i + 1);
     }
     return false;
+}
+
+/// Verdict of one type-body brace trace step (isClosureWrappingType):
+/// keep scanning, a `}` closed with the depth still at 0 (the body
+/// never opened right), or the matching `}` closed the body (the dot
+/// check follows at the caller).
+const ClosureBraceVerdict = enum { continue_scan, unbalanced_close, balanced_close };
+
+/// Advance one char of the type-body brace trace
+/// (isClosureWrappingType): quote/comment content steps the scan
+/// forward, `{` deepens, and `}` shallows the depth — reporting an
+/// unbalanced or balanced close so the caller can decide the verdict.
+fn stepClosureChar(scan: *ClosureBodyScan, content: []const u8, i: *usize) ClosureBraceVerdict {
+    if (scanSwallowComment(scan, content[i.*])) return .continue_scan;
+    if (scanSkipQuoted(scan, content, i.*)) |extra| {
+        i.* += extra;
+        return .continue_scan;
+    }
+    if (scanStartComment(scan, content, i.*)) |extra| {
+        i.* += extra;
+        return .continue_scan;
+    }
+    const c = content[i.*];
+    if (c == '{') {
+        scan.depth += 1;
+        return .continue_scan;
+    }
+    if (c != '}') return .continue_scan;
+    if (scan.depth == 0) return .unbalanced_close;
+    scan.depth -= 1;
+    return if (scan.depth == 0) .balanced_close else .continue_scan;
 }
 
 /// Mutable state for the type-body brace trace: quote/comment modes are
@@ -29786,7 +29865,15 @@ fn trackCFGBraces(t: []const u8, state: *CFGState) bool {
     }
     // String/char content and trailing comments carry no braces: a `}` in
     // `"}"` or `// }` must not end the body early and truncate extraction.
-    const code = stripLineComment(t[body_offset..]);
+    return scanCFGBodyBraces(stripLineComment(t[body_offset..]), state);
+}
+
+/// Count body braces on one post-signature line (trackCFGBraces) and
+/// report whether the body closed: a `}` closed the depth AND the line
+/// ends at depth 0. A balanced container on one line dips to depth 0
+/// mid-line before reopening, so the line-end condition is what ends
+/// the function.
+fn scanCFGBodyBraces(code: []const u8, state: *CFGState) bool {
     var mode: QuoteMode = .none;
     var closed = false;
     var i: usize = 0;
@@ -29827,22 +29914,8 @@ fn scanCFGSignatureLine(t: []const u8, state: *CFGState) usize {
     };
     lit.in_str = state.sig_in_str;
     var i: usize = 0;
-    while (i < t.len) : (i += 1) {
-        const pos = lit.updateForChar(t, i) orelse continue;
-        const c = t[pos];
-        if (c == '(') state.paren_depth += 1;
-        if (c == ')') state.paren_depth -= 1;
-        if (c == '}' and state.sig_container_depth > 0) {
-            state.sig_container_depth -= 1;
-        }
-        if (c != '{') continue;
-        if (state.paren_depth != 0 or isErrorSetOpen(t, pos)) {
-            state.sig_container_depth += 1;
-            continue;
-        }
-        state.body_started = true;
-        state.brace_depth = 1;
-        return pos + 1;
+    while (i < t.len) {
+        if (stepCFGSignatureChar(&lit, t, &i, state)) |body_after| return body_after;
     }
     // Carry the string state only across a real continuation: a string
     // still open at the line end continues only when the line ends with
@@ -29850,6 +29923,36 @@ fn scanCFGSignatureLine(t: []const u8, state: *CFGState) usize {
     // is broken code and must not mask the next line (EPH-I0887).
     state.sig_in_str = lit.in_str and lineEndsInStringContinuation(t);
     return t.len;
+}
+
+/// Advance one signature-scan char (scanCFGSignatureLine); returns the
+/// index just past the body brace when the body opens at this char, or
+/// null to keep scanning. Tracks paren depth and signature containers
+/// (anonymous enum/struct param types, error sets, default-value
+/// literals) so a container's `}` cannot close the paren count early,
+/// and gates the body brace on paren depth 0 outside an error set.
+fn stepCFGSignatureChar(
+    lit: *types.LiteralState,
+    t: []const u8,
+    i: *usize,
+    state: *CFGState,
+) ?usize {
+    i.* += 1;
+    const pos = lit.updateForChar(t, i.* - 1) orelse return null;
+    const c = t[pos];
+    if (c == '(') state.paren_depth += 1;
+    if (c == ')') state.paren_depth -= 1;
+    if (c == '}' and state.sig_container_depth > 0) {
+        state.sig_container_depth -= 1;
+    }
+    if (c != '{') return null;
+    if (state.paren_depth != 0 or isErrorSetOpen(t, pos)) {
+        state.sig_container_depth += 1;
+        return null;
+    }
+    state.body_started = true;
+    state.brace_depth = 1;
+    return pos + 1;
 }
 
 /// True when the line ends with a `\`+newline continuation: the trailing
@@ -31519,14 +31622,7 @@ fn isSafeBuiltin(t: []const u8, type_ctx: ?*const TypeContext) bool {
     // Zig builtins (version-aware via compat layer)
     if (compat.containsBuiltin(t)) return true;
     // Return-type resolution (definitive when available)
-    if (type_ctx) |ctx| {
-        const rk = resolveReturnKind(ctx, t);
-        switch (rk) {
-            .void_type, .value, .optional, .noreturn_type => return true,
-            .error_union => return false,
-            .unknown => {}, // fall through to vocab
-        }
-    }
+    if (returnKindDiscardVerdict(type_ctx, t)) |verdict| return verdict;
     // Stdlib safe methods — type-aware
     const stdlib_vars_ptr = if (type_ctx) |ctx| &ctx.stdlib_vars else null;
     if (isMethodOnStdlibVar(t, stdlib_vars_ptr, compat.getSafeMethodPatterns())) return true;
@@ -31536,6 +31632,18 @@ fn isSafeBuiltin(t: []const u8, type_ctx: ?*const TypeContext) bool {
     const field_patterns = [_][]const u8{ ".len", ".items" };
     if (containsAnyPatternInCode(t, &field_patterns)) return true;
     return compat.containsOptionalMethod(t);
+}
+
+/// Discard verdict from the return kind when a type context resolves it
+/// (isSafeBuiltin): true = safe, false = error union (unsafe), null =
+/// unknown — the caller falls through to the vocab checks on unknown.
+fn returnKindDiscardVerdict(type_ctx: ?*const TypeContext, t: []const u8) ?bool {
+    const ctx = type_ctx orelse return null;
+    return switch (resolveReturnKind(ctx, t)) {
+        .void_type, .value, .optional, .noreturn_type => true,
+        .error_union => false,
+        .unknown => null,
+    };
 }
 
 /// Per-file context for the ignored-error scan (ZA205): output plumbing plus
@@ -31836,23 +31944,28 @@ fn collectNullChecksInBlock(ctx: NullSafetyCtx, bid: usize) !void {
         if (ln < ctx.func_line) continue;
         const idx = ln - ctx.func_line;
         if (idx >= ctx.lines.len) continue;
-        const t = mem.trim(u8, ctx.lines[idx], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        if (!isNullCheckConditional(t)) continue;
-        const fact = classifyNullCheck(t, ctx.lines, idx) orelse continue;
-        // A true-edge fact holds on the then side, so every block whose
-        // range covers the condition line sees the non-null state. A
-        // false-edge fact holds only after the exit; seeding the owner or
-        // the then block would suppress a deref before the guard or inside
-        // the null arm (EPH-I0488). genFallThroughFact places it at the
-        // branch_false successors instead.
-        if (fact.polarity == .true_edge)
-            try ctx.checked[bid].put(ctx.allocator, fact.var_name, {});
-        if (!ownsConditionLine(ctx.cfg, bid, ln)) continue;
-        try ctx.polarity[bid].put(ctx.allocator, fact.var_name, fact.polarity);
-        if (fact.polarity == .false_edge)
-            try genFallThroughFact(ctx, bid, fact.var_name);
+        try collectNullCheckLine(ctx, bid, ln, idx);
     }
+}
+
+/// Collect null-check facts from one block line (collectNullChecksInBlock):
+/// classify the conditional, seed the checked set, and place polarity and
+/// fall-through facts when the block owns the line's branch edges. A
+/// true-edge fact holds on the then side, so every block whose range
+/// covers the condition line sees the non-null state. A false-edge fact
+/// holds only after the exit; seeding the owner or the then block would
+/// suppress a deref before the guard or inside the null arm (EPH-I0488).
+/// genFallThroughFact places it at the branch_false successors instead.
+fn collectNullCheckLine(ctx: NullSafetyCtx, bid: usize, ln: usize, idx: usize) !void {
+    const t = mem.trim(u8, ctx.lines[idx], " \t\r");
+    if (isCommentOrMultilineString(t) or !isNullCheckConditional(t)) return;
+    const fact = classifyNullCheck(t, ctx.lines, idx) orelse return;
+    if (fact.polarity == .true_edge)
+        try ctx.checked[bid].put(ctx.allocator, fact.var_name, {});
+    if (!ownsConditionLine(ctx.cfg, bid, ln)) return;
+    try ctx.polarity[bid].put(ctx.allocator, fact.var_name, fact.polarity);
+    if (fact.polarity == .false_edge)
+        try genFallThroughFact(ctx, bid, fact.var_name);
 }
 
 /// Meet inputs for the null-check propagation (EPH-I0678): the per-block
@@ -31967,35 +32080,65 @@ fn removeInlineArmViolations(
 fn intersectPredChecks(ctx: NullMeetCtx, bid: usize) !bool {
     var preds = std.ArrayListUnmanaged(NullPredInfo).empty;
     defer preds.deinit(ctx.allocator);
-    for (ctx.cfg.edges.items) |edge| {
-        if (edge.to != bid) continue;
-        // Return blocks wire a phantom sequential edge to the merge but are
-        // unreachable past the return, so they must not vote in the meet
-        // (mirrors the is_return skip in meetFreedPreds, EPH-I0677).
-        if (edge.from < ctx.cfg.blocks.items.len and
-            ctx.cfg.blocks.items[edge.from].is_return) continue;
-        try preds.append(ctx.allocator, .{ .block = edge.from, .kind = edge.kind });
-    }
+    try collectMeetPreds(ctx, bid, &preds);
     if (preds.items.len == 0) return false;
 
     var intersection: std.StringHashMapUnmanaged(void) = .empty;
     defer intersection.deinit(ctx.allocator);
+    try buildNullIntersection(ctx, preds.items, &intersection);
+    return mergeNullIntersection(ctx, bid, &intersection);
+}
+
+/// Collect the voting predecessors of block `bid` into `preds`
+/// (intersectPredChecks). Return blocks wire a phantom sequential edge
+/// to the merge but are unreachable past the return, so they must not
+/// vote in the meet (mirrors the is_return skip in meetFreedPreds,
+/// EPH-I0677).
+fn collectMeetPreds(
+    ctx: NullMeetCtx,
+    bid: usize,
+    preds: *std.ArrayListUnmanaged(NullPredInfo),
+) !void {
+    for (ctx.cfg.edges.items) |edge| {
+        if (edge.to != bid) continue;
+        if (edge.from < ctx.cfg.blocks.items.len and
+            ctx.cfg.blocks.items[edge.from].is_return) continue;
+        try preds.append(ctx.allocator, .{ .block = edge.from, .kind = edge.kind });
+    }
+}
+
+/// Build the edge-filtered intersection of the preds' checked sets
+/// (intersectPredChecks): each carrying pred initializes or narrows it.
+/// An empty inline-arm pred wipes nothing it does not violate: only the
+/// vars its own branch_false in-edges prove absent (EPH-I0863).
+fn buildNullIntersection(
+    ctx: NullMeetCtx,
+    preds: []const NullPredInfo,
+    intersection: *std.StringHashMapUnmanaged(void),
+) !void {
     var init_done = false;
-    for (preds.items) |pred| {
+    for (preds) |pred| {
         if (!predCarriesFact(ctx, pred)) continue;
         if (!init_done) {
             init_done = true;
-            try initFilteredIntersection(ctx, &intersection, pred);
+            try initFilteredIntersection(ctx, intersection, pred);
         } else {
-            try narrowFilteredIntersection(ctx, &intersection, pred);
+            try narrowFilteredIntersection(ctx, intersection, pred);
         }
     }
-    // An empty inline-arm pred wipes nothing it does not violate: only the
-    // vars its own branch_false in-edges prove absent (EPH-I0863).
-    for (preds.items) |pred| {
+    for (preds) |pred| {
         if (predCarriesFact(ctx, pred)) continue;
-        try removeInlineArmViolations(ctx, &intersection, pred);
+        try removeInlineArmViolations(ctx, intersection, pred);
     }
+}
+
+/// Merge the intersection into block `bid`'s checked set; reports
+/// whether any new fact landed (the fixpoint-change signal).
+fn mergeNullIntersection(
+    ctx: NullMeetCtx,
+    bid: usize,
+    intersection: *std.StringHashMapUnmanaged(void),
+) !bool {
     var any_changed = false;
     var it = intersection.iterator();
     while (it.next()) |e| {
@@ -32316,24 +32459,47 @@ fn analyzeCFGErrors(run: CFGRunCtx) !std.ArrayListUnmanaged(Issue) {
 
     for (run.cfg.blocks.items) |block| {
         if (block.start_line == 0 or block.start_line > block.end_line) continue;
-
-        for (block.start_line..block.end_line + 1) |line_num| {
-            if (line_num < run.func.start) continue;
-            const idx = line_num - run.func.start;
-            if (idx >= run.func.lines.len) continue;
-
-            const t = mem.trim(u8, run.func.lines[idx], " \t\r");
-            if (isCommentOrMultilineString(t)) continue;
-            if (is_test_ctx) continue;
-
-            if (checkCFGCatchUnreachable(run, t, line_num, idx)) |issue|
-                try issues.append(allocator, issue);
-            if (checkOrelseUnreachable(run, t, line_num, idx)) |issue|
-                try issues.append(allocator, issue);
-        }
+        // Test blocks skip every verdict check, so a test fn ends the
+        // block loop outright.
+        if (is_test_ctx) break;
+        try analyzeCFGErrorBlock(run, &issues, block.start_line, block.end_line);
     }
 
     return issues;
+}
+
+/// ZA202/ZA207 checks for one CFG block line range (analyzeCFGErrors):
+/// the catch-unreachable and orelse-unreachable verdict probes on every
+/// code line of the block.
+fn analyzeCFGErrorBlock(
+    run: CFGRunCtx,
+    issues: *std.ArrayListUnmanaged(Issue),
+    start_line: usize,
+    end_line: usize,
+) !void {
+    for (start_line..end_line + 1) |line_num| {
+        if (line_num < run.func.start) continue;
+        const idx = line_num - run.func.start;
+        if (idx >= run.func.lines.len) continue;
+        const t = mem.trim(u8, run.func.lines[idx], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        try checkCFGErrorLine(run, issues, t, line_num);
+    }
+}
+
+/// ZA202/ZA207 checks for one CFG block line (analyzeCFGErrorBlock):
+/// the catch-unreachable and orelse-unreachable verdict probes.
+fn checkCFGErrorLine(
+    run: CFGRunCtx,
+    issues: *std.ArrayListUnmanaged(Issue),
+    t: []const u8,
+    line_num: usize,
+) !void {
+    const idx = line_num - run.func.start;
+    if (checkCFGCatchUnreachable(run, t, line_num, idx)) |issue|
+        try issues.append(run.file.allocator, issue);
+    if (checkOrelseUnreachable(run, t, line_num, idx)) |issue|
+        try issues.append(run.file.allocator, issue);
 }
 
 /// Line context for the catch-verdict checks (ZA202/ZA207): the trimmed

@@ -6319,9 +6319,11 @@ fn bracedLoopBodyEnd(
     return null;
 }
 
-/// Fold one non-close-first line into the walk depth with the net-zero
-/// convention (EPH-I1191): a balanced line leaves the depth unchanged,
-/// opens add, closes subtract (saturating).
+/// Fold one non-close-first line into the walk depth with the dominant-flavor
+/// convention (EPH-I1191, mirroring braceCloseLine): the open-dominant line
+/// adds its opens, the close-dominant line subtracts its closes. An
+/// unbalanced mixed line diverges by the minority count, fail-closed
+/// (EPH-I1208).
 fn foldNonCloseLine(t: []const u8, depth: usize) usize {
     const bc = braceCountOnLine(t);
     var d = depth;
@@ -29987,8 +29989,10 @@ fn finishCFGFunction(file: CFGFileCtx, scan: CFGScanCtx) !void {
 /// lines, and run the errdefer/direct-free pairing when it closes. Every
 /// line of the block joins the collection — comments and blank lines
 /// included — so the detectors' line-number arithmetic (func_line + idx)
-/// stays exact. A nested fn's body stays out: the fn pass owns those
-/// lines.
+/// stays exact. A nested fn's body joins the collection (the walk tracks
+/// braces, not fn boundaries): nested fns in test blocks are a 0.16 compile
+/// error, so the consequence is bounded to invalid code and fires toward
+/// warning (EPH-I1207).
 fn handleCFGTestLine(
     file: CFGFileCtx,
     scan: CFGScanCtx,

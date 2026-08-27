@@ -400,7 +400,7 @@ export EPHOR_CURL_PATH=/usr/bin/curl
 
 An override that is not absolute or does not resolve prints a warning and falls back to `PATH`. The fallback keeps a typo from blocking the run. The threat is a hostile environment, and the operator controls the overrides.
 
-The subprocess boundary is fixed. The `check` and `fmt-check` commands spawn one child process per run: `zig fmt --check` on the scanned path. The child is read-only: no build, no test, and no execution of scanned code. Its output is capped at 10 MB, and its paths gate on the scan root. Ephor resolves the `zig` binary to an absolute path at startup, so the spawned binary is fixed before any scan input is read.
+The subprocess boundary is fixed. The `check` and `fmt-check` commands spawn one analysis child per run: `zig fmt --check` on the scanned path. The update check (see Update Check) may add a capped `curl` fetch when its 24 h cache is stale. The child is read-only: no build, no test, and no execution of scanned code. Its output is capped at 10 MB, and its paths gate on the scan root. Ephor resolves the `zig` binary to an absolute path at startup, so the spawned binary is fixed before any scan input is read.
 
 ## Rule IDs
 

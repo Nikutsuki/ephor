@@ -940,7 +940,9 @@ fn aliasTarget(sctx: ScanCtx, scan: *const FnScan, init: NodeIndex) ?[]const u8 
 /// (EPH-I1185): every prong must be a labeled block (group and
 /// @as/@ptrCast layers allowed) resolving to the same root; else the
 /// switch stays unresolvable (FN-only). Direct returns of wrapped
-/// blocks stay silent — only binding-path consumers resolve.
+/// blocks stay silent. The allow_bare=true posture is probe-pinned
+/// (0.16.0): Sema catches a bare `&var` break at the return sink even
+/// through the wrapper; the store and binding sinks stay silent.
 fn switchValueRoot(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?[]const u8 {
     const sw = sctx.tree.fullSwitch(node) orelse return null;
     var found: ?[]const u8 = null;
@@ -1086,13 +1088,13 @@ fn classifyBlockReturn(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Fin
 /// only a consumer that provably escapes adjudicates, so the sig
 /// merlin.zig shape (a block value consumed in-function by a call) and
 /// a discarded-statement block stay silent. Label-aware (EPH-I1183):
-/// only breaks naming this block's label set its value; same-text
-/// shadowing folds innermost (only the named root can misattribute).
+/// only breaks naming this block's label set its value.
 ///
-/// `allow_bare`: a bare `&var` break feeding a direct return or an
-/// out-param store is compiler-caught (probed 0.16.0) — those sinks
-/// pass false, the alias machinery passes true. The field form (`&v.a`)
-/// is the silent gap at every sink.
+/// `allow_bare`: a bare `&var` break feeding a direct return is
+/// compiler-caught (probed 0.16.0) — the return sink passes false, the
+/// alias machinery passes true. The store sink is Sema-silent for the
+/// block-value form (probe-pinned, EPH-I1210) and keeps false as a
+/// documented FN. The field form (`&v.a`) is silent at every sink.
 fn blockValueRoot(
     sctx: ScanCtx,
     scan: *const FnScan,
@@ -1120,8 +1122,7 @@ fn blockValueRoot(
 }
 
 /// The label token naming a block (`blk:`), or null when unlabeled
-/// (EPH-I1183): the pair before the lbrace, the probe Ast.firstToken
-/// uses to widen a block's range.
+/// (EPH-I1183): the identifier-colon pair before the lbrace.
 fn blockLabelToken(tree: *const Ast, block: NodeIndex) ?Ast.TokenIndex {
     const lbrace = tree.nodeMainToken(block);
     if (!tree.isTokenPrecededByTags(lbrace, &.{ .identifier, .colon })) return null;

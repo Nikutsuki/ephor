@@ -310,7 +310,9 @@ test "ZA111: label-aware block breaks keep nested inner breaks out (EPH-I1183)" 
     // silenced the outer through the all-breaks sweep (the FN). g: the
     // void-returned outer block must stay silent — the inner break's
     // stack root is the inner block's value, never the outer's (the
-    // contrived FP).
+    // contrived FP). g's local is named w so the pre-fix false fire
+    // names 'w': the 'v' needle and the 'w'-absence needle both fail
+    // against the pre-fix code (the RED).
     var issues = try runZa111(a,
         \\const S = struct { a: u32 };
         \\fn make() *u32 {
@@ -324,9 +326,9 @@ test "ZA111: label-aware block breaks keep nested inner breaks out (EPH-I1183)" 
         \\    };
         \\}
         \\fn g() void {
-        \\    var v = S{ .a = 7 };
+        \\    var w = S{ .a = 7 };
         \\    return outer: {
-        \\        const p = inner: { break :inner &v.a; };
+        \\        const p = inner: { break :inner &w.a; };
         \\        _ = p;
         \\    };
         \\}
@@ -334,6 +336,7 @@ test "ZA111: label-aware block breaks keep nested inner breaks out (EPH-I1183)" 
     defer types.deinitIssues(&issues, a);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "'v'") != null);
+    try std.testing.expect(mem.indexOf(u8, issues.items[0].message, "'w'") == null);
 }
 
 test "ZA111: while payload capture return fires, by-value stays silent (EPH-I1184)" {

@@ -19054,35 +19054,38 @@ fn extractCreateCaller(t: []const u8, create_pos: usize) ?[]const u8 {
     return t[start..create_pos];
 }
 
-/// Extract the allocator name from an allocation line
-fn extractAllocatorName(t: []const u8) ?[]const u8 {
-    // Find first allocation method position using compat layer patterns
+/// Position of the first allocation-method pattern in the line, or null.
+fn firstAllocMethodPos(t: []const u8) ?usize {
     var first_pos: ?usize = null;
     for (compat.getAllocMethodPatterns()) |pat| {
-        if (mem.indexOf(u8, t, pat)) |pos| {
-            if (first_pos == null or pos < first_pos.?)
-                first_pos = pos;
-        }
+        const pos = mem.indexOf(u8, t, pat) orelse continue;
+        if (first_pos == null or pos < first_pos.?) first_pos = pos;
     }
+    return first_pos;
+}
 
+/// The bare identifier inside [start..end), or null when the span
+/// carries no identifier.
+fn extractAllocIdent(t: []const u8, start: usize, end: usize) ?[]const u8 {
+    if (start >= end) return null;
+    var name_end = start;
+    while (name_end < end and isIdent(t[name_end])) name_end += 1;
+    if (name_end == start) return null;
+    return t[start..name_end];
+}
+
+/// Extract the allocator name from an allocation line
+fn extractAllocatorName(t: []const u8) ?[]const u8 {
+    // Find the first allocation method position using compat layer patterns
+    const end = firstAllocMethodPos(t) orelse return null;
     // Walk backwards to find the allocator name
-    const end = first_pos orelse return null;
     var start = end;
     while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
         start -= 1;
     }
     // Skip the leading dot if any
     while (start < end and t[start] == '.') start += 1;
-
-    if (start < end) {
-        // Find just the allocator identifier
-        var name_end = start;
-        while (name_end < end and isIdent(t[name_end])) {
-            name_end += 1;
-        }
-        if (name_end > start) return t[start..name_end];
-    }
-    return null;
+    return extractAllocIdent(t, start, end);
 }
 
 /// Patterns where allocator is the first function argument (not the receiver).
@@ -19158,6 +19161,37 @@ const third_arg_alloc_patterns = [_][]const u8{
     ".realPathFileAlloc(",
 };
 
+/// One-step verdicts for the top-level-comma skip walk.
+const CommaSkipVerdict = enum { scan_on, found, closed };
+
+/// True when `c` opens a bracket group.
+fn isOpenBracket(c: u8) bool {
+    return c == '(' or c == '[' or c == '{';
+}
+
+/// True when `c` closes a bracket group.
+fn isCloseBracket(c: u8) bool {
+    return c == ')' or c == ']' or c == '}';
+}
+
+/// Fold one byte into the carried bracket depth and report its effect on
+/// the skip walk: a top-level comma ends the walk with a position, a
+/// closing paren at depth zero ends it without one, anything else keeps
+/// scanning.
+fn stepTopLevelComma(c: u8, depth: *i32) CommaSkipVerdict {
+    if (isOpenBracket(c)) {
+        depth.* += 1;
+        return .scan_on;
+    }
+    if (isCloseBracket(c)) {
+        if (c == ')' and depth.* == 0) return .closed;
+        depth.* -= 1;
+        return .scan_on;
+    }
+    if (c == ',' and depth.* == 0) return .found;
+    return .scan_on;
+}
+
 /// Return the position just after the first comma at bracket depth zero
 /// following `start`, or null when the call closes first. Nested parens,
 /// brackets, and braces inside the skipped argument (array dims, tuple
@@ -19166,19 +19200,9 @@ fn skipPastTopLevelComma(t: []const u8, start: usize) ?usize {
     var depth: i32 = 0;
     var s = start;
     while (s < t.len) : (s += 1) {
-        const c = t[s];
-        switch (c) {
-            '(', '[', '{' => depth += 1,
-            ')' => {
-                if (depth == 0) return null;
-                depth -= 1;
-            },
-            ']', '}' => depth -= 1,
-            ',' => {
-                if (depth == 0) return s + 1;
-            },
-            else => {},
-        }
+        const verdict = stepTopLevelComma(t[s], &depth);
+        if (verdict == .found) return s + 1;
+        if (verdict == .closed) return null;
     }
     return null;
 }
@@ -19528,6 +19552,20 @@ fn isCFFIDiscard(t: []const u8) bool {
     return after_discard[0] >= 'A' and after_discard[0] <= 'Z';
 }
 
+/// Definitive discard verdict from return-type resolution: true (the
+/// return carries no error to lose), false (error union — the discard
+/// stays reportable), or null when the type context cannot classify the
+/// return. The null arm falls through to the vocabulary fallbacks
+/// (EPH-I0410).
+fn resolveDiscardVerdict(ctx: *const TypeContext, t: []const u8) ?bool {
+    const rk = resolveReturnKind(ctx, t);
+    return switch (rk) {
+        .void_type, .value, .optional, .noreturn_type => true,
+        .error_union => false,
+        .unknown => null,
+    };
+}
+
 /// Check if a discarded result is safe (void/non-error return type)
 fn isSafeToDiscard(t: []const u8, type_ctx: ?*const TypeContext) bool {
     // Stdlib cleanup patterns (void methods: .free, .destroy, .deinit) — always safe.
@@ -19536,12 +19574,7 @@ fn isSafeToDiscard(t: []const u8, type_ctx: ?*const TypeContext) bool {
     if (containsAnyPatternInCode(t, compat.getCleanupPatterns())) return true;
     // Return-type resolution (definitive when available)
     if (type_ctx) |ctx| {
-        const rk = resolveReturnKind(ctx, t);
-        switch (rk) {
-            .void_type, .value, .optional, .noreturn_type => return true,
-            .error_union => return false,
-            .unknown => {}, // fall through to vocab
-        }
+        if (resolveDiscardVerdict(ctx, t)) |safe| return safe;
     }
     // Stdlib safe methods — type-aware: method patterns (.clear, .next, etc.)
     // only match when receiver is a tracked stdlib variable
@@ -19565,7 +19598,8 @@ const TestBlockState = struct {
 
 /// Track test block boundaries. Braces in string/char literals and
 /// comments are data: they neither open a test block nor close one
-/// (EPH-I0883).
+/// (EPH-I0883). The carried block walk is the shared code-position
+/// brace tracker (trackBraceBlock): the same mask, the same close rule.
 fn trackTestBlock(
     t: []const u8,
     in_test: bool,
@@ -19589,18 +19623,8 @@ fn trackTestBlock(
         brace_depth = 0;
     }
     if (!in_block) return .{ .in_test = false, .depth = brace_depth };
-    var lit = types.LiteralState.forLine(t) orelse
-        return .{ .in_test = in_block, .depth = brace_depth };
-    var i: usize = 0;
-    while (i < t.len) : (i += 1) {
-        if (lit.updateForChar(t, i) == null) continue;
-        if (t[i] == '{') brace_depth += 1;
-        if (t[i] == '}') {
-            if (brace_depth > 0) brace_depth -= 1;
-            if (brace_depth == 0) in_block = false;
-        }
-    }
-    return .{ .in_test = in_block, .depth = brace_depth };
+    const r = trackBraceBlock(t, in_block, brace_depth);
+    return .{ .in_test = r.in_block, .depth = r.depth };
 }
 
 /// Line context for silent-catch detection (ZA201): the trimmed line, its
@@ -19681,6 +19705,17 @@ fn isCleanupFunction(name: []const u8) bool {
     return false;
 }
 
+/// Method name called at `dot` (a `.`), or null when the dot does not
+/// open a method call: no identifier follows the dot, or no `(` closes
+/// the name.
+fn methodNameAt(t: []const u8, dot: usize) ?[]const u8 {
+    var end = dot + 1;
+    while (end < t.len and isIdent(t[end])) end += 1;
+    if (end == dot + 1) return null;
+    if (end >= t.len or t[end] != '(') return null;
+    return t[dot + 1 .. end];
+}
+
 /// Check if the called method on the line is a cleanup/best-effort operation.
 /// Matches `.leaseRevoke(`, `.close(`, `.cleanup(`, `.shutdown(`, etc.
 /// Case-insensitive camelCase-segment match: `leaseRevoke` matches
@@ -19700,17 +19735,10 @@ fn isCleanupMethodCall(t: []const u8) bool {
     while (mem.indexOfScalarPos(u8, t, pos, '.')) |dot| {
         pos = dot + 1;
         if (comment_start != null and dot >= comment_start.?) continue;
-        if (pos >= t.len) break;
-        // Extract method name after the dot
-        var end = pos;
-        while (end < t.len and isIdent(t[end])) end += 1;
-        if (end == pos) continue;
-        if (end >= t.len or t[end] != '(') continue;
-        const method = t[pos..end];
+        const method = methodNameAt(t, dot) orelse continue;
         // Check if method name contains any cleanup keyword (case-insensitive)
-        if (containsCleanupKeyword(method, &cleanup_keywords)) {
-            if (!cls.isInsideString(dot)) return true;
-        }
+        if (containsCleanupKeyword(method, &cleanup_keywords) and
+            !cls.isInsideString(dot)) return true;
     }
     return false;
 }
@@ -19747,6 +19775,26 @@ fn containsCleanupKeyword(name: []const u8, keywords: []const []const u8) bool {
 /// first byte after an optional `|payload|` and surrounding whitespace.
 const CatchSite = struct { col: usize, rest: usize };
 
+/// True when `pos` opens a real `catch` keyword: identifier-bounded on
+/// both sides and outside string literals (EPH-I0020).
+fn isRealCatchPos(t: []const u8, cls: *LineClassifier, pos: usize) bool {
+    if (pos > 0 and isIdent(t[pos - 1])) return false;
+    const after = pos + "catch".len;
+    if (after < t.len and isIdent(t[after])) return false;
+    return !cls.isInsideString(pos);
+}
+
+/// Rest index past an optional `|payload|` pipe group, or null when the
+/// pipe never closes. An unterminated payload pipe (`catch | y;` —
+/// invalid Zig) is skipped, not fatal: the caller resumes after this
+/// occurrence so a later REAL catch on the same line is still found
+/// (EPH-I0020).
+fn catchRestAfterPayload(t: []const u8, rest: usize) ?usize {
+    if (rest >= t.len or t[rest] != '|') return rest;
+    const close = mem.indexOfScalarPos(u8, t, rest + 1, '|') orelse return null;
+    return close + 1 + skipLeadingWhitespace(t[close + 1 ..]);
+}
+
 /// Find the first real `catch` keyword at/after `start`: not inside a string
 /// literal, not embedded in a longer identifier on either side, not inside a
 /// `//` comment. `rest` skips an optional `|payload|` so callers match what
@@ -19761,22 +19809,11 @@ fn findCatchSite(t: []const u8, start: usize) ?CatchSite {
     var s = start;
     while (mem.indexOfPos(u8, t, s, "catch")) |pos| {
         s = pos + 5;
-        if (pos > 0 and isIdent(t[pos - 1])) continue;
-        const after = pos + 5;
-        if (after < t.len and isIdent(t[after])) continue;
-        if (cls.isInsideString(pos)) continue;
+        if (!isRealCatchPos(t, &cls, pos)) continue;
         // A comment swallows the rest of the line — no real catch beyond it.
         if (comment_start != null and pos >= comment_start.?) return null;
-        var rest = after + skipLeadingWhitespace(t[after..]);
-        if (rest < t.len and t[rest] == '|') {
-            // An unterminated payload pipe (`catch | y;` — invalid Zig) is
-            // skipped, not fatal: the scan resumes after this occurrence so
-            // a later REAL catch on the same line is still found
-            // (EPH-I0020). The break form aborted the per-line scan here, a
-            // fail-safe FN reachable only on non-compiling code.
-            const close = mem.indexOfScalarPos(u8, t, rest + 1, '|') orelse continue;
-            rest = close + 1 + skipLeadingWhitespace(t[close + 1 ..]);
-        }
+        var rest = pos + 5 + skipLeadingWhitespace(t[pos + 5 ..]);
+        rest = catchRestAfterPayload(t, rest) orelse continue;
         return .{ .col = pos, .rest = rest };
     }
     return null;
@@ -19974,6 +20011,49 @@ fn extractVarDeclName(t: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Address-of fill forms for one occurrence at `i`: &var, &(var)
+/// (grouping parens, EPH-I0822), &Struct.var, with any spacing around
+/// the dot (`&opts. buf`, EPH-I0796, EPH-I0805). The chain walk treats
+/// inter-token whitespace as transparent, and the grouping paren on the
+/// bare name bridges the walk the same way the chain form does.
+fn isAmpFillOccurrence(t: []const u8, i: usize) bool {
+    if (i > 0 and t[i - 1] == '&') return true;
+    if (i > 0 and t[i - 1] == '(' and hasAmpBeforeChain(t, i)) return true;
+    return i > 1 and hasLeftDot(t, i) and hasAmpBeforeChain(t, i);
+}
+
+/// True when the occurrence is the variable itself: not mid-identifier
+/// (box[...], box =) and not a field of another var (foo.x[...],
+/// foo.x =). The dot check skips whitespace, so a spaced dot
+/// (foo . x[...] =) keeps the field verdict (EPH-I0786).
+fn isSelfMatch(t: []const u8, i: usize) bool {
+    return i == 0 or (!isIdent(t[i - 1]) and !hasLeftDot(t, i));
+}
+
+/// True when `i` is a code-position occurrence of var_name: not inside
+/// a string literal, not after a mid-line `//` (EPH-I0104, EPH-I0153).
+/// The identifier boundary check stays with the caller (it owns the
+/// end index).
+fn isVarOccurrenceInCode(
+    i: usize,
+    cls: *LineClassifier,
+    comment_start: ?usize,
+) bool {
+    if (cls.isInsideString(i)) return false;
+    return comment_start == null or i < comment_start.?;
+}
+
+/// Self-fill forms for one occurrence at `i`: var_name[...] in a write
+/// context (slice forms keep the load-bearing fill verdict, EPH-I0102;
+/// bare element reads do not fill, EPH-I0752) and var_name = direct
+/// assignment.
+fn isSelfFillOccurrence(t: []const u8, var_name: []const u8, i: usize) bool {
+    const end_i = i + var_name.len;
+    if (end_i < t.len and t[end_i] == '[' and
+        classifyBracketUse(t, end_i) == .fill) return true;
+    return isAssignmentTarget(t, var_name, i);
+}
+
 /// Check if any occurrence of var_name is directly filled on this line:
 /// &var, &(var) (grouping parens, EPH-I0822), &Struct.var, var[...] =, or
 /// var as an assignment target.
@@ -19994,37 +20074,21 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
         if (!mem.eql(u8, t[i .. i + var_name.len], var_name)) continue;
         // Check it is a word boundary (not middle of identifier)
         const end_i = i + var_name.len;
-        const after_ok = end_i >= t.len or !isIdent(t[end_i]);
-        if (!after_ok) continue;
-        if (cls.isInsideString(i)) continue;
-        if (comment_start != null and i >= comment_start.?) continue;
-
+        if (end_i < t.len and isIdent(t[end_i])) continue;
+        if (!isVarOccurrenceInCode(i, &cls, comment_start)) continue;
         // Pattern 1: &var_name or &Struct.var_name, with any spacing
-        // around the dot (`&opts. buf`, EPH-I0796). The chain walk treats
-        // inter-token whitespace as transparent, so a space before the dot
-        // (`&opts . buf`) keeps the fill verdict (EPH-I0805). A grouping
-        // paren on the bare name (`use(&(x))`, EPH-I0822) takes the same
-        // bridge as the chain form: the walk crosses the paren only when
-        // the byte immediately left of it is '&' or '('.
-        if (i > 0 and t[i - 1] == '&') return true;
-        if (i > 0 and t[i - 1] == '(' and hasAmpBeforeChain(t, i)) return true;
-        if (i > 1 and hasLeftDot(t, i) and hasAmpBeforeChain(t, i)) return true;
-
+        // around the dot (EPH-I0796). A grouping paren on the bare name
+        // (`use(&(x))`, EPH-I0822) takes the same bridge as the chain
+        // form: the walk crosses the paren only when the byte
+        // immediately left of it is '&' or '('.
+        if (isAmpFillOccurrence(t, i)) return true;
         // Patterns 2/3 require the match to be the variable itself: not
-        // mid-identifier (box[...], box =) and not a field of another var
-        // (foo.x[...], foo.x =). The identifier boundary stays on the
-        // immediate byte. The dot check skips whitespace, so a spaced dot
-        // (foo . x[...] =) keeps the field verdict (EPH-I0786).
-        const self_match = i == 0 or (!isIdent(t[i - 1]) and !hasLeftDot(t, i));
-
-        // Pattern 2: var_name[...] in a write context. Slice forms keep
-        // the load-bearing fill verdict (EPH-I0102). Bare element reads
-        // do not fill (EPH-I0752).
-        if (self_match and end_i < t.len and t[end_i] == '[' and
-            classifyBracketUse(t, end_i) == .fill) return true;
-
-        // Pattern 3: var_name = ... (direct assignment)
-        if (self_match and isAssignmentTarget(t, var_name, i)) return true;
+        // mid-identifier (box[...], box =) and not a field of another
+        // var (foo.x[...], foo.x =). The identifier boundary stays on
+        // the immediate byte. The dot check skips whitespace, so a
+        // spaced dot (foo . x[...] =) keeps the field verdict
+        // (EPH-I0786).
+        if (isSelfMatch(t, i) and isSelfFillOccurrence(t, var_name, i)) return true;
     }
     return false;
 }
@@ -20618,6 +20682,39 @@ fn extractVarDeclNameBefore(t: []const u8, col: usize) ?[]const u8 {
     return name;
 }
 
+/// Verdicts for one `= undefined` occurrence: skip it, stop the line
+/// scan, record a decl, or report it.
+const UndefinedOccVerdict = enum { skip, stop, decl, report };
+
+/// Classification of one `= undefined` occurrence: its verdict plus the
+/// declared name for the decl arm.
+const UndefinedOccClass = struct {
+    verdict: UndefinedOccVerdict,
+    decl_name: []const u8 = "",
+};
+
+/// Classify one `= undefined` occurrence at `col` in the original
+/// decision order: continuation text, string data, the comment boundary
+/// (which stops the line scan), struct fields, cleanup patterns, decl
+/// names, and struct-field defaults (EPH-I0410, EPH-I0418).
+fn classifyUndefinedOccurrence(
+    t: []const u8,
+    col: usize,
+    cls: *LineClassifier,
+    comment_start: ?usize,
+) UndefinedOccClass {
+    if (isUndefinedContinuation(t, col)) return .{ .verdict = .skip };
+    if (cls.isInsideString(col)) return .{ .verdict = .skip };
+    // Everything from the comment start on is prose, not code.
+    if (comment_start != null and col >= comment_start.?) return .{ .verdict = .stop };
+    if (isStructFieldPattern(t, col)) return .{ .verdict = .skip };
+    if (isCleanupUndefinedPattern(t, col)) return .{ .verdict = .skip };
+    if (extractVarDeclNameBefore(t, col)) |name|
+        return .{ .verdict = .decl, .decl_name = name };
+    if (isStructFieldDefault(t, col)) return .{ .verdict = .skip };
+    return .{ .verdict = .report };
+}
+
 /// Scan a line for `= undefined` occurrences: track new decl-var pendings,
 /// and report non-decl undefined assignments immediately.
 fn scanUndefinedOccurrences(
@@ -20633,17 +20730,13 @@ fn scanUndefinedOccurrences(
     var s: usize = 0;
     while (mem.indexOfPos(u8, ctx.t, s, "= undefined")) |col| {
         s = col + 1;
-        if (isUndefinedContinuation(ctx.t, col)) continue;
-        if (cls.isInsideString(col)) continue;
-        // Everything from the comment start on is prose, not code.
-        if (comment_start != null and col >= comment_start.?) return;
-        if (isStructFieldPattern(ctx.t, col)) continue;
-        if (isCleanupUndefinedPattern(ctx.t, col)) continue;
-        if (extractVarDeclNameBefore(ctx.t, col)) |name| {
-            set.add(name, ctx.line, col + 1);
+        const r = classifyUndefinedOccurrence(ctx.t, col, &cls, comment_start);
+        if (r.verdict == .stop) return;
+        if (r.verdict == .skip) continue;
+        if (r.verdict == .decl) {
+            set.add(r.decl_name, ctx.line, col + 1);
             continue;
         }
-        if (isStructFieldDefault(ctx.t, col)) continue;
         if (makeUndefinedIssue(ctx.path, ctx.line, col + 1)) |issue| {
             try issues.append(allocator, issue);
         }
@@ -20978,6 +21071,44 @@ fn trackStructBraces(t: []const u8, ss: *StructLiteralState) void {
 /// (EPH-I0893).
 const struct_literal_field_depth = 1;
 
+/// Result of folding one prefix of the line into the carried brace
+/// depth: whether the tracked literal closed (depth returned to zero)
+/// and the walk/count values to carry forward (EPH-I0893).
+const BraceFoldResult = struct {
+    closed: bool,
+    next_i: usize,
+    next_depth: usize,
+};
+
+/// Advance the literal-masked brace walk from `i` to the end of `t`,
+/// folding code-position braces into the carried depth. The caller
+/// bounds the slice at the occurrence position. When the tracked
+/// literal's close returns the depth to zero, the walk stops: a
+/// same-line second declaration would re-raise the depth and its fields
+/// would be misattributed (EPH-I0893). On continuation lines the walk
+/// base is the carried start-of-line depth, so the depth reaches zero
+/// only at the tracked literal's own close.
+fn foldBracesTo(
+    t: []const u8,
+    lit: *types.LiteralState,
+    i: usize,
+    depth: usize,
+) BraceFoldResult {
+    var d = depth;
+    var pos = i;
+    while (pos < t.len) : (pos += 1) {
+        const cp = lit.updateForChar(t, pos) orelse continue;
+        if (t[cp] == '{') {
+            d += 1;
+            continue;
+        }
+        if (t[cp] != '}' or d == 0) continue;
+        d -= 1;
+        if (d == 0) return .{ .closed = true, .next_i = pos, .next_depth = d };
+    }
+    return .{ .closed = false, .next_i = pos, .next_depth = d };
+}
+
 /// Collect every `= undefined` field at the tracked literal's own depth.
 /// The walk is literal-masked and brace-counted from the line start
 /// (struct_state.brace_depth carries across lines): a nested
@@ -20998,23 +21129,10 @@ fn collectUndefinedField(t: []const u8, ln: usize, s: *ErrorAnalysisState) void 
     var search_from: usize = 0;
     while (mem.indexOfPos(u8, t, search_from, "= undefined")) |undef_pos| {
         search_from = undef_pos + 1;
-        while (i < undef_pos) : (i += 1) {
-            const pos = lit.updateForChar(t, i) orelse continue;
-            if (t[pos] == '{') depth += 1;
-            if (t[pos] != '}' or depth == 0) continue;
-            depth -= 1;
-            // The tracked literal's close returns the depth to zero,
-            // the level the declaration line started at. Stop the
-            // walk: a same-line second declaration would re-raise the
-            // depth and its fields would be misattributed
-            // (EPH-I0893). On continuation lines the walk base is the
-            // carried start-of-line depth (collectUndefinedField runs
-            // before trackStructBraces), so the depth reaches zero
-            // only here, at the tracked literal's own close: the
-            // literal is still open on every earlier position of the
-            // line, and a later line's collect bails on in_literal.
-            if (depth == 0) return;
-        }
+        const fold = foldBracesTo(t[0..undef_pos], &lit, i, depth);
+        if (fold.closed) return;
+        i = fold.next_i;
+        depth = fold.next_depth;
         // The occurrence must sit in code position: inside a string,
         // char literal, comment, or `\\` multiline tail, the text is
         // data (EPH-I0883). `=` is not a quote, so the probe does not
@@ -21683,6 +21801,50 @@ fn scanBlankedChunk(scan: *ErrRetFnScan, blanked: []const u8) void {
     scan.brace_depth = braceDelta(scan.brace_depth, blanked);
 }
 
+/// Inputs for one ZA209 fn-scan line step: the issue sink, the scan
+/// state, and the blank buffer.
+const ErrRetLineCtx = struct {
+    a: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    path: []const u8,
+    all_lines: []const []const u8,
+    scan: *ErrRetFnScan,
+    blank_buf: *[512]u8,
+};
+
+/// Apply one line to the ZA209 fn scan: open a fn, record evidence, fold
+/// the blanked code into the scan state, and finish the fn when the body
+/// closes (EPH-I0423).
+fn processErrRetLine(ctx: ErrRetLineCtx, line: []const u8, idx: usize) !void {
+    const t = mem.trim(u8, line, " \t\r");
+    if (isCommentOrMultilineString(t)) return;
+    // Comment text is prose, never evidence (EPH-I0411): the evidence
+    // scans run on the comment-stripped prefix. findCommentStart is
+    // string-aware, so a `//` inside a string literal stays data.
+    const code_end = findCommentStart(line) orelse line.len;
+    const code = mem.trim(u8, line[0..code_end], " \t\r");
+    if (!ctx.scan.in_fn) {
+        startErrRetFn(ctx.all_lines[idx..], idx + 1, ctx.scan);
+        if (!ctx.scan.in_fn) return;
+    }
+    // Signature lines (before the body brace) may declare error-typed
+    // params on their own continuation lines — record them from the
+    // content-backed line, never from the joined stack buffer.
+    if (!ctx.scan.body_started) recordErrorTypedParams(code, ctx.scan);
+    scanErrRetEvidence(code, ctx.scan);
+    // Braces count only real code: trailing comments stripped, string
+    // and char literal contents blanked (a `"}"` must not close the fn).
+    // Lines longer than the mask buffer blank in chunks with literal
+    // state carried across chunk boundaries (EPH-I0423): the single-shot
+    // blankLiteralContents fails open past 512 bytes, so a literal
+    // brace on a long generated line would corrupt the fn-depth scan.
+    var blank_iter = BlankChunkIter.init(line[0..code_end], ctx.blank_buf);
+    while (blank_iter.next()) |blanked| scanBlankedChunk(ctx.scan, blanked);
+    if (ctx.scan.body_started and ctx.scan.brace_depth == 0) {
+        try finishErrRetFn(ctx.a, ctx.issues, ctx.path, ctx.scan);
+    }
+}
+
 /// Walk a file's lines and flag error-union fns with no error path.
 fn checkUselessErrorReturns(
     a: Allocator,
@@ -21692,34 +21854,16 @@ fn checkUselessErrorReturns(
 ) !void {
     var scan = ErrRetFnScan{};
     var blank_buf: [512]u8 = undefined;
+    const ctx = ErrRetLineCtx{
+        .a = a,
+        .issues = issues,
+        .path = path,
+        .all_lines = all_lines,
+        .scan = &scan,
+        .blank_buf = &blank_buf,
+    };
     for (all_lines, 0..) |line, idx| {
-        const t = mem.trim(u8, line, " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        // Comment text is prose, never evidence (EPH-I0411): the evidence
-        // scans run on the comment-stripped prefix. findCommentStart is
-        // string-aware, so a `//` inside a string literal stays data.
-        const code_end = findCommentStart(line) orelse line.len;
-        const code = mem.trim(u8, line[0..code_end], " \t\r");
-        if (!scan.in_fn) {
-            startErrRetFn(all_lines[idx..], idx + 1, &scan);
-            if (!scan.in_fn) continue;
-        }
-        // Signature lines (before the body brace) may declare error-typed
-        // params on their own continuation lines — record them from the
-        // content-backed line, never from the joined stack buffer.
-        if (!scan.body_started) recordErrorTypedParams(code, &scan);
-        scanErrRetEvidence(code, &scan);
-        // Braces count only real code: trailing comments stripped, string
-        // and char literal contents blanked (a `"}"` must not close the fn).
-        // Lines longer than the mask buffer blank in chunks with literal
-        // state carried across chunk boundaries (EPH-I0423): the single-shot
-        // blankLiteralContents fails open past 512 bytes, so a literal
-        // brace on a long generated line would corrupt the fn-depth scan.
-        var blank_iter = BlankChunkIter.init(line[0..code_end], &blank_buf);
-        while (blank_iter.next()) |blanked| scanBlankedChunk(&scan, blanked);
-        if (scan.body_started and scan.brace_depth == 0) {
-            try finishErrRetFn(a, issues, path, &scan);
-        }
+        try processErrRetLine(ctx, line, idx);
     }
 }
 

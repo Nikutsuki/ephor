@@ -21919,23 +21919,48 @@ const ErrorLineCtx = struct {
     }
 };
 
+/// Append an optional issue to the sink — the shared emit step for every
+/// line check.
+fn appendIfPresent(
+    issues: *std.ArrayListUnmanaged(Issue),
+    allocator: Allocator,
+    issue: ?Issue,
+) !void {
+    if (issue) |i| try issues.append(allocator, i);
+}
+
 /// Check all error patterns on a single line
 fn checkLineErrors(ctx: ErrorLineCtx) !void {
     // ZA201 (silent catch) — suppressed in test context, where ZT104's
     // note is the replacement (same inversion as ZA202/ZA203 below): a
     // test gets exactly one report per catch, never two.
     if (!ctx.in_defer and !ctx.in_test) {
-        if (checkSilentCatch(ctx.silentCatchCtx())) |i| {
-            try ctx.issues.append(ctx.allocator, i);
-        }
+        try appendIfPresent(ctx.issues, ctx.allocator, checkSilentCatch(ctx.silentCatchCtx()));
     }
-    // ZA202: catch unreachable — suppress in test blocks (intentional assertions)
+    // ZA202/ZA203: unreachable patterns — suppressed in test blocks
+    // (intentional assertions).
+    try checkUnreachablePatterns(ctx);
+    // ZA207: catch undefined (dangerous — converts errors to UB)
+    try appendIfPresent(ctx.issues, ctx.allocator, checkCatchUndefined(ctx.catchVerdictCtx()));
+    // ZA204: resolve pending undefineds, then track new ones.
+    try updateUndefinedTracking(ctx);
+    // ZA205 emits only from analyzeIgnoredErrors (EPH-I0408). A second
+    // emitter here double-reported every zero-arg discard.
+    // ZA208: @panic() detection — suppress in test blocks and test files.
+    // ZA210: catch |e| return e (note, off by default — print-time filtered).
+    try checkPanicAndCatchReturn(ctx);
+}
+
+/// ZA202/ZA203 line checks, both suppressed in test blocks (intentional
+/// assertions).
+fn checkUnreachablePatterns(ctx: ErrorLineCtx) !void {
     if (!ctx.in_test) {
-        if (checkCatchUnreachable(ctx.catchVerdictCtx())) |i| {
-            try ctx.issues.append(ctx.allocator, i);
-        }
+        try appendIfPresent(
+            ctx.issues,
+            ctx.allocator,
+            checkCatchUnreachable(ctx.catchVerdictCtx()),
+        );
     }
-    // ZA203: orelse unreachable — suppress in test blocks (intentional assertions)
     if (!ctx.in_test) {
         const orelse_ctx: LineOrelseCtx = .{
             .t = ctx.t,
@@ -21945,37 +21970,31 @@ fn checkLineErrors(ctx: ErrorLineCtx) !void {
             .line_idx = ctx.line_idx,
             .func_start = ctx.func_start,
         };
-        if (checkLineOrelseUnreachable(orelse_ctx)) |i| {
-            try ctx.issues.append(ctx.allocator, i);
-        }
+        try appendIfPresent(ctx.issues, ctx.allocator, checkLineOrelseUnreachable(orelse_ctx));
     }
-    // ZA207: catch undefined (dangerous — converts errors to UB)
-    if (checkCatchUndefined(ctx.catchVerdictCtx())) |i| {
-        try ctx.issues.append(ctx.allocator, i);
-    }
-    // Always resolve pending undefineds (even at module boundary) to avoid
-    // losing ZA204 issues when skip_undefined transitions from false→true.
-    // The update pass checks fill patterns and scope boundaries per var.
+}
+
+/// ZA204 undefined-var tracking: resolve every pending var (even at module
+/// boundary, so a skip_undefined false→true transition never drops an
+/// issue — the update pass checks fill patterns and scope boundaries per
+/// var), then record NEW undefineds unless the line is test/module-level
+/// context. Multiple vars may be pending at once (the old single-slot
+/// tracker dropped every decl after the first).
+fn updateUndefinedTracking(ctx: ErrorLineCtx) !void {
     const undef_ctx: UndefinedLineCtx = .{ .t = ctx.t, .path = ctx.path, .line = ctx.line };
     try updatePendingUndefinedSet(undef_ctx, ctx.pending, ctx.issues, ctx.allocator);
-    // Only track NEW undefineds when not in test/module-level context.
-    // Multiple vars may be pending at once (the old single-slot tracker
-    // dropped every decl after the first).
     if (!ctx.skip_undefined) {
         try trackNewUndefined(undef_ctx, ctx.pending, ctx.issues, ctx.allocator);
     }
-    // ZA205 emits only from analyzeIgnoredErrors (EPH-I0408). A second
-    // emitter here double-reported every zero-arg discard.
-    // ZA208: @panic() detection — suppress in test blocks and test files
+}
+
+/// ZA208 @panic detection (suppressed in test blocks and test files) and
+/// the ZA210 catch-return note, in emission order.
+fn checkPanicAndCatchReturn(ctx: ErrorLineCtx) !void {
     if (!ctx.in_test) {
-        if (checkPanic(ctx.t, ctx.path, ctx.line)) |i| {
-            try ctx.issues.append(ctx.allocator, i);
-        }
+        try appendIfPresent(ctx.issues, ctx.allocator, checkPanic(ctx.t, ctx.path, ctx.line));
     }
-    // ZA210: catch |e| return e (note, off by default — print-time filtered)
-    if (checkNoCatchReturn(ctx.t, ctx.path, ctx.line)) |i| {
-        try ctx.issues.append(ctx.allocator, i);
-    }
+    try appendIfPresent(ctx.issues, ctx.allocator, checkNoCatchReturn(ctx.t, ctx.path, ctx.line));
 }
 
 /// Report still-pending undefined vars at end of file (scope never filled)
@@ -22034,16 +22053,23 @@ fn findExitCallInCode(t: []const u8) ?usize {
         from = pos + "exit(".len;
         if (cls.isInsideString(pos)) continue;
         if (comment_start != null and pos >= comment_start.?) continue;
-        const quals = [_][]const u8{ "std.process.", "process.", "std.posix.", "posix." };
-        for (quals) |q| {
-            if (pos < q.len) continue;
-            const q_start = pos - q.len;
-            if (!mem.endsWith(u8, t[0..pos], q)) continue;
-            // Identifier boundary: `x_process.exit(` is a user method,
-            // not a std process exit.
-            if (q_start > 0 and isIdent(t[q_start - 1])) continue;
-            return pos;
-        }
+        if (qualifiedExitCall(t, pos)) |p| return p;
+    }
+    return null;
+}
+
+/// `pos` when a process-exit qualifier ends exactly at it with an
+/// identifier boundary before it, else null.
+fn qualifiedExitCall(t: []const u8, pos: usize) ?usize {
+    const quals = [_][]const u8{ "std.process.", "process.", "std.posix.", "posix." };
+    for (quals) |q| {
+        if (pos < q.len) continue;
+        const q_start = pos - q.len;
+        if (!mem.endsWith(u8, t[0..pos], q)) continue;
+        // Identifier boundary: `x_process.exit(` is a user method,
+        // not a std process exit.
+        if (q_start > 0 and isIdent(t[q_start - 1])) continue;
+        return pos;
     }
     return null;
 }
@@ -22282,6 +22308,20 @@ fn skipPastChar(code: []const u8, start: usize) usize {
     return code.len;
 }
 
+/// Skip a string or char literal starting at `i.*`, advancing `i` past
+/// its closing quote. Returns false when the byte is not a literal quote.
+fn skipLiteral(code: []const u8, i: *usize) bool {
+    if (code[i.*] == '"') {
+        i.* = skipPastString(code, i.*);
+        return true;
+    }
+    if (code[i.*] == '\'') {
+        i.* = skipPastChar(code, i.*);
+        return true;
+    }
+    return false;
+}
+
 /// End index of the identifier run (dots allowed) starting at `start`.
 fn identRunEnd(code: []const u8, start: usize) usize {
     var i = start;
@@ -22322,25 +22362,26 @@ fn nextCallSite(code: []const u8, from: usize) ?CallSite {
             // Non-call quoted ident: the string handler below skips the
             // quoted content to the same end position (EPH-I0908).
         }
-        if (code[i] == '"') {
-            i = skipPastString(code, i);
-            continue;
-        }
-        if (code[i] == '\'') {
-            i = skipPastChar(code, i);
-            continue;
-        }
+        if (skipLiteral(code, &i)) continue;
         if (types.isMultilineOpenerAt(code, i)) return null;
         if (!isIdent(code[i])) {
             i += 1;
             continue;
         }
-        const end = identRunEnd(code, i);
-        const paren = skipWhitespace(code, end);
-        if (paren < code.len and code[paren] == '(') {
-            return .{ .start = i, .name_end = end, .open_paren = paren };
-        }
-        i = end;
+        if (identRunCallSite(code, &i)) |site| return site;
+    }
+    return null;
+}
+
+/// The call site of the identifier run at `i.*`, or null when no `(`
+/// follows the run. Either way advances `i` past the run.
+fn identRunCallSite(code: []const u8, i: *usize) ?CallSite {
+    const start = i.*;
+    const end = identRunEnd(code, start);
+    const paren = skipWhitespace(code, end);
+    i.* = end;
+    if (paren < code.len and code[paren] == '(') {
+        return .{ .start = start, .name_end = end, .open_paren = paren };
     }
     return null;
 }
@@ -22628,18 +22669,8 @@ fn splitTopLevelArgs(args: []const u8, out: *[4][]const u8) usize {
     var i: usize = 0;
     while (i < args.len) {
         const c = args[i];
-        if (c == '"') {
-            i = skipPastString(args, i);
-            continue;
-        }
-        if (c == '\'') {
-            i = skipPastChar(args, i);
-            continue;
-        }
-        if (c == '(' or c == '[' or c == '{') depth += 1;
-        if (c == ')' or c == ']' or c == '}') {
-            if (depth > 0) depth -= 1;
-        }
+        if (skipLiteral(args, &i)) continue;
+        depth = updatedBracketDepth(depth, c);
         if (c == ',' and depth == 0 and n < out.len) {
             out[n] = args[start..i];
             n += 1;
@@ -22654,6 +22685,16 @@ fn splitTopLevelArgs(args: []const u8, out: *[4][]const u8) usize {
     return n;
 }
 
+/// Bracket depth after one non-literal byte: openers increment, closers
+/// decrement (clamped at zero — a stray closer never underflows).
+fn updatedBracketDepth(depth: usize, c: u8) usize {
+    if (isOpenBracket(c)) return depth + 1;
+    if (isCloseBracket(c)) {
+        return if (depth > 0) depth - 1 else depth;
+    }
+    return depth;
+}
+
 /// Position of a top-level `==` or `!=` in an expect() argument, skipping
 /// literals and nested expressions (a comparison inside call args is not
 /// the asserted condition).
@@ -22662,23 +22703,18 @@ fn findTopLevelEqOp(args: []const u8) ?usize {
     var i: usize = 0;
     while (i + 1 < args.len) {
         const c = args[i];
-        if (c == '"') {
-            i = skipPastString(args, i);
-            continue;
-        }
-        if (c == '\'') {
-            i = skipPastChar(args, i);
-            continue;
-        }
-        if (c == '(' or c == '[' or c == '{') depth += 1;
-        if (c == ')' or c == ']' or c == '}') {
-            if (depth > 0) depth -= 1;
-        }
-        if (depth == 0 and c == '=' and args[i + 1] == '=') return i;
-        if (depth == 0 and c == '!' and args[i + 1] == '=') return i;
+        if (skipLiteral(args, &i)) continue;
+        depth = updatedBracketDepth(depth, c);
+        if (depth == 0 and isEqOpAt(args, i)) return i;
         i += 1;
     }
     return null;
+}
+
+/// True when an equality operator (`==` or `!=`) starts at `i` — the
+/// caller guarantees `i + 1` is in bounds.
+fn isEqOpAt(args: []const u8, i: usize) bool {
+    return (args[i] == '=' or args[i] == '!') and args[i + 1] == '=';
 }
 
 /// ZT103 message when an expect() argument is trivially true, else null.
@@ -22846,18 +22882,26 @@ fn blankLiteralContents(line: []const u8, buf: []u8) []const u8 {
         // A `\\` opener's tail is string data (EPH-I0671): blank to end of
         // line so tail braces never reach brace tracking.
         if (types.isMultilineOpenerAt(line, i)) {
-            while (i < line.len) : (i += 1) buf[i] = ' ';
+            blankRange(buf, i, line.len);
             break;
         }
-        if (c == '"' or c == '\'') {
-            const end = if (c == '"') skipPastString(line, i) else skipPastChar(line, i);
-            while (i < end) : (i += 1) buf[i] = ' ';
+        const start = i;
+        if (skipLiteral(line, &i)) {
+            // Blank the literal contents AND both quote delimiters.
+            blankRange(buf, start, i);
             continue;
         }
         buf[i] = c;
         i += 1;
     }
     return buf[0..line.len];
+}
+
+/// Blank `buf[start..end]` to spaces (literal content never reaches brace
+/// tracking).
+fn blankRange(buf: []u8, start: usize, end: usize) void {
+    var i = start;
+    while (i < end) : (i += 1) buf[i] = ' ';
 }
 
 /// Chunked literal-blanker for lines longer than the caller's mask buffer
@@ -23127,16 +23171,7 @@ const FnCallFacts = struct {
             try self.ensureFn(allocator, def.name);
             span.sig_parens = 0;
         }
-        var body_open = false;
-        for (forms.blanked) |c| {
-            if (c == '(') span.sig_parens += 1;
-            if (c == ')' and span.sig_parens > 0) span.sig_parens -= 1;
-            if (c == '{' and span.sig_parens == 0) {
-                body_open = true;
-                break;
-            }
-        }
-        if (!body_open) {
+        if (!findBodyOpen(forms.blanked, &span.sig_parens)) {
             // Judge the terminator on the comment-stripped code: a trailing
             // comment must not hide the `;` (EPH-I0755).
             const tc = mem.trim(u8, forms.code, " \t\r");
@@ -23176,6 +23211,26 @@ const FnSpanState = struct {
     depth: usize = 0,
     sig_parens: usize = 0,
 };
+
+/// True when the literal-blanked line opens a fn body: the first `{`
+/// OUTSIDE the signature's parens. `sig_parens` is the carried paren depth
+/// (in/out — a `.{}` default on a wrapped param line stays inside the
+/// signature). The depth is written back on both paths: at the body `{` it
+/// is 0 by construction, and without an open every paren on the line
+/// counts.
+fn findBodyOpen(blanked: []const u8, sig_parens: *usize) bool {
+    var depth = sig_parens.*;
+    for (blanked) |c| {
+        if (c == '(') depth += 1;
+        if (c == ')' and depth > 0) depth -= 1;
+        if (c == '{' and depth == 0) {
+            sig_parens.* = depth;
+            return true;
+        }
+    }
+    sig_parens.* = depth;
+    return false;
+}
 
 /// Brace depth after processing one literal-blanked line.
 fn braceDelta(depth: usize, blanked: []const u8) usize {
@@ -23267,22 +23322,37 @@ fn lieStateFromStringName(
     if (close < 2 or rest[close - 1] != '"') return state;
     const inner = rest[1 .. close - 1];
     state.name = inner;
+    collectLieCandidates(inner, facts, &state);
+    return state;
+}
+
+/// Fill the candidate slots from the words of a string-form test name.
+fn collectLieCandidates(
+    inner: []const u8,
+    facts: *const FnCallFacts,
+    state: *LieTestState,
+) void {
     var pos: usize = 0;
     while (pos < inner.len and state.candidate_count < max_lie_candidates) {
         if (!isIdent(inner[pos])) {
             pos += 1;
             continue;
         }
-        var end = pos;
-        while (end < inner.len and isIdent(inner[end])) end += 1;
-        const word = inner[pos..end];
-        pos = end;
+        const word = inner[pos..identWordEnd(inner, pos)];
+        pos += word.len;
         if (!looksLikeCodeRef(word)) continue;
         if (!facts.callees.contains(word) or facts.excluded.contains(word)) continue;
         state.candidates[state.candidate_count] = word;
         state.candidate_count += 1;
     }
-    return state;
+}
+
+/// End of the identifier word at `start` (no dots — a dotted path
+/// contributes each segment as its own candidate word).
+fn identWordEnd(text: []const u8, start: usize) usize {
+    var end = start;
+    while (end < text.len and isIdent(text[end])) end += 1;
+    return end;
 }
 
 /// Extract ZT101 state from a test opener line (`t` starts with "test "):
@@ -24249,44 +24319,57 @@ fn collectUntestedFnIdents(
 ) !void {
     var i: usize = 0;
     while (i < code.len) {
-        const c = code[i];
-        if (c == '"') {
-            i = skipPastString(code, i);
-            continue;
-        }
-        if (c == '\'') {
-            i = skipPastChar(code, i);
-            continue;
-        }
-        if (c == '@') {
+        if (skipLiteral(code, &i)) continue;
+        if (code[i] == '@') {
             const next = try collectQuotedIdentEvidence(ctx, code, i, in_test_context) orelse
                 (i + 1);
             i = next;
             continue;
         }
-        if (!isIdent(c)) {
+        if (!isIdent(code[i])) {
             i += 1;
             continue;
         }
-        const end = identRunEnd(code, i);
-        const paren = skipWhitespace(code, end);
-        const is_call = paren < code.len and code[paren] == '(';
-        // A bare `.field` run is a struct-literal LHS/shorthand or an enum
-        // tag — a field name, never a fn value reference (EPH-I0909): it
-        // must not alias a same-named pub fn (`Fs.cwd` suppressed by
-        // `.cwd = .{...}` literals). Field-ACCESS dots (after `)`, `]`,
-        // `}`, a literal, a digit, `*`, `?`, or a continuation-line base —
-        // EPH-I0911, EPH-I0913) stay conservative — the field may hold a
-        // fn value (`@import("row.zig").neverExtendBg`).
-        const is_bare_field = i > 0 and code[i - 1] == '.' and
-            !isFieldAccessDot(code, i - 1, prev_tail);
-        if (in_test_context) {
-            try ctx.evidence.addTestedRun(ctx.allocator, code[i..end]);
-        } else if (!is_bare_field) {
-            try ctx.evidence.addNonTestRun(ctx.allocator, code[i..end], is_call);
-        }
-        i = end;
+        try collectIdentRunEvidence(ctx, code, &i, .{
+            .in_test_context = in_test_context,
+            .prev_tail = prev_tail,
+        });
     }
+}
+
+/// Per-run ZT105 tokenizer inputs that change per line (not part of the
+/// scan ctx): the test-context flag and the previous line's ending token.
+const UntestedRunFlags = struct {
+    in_test_context: bool,
+    prev_tail: LineTail,
+};
+
+/// Record one identifier run's ZT105 evidence and advance `i` past the run.
+fn collectIdentRunEvidence(
+    ctx: *const UntestedFnScanCtx,
+    code: []const u8,
+    i: *usize,
+    flags: UntestedRunFlags,
+) !void {
+    const start = i.*;
+    const end = identRunEnd(code, start);
+    const paren = skipWhitespace(code, end);
+    const is_call = paren < code.len and code[paren] == '(';
+    // A bare `.field` run is a struct-literal LHS/shorthand or an enum
+    // tag — a field name, never a fn value reference (EPH-I0909): it
+    // must not alias a same-named pub fn (`Fs.cwd` suppressed by
+    // `.cwd = .{...}` literals). Field-ACCESS dots (after `)`, `]`,
+    // `}`, a literal, a digit, `*`, `?`, or a continuation-line base —
+    // EPH-I0911, EPH-I0913) stay conservative — the field may hold a
+    // fn value (`@import("row.zig").neverExtendBg`).
+    const is_bare_field = start > 0 and code[start - 1] == '.' and
+        !isFieldAccessDot(code, start - 1, flags.prev_tail);
+    if (flags.in_test_context) {
+        try ctx.evidence.addTestedRun(ctx.allocator, code[start..end]);
+    } else if (!is_bare_field) {
+        try ctx.evidence.addNonTestRun(ctx.allocator, code[start..end], is_call);
+    }
+    i.* = end;
 }
 
 /// Collect the last segments of call targets on one test-block line as
@@ -25163,16 +25246,7 @@ fn updateConcurrencySpan(
     // Scan the literal-blanked line for the body open: paren depth is
     // carried across lines, so a `.{}` default on a wrapped param line
     // stays inside the signature.
-    var body_open = false;
-    for (blanked) |c| {
-        if (c == '(') state.sig_parens += 1;
-        if (c == ')' and state.sig_parens > 0) state.sig_parens -= 1;
-        if (c == '{' and state.sig_parens == 0) {
-            body_open = true;
-            break;
-        }
-    }
-    if (!body_open) {
+    if (!findBodyOpen(blanked, &state.sig_parens)) {
         if (mem.endsWith(u8, tc, ";")) state.pending_fn = false;
         return;
     }

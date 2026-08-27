@@ -25276,13 +25276,6 @@ const ResolvedCall = struct {
 };
 
 /// Record one classified lock-family call into the open fn record (ZC101).
-/// Acquires inside defer context or with discarded results are NOT
-/// scoped ownership for ZC101/ZC102 — they are dropped (a discarded
-/// `_ = file.tryLock(...)` is the hold-till-close file-lock idiom, and a
-/// defer-context acquire cannot be the subject of a coverage verdict).
-/// Releases are split deferred vs plain for the coverage cascade.
-/// Deferred releases are attributed the defer STATEMENT's depth;
-/// plain releases keep their call-site depth.
 fn recordLockCall(
     state: *ConcurrencyScanState,
     lc: ConcLineCtx,
@@ -25291,31 +25284,55 @@ fn recordLockCall(
 ) !void {
     const rec = state.current();
     switch (kind) {
-        .acquire => {
-            const acq: LockAcquire = .{
-                .line = lc.line_num,
-                .col = call.start + 1,
-                .receiver = call.receiver,
-                .method = call.seg,
-                .depth = call.depth,
-                .cond_position = isCondPosition(lc.blanked, call.start),
-            };
-            if (lc.defer_ctx or isDiscardedAcquire(lc.code, call.start)) return;
-            try rec.acquires.append(state.allocator, acq);
-        },
-        .release => {
-            const list = if (lc.defer_ctx) &rec.defer_releases else &rec.plain_releases;
-            const depth = if (lc.defer_ctx) lc.defer_attr_depth else call.depth;
-            try list.append(state.allocator, .{
-                .line = lc.line_num,
-                .col = call.start + 1,
-                .receiver = call.receiver,
-                .method = call.seg,
-                .depth = depth,
-            });
-        },
+        .acquire => try recordAcquireLock(rec, lc, call, state.allocator),
+        .release => try recordReleaseLock(rec, lc, call, state.allocator),
         .other => {},
     }
+}
+
+/// Record one lock-family acquire (recordLockCall): the ZC101 lock record
+/// with the condition-position verdict. Acquires inside defer context or
+/// with discarded results are NOT scoped ownership for ZC101/ZC102 —
+/// they are dropped (a discarded `_ = file.tryLock(...)` is the
+/// hold-till-close file-lock idiom, and a defer-context acquire cannot
+/// be the subject of a coverage verdict).
+fn recordAcquireLock(
+    rec: *FnLockRecord,
+    lc: ConcLineCtx,
+    call: ResolvedCall,
+    allocator: Allocator,
+) !void {
+    const acq: LockAcquire = .{
+        .line = lc.line_num,
+        .col = call.start + 1,
+        .receiver = call.receiver,
+        .method = call.seg,
+        .depth = call.depth,
+        .cond_position = isCondPosition(lc.blanked, call.start),
+    };
+    if (lc.defer_ctx or isDiscardedAcquire(lc.code, call.start)) return;
+    try rec.acquires.append(allocator, acq);
+}
+
+/// Record one lock-family release (recordLockCall). Releases are split
+/// deferred vs plain for the coverage cascade: deferred releases are
+/// attributed the defer STATEMENT's depth, plain releases keep their
+/// call-site depth.
+fn recordReleaseLock(
+    rec: *FnLockRecord,
+    lc: ConcLineCtx,
+    call: ResolvedCall,
+    allocator: Allocator,
+) !void {
+    const list = if (lc.defer_ctx) &rec.defer_releases else &rec.plain_releases;
+    const depth = if (lc.defer_ctx) lc.defer_attr_depth else call.depth;
+    try list.append(allocator, .{
+        .line = lc.line_num,
+        .col = call.start + 1,
+        .receiver = call.receiver,
+        .method = call.seg,
+        .depth = depth,
+    });
 }
 
 /// First argument text of the call at `open_paren` (ZC101, EPH-I0903):
@@ -25356,10 +25373,17 @@ fn isCondPosition(blanked: []const u8, call_start: usize) bool {
         if (blanked[i] == ')') depth -= 1;
     }
     if (depth != 0) return false;
-    // A block must open after the condition's close parens. Enclosing
-    // groups may close in between (`if (a and (mu.tryLock())) {`), and
-    // for the direct shape the call's own close IS the guard's close.
+    return guardBlockOpens(blanked, i, call_start);
+}
+
+/// True when a `{` follows the guard's close at `from` (isCondPosition):
+/// enclosing groups may close in between (`if (a and (mu.tryLock())) {`),
+/// and for the direct shape the call's own close IS the guard's close.
+/// The block must follow the ENCLOSING condition's close: a `{` inside a
+/// still-open helper group is an argument shape, never a guard block.
+fn guardBlockOpens(blanked: []const u8, from: usize, call_start: usize) bool {
     var guard_depth: i32 = 0;
+    var i = from;
     while (i < blanked.len) : (i += 1) {
         const c = blanked[i];
         if (c == ' ' or c == '\t') continue;
@@ -25471,36 +25495,54 @@ fn skipBlockComment(t: []const u8, i: usize) usize {
 fn deferKeywordPos(t: []const u8) ?usize {
     var i: usize = 0;
     while (i < t.len) {
-        const c = t[i];
-        // Skip literal content so prose holding the word `defer` cannot
-        // match: a string or char literal, a `\\` multiline opener (the
-        // rest of the line is string content), or a comment.
-        if (c == '"' or c == '\'') {
-            i = if (c == '"') skipPastString(t, i) else skipPastChar(t, i);
+        if (deferScanEnds(t, i)) return null;
+        if (skipDeferLiteral(t, i)) |next| {
+            i = next;
             continue;
         }
-        if (types.isMultilineOpenerAt(t, i)) return null;
-        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') return null;
-        if (c == '/' and i + 1 < t.len and t[i + 1] == '*') {
-            i = skipBlockComment(t, i);
-            continue;
-        }
-        if (c != 'd' and c != 'e') {
-            i += 1;
-            continue;
-        }
-        const kw = if (c == 'd') "defer" else "errdefer";
-        const kw_end = i + kw.len;
-        if (kw_end <= t.len and mem.startsWith(u8, t[i..], kw) and
-            (kw_end == t.len or t[kw_end] == ' ' or t[kw_end] == '\t' or
-                t[kw_end] == '{') and (i == 0 or !isIdent(t[i - 1])) and
-            deferOpensStatement(t, i))
-        {
-            return i;
-        }
+        if (deferKeywordAt(t, i)) return i;
         i += 1;
     }
     return null;
+}
+
+/// True when the defer scan must end at `i` without a match: a `\\`
+/// multiline opener (the rest of the line is string content) or a line
+/// comment. String and char literals still skip, so prose holding the
+/// word `defer` is never a defer statement.
+fn deferScanEnds(t: []const u8, i: usize) bool {
+    if (types.isMultilineOpenerAt(t, i)) return true;
+    return t[i] == '/' and i + 1 < t.len and t[i + 1] == '/';
+}
+
+/// New scan index when `i` opens a literal or block comment, else null:
+/// a string or char literal skips to its close, a `/* */` comment skips
+/// past the closer (the line end when unterminated).
+fn skipDeferLiteral(t: []const u8, i: usize) ?usize {
+    if (t[i] == '"') return skipPastString(t, i);
+    if (t[i] == '\'') return skipPastChar(t, i);
+    if (t[i] == '/' and i + 1 < t.len and t[i + 1] == '*') return skipBlockComment(t, i);
+    return null;
+}
+
+/// True when a `defer`/`errdefer` keyword starts at `i`: the word
+/// matches, a token boundary follows on both sides, and the statement
+/// position holds. A byte that is not 'd'/'e' fails the word match.
+fn deferKeywordAt(t: []const u8, i: usize) bool {
+    const kw = if (t[i] == 'd') "defer" else "errdefer";
+    const kw_end = i + kw.len;
+    if (kw_end > t.len or !mem.startsWith(u8, t[i..], kw)) return false;
+    if (!deferKeywordBoundary(t, kw_end, i)) return false;
+    return deferOpensStatement(t, i);
+}
+
+/// True when the defer keyword at [i..kw_end] is token-bounded: the
+/// line end, whitespace, or a body `{` follows, and no identifier char
+/// precedes (a keyword glued to an identifier — `undefer` — is part of
+/// that word).
+fn deferKeywordBoundary(t: []const u8, kw_end: usize, i: usize) bool {
+    return (kw_end == t.len or t[kw_end] == ' ' or t[kw_end] == '\t' or
+        t[kw_end] == '{') and (i == 0 or !isIdent(t[i - 1]));
 }
 
 /// True when the keyword at `pos` opens a statement: the preceding
@@ -25956,6 +25998,22 @@ fn onWalkClose(walk: *DoubleLockWalk, c: BlockClose) void {
     }
 }
 
+/// Apply one lock event to the ZC102 walk (evaluateDoubleLock).
+fn applyLockEvent(walk: *DoubleLockWalk, ev: LockEvent) !void {
+    switch (ev) {
+        .acquire => |acq| try onWalkAcquire(walk, acq),
+        .plain_rel => |rel| onWalkPlainRelease(walk, rel),
+        .defer_rel => |rel| try onWalkDeferRelease(walk, rel),
+        .close => |c| onWalkClose(walk, c),
+        // Nested-fn boundary: the body that follows is an independent
+        // flow — a lock is never held across a fn boundary (mach
+        // Objects type factory: tryLock/lock/unlock wrapper methods).
+        // An outer-fn hold suspended through the nested region is not
+        // restored — accepted FN, documented in EPH-I0036.
+        .boundary => walk.held.clearRetainingCapacity(),
+    }
+}
+
 /// ZC102: walk one fn's lock events in source order, tracking per-receiver
 /// held state. A blocking acquire while the receiver is held on the same
 /// linear path (or on overlapping paths once the hold is path-
@@ -25966,20 +26024,7 @@ fn evaluateDoubleLock(sink: *const ConcurrencyIssueSink, rec: *const FnLockRecor
     defer events.deinit(sink.allocator);
     var walk: DoubleLockWalk = .{ .sink = sink };
     defer walk.deinit(sink.allocator);
-    for (events.items) |ev| {
-        switch (ev) {
-            .acquire => |acq| try onWalkAcquire(&walk, acq),
-            .plain_rel => |rel| onWalkPlainRelease(&walk, rel),
-            .defer_rel => |rel| try onWalkDeferRelease(&walk, rel),
-            .close => |c| onWalkClose(&walk, c),
-            // Nested-fn boundary: the body that follows is an independent
-            // flow — a lock is never held across a fn boundary (mach
-            // Objects type factory: tryLock/lock/unlock wrapper methods).
-            // An outer-fn hold suspended through the nested region is not
-            // restored — accepted FN, documented in EPH-I0036.
-            .boundary => walk.held.clearRetainingCapacity(),
-        }
-    }
+    for (events.items) |ev| try applyLockEvent(&walk, ev);
 }
 
 /// The conditional try-acquire matching this release, if any (ZC103):
@@ -26537,7 +26582,6 @@ const IdentUseIndex = struct {
         code: []const u8,
         line_num: usize,
     ) !void {
-        const alloc = arena.allocator();
         var cls = LineClassifier.init(code);
         var i: usize = 0;
         while (i < code.len) {
@@ -26553,13 +26597,7 @@ const IdentUseIndex = struct {
             // declaration's own-line use. The direct scan applies the
             // same rule, so index and oracle agree.
             const map = if (isMemberAccessAt(code, start)) &self.member_map else &self.map;
-            // Dupe before getOrPut: a committed slot always holds an owned
-            // key. A redundant dupe for an existing key stays unreachable
-            // arena memory, reclaimed at deinit.
-            const owned = try alloc.dupe(u8, code[start..i]);
-            const gop = try map.getOrPut(alloc, owned);
-            if (!gop.found_existing) gop.value_ptr.* = .empty;
-            try gop.value_ptr.append(alloc, line_num);
+            try recordRun(map, arena, code[start..i], line_num);
         }
     }
 
@@ -26589,6 +26627,23 @@ const IdentUseIndex = struct {
         return total;
     }
 };
+
+/// Record one identifier occurrence into `map` (IdentUseIndex.scanCode).
+/// Dupe before getOrPut: a committed slot always holds an owned key. A
+/// redundant dupe for an existing key stays unreachable arena memory,
+/// reclaimed at deinit.
+fn recordRun(
+    map: *std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)),
+    arena: *std.heap.ArenaAllocator,
+    name: []const u8,
+    line_num: usize,
+) !void {
+    const alloc = arena.allocator();
+    const owned = try alloc.dupe(u8, name);
+    const gop = try map.getOrPut(alloc, owned);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    try gop.value_ptr.append(alloc, line_num);
+}
 
 /// Extract variable name for unused detection (filters out _ prefix and short names)
 fn extractUnusedDeclName(t: []const u8, is_const: bool) ?[]const u8 {
@@ -27486,26 +27541,56 @@ fn isTypeFactory(sig: []const u8) bool {
     while (i < sig.len) : (i += 1) {
         if (sig[i] == '\n') lit.in_comment = false;
         const pos = lit.updateForChar(sig, i) orelse continue;
-        const c = sig[pos];
-        if (c == '(') {
-            depth += 1;
-            continue;
-        }
-        if (c == '{' and depth == 0) return false;
-        if (c != ')' or depth == 0) continue;
-        depth -= 1;
-        // Only the outermost close may offer the return type. An inner
-        // group close (a fn-pointer param) stays at depth > 0; its
-        // `) type` is the fn-pointer's own return type (EPH-I0457).
-        if (depth != 0) continue;
-        var j = pos + 1;
-        while (j < sig.len and (sig[j] == ' ' or sig[j] == '\t')) j += 1;
-        if (j + 4 > sig.len) continue;
-        if (!mem.eql(u8, sig[j .. j + 4], "type")) continue;
-        if (j + 4 < sig.len and isIdent(sig[j + 4])) continue;
-        return true;
+        const verdict = typeFactoryStep(sig, sig[pos], pos, &depth);
+        if (verdict == .no) return false;
+        if (verdict == .yes) return true;
     }
     return false;
+}
+
+/// One code-position step verdict for the type-factory scan
+/// (isTypeFactory): `.advance` keeps the walk running, `.no` ends it
+/// without a factory (the body `{` at depth 0), `.yes` ends it with one
+/// (`) type` after an outermost close).
+const TypeFactoryVerdict = enum { advance, no, yes };
+
+/// Apply one code-position char to the type-factory scan (isTypeFactory):
+/// parens update `depth`, a body `{` at depth 0 ends the scan without a
+/// factory, and an outermost close offers the return-type marker. Only
+/// the outermost close may offer the return type — an inner group close
+/// (a fn-pointer param) stays at depth > 0 and its `) type` is the
+/// fn-pointer's own return type (EPH-I0457). A close whose suffix is not
+/// the marker keeps the walk running, exactly like the pre-refactor scan
+/// (a later outermost close may still match — reachable only on shapes
+/// where the return type re-opens a group, which valid Zig never emits).
+fn typeFactoryStep(
+    sig: []const u8,
+    c: u8,
+    pos: usize,
+    depth: *usize,
+) TypeFactoryVerdict {
+    if (c == '(') {
+        depth.* += 1;
+        return .advance;
+    }
+    if (c == '{' and depth.* == 0) return .no;
+    if (c != ')' or depth.* == 0) return .advance;
+    depth.* -= 1;
+    if (depth.* != 0) return .advance;
+    if (sigHasTypeMarker(sig, pos + 1)) return .yes;
+    return .advance;
+}
+
+/// True when the return-type marker follows the outermost close paren at
+/// `after_close` (isTypeFactory): whitespace, the word `type`, then a
+/// non-identifier byte or the line end. Matches the one-line convention:
+/// `) type` with one space, identifier-bounded.
+fn sigHasTypeMarker(sig: []const u8, after_close: usize) bool {
+    var j = after_close;
+    while (j < sig.len and (sig[j] == ' ' or sig[j] == '\t')) j += 1;
+    if (j + 4 > sig.len) return false;
+    if (!mem.eql(u8, sig[j .. j + 4], "type")) return false;
+    return j + 4 >= sig.len or !isIdent(sig[j + 4]);
 }
 
 /// True when a callconv(.c)/(.C) mark follows the parameter list of `sig`
@@ -27799,66 +27884,86 @@ fn markCognitiveScope(scan: *BraceScan, state: *ComplexityState) void {
     if (state.nest < 32) state.cog_markers |= @as(u32, 1) << @intCast(state.nest);
 }
 
+/// Apply one code-position brace to the carried complexity state (the
+/// shared brace tracker for trackBraceNesting and elseFamilyNest): an
+/// open routes through applyOpenBrace, a close at a positive depth
+/// through applyCloseBrace. True when the close ended the fn (nest
+/// reached zero).
 fn updateBraceState(
     c: u8,
     is_switch: bool,
     scan: *BraceScan,
     state: *ComplexityState,
 ) bool {
-    if (c == '{') {
-        // EPH-I0811: a `{` right after a code `.` opens an anonymous
-        // struct/array literal — data, not a control-flow block. It adds no
-        // depth; its paired close skips too (LIFO, below). The adjacency is
-        // exact: `.` + `{` is the one literal token, and scan.prev_c only
-        // ever holds code chars. Depths >= 32 cannot be recorded, so the
-        // brace counts there and stays balanced by its real close (mirrors
-        // the prong guard).
-        // EPH-I0820: a named-type literal (Type{ ... }) still counts as a
-        // real open. Adjacency cannot separate it from a block: `else{`
-        // and `catch{` are real blocks whose `{` follows an identifier
-        // char, so a prev_c-is-identifier mask would be unsafe.
-        if (scan.prev_c == '.' and state.nest < 32) {
-            state.lit_opens[state.nest] += 1;
-        } else if (is_switch and scan.first and state.nest < 32) {
-            // EPH-I0451: a switch prong's open brace adds no depth. Skipping
-            // only the open left every block prong at net -1 and ended fns
-            // mid-switch, so the skip is recorded per depth and the matching
-            // close skips too. Only the line's first `{` is the prong's; later
-            // opens on the line are inner braces and count. Depths >= 32
-            // cannot be recorded, so the brace counts there and stays balanced
-            // by its real close.
-            state.prong_opens[state.nest] += 1;
-        } else {
-            state.nest += 1;
-            if (state.nest > state.max_nest) state.max_nest = state.nest;
-            markCognitiveScope(scan, state);
-        }
-        scan.first = false;
-    }
-    if (c == '}' and state.nest > 0) {
-        // EPH-I0811: a pending literal open pairs first — a literal is
-        // always the innermost open at its depth, so its close arrives
-        // before any prong or control close.
-        if (state.nest < 32 and state.lit_opens[state.nest] > 0) {
-            state.lit_opens[state.nest] -= 1;
-            return false;
-        }
-        // EPH-I0451: closes pair LIFO. A close at a depth with a pending
-        // skipped open matches that open and skips too; inner counted
-        // braces always balance before this close arrives.
-        if (state.nest < 32 and state.prong_opens[state.nest] > 0) {
-            state.prong_opens[state.nest] -= 1;
-            return false;
-        }
-        // Decrement cognitive nesting if this depth was marked cognitive
-        const marked = state.nest < 32 and
-            (state.cog_markers & (@as(u32, 1) << @intCast(state.nest))) != 0;
-        if (marked) state.cog_markers &= ~(@as(u32, 1) << @intCast(state.nest));
-        if (marked and state.cog_nest > 0) state.cog_nest -= 1;
-        state.nest -= 1;
-        if (state.nest == 0) return true;
-    }
+    if (c == '{') applyOpenBrace(is_switch, scan, state);
+    if (c == '}' and state.nest > 0) return applyCloseBrace(state);
     return false;
+}
+
+/// Apply one `{` open (updateBraceState).
+/// EPH-I0811: a `{` right after a code `.` opens an anonymous
+/// struct/array literal — data, not a control-flow block. It adds no
+/// depth; its paired close skips too (LIFO, below). The adjacency is
+/// exact: `.` + `{` is the one literal token, and scan.prev_c only
+/// ever holds code chars. Depths >= 32 cannot be recorded, so the
+/// brace counts there and stays balanced by its real close (mirrors
+/// the prong guard).
+/// EPH-I0820: a named-type literal (Type{ ... }) still counts as a
+/// real open. Adjacency cannot separate it from a block: `else{`
+/// and `catch{` are real blocks whose `{` follows an identifier
+/// char, so a prev_c-is-identifier mask would be unsafe.
+fn applyOpenBrace(is_switch: bool, scan: *BraceScan, state: *ComplexityState) void {
+    if (scan.prev_c == '.' and state.nest < 32) {
+        state.lit_opens[state.nest] += 1;
+    } else if (is_switch and scan.first and state.nest < 32) {
+        // EPH-I0451: a switch prong's open brace adds no depth. Skipping
+        // only the open left every block prong at net -1 and ended fns
+        // mid-switch, so the skip is recorded per depth and the matching
+        // close skips too. Only the line's first `{` is the prong's; later
+        // opens on the line are inner braces and count. Depths >= 32
+        // cannot be recorded, so the brace counts there and stays balanced
+        // by its real close.
+        state.prong_opens[state.nest] += 1;
+    } else {
+        state.nest += 1;
+        if (state.nest > state.max_nest) state.max_nest = state.nest;
+        markCognitiveScope(scan, state);
+    }
+    scan.first = false;
+}
+
+/// Apply one `}` close at a positive depth (updateBraceState), true
+/// when the close ended the fn.
+/// EPH-I0811: a pending literal open pairs first — a literal is
+/// always the innermost open at its depth, so its close arrives
+/// before any prong or control close.
+/// EPH-I0451: closes pair LIFO. A close at a depth with a pending
+/// skipped open matches that open and skips too; inner counted
+/// braces always balance before this close arrives.
+fn applyCloseBrace(state: *ComplexityState) bool {
+    if (state.nest < 32 and state.lit_opens[state.nest] > 0) {
+        state.lit_opens[state.nest] -= 1;
+        return false;
+    }
+    if (state.nest < 32 and state.prong_opens[state.nest] > 0) {
+        state.prong_opens[state.nest] -= 1;
+        return false;
+    }
+    return closeMarkedBrace(state);
+}
+
+/// Close one real (non-skipped) brace: decrement the cognitive marker
+/// when this depth was marked, then report whether the close ended the
+/// fn (nest reached zero).
+fn closeMarkedBrace(state: *ComplexityState) bool {
+    if (state.nest < 32 and
+        (state.cog_markers & (@as(u32, 1) << @intCast(state.nest))) != 0)
+    {
+        state.cog_markers &= ~(@as(u32, 1) << @intCast(state.nest));
+        if (state.cog_nest > 0) state.cog_nest -= 1;
+    }
+    state.nest -= 1;
+    return state.nest == 0;
 }
 
 /// Shared reporting context for complexity accumulation (keeps ≤4 params)
@@ -28609,54 +28714,55 @@ fn checkConstDeclName(
     var name_col: usize = undefined;
     const name = declNameAt(t, kw_pos + "const".len, &name_end, &name_col) orelse return;
     if (name[0] == '_') return;
-
-    // The classification sees only THIS declaration: its own `=` (the
-    // first at or after the name) and its own RHS (up to the next
-    // top-level `;` or end of line). A line can carry several
-    // declarations, and whole-line classification let a neighbor's RHS
-    // classify the checked decl — `const x = struct {}; const good = 2;`
-    // fired on good, and `const a = 1; const X = struct {};` fired on a
-    // (EPH-I0896). A declaration without its own `=` has no RHS to
-    // classify: the empty segment reads as a plain value.
-    const eq_rel = mem.indexOf(u8, t[name_end..], "=");
-    const decl_seg = if (eq_rel) |eq|
-        t[name_end..findDeclEnd(t, name_end + eq)]
-    else
-        t[name_end..];
-
-    // Cheap line-only classification first. The multi-line closure check is
-    // expensive (byte-scans the full type body), so only run it on
-    // declarations that look like type defs AND would actually be reported
-    // for naming.
-    if (isTypeDefinitionLine(decl_seg)) {
-        if (isTitleCase(name)) return;
-        // Non-TitleCase name on a type-looking line — check if it is actually a
-        // closure-wrapping function alias (`const x = struct { fn ... }.call;`).
-        if (!isClosureFunctionAlias(decl_seg, content, t_start + name_end)) {
-            try reportNamingIssue(ctx.issues, ctx.allocator, .{
-                .path = ctx.path,
-                .line = ctx.line_num,
-                .col = name_col,
-                .kind = "type",
-                .name = name,
-                .expected = "TitleCase",
-            });
-            return;
-        }
-        if (isCamelCase(name)) return;
-        try reportNaming(ctx, .{
-            .col = name_col,
-            .kind = "function",
-            .name = name,
-            .expected = "camelCase",
-        });
+    // The classification sees only THIS declaration (declSegmentAt): a
+    // line can carry several declarations, and whole-line classification
+    // let a neighbor's RHS classify the checked decl — `const x = struct
+    // {}; const good = 2;` fired on good, and `const a = 1; const X =
+    // struct {};` fired on a (EPH-I0896).
+    const decl_seg = declSegmentAt(t, name_end);
+    if (!isTypeDefinitionLine(decl_seg)) {
+        try checkExemptConstName(ctx, decl_seg, name, name_col);
         return;
     }
-    // The exemption path classifies per-segment too: the @import and
-    // function-alias exemptions must not read a same-line neighbor's RHS
-    // (`const a = @import("x"); const badName = 1;` fires on badName,
-    // `const x = mod.myAlias; const myAlias = 1;` fires on myAlias —
-    // EPH-I0897, EPH-I0898).
+    // Cheap line-only classification first. The multi-line closure check
+    // is expensive (byte-scans the full type body), so only run it on
+    // declarations that look like type defs AND would actually be
+    // reported for naming.
+    if (isTitleCase(name)) return;
+    // Non-TitleCase name on a type-looking line — check if it is
+    // actually a closure-wrapping function alias
+    // (`const x = struct { fn ... }.call;`).
+    if (!isClosureFunctionAlias(decl_seg, content, t_start + name_end)) {
+        try reportConstTypeNaming(ctx, name, name_col);
+        return;
+    }
+    try checkConstFnAliasNaming(ctx, name, name_col);
+}
+
+/// The checked declaration's own RHS segment (checkConstDeclName): from
+/// the name's end to the next top-level `;` (findDeclEnd), or to the
+/// line end when the declaration has no `=` or continues on a later
+/// line. The segment's own `=` is the first at or after the name, so a
+/// same-line neighbor's RHS never classifies the checked decl; a
+/// declaration without its own `=` has no RHS to classify — the empty
+/// segment reads as a plain value (EPH-I0896).
+fn declSegmentAt(t: []const u8, name_end: usize) []const u8 {
+    const eq_rel = mem.indexOf(u8, t[name_end..], "=");
+    return if (eq_rel) |eq| t[name_end..findDeclEnd(t, name_end + eq)] else t[name_end..];
+}
+
+/// The exemption path for a non-type const decl (checkConstDeclName):
+/// report a non-conforming name unless the @import or function-alias
+/// exemption holds. The exemptions classify per-segment too — they
+/// must not read a same-line neighbor's RHS (`const a = @import("x");
+/// const badName = 1;` fires on badName, `const x = mod.myAlias; const
+/// myAlias = 1;` fires on myAlias — EPH-I0897, EPH-I0898).
+fn checkExemptConstName(
+    ctx: NamingLineCtx,
+    decl_seg: []const u8,
+    name: []const u8,
+    name_col: usize,
+) !void {
     if (!isValidConstName(decl_seg, name))
         try reportNamingIssue(ctx.issues, ctx.allocator, .{
             .path = ctx.path,
@@ -28666,6 +28772,32 @@ fn checkConstDeclName(
             .name = name,
             .expected = "snake_case",
         });
+}
+
+/// Report a non-TitleCase name on a type-definition line
+/// (checkConstDeclName).
+fn reportConstTypeNaming(ctx: NamingLineCtx, name: []const u8, name_col: usize) !void {
+    try reportNamingIssue(ctx.issues, ctx.allocator, .{
+        .path = ctx.path,
+        .line = ctx.line_num,
+        .col = name_col,
+        .kind = "type",
+        .name = name,
+        .expected = "TitleCase",
+    });
+}
+
+/// Check a closure-wrapping function alias name (checkConstDeclName):
+/// camelCase conforms, anything else reports the function-name
+/// convention.
+fn checkConstFnAliasNaming(ctx: NamingLineCtx, name: []const u8, name_col: usize) !void {
+    if (isCamelCase(name)) return;
+    try reportNaming(ctx, .{
+        .col = name_col,
+        .kind = "function",
+        .name = name,
+        .expected = "camelCase",
+    });
 }
 
 /// End of the declaration whose initializer starts at `eq_pos`: the next
@@ -28678,16 +28810,8 @@ fn findDeclEnd(t: []const u8, eq_pos: usize) usize {
     var i = eq_pos + 1;
     while (i < t.len) : (i += 1) {
         if (lit.updateForChar(t, i) == null) continue;
-        const c = t[i];
-        if (c == '{' or c == '(' or c == '[') {
-            depth += 1;
-            continue;
-        }
-        if (c == '}' or c == ')' or c == ']') {
-            if (depth > 0) depth -= 1;
-            continue;
-        }
-        if (c == ';' and depth == 0) return i;
+        depth = updatedBracketDepth(depth, t[i]);
+        if (t[i] == ';' and depth == 0) return i;
     }
     return t.len;
 }
@@ -28771,42 +28895,76 @@ fn fnReturnsType(t: []const u8, after_name: usize) bool {
 fn checkFnNaming(ctx: NamingLineCtx) !void {
     const t = ctx.t;
     // Extern declaration names are ABI-fixed and can never conform.
-    // `export fn` is NOT exempt — those names are project-chosen identifiers.
-    // The exemption covers the extern declaration itself: a same-line
-    // trailing decl starts its own segment and is still checked
-    // (EPH-I0901).
-    // realTokenPosFrom filters string/comment occurrences and enforces
-    // ident boundaries, so each hit is a real code token.
+    // `export fn` is NOT exempt — those names are project-chosen
+    // identifiers. The exemption covers the extern declaration itself:
+    // a same-line trailing decl starts its own segment and is still
+    // checked (EPH-I0901). realTokenPosFrom filters string/comment
+    // occurrences and enforces ident boundaries, so each hit is a real
+    // code token.
     var from: usize = 0;
     while (realTokenPosFrom(t, "fn", from)) |fn_pos| {
         from = fn_pos + "fn".len;
         if (declIsExternOwned(t, fn_pos)) continue;
-        const start = fn_pos + "fn".len;
-        var name_end: usize = undefined;
-        var name_col: usize = start + 1;
-        const name = declNameAt(t, start, &name_end, &name_col) orelse continue;
-        if (name.len > 0 and name[0] == '_') continue;
-        const returns_type = fnReturnsType(t, name_end);
-        if (returns_type and !isTitleCase(name)) {
-            try reportNamingIssue(ctx.issues, ctx.allocator, .{
-                .path = ctx.path,
-                .line = ctx.line_num,
-                .col = name_col,
-                .kind = "type-returning fn",
-                .name = name,
-                .expected = "TitleCase",
-            });
-        } else if (!returns_type and !isCamelCase(name)) {
-            try reportNamingIssue(ctx.issues, ctx.allocator, .{
-                .path = ctx.path,
-                .line = ctx.line_num,
-                .col = name_col,
-                .kind = "function",
-                .name = name,
-                .expected = "camelCase",
-            });
-        }
+        const facts = fnNameFacts(t, fn_pos) orelse continue;
+        try checkOneFnName(ctx, t, facts);
     }
+}
+
+/// The name facts of one `fn` declaration at `fn_pos`, or null when the
+/// declaration carries no reportable name: a fn-pointer TYPE
+/// (`*const fn(...)`) fails declNameAt on its `(`, and `_`-prefixed
+/// names are exempt.
+const FnNameFacts = struct {
+    name: []const u8,
+    name_col: usize,
+    name_end: usize,
+};
+
+fn fnNameFacts(t: []const u8, fn_pos: usize) ?FnNameFacts {
+    const start = fn_pos + "fn".len;
+    var name_end: usize = undefined;
+    var name_col: usize = start + 1;
+    const name = declNameAt(t, start, &name_end, &name_col) orelse return null;
+    if (name.len > 0 and name[0] == '_') return null;
+    return .{ .name = name, .name_col = name_col, .name_end = name_end };
+}
+
+/// Check one fn name (checkFnNaming): type-returning fns follow
+/// TitleCase, plain fns follow camelCase.
+fn checkOneFnName(ctx: NamingLineCtx, t: []const u8, facts: FnNameFacts) !void {
+    if (fnReturnsType(t, facts.name_end)) {
+        try checkTypeReturningFnName(ctx, facts.name, facts.name_col);
+    } else {
+        try checkPlainFnName(ctx, facts.name, facts.name_col);
+    }
+}
+
+/// Check a type-returning fn name (checkOneFnName): TitleCase conforms,
+/// anything else reports the type-returning convention.
+fn checkTypeReturningFnName(ctx: NamingLineCtx, name: []const u8, name_col: usize) !void {
+    if (isTitleCase(name)) return;
+    try reportNamingIssue(ctx.issues, ctx.allocator, .{
+        .path = ctx.path,
+        .line = ctx.line_num,
+        .col = name_col,
+        .kind = "type-returning fn",
+        .name = name,
+        .expected = "TitleCase",
+    });
+}
+
+/// Check a plain fn name (checkOneFnName): camelCase conforms, anything
+/// else reports the function convention.
+fn checkPlainFnName(ctx: NamingLineCtx, name: []const u8, name_col: usize) !void {
+    if (isCamelCase(name)) return;
+    try reportNamingIssue(ctx.issues, ctx.allocator, .{
+        .path = ctx.path,
+        .line = ctx.line_num,
+        .col = name_col,
+        .kind = "function",
+        .name = name,
+        .expected = "camelCase",
+    });
 }
 
 /// Check error naming against the configured convention (ZA703; default

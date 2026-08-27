@@ -12575,7 +12575,7 @@ fn hasNoFreeAllocatorParameter(lines: []const []const u8) bool {
         // code-position-masked: a `) {` inside a comment or string is
         // data, not the body opener, so a later arena-typed parameter
         // line is still scanned (EPH-I0900).
-        if (findTagInCode(t, ") ", 0) != null and hasCodeChar(t, '{')) break;
+        if (isFnBodyOpenLine(t)) break;
     }
     return false;
 }
@@ -16427,11 +16427,22 @@ const ImportGraph = struct {
                 return err;
             };
             const imports = self.findImportsForPath(current) orelse continue;
-            for (imports) |imp| {
-                const resolved = imp.resolved orelse continue;
-                if (!self.reachable.contains(resolved))
-                    try worklist.append(self.allocator, resolved);
-            }
+            try self.enqueueResolvedImports(&worklist, imports);
+        }
+    }
+
+    /// Append every resolved import of `imports` not yet reachable to the
+    /// worklist. The worklist entries stay borrowed: the reachable set
+    /// owns a dupe of every path it inserts.
+    fn enqueueResolvedImports(
+        self: *ImportGraph,
+        worklist: *std.ArrayListUnmanaged([]const u8),
+        imports: []const ImportInfo,
+    ) !void {
+        for (imports) |imp| {
+            const resolved = imp.resolved orelse continue;
+            if (self.reachable.contains(resolved)) continue;
+            try worklist.append(self.allocator, resolved);
         }
     }
 
@@ -16735,23 +16746,35 @@ const ImportGraph = struct {
         defer dir.close(self.diag.io);
         var iter = dir.iterate();
         while (try iter.next(self.diag.io)) |entry| {
-            if (entry.kind != .directory) continue;
-            if (isSkippableDir(entry.name)) continue;
-            const full = std.fmt.allocPrint(
-                self.allocator,
-                "{s}/{s}",
-                .{ search_dir, entry.name },
-            ) catch continue;
-            defer self.allocator.free(full);
-            if (mem.eql(u8, entry.name, mod_name)) {
-                self.markAllZigFilesReachable(full);
-            } else {
-                self.findAndMarkModuleDir(
-                    full,
-                    mod_name,
-                    depth - 1,
-                ) catch continue;
-            }
+            self.handleModuleDirEntry(search_dir, mod_name, depth, entry);
+        }
+    }
+
+    /// Handle one directory entry during the module-name search. A
+    /// subdirectory recurses one level deeper; a name match marks every
+    /// .zig file under the directory reachable. Void: every failure is
+    /// the skip-entry form (the pre-refactor `catch continue`), and the
+    /// void signature keeps the error set inference acyclic between the
+    /// two mutually recursive functions.
+    fn handleModuleDirEntry(
+        self: *ImportGraph,
+        search_dir: []const u8,
+        mod_name: []const u8,
+        depth: usize,
+        entry: std.Io.Dir.Entry,
+    ) void {
+        if (entry.kind != .directory) return;
+        if (isSkippableDir(entry.name)) return;
+        const full = std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ search_dir, entry.name },
+        ) catch return;
+        defer self.allocator.free(full);
+        if (mem.eql(u8, entry.name, mod_name)) {
+            self.markAllZigFilesReachable(full);
+        } else {
+            self.findAndMarkModuleDir(full, mod_name, depth - 1) catch return;
         }
     }
 
@@ -17154,10 +17177,7 @@ fn collectNoFreeAllocatorNames(
     for (lines[0..sig_limit]) |line| {
         const t = mem.trim(u8, line, " \t\r");
         // Stop scanning once we hit the function body (lines starting with real code)
-        if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ") or
-            mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "if ") or
-            mem.startsWith(u8, t, "return ") or mem.startsWith(u8, t, "try "))
-            break;
+        if (isFnBodyStartLine(t)) break;
         try collectSigArenaParams(a, t, &names);
     }
 
@@ -17167,39 +17187,71 @@ fn collectNoFreeAllocatorNames(
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        if (!(mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var "))) continue;
-        const name = extractVarDeclName(t) orelse continue;
-
-        const init_ctx: NoFreeInitCtx = .{
-            .name = name,
+        const ctx: NoFreeDeclCtx = .{
             .no_free_inits = no_free_inits,
-            .names = &names,
-        };
-        try trackNoFreeTypeInit(a, t, init_ctx);
-
-        // Track local variables named "arena" as no-free allocators:
-        // `const arena = session.arena;`, `const arena = b.allocator;` etc.
-        // Naming a variable "arena" is a strong convention signal in Zig that
-        // it is backed by an arena allocator. False negative risk is near-zero.
-        const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
-        var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
-        if (mem.startsWith(u8, rhs, "try ")) rhs = rhs[4..];
-
-        // Arena-named locals are no-free by convention (ADR-0007): the
-        // name arm matches "arena" exactly, so counter names like
-        // arena_count stay need-free (EPH-I0387).
-        if (!names.contains(name) and isArenaName(name)) try names.put(a, name, {});
-        // Alias tracking for an arena-named var is a no-op (the put above
-        // already covers it): the former skip-continue here was dead.
-
-        const alias_ctx: NoFreeAliasCtx = .{
-            .names = &names,
             .file_fields = file_no_free_fields,
+            .names = &names,
         };
-        try trackAllocatorAlias(a, rhs, name, alias_ctx);
+        try collectNoFreeDeclLine(a, t, ctx);
     }
 
     return names;
+}
+
+/// Bundle for collectNoFreeDeclLine (keeps param count legal).
+const NoFreeDeclCtx = struct {
+    no_free_inits: []const []const u8,
+    file_fields: ?*const std.StringHashMapUnmanaged(void),
+    names: *std.StringHashMapUnmanaged(void),
+};
+
+/// Track one var/const declaration line in the no-free name set: type
+/// init patterns, arena-named locals (ADR-0007), and accessor aliases.
+/// The name extraction subsumes the former const/var prefix guard: it
+/// re-checks the same prefixes and returns null on every line the guard
+/// skipped.
+fn collectNoFreeDeclLine(
+    a: Allocator,
+    t: []const u8,
+    ctx: NoFreeDeclCtx,
+) !void {
+    const name = extractVarDeclName(t) orelse return;
+
+    const init_ctx: NoFreeInitCtx = .{
+        .name = name,
+        .no_free_inits = ctx.no_free_inits,
+        .names = ctx.names,
+    };
+    try trackNoFreeTypeInit(a, t, init_ctx);
+
+    // Track local variables named "arena" as no-free allocators:
+    // `const arena = session.arena;`, `const arena = b.allocator;` etc.
+    // Naming a variable "arena" is a strong convention signal in Zig that
+    // it is backed by an arena allocator. False negative risk is near-zero.
+    const eq_pos = mem.indexOf(u8, t, " = ") orelse return;
+    var rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t");
+    if (mem.startsWith(u8, rhs, "try ")) rhs = rhs[4..];
+
+    // Arena-named locals are no-free by convention (ADR-0007): the
+    // name arm matches "arena" exactly, so counter names like
+    // arena_count stay need-free (EPH-I0387).
+    if (!ctx.names.contains(name) and isArenaName(name)) try ctx.names.put(a, name, {});
+    // Alias tracking for an arena-named var is a no-op (the put above
+    // already covers it): the former skip-continue here was dead.
+
+    const alias_ctx: NoFreeAliasCtx = .{
+        .names = ctx.names,
+        .file_fields = ctx.file_fields,
+    };
+    try trackAllocatorAlias(a, rhs, name, alias_ctx);
+}
+
+/// True when a signature-scan line starts with real code: the function
+/// body has begun and the parameter scan stops.
+fn isFnBodyStartLine(t: []const u8) bool {
+    return mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ") or
+        mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "if ") or
+        mem.startsWith(u8, t, "return ") or mem.startsWith(u8, t, "try ");
 }
 
 const NoFreeAliasCtx = struct {
@@ -17315,15 +17367,33 @@ fn trackAllocatorAlias(
     name: []const u8,
     ctx: NoFreeAliasCtx,
 ) !void {
-    const dot_alloc = mem.indexOf(u8, rhs, ".allocator()") orelse
-        (mem.indexOf(u8, rhs, ".get()") orelse return);
+    const dot_alloc = allocatorAliasDot(rhs) orelse return;
     const source = rhs[0..dot_alloc];
     if (source.len == 0) return;
-    if (isAllIdent(source) and ctx.names.contains(source)) {
-        try ctx.names.put(a, name, {});
+    // Plain ident sources: a tracked source makes the alias no-free, an
+    // untracked one is a no-op (a plain ident has no dotted field form
+    // to try).
+    if (isAllIdent(source)) {
+        if (ctx.names.contains(source)) try ctx.names.put(a, name, {});
         return;
     }
     // Dotted sources: self.arena.allocator(), x.fba.allocator()
+    try trackFieldAlias(a, name, source, ctx);
+}
+
+/// The accessor dot column: `.allocator()` first, then `.get()`.
+fn allocatorAliasDot(rhs: []const u8) ?usize {
+    return mem.indexOf(u8, rhs, ".allocator()") orelse mem.indexOf(u8, rhs, ".get()");
+}
+
+/// Track the alias when the last field of a dotted source is a tracked
+/// name or a file-level no-free field (EPH-I0831).
+fn trackFieldAlias(
+    a: Allocator,
+    name: []const u8,
+    source: []const u8,
+    ctx: NoFreeAliasCtx,
+) !void {
     const last_dot = mem.lastIndexOf(u8, source, ".") orelse return;
     const field = source[last_dot + 1 ..];
     if (field.len == 0) return;
@@ -17353,46 +17423,74 @@ fn collectNoFreeFieldNames(
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-
-        // Match struct field declarations: `field_name: TypePattern`
-        // Must contain `: ` (field declaration syntax) but NOT `const ` or `var `
-        // (those are variable declarations handled by collectNoFreeAllocatorNames)
-        if (mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var ")) continue;
-        if (mem.startsWith(u8, t, "pub const ") or mem.startsWith(u8, t, "pub var ")) continue;
-
-        // Look for `identifier: type_pattern` pattern
-        const colon_pos = mem.indexOf(u8, t, ": ") orelse continue;
-        if (colon_pos == 0) continue;
-
-        // Extract field name (everything before the colon must be a valid identifier)
-        const field_name = t[0..colon_pos];
-        if (field_name.len == 0 or !isAllIdent(field_name)) continue;
-
-        // Check if the type after `: ` matches a no-free allocator type
-        const type_part = mem.trim(u8, t[colon_pos + 2 ..], " \t");
-        var matched = false;
-        for (field_type_patterns) |pat| {
-            if (!mem.startsWith(u8, type_part, pat)) continue;
-            // Verify the match is a complete type (followed by , or = or end)
-            matched = type_part.len == pat.len or
-                type_part[pat.len] == ',' or
-                type_part[pat.len] == ' ' or
-                type_part[pat.len] == '=';
-            if (matched) break;
-        }
-        if (matched) try names.put(a, field_name, {});
-
-        // Name-based heuristic: fields named exactly "arena" (ADR-0007)
-        // with type Allocator/std.mem.Allocator/mem.Allocator are treated as no-free.
-        // In the Zig ecosystem, arena-named Allocator fields are always backed by
-        // ArenaAllocator — naming a GPA-backed allocator "arena" would be a severe
-        // convention violation.
-        const arena_no_free = !names.contains(field_name) and isArenaName(field_name) and
-            isAllocatorType(type_part);
-        if (arena_no_free) try names.put(a, field_name, {});
+        try collectNoFreeFieldLine(a, t, field_type_patterns, &names);
     }
 
     return names;
+}
+
+/// Track one field-declaration line in the no-free field set. Var/const
+/// declarations (including pub-prefixed forms) are not struct fields:
+/// those go through collectNoFreeAllocatorNames.
+fn collectNoFreeFieldLine(
+    a: Allocator,
+    t: []const u8,
+    field_type_patterns: []const []const u8,
+    names: *std.StringHashMapUnmanaged(void),
+) !void {
+    if (varDeclPrefixLen(t) > 0) return;
+
+    // Match struct field declarations: `field_name: TypePattern`
+    const decl = extractFieldDecl(t) orelse return;
+
+    // Check if the type after `: ` matches a no-free allocator type
+    if (matchesNoFreeFieldType(decl.type_part, field_type_patterns))
+        try names.put(a, decl.name, {});
+
+    // Name-based heuristic: fields named exactly "arena" (ADR-0007)
+    // with type Allocator/std.mem.Allocator/mem.Allocator are treated as no-free.
+    // In the Zig ecosystem, arena-named Allocator fields are always backed by
+    // ArenaAllocator — naming a GPA-backed allocator "arena" would be a severe
+    // convention violation.
+    const arena_no_free = !names.contains(decl.name) and isArenaName(decl.name) and
+        isAllocatorType(decl.type_part);
+    if (arena_no_free) try names.put(a, decl.name, {});
+}
+
+/// One `name: Type` field declaration split at the first `: `.
+const FieldDecl = struct {
+    name: []const u8,
+    type_part: []const u8,
+};
+
+/// Extract the field name and trimmed type part from a field
+/// declaration line, or null when the line does not carry one: no
+/// `: `, a leading colon, or a non-identifier name.
+fn extractFieldDecl(t: []const u8) ?FieldDecl {
+    // Look for `identifier: type_pattern` pattern
+    const colon_pos = mem.indexOf(u8, t, ": ") orelse return null;
+    if (colon_pos == 0) return null;
+
+    // Extract field name (everything before the colon must be a valid identifier)
+    const field_name = t[0..colon_pos];
+    if (field_name.len == 0 or !isAllIdent(field_name)) return null;
+    const type_part = mem.trim(u8, t[colon_pos + 2 ..], " \t");
+    return .{ .name = field_name, .type_part = type_part };
+}
+
+/// True when `type_part` starts with a no-free field type pattern and
+/// the match is a complete type: the pattern ends the string, or the
+/// next char is a terminator (`,`/` `/`=`).
+fn matchesNoFreeFieldType(type_part: []const u8, pats: []const []const u8) bool {
+    for (pats) |pat| {
+        if (!mem.startsWith(u8, type_part, pat)) continue;
+        // Verify the match is a complete type (followed by , or = or end)
+        if (type_part.len == pat.len or
+            type_part[pat.len] == ',' or
+            type_part[pat.len] == ' ' or
+            type_part[pat.len] == '=') return true;
+    }
+    return false;
 }
 
 /// True when a name marks an arena allocator by convention. Exact match
@@ -17447,29 +17545,39 @@ fn collectNoFreeFieldNamesFromContent(
 /// OR where the segment is named "arena" (name-based cross-file heuristic).
 fn isNoFreeFieldChain(t: []const u8, no_free_fields: *const std.StringHashMapUnmanaged(void)) bool {
     // Find the allocation method position
-    var method_pos: ?usize = null;
-    for (compat.getAllocMethodPatterns()) |pat| {
-        if (mem.indexOf(u8, t, pat)) |pos| {
-            if (method_pos == null or pos < method_pos.?)
-                method_pos = pos;
-        }
-    }
-    const end = method_pos orelse return false;
+    const end = allocMethodPos(t) orelse return false;
     if (end == 0) return false;
 
-    // Walk backwards to extract the full receiver chain (e.g. "self.arena")
-    var start = end;
-    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
-        start -= 1;
-    }
+    // Walk backwards to extract the full receiver chain (e.g. "self.arena").
+    // The chain's last char is `end - 1`, so the receiverChainStart
+    // anchor is `end + 1` (that helper walks from one before the anchor).
+    const start = receiverChainStart(t, end + 1);
     if (start >= end) return false;
     const chain = t[start..end];
 
     // Must be a dotted chain (not just a bare identifier)
     if (mem.indexOf(u8, chain, ".") == null) return false;
 
-    // Check each segment of the chain against known no-free field names
-    // AND against the arena name heuristic (cross-file support)
+    return chainHasNoFreeSegment(chain, no_free_fields);
+}
+
+/// Column of the earliest allocator method pattern occurrence in `t`.
+fn allocMethodPos(t: []const u8) ?usize {
+    var method_pos: ?usize = null;
+    for (compat.getAllocMethodPatterns()) |pat| {
+        if (mem.indexOf(u8, t, pat)) |pos| {
+            if (method_pos == null or pos < method_pos.?) method_pos = pos;
+        }
+    }
+    return method_pos;
+}
+
+/// True when any chain segment is a known no-free field name or is named
+/// exactly "arena" (the cross-file heuristic, ADR-0007).
+fn chainHasNoFreeSegment(
+    chain: []const u8,
+    no_free_fields: *const std.StringHashMapUnmanaged(void),
+) bool {
     var iter_start: usize = 0;
     while (iter_start < chain.len) {
         // Find next dot or end of chain
@@ -17509,43 +17617,66 @@ fn collectAllAllocatorNames(
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        if (!(mem.startsWith(u8, t, "const ") or mem.startsWith(u8, t, "var "))) continue;
-        const name = extractVarDeclName(t) orelse continue;
-
-        // Track variables initialized with known allocator types
-        var init_match = false;
-        for (alloc_inits) |init_pat| {
-            if (mem.indexOf(u8, t, init_pat) == null) continue;
-            init_match = true;
-            break;
-        }
-        if (init_match) try names.put(a, name, {});
-
-        // Track variables assigned global singleton allocators
-        const eq_pos = mem.indexOf(u8, t, " = ") orelse continue;
-        const rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t;");
-        var global_match = false;
-        for (global_allocs) |g| {
-            if (!mem.endsWith(u8, rhs, g)) continue;
-            global_match = true;
-            break;
-        }
-        if (global_match) try names.put(a, name, {});
-
-        // Track .allocator() aliases: const X = Y.allocator()
-        // where Y is any tracked allocator variable
-        var alias_of_tracked = false;
-        if (mem.indexOf(u8, rhs, ".allocator()")) |dp| {
-            const source = rhs[0..dp];
-            alias_of_tracked = source.len > 0 and isAllIdent(source) and names.contains(source);
-        }
-        if (alias_of_tracked) try names.put(a, name, {});
+        const ctx: AllAllocDeclCtx = .{
+            .alloc_inits = alloc_inits,
+            .global_allocs = global_allocs,
+            .names = &names,
+        };
+        try collectAllAllocDeclLine(a, t, ctx);
     }
 
     // Also track function parameters typed as Allocator
     try trackAllocatorParams(a, lines, &names);
 
     return names;
+}
+
+/// Bundle for collectAllAllocDeclLine (keeps param count legal).
+const AllAllocDeclCtx = struct {
+    alloc_inits: []const []const u8,
+    global_allocs: []const []const u8,
+    names: *std.StringHashMapUnmanaged(void),
+};
+
+/// Track one var/const declaration line in the all-allocator name set:
+/// known init patterns, global singleton assignments, and `.allocator()`
+/// aliases of already-tracked names. The name extraction subsumes the
+/// former const/var prefix guard: it re-checks the same prefixes and
+/// returns null on every line the guard skipped.
+fn collectAllAllocDeclLine(
+    a: Allocator,
+    t: []const u8,
+    ctx: AllAllocDeclCtx,
+) !void {
+    const name = extractVarDeclName(t) orelse return;
+
+    // Track variables initialized with known allocator types
+    if (hasAnyInitPattern(t, ctx.alloc_inits)) try ctx.names.put(a, name, {});
+
+    // Track variables assigned global singleton allocators
+    const eq_pos = mem.indexOf(u8, t, " = ") orelse return;
+    const rhs = mem.trim(u8, t[eq_pos + 3 ..], " \t;");
+    if (endsWithGlobalAlloc(rhs, ctx.global_allocs)) try ctx.names.put(a, name, {});
+
+    // Track .allocator() aliases: const X = Y.allocator()
+    // where Y is any tracked allocator variable
+    if (trackedAliasSource(rhs, ctx.names)) try ctx.names.put(a, name, {});
+}
+
+/// True when the rhs ends with a known global singleton allocator name.
+fn endsWithGlobalAlloc(rhs: []const u8, global_allocs: []const []const u8) bool {
+    for (global_allocs) |g| {
+        if (mem.endsWith(u8, rhs, g)) return true;
+    }
+    return false;
+}
+
+/// True when the rhs carries `.allocator()` on a tracked plain-ident
+/// source: `const X = Y.allocator()` with Y already in the name set.
+fn trackedAliasSource(rhs: []const u8, names: *const std.StringHashMapUnmanaged(void)) bool {
+    const dp = mem.indexOf(u8, rhs, ".allocator()") orelse return false;
+    const source = rhs[0..dp];
+    return source.len > 0 and isAllIdent(source) and names.contains(source);
 }
 
 /// Scan the first ~10 lines for parameters typed as Allocator and track them.
@@ -17560,11 +17691,8 @@ fn trackAllocatorParams(
     for (lines[0..@min(10, lines.len)]) |line| {
         const t = mem.trim(u8, line, " \t\r");
         // Parameter with Allocator type: "name: Allocator" or "name: std.mem.Allocator"
-        const colon_pos = mem.indexOf(u8, t, ": Allocator") orelse
-            mem.indexOf(u8, t, ": std.mem.Allocator") orelse
-            mem.indexOf(u8, t, ": *Allocator") orelse
-            mem.indexOf(u8, t, ":Allocator") orelse {
-            if (findTagInCode(t, ") ", 0) != null and hasCodeChar(t, '{')) break;
+        const colon_pos = allocatorParamColon(t) orelse {
+            if (isFnBodyOpenLine(t)) break;
             continue;
         };
         // Extract parameter name (word before the colon); isIdent covers
@@ -17573,8 +17701,23 @@ fn trackAllocatorParams(
         while (start > 0 and isIdent(t[start - 1])) start -= 1;
         if (start < colon_pos) try names.put(a, t[start..colon_pos], {});
         // Stop at function body
-        if (findTagInCode(t, ") ", 0) != null and hasCodeChar(t, '{')) break;
+        if (isFnBodyOpenLine(t)) break;
     }
+}
+
+/// Column of the first Allocator-typed parameter form on the line.
+fn allocatorParamColon(t: []const u8) ?usize {
+    return mem.indexOf(u8, t, ": Allocator") orelse
+        mem.indexOf(u8, t, ": std.mem.Allocator") orelse
+        mem.indexOf(u8, t, ": *Allocator") orelse
+        mem.indexOf(u8, t, ":Allocator");
+}
+
+/// True when the line opens the function body. The probe is
+/// code-position-masked: a `) {` inside a comment or string is data,
+/// not the body opener (EPH-I0900).
+fn isFnBodyOpenLine(t: []const u8) bool {
+    return findTagInCode(t, ") ", 0) != null and hasCodeChar(t, '{');
 }
 
 /// Scan file content to find functions called with no-free allocator arguments.
@@ -17605,15 +17748,15 @@ fn collectNoFreeVars(a: Allocator, content: []const u8) !std.StringHashMapUnmana
         if (isCommentOrMultilineString(t)) continue;
         if (!mem.startsWith(u8, t, "const ") and !mem.startsWith(u8, t, "var ")) continue;
         const name = extractVarDeclName(t) orelse continue;
-        if (hasNoFreeInit(t, no_free_inits)) try vars.put(a, name, {});
+        if (hasAnyInitPattern(t, no_free_inits)) try vars.put(a, name, {});
         try trackNoFreeAllocAlias(a, t, name, &vars);
     }
     return vars;
 }
 
-/// True when the declaration line matches a known no-free allocator init pattern.
-fn hasNoFreeInit(t: []const u8, no_free_inits: []const []const u8) bool {
-    for (no_free_inits) |pat| {
+/// True when the declaration line matches any pattern in `init_pats`.
+fn hasAnyInitPattern(t: []const u8, init_pats: []const []const u8) bool {
+    for (init_pats) |pat| {
         if (mem.indexOf(u8, t, pat) != null) return true;
     }
     return false;
@@ -18482,20 +18625,11 @@ fn registerVarDecl(
             try ctx.var_types.put(a, var_name, type_name);
         }
     }
-    var matched = false;
-    for (pats.container_inits) |init_pat| {
-        if (mem.indexOf(u8, t, init_pat) == null) continue;
-        matched = true;
-        break;
-    }
-    if (!matched) {
-        for (pats.allocator_inits) |init_pat| {
-            if (mem.indexOf(u8, t, init_pat) == null) continue;
-            matched = true;
-            break;
-        }
-    }
-    if (matched) try ctx.stdlib_vars.put(a, var_name, {});
+    // The allocator set probes only when no container init matched, the
+    // pre-refactor short-circuit order.
+    if (hasAnyInitPattern(t, pats.container_inits) or
+        hasAnyInitPattern(t, pats.allocator_inits))
+        try ctx.stdlib_vars.put(a, var_name, {});
 }
 
 fn parseFileTypeContext(a: Allocator, content: []const u8) !TypeContext {
@@ -18619,43 +18753,57 @@ fn noFreeChainAt(
     const pos = mem.indexOf(u8, t, marker) orelse return false;
 
     // Verify what follows is an allocator method (short names from compat layer)
-    const after = t[pos + marker.len ..];
-    var is_alloc_method = false;
-    for (compat.getAllocMethodShortNames()) |short_name| {
-        // Check "methodName(" pattern after the chain marker
-        if (after.len > short_name.len and
-            mem.startsWith(u8, after, short_name) and
-            after[short_name.len] == '(')
-        {
-            is_alloc_method = true;
-            break;
-        }
-    }
-    if (!is_alloc_method) return false;
+    if (!isAllocMethodAfter(t[pos + marker.len ..])) return false;
 
     // Extract source variable/field name before the accessor marker
     var start = pos;
     while (start > 0 and isIdent(t[start - 1])) start -= 1;
-    if (start < pos) {
-        const source = t[start..pos];
-        // Check local variable names (e.g. arena.allocator().alloc())
-        if (no_free_names.contains(source)) return true;
-
-        // Check struct field names (e.g. self.arena.allocator().alloc())
-        if (no_free_fields) |fields| {
-            if (fields.contains(source)) return true;
-        }
-
-        // Name-based heuristic: the immediate source before the accessor
-        // is named exactly "arena" (ADR-0007) — cross-file support.
-        if (isArenaName(source)) return true;
-    }
+    if (start < pos and isNoFreeSource(t[start..pos], no_free_names, no_free_fields))
+        return true;
 
     // Inline no-free inits in the receiver (`std.heap.stackFallback(
     // 4096, a).get().alloc(...)`): the stdlib type pattern is the
     // anchor (EPH-I0831).
+    return hasNoFreeInitBefore(t, pos);
+}
+
+/// True when the text after an accessor marker starts with an allocator
+/// method short name followed by `(`.
+fn isAllocMethodAfter(after: []const u8) bool {
+    for (compat.getAllocMethodShortNames()) |short_name| {
+        // Check "methodName(" pattern after the chain marker
+        if (after.len > short_name.len and
+            mem.startsWith(u8, after, short_name) and
+            after[short_name.len] == '(') return true;
+    }
+    return false;
+}
+
+/// True when the source name before an accessor marker is no-free by
+/// tracking or by the arena-name convention (ADR-0007).
+fn isNoFreeSource(
+    source: []const u8,
+    no_free_names: *const std.StringHashMapUnmanaged(void),
+    no_free_fields: ?*const std.StringHashMapUnmanaged(void),
+) bool {
+    // Check local variable names (e.g. arena.allocator().alloc())
+    if (no_free_names.contains(source)) return true;
+
+    // Check struct field names (e.g. self.arena.allocator().alloc())
+    if (no_free_fields) |fields| {
+        if (fields.contains(source)) return true;
+    }
+
+    // Name-based heuristic: the immediate source before the accessor
+    // is named exactly "arena" (ADR-0007) — cross-file support.
+    return isArenaName(source);
+}
+
+/// True when a no-free init pattern occurs before column `end` (the
+/// inline receiver form, EPH-I0831).
+fn hasNoFreeInitBefore(t: []const u8, end: usize) bool {
     for (compat.getNoFreeInitPatterns()) |init_pat| {
-        if (mem.indexOf(u8, t[0..pos], init_pat) != null) return true;
+        if (mem.indexOf(u8, t[0..end], init_pat) != null) return true;
     }
     return false;
 }

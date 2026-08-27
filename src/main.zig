@@ -4446,6 +4446,20 @@ fn statementEffectPos(
     return no_assign_effect;
 }
 
+/// Fold one bracket char into a carried depth; true when a closing char
+/// brings the depth to exactly zero (the group closed on this line).
+fn bracketGroupClosed(depth: *usize, c: u8) bool {
+    switch (c) {
+        '(', '[', '{' => depth.* += 1,
+        ')', ']', '}' => {
+            depth.* -= 1;
+            return depth.* == 0;
+        },
+        else => {},
+    }
+    return false;
+}
+
 /// Scan one trimmed line for the closing bracket that brings `depth` to
 /// zero, starting at column `start`. Returns the column just past it, or
 /// null when the expression continues past this line. Bracket depth and
@@ -4467,12 +4481,8 @@ fn scanLineForParenClose(
         }
         if (mode.* != .none) continue;
         if (types.isMultilineOpenerAt(t, i)) break;
-        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
-        if (c == '(' or c == '[' or c == '{') depth.* += 1;
-        if (c == ')' or c == ']' or c == '}') {
-            depth.* -= 1;
-            if (depth.* == 0) return i + 1;
-        }
+        if (isLineCommentOpenerAt(t, i)) break;
+        if (bracketGroupClosed(depth, c)) return i + 1;
     }
     return null;
 }
@@ -4610,6 +4620,37 @@ fn hasSliceOccurrence(t: []const u8, var_name: []const u8) bool {
     return false;
 }
 
+/// True when the occurrence at pos has the fill-call target shape: word
+/// boundaries on both sides, not a field of another var (`foo.x`, with
+/// any spacing around the dot — EPH-I0795), and not a slice-index form.
+/// The spacing never changes the verdict here: both return arms of
+/// nextFillCallOccurrence need '&' or '(' immediately left of the name,
+/// so a spaced-dot occurrence falls through either way. Slice-index
+/// occurrences are hasDirectFill Pattern-2 territory — whole-line
+/// coverage — and the `[` bar denies whole-var credit to element-address
+/// call-fills (EPH-I0827 ruling): one element store does not prove
+/// whole-var initialization, and whole-var credit would turn
+/// partial-init reads into silent false negatives — the unsound
+/// direction. The bar costs an over-warn on fill-loop-then-whole-read
+/// shapes, the fail-safe direction. EPH-I0822 gave `&buf[i]` and
+/// `&(buf[i])` spelling parity, so the bar is uniform.
+fn isFillCallOccurrenceShape(t: []const u8, pos: usize, name: []const u8) bool {
+    if (pos > 0 and isIdent(t[pos - 1])) return false;
+    if (hasLeftDot(t, pos)) return false;
+    const end = pos + name.len;
+    if (end < t.len and (isIdent(t[end]) or t[end] == '[')) return false;
+    return true;
+}
+
+/// True when the occurrence at pos is an address-of call form: `&var`
+/// passed as a call argument, or the grouping-paren spelling `&(x)`
+/// (EPH-I0822).
+fn isAddressOfCallForm(t: []const u8, pos: usize) bool {
+    if (pos == 0) return false;
+    if (t[pos - 1] == '&') return true;
+    return t[pos - 1] == '(' and hasAmpBeforeChain(t, pos);
+}
+
 /// Next occurrence of var_name at or after s.* that is a fill-CALL target,
 /// advancing s.* past the matched name. Two classes: `&var` passed as a
 /// call argument (`fill(&x)`, `foo.read(&x)` — the call-fill heuristic
@@ -4628,31 +4669,8 @@ fn nextFillCallOccurrence(t: []const u8, var_name: []const u8, s: *usize) ?usize
     while (mem.indexOf(u8, t[s.*..], var_name)) |rel| {
         const pos = s.* + rel;
         s.* = pos + var_name.len;
-        // The match must be the variable itself: not mid-identifier
-        // (box) and not a field of another var (foo.x, with any spacing
-        // around the dot — EPH-I0795). The spacing never changes the
-        // verdict here: both return arms need '&' or '(' immediately left
-        // of the name, so a spaced-dot occurrence falls through either way.
-        if (pos > 0 and isIdent(t[pos - 1])) continue;
-        if (hasLeftDot(t, pos)) continue;
-        if (pos + var_name.len < t.len and isIdent(t[pos + var_name.len])) continue;
-        // Slice-index occurrences are Pattern-2 — whole-line coverage.
-        // The `[` bar denies whole-var credit to element-address
-        // call-fills (EPH-I0827 ruling): one element store does not
-        // prove whole-var initialization, and whole-var credit would
-        // turn partial-init reads into silent false negatives — the
-        // unsound direction. The bar costs an over-warn on
-        // fill-loop-then-whole-read shapes, the fail-safe direction.
-        // EPH-I0822 gave `&buf[i]` and `&(buf[i])` spelling parity, so
-        // the bar is uniform.
-        if (pos + var_name.len < t.len and t[pos + var_name.len] == '[') continue;
-        // `&var` call argument: the call-fill heuristic writes through the
-        // pointer. The grouping-paren form `&(x)` is the same address-of
-        // (EPH-I0822): the amp-paren bridge carries the verdict. Outside a
-        // call the address escapes untracked.
-        if (pos > 0 and
-            (t[pos - 1] == '&' or (t[pos - 1] == '(' and hasAmpBeforeChain(t, pos))))
-        {
+        if (!isFillCallOccurrenceShape(t, pos, var_name)) continue;
+        if (isAddressOfCallForm(t, pos)) {
             if (unmatchedOpenParenBefore(t, pos - 1)) |open| return open;
             continue;
         }
@@ -4738,6 +4756,38 @@ fn genLoopFill(
     first_effect[bid] = minAssignEffect(first_effect[bid], header_effect);
 }
 
+/// Fold one code-position char into the paren and bracket depths of a
+/// for-header scan. Header braces (`for (o.{ 1, 2 }) |x|`) and
+/// call-argument literals must stay out of the body balance.
+fn foldHeaderDepths(c: u8, paren: *usize, bracket: *usize) void {
+    switch (c) {
+        '(' => paren.* += 1,
+        ')' => paren.* -|= 1,
+        '[' => bracket.* += 1,
+        ']' => bracket.* -|= 1,
+        else => {},
+    }
+}
+
+/// Fold one code-position char into the oneline-loop body depth; returns
+/// the verdict when the char decides the loop's fate on this line:
+/// closed (a depth-0 `;` ends a brace-less body, or the body brace's
+/// `}` balances), or multi-line (a `}` with no body brace on this line —
+/// the body sits on a later line). Null keeps the scan going.
+fn onelineBodyStep(brace_depth: *usize, c: u8) ?bool {
+    if (c == '{') {
+        brace_depth.* += 1;
+        return null;
+    }
+    if (c == ';') {
+        return if (brace_depth.* == 0) true else null;
+    }
+    if (c != '}') return null;
+    if (brace_depth.* == 0) return false;
+    brace_depth.* -= 1;
+    return if (brace_depth.* == 0) true else null;
+}
+
 /// True when the `for` loop that starts on this line completes on the
 /// same line: its braced body closes within the line's code portion
 /// (statements after the close sit outside the loop), or its brace-less
@@ -4759,17 +4809,9 @@ fn hasOnelineLoopClose(t: []const u8) bool {
             i += skip;
             continue;
         }
-        if (c == '(') paren_depth += 1;
-        if (c == ')') paren_depth -|= 1;
-        if (c == '[') bracket_depth += 1;
-        if (c == ']') bracket_depth -|= 1;
+        foldHeaderDepths(c, &paren_depth, &bracket_depth);
         if (paren_depth != 0 or bracket_depth != 0) continue;
-        if (c == '{') brace_depth += 1;
-        if (c == ';' and brace_depth == 0) return true;
-        if (c != '}') continue;
-        if (brace_depth == 0) return false;
-        brace_depth -= 1;
-        if (brace_depth == 0) return true;
+        if (onelineBodyStep(&brace_depth, c)) |verdict| return verdict;
     }
     return false;
 }
@@ -4798,6 +4840,37 @@ const ForLoopTracker = struct {
         }
     }
 
+    /// Net brace delta of one line in code position: a '}' inside a
+    /// string or char literal or a `\\` tail does not count (EPH-I0107,
+    /// EPH-I0751).
+    fn codeBraceDelta(t: []const u8) i32 {
+        var count: i32 = 0;
+        var mode: QuoteMode = .none;
+        var i: usize = 0;
+        while (i < t.len) : (i += 1) {
+            const c = t[i];
+            if (scanQuoteStep(&mode, c)) |skip| {
+                i += skip;
+                continue;
+            }
+            if (types.isMultilineOpenerAt(t, i)) break;
+            if (c == '{') count += 1;
+            if (c == '}') count -= 1;
+        }
+        return count;
+    }
+
+    /// Record the loop-carried fill at this tracker's loop block: the
+    /// loop-header block gens the var, covered from the header's first
+    /// line (the fill replays every iteration).
+    fn recordLoopFill(
+        self: *const ForLoopTracker,
+        gen: []bool,
+        first_effect: []AssignEffect,
+    ) void {
+        if (self.start_bid) |bid| genLoopFill(gen, first_effect, bid, self.start_idx);
+    }
+
     fn checkLoopEnd(self: *ForLoopTracker, t: []const u8, idx: usize) void {
         if (!self.in_loop) return;
         // A one-line loop completes on its start line, so the
@@ -4812,23 +4885,7 @@ const ForLoopTracker = struct {
             return;
         }
         if (mem.indexOf(u8, t, "}") == null) return;
-        // String and char content carries no braces: a '}' inside a
-        // literal must not end the loop early (EPH-I0107). A `\\` opener's
-        // tail is string data for the same reason (EPH-I0751).
-        var brace_count: i32 = 0;
-        var mode: QuoteMode = .none;
-        var i: usize = 0;
-        while (i < t.len) : (i += 1) {
-            const c = t[i];
-            if (scanQuoteStep(&mode, c)) |skip| {
-                i += skip;
-                continue;
-            }
-            if (types.isMultilineOpenerAt(t, i)) break;
-            if (c == '{') brace_count += 1;
-            if (c == '}') brace_count -= 1;
-        }
-        if (brace_count < 0) self.in_loop = false;
+        if (codeBraceDelta(t) < 0) self.in_loop = false;
     }
 
     fn checkIndexedAssign(
@@ -4849,13 +4906,13 @@ const ForLoopTracker = struct {
             // later genuine fill on the same line still counts.
             if (t[end_pos] == '[') {
                 if (classifyBracketUse(t, end_pos) == .read) continue;
-                if (self.start_bid) |bid| genLoopFill(gen, first_effect, bid, self.start_idx);
+                self.recordLoopFill(gen, first_effect);
                 return;
             }
             // Pattern: var_name.field[...] = (field access + indexed)
             // Handles: result.v[col].v[row] = sum
             if (t[end_pos] == '.' and isAssignmentTarget(t, var_name, pos)) {
-                if (self.start_bid) |bid| genLoopFill(gen, first_effect, bid, self.start_idx);
+                self.recordLoopFill(gen, first_effect);
                 return;
             }
         }
@@ -5821,6 +5878,49 @@ fn collectPayloadShadowSpans(
     }
 }
 
+/// True when the line indirectly initializes vn through a modeled
+/// non-indexed form: a method call, an asm output constraint, a
+/// struct-field assignment, a mutable slice pass, or an inline-for
+/// element fill (EPH-I0339). A method call that the fill-verdict layer
+/// already models as a fill at statement precision (`x.init()` or a
+/// marker call carrying `&x`) keeps that treatment instead of the
+/// whole-function drop (EPH-I1173). An unknown method (`x.setup()`) and
+/// the stdlib modifying methods may still initialize through self, so
+/// the drop covers them (the modifying-method FN is the documented
+/// residual).
+fn lineIndirectlyInitializes(
+    t: []const u8,
+    vn: []const u8,
+    field_scan: *FieldAssignScan,
+    in_inline_for: *bool,
+) bool {
+    if (hasMethodCallOnVar(t, vn) and !isMethodFillLine(t, vn))
+        return true;
+    if (hasAsmOutputVar(t, vn)) return true;
+    if (field_scan.step(t, vn)) return true;
+    if (hasSlicePassToFunction(t, vn)) return true;
+    return isInlineForAssignment(t, vn, in_inline_for);
+}
+
+/// True when the line, inside an open for loop, assigns an array element
+/// of vn (`for (...) |...| { ... args[i] = ...; }`). Updates the carried
+/// for-loop depth: an opener line adds its body braces unless the loop
+/// completes on the line — a one-line loop carries no depth into later
+/// lines, and without the guard a post-loop fill reads as loop-carried
+/// and masks a genuine read inside the loop (EPH-I0785).
+fn forLoopIndexAssign(t: []const u8, vn: []const u8, depth: *usize) bool {
+    const opens_for = mem.startsWith(u8, t, "for ") or
+        mem.startsWith(u8, t, "for(");
+    if (opens_for) {
+        if (!hasOnelineLoopClose(t)) depth.* += countCodeChar(t, '{');
+        return false;
+    }
+    if (depth.* == 0) return false;
+    depth.* += countCodeChar(t, '{');
+    depth.* -|= countCodeChar(t, '}');
+    return depth.* > 0 and isArrayIndexAssignment(t, vn);
+}
+
 /// True when the variable is initialized indirectly anywhere in the
 /// body: a method call on it, an asm output constraint, a struct-field
 /// assignment, a mutable slice passed to a call, an inline-for element
@@ -5837,36 +5937,9 @@ fn isIndirectlyInitialized(
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        // A method call that the fill-verdict layer already models as a
-        // fill at statement precision (`x.init()` or a marker call
-        // carrying `&x`) keeps that treatment instead of the
-        // whole-function drop (EPH-I1173). An unknown method
-        // (`x.setup()`) and the stdlib modifying methods may still
-        // initialize through self, so the drop covers them (the
-        // modifying-method FN is the documented residual).
-        if (hasMethodCallOnVar(t, vn) and !isMethodFillLine(t, vn))
+        if (lineIndirectlyInitializes(t, vn, &field_scan, &in_inline_for))
             return true;
-        if (hasAsmOutputVar(t, vn)) return true;
-        if (field_scan.step(t, vn)) return true;
-        if (hasSlicePassToFunction(t, vn)) return true;
-        if (isInlineForAssignment(t, vn, &in_inline_for))
-            return true;
-        // Track for-loop depth and detect array element assignment
-        // inside for loops: for (...) |...| { ... args[i] = ...; }
-        const opens_for = mem.startsWith(u8, t, "for ") or
-            mem.startsWith(u8, t, "for(");
-        if (opens_for) {
-            // A one-line loop completes on its own line and carries no
-            // depth into later lines: without the guard, a post-loop fill
-            // reads as loop-carried and masks a genuine read inside the
-            // loop (EPH-I0785).
-            if (!hasOnelineLoopClose(t)) in_for_loop += countCodeChar(t, '{');
-            continue;
-        }
-        if (in_for_loop == 0) continue;
-        in_for_loop += countCodeChar(t, '{');
-        in_for_loop -|= countCodeChar(t, '}');
-        if (in_for_loop > 0 and isArrayIndexAssignment(t, vn))
+        if (forLoopIndexAssign(t, vn, &in_for_loop))
             return true;
     }
     return false;
@@ -5926,6 +5999,23 @@ fn hasAmpBeforeElem(t: []const u8, vpos: usize) bool {
     return i > 0 and t[i - 1] == '&';
 }
 
+/// True when the occurrence at vpos is a clean slice-pass candidate:
+/// word boundaries on both sides and outside string content
+/// (EPH-I0153). One classifier walk per line, so the classifier is
+/// shared across occurrences.
+fn isCleanSliceOccurrence(
+    t: []const u8,
+    vn: []const u8,
+    vpos: usize,
+    cls: *LineClassifier,
+) bool {
+    if (vpos > 0 and isIdent(t[vpos - 1])) return false;
+    const end = vpos + vn.len;
+    if (end >= t.len) return false;
+    if (isIdent(t[end])) return false;
+    return !cls.isInsideString(vpos);
+}
+
 /// Check if a mutable slice of the variable is passed to a function call.
 /// Pattern: func(var_name[0..]) or func(var_name[0..N])
 /// Passing a mutable slice allows the callee to write into the array,
@@ -5946,43 +6036,20 @@ fn hasSlicePassToFunction(t: []const u8, vn: []const u8) bool {
     var cls = LineClassifier.init(t);
     var pos: usize = 0;
     while (mem.indexOfPos(u8, t, pos, vn)) |vpos| {
-        // Word boundary check before
-        if (vpos > 0 and isIdent(t[vpos - 1])) {
-            pos = vpos + vn.len;
-            continue;
-        }
-        const end = vpos + vn.len;
-        if (end >= t.len) {
-            pos = end;
-            continue;
-        }
-        // Word boundary check after
-        if (isIdent(t[end])) {
-            pos = end;
-            continue;
-        }
-        // Skip if inside string or comment
-        if (cls.isInsideString(vpos)) {
-            pos = end;
-            continue;
-        }
+        pos = vpos + vn.len;
+        if (!isCleanSliceOccurrence(t, vn, vpos, &cls)) continue;
+        // Skip occurrences inside a comment: the line has no slice pass
+        // in code.
         if (findCommentStart(t[0..vpos]) != null) return false;
         // Check for var_name[ pattern (slice creation)
-        if (t[end] != '[') {
-            pos = end;
-            continue;
-        }
+        if (t[pos] != '[') continue;
         // Only an occurrence inside unmatched parens can be an indirect
         // init here. Outside parens the gen-side fill sites adjudicate.
-        if (!isInsideCallArg(t, vpos)) {
-            pos = end;
-            continue;
-        }
+        if (!isInsideCallArg(t, vpos)) continue;
         // Fill-verdict and address-pass forms keep the drop (EPH-I0102).
         // A by-value element occurrence in parens is a read (EPH-I0773).
-        if (classifyBracketUse(t, end) == .fill) return true;
+        if (classifyBracketUse(t, pos) == .fill) return true;
         if (hasAmpBeforeElem(t, vpos)) return true;
-        pos = end;
     }
     return false;
 }
@@ -5996,6 +6063,28 @@ fn isInsideCallArg(t: []const u8, vpos: usize) bool {
     return unmatchedOpenParenBefore(t, vpos) != null;
 }
 
+/// True when the line opens an inline-for loop body.
+fn opensInlineFor(t: []const u8) bool {
+    return mem.startsWith(u8, t, "inline for ") or
+        mem.startsWith(u8, t, "inline for(");
+}
+
+/// True when the line assigns to vn through a field or index access at
+/// the first occurrence of the name.
+fn assignsViaFieldOrIndex(t: []const u8, vn: []const u8) bool {
+    const pos = mem.indexOf(u8, t, vn) orelse return false;
+    const end = pos + vn.len;
+    if (end >= t.len) return false;
+    if (t[end] != '.' and t[end] != '[') return false;
+    return isAssignmentTarget(t, vn, pos);
+}
+
+/// True when the line closes an inline-for body (simplified: a close
+/// brace at line start).
+fn closesInlineFor(t: []const u8) bool {
+    return mem.eql(u8, t, "}") or mem.startsWith(u8, t, "} ");
+}
+
 /// Check if variable is assigned inside an inline for loop
 /// Pattern: inline for (...) |...| { ... var_name.field = ... }
 fn isInlineForAssignment(
@@ -6003,21 +6092,12 @@ fn isInlineForAssignment(
     vn: []const u8,
     in_inline_for: *bool,
 ) bool {
-    if (mem.startsWith(u8, t, "inline for ") or
-        mem.startsWith(u8, t, "inline for("))
-    {
+    if (opensInlineFor(t)) {
         in_inline_for.* = true;
     }
     if (!in_inline_for.*) return false;
-    // Check if variable is being assigned via field/index access
-    if (mem.indexOf(u8, t, vn)) |pos| {
-        const end = pos + vn.len;
-        if (end < t.len and (t[end] == '.' or t[end] == '[')) {
-            if (isAssignmentTarget(t, vn, pos)) return true;
-        }
-    }
-    // Track when inline for ends (simplified: close brace at line start)
-    if (mem.eql(u8, t, "}") or mem.startsWith(u8, t, "} ")) {
+    if (assignsViaFieldOrIndex(t, vn)) return true;
+    if (closesInlineFor(t)) {
         in_inline_for.* = false;
     }
     return false;
@@ -6216,6 +6296,39 @@ fn windowVerdict(
     return .scan;
 }
 
+/// True when a candidate guard-if line in the lookback window assigns
+/// var_name in a block that dominates the read. An else-if arm runs only
+/// when the prior arms fail: its assignment does not dominate a later
+/// plain `if (c)` read. A guard-if gated by a conditional or loop the
+/// read does not share may never run while the read does; the assignment
+/// then does not dominate the read either (EPH-I0329).
+fn windowHasCorrelatedAssignment(
+    lines: []const []const u8,
+    read_idx: usize,
+    guard_cond: []const u8,
+    var_name: []const u8,
+) bool {
+    const cand_start = read_idx -| guard_candidate_window;
+    for (cand_start..read_idx) |i| {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (!hasIfCondition(t, guard_cond)) continue;
+        if (isElseArmOpener(t)) continue;
+        if (!guardDominatesRead(lines, i, read_idx)) continue;
+        if (blockContainsAssignment(lines, i, read_idx, var_name)) return true;
+    }
+    return false;
+}
+
+/// Next hop in the enclosing-if walk: the line of the nearest enclosing
+/// if before search_from, or null when the walk ends at line 0 or finds
+/// no opener.
+fn nextGuardHopLine(lines: []const []const u8, search_from: usize) ?usize {
+    const if_line = findEnclosingIfLine(lines, search_from) orelse return null;
+    if (if_line == 0) return null;
+    return if_line;
+}
+
 /// Check if a variable read at `read_idx` is inside an if-block whose condition
 /// also guards an earlier assignment to the same variable.
 /// Pattern: if (cond) { x = val; } ... if (cond) { use(x); }
@@ -6271,31 +6384,12 @@ fn isCorrelatedGuardRead(
             if (search_from == read_idx) read_col else 0,
         ) orelse break;
 
-        const cand_start = read_idx -| guard_candidate_window;
-        for (cand_start..read_idx) |i| {
-            const t = mem.trim(u8, lines[i], " \t\r");
-            if (isCommentOrMultilineString(t)) continue;
-            if (!hasIfCondition(t, guard_cond)) continue;
-            // An else-if arm runs only when the prior arms fail: its
-            // assignment does not dominate a later plain `if (c)` read.
-            if (isElseArmOpener(t)) continue;
-            // A guard-if gated by a conditional or loop the read does not
-            // share may never run while the read does; the assignment then
-            // does not dominate the read either.
-            if (!guardDominatesRead(lines, i, read_idx)) continue;
-            if (blockContainsAssignment(
-                lines,
-                i,
-                read_idx,
-                var_name,
-            )) return true;
-        }
+        if (windowHasCorrelatedAssignment(lines, read_idx, guard_cond, var_name))
+            return true;
 
         // Walk back further past the if we just found to check
         // outer enclosing ifs
-        const if_line = findEnclosingIfLine(lines, search_from) orelse break;
-        if (if_line == 0) break;
-        search_from = if_line;
+        search_from = nextGuardHopLine(lines, search_from) orelse break;
     }
     return false;
 }
@@ -7523,22 +7617,14 @@ const OnelineIfBody = struct {
     close: usize,
 };
 
-fn onelineIfBodyRegion(t: []const u8) ?OnelineIfBody {
-    const cp = conditionCloseParen(t) orelse return null;
-    // The body brace is the next `{` after the close paren.
-    const after = t[cp + 1 ..];
-    var open: ?usize = null;
-    for (after, 0..) |c, ci| {
-        if (c == '{') {
-            open = cp + 1 + ci;
-            break;
-        }
-    }
-    const o = open orelse return null;
-    // The body region ends at the `}` matching the body brace.
+/// Column of the `}` matching the `{` at open, scanning quote-aware:
+/// string and char content carries no braces. Null when a `\\` multiline
+/// opener cuts the scan — its tail is string data, so the group closes
+/// on a later line (EPH-I0751).
+fn matchingCloseBraceCol(t: []const u8, open: usize) ?usize {
     var depth: usize = 1;
     var mode: QuoteMode = .none;
-    var i: usize = o + 1;
+    var i: usize = open + 1;
     while (i < t.len) : (i += 1) {
         const c = t[i];
         if (scanQuoteStep(&mode, c)) |skip| {
@@ -7552,9 +7638,19 @@ fn onelineIfBodyRegion(t: []const u8) ?OnelineIfBody {
         }
         if (c != '}') continue;
         depth -= 1;
-        if (depth == 0) return .{ .open = o, .close = i };
+        if (depth == 0) return i;
     }
     return null;
+}
+
+fn onelineIfBodyRegion(t: []const u8) ?OnelineIfBody {
+    const cp = conditionCloseParen(t) orelse return null;
+    // The body brace is the next `{` after the close paren.
+    const rel = mem.indexOfScalar(u8, t[cp + 1 ..], '{') orelse return null;
+    const o = cp + 1 + rel;
+    // The body region ends at the `}` matching the body brace.
+    const close = matchingCloseBraceCol(t, o) orelse return null;
+    return .{ .open = o, .close = close };
 }
 
 /// Column of the condition's close paren on an if-opener line: the `)`

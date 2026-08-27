@@ -11808,6 +11808,67 @@ fn bracedBodyExtent(
     return .{ .first = func_line + idx + 1, .last = func_line + close_idx - 1 };
 }
 
+/// One step of the loop-body extent scan: the classification of line
+/// `idx` against the current resume position `pos`. `.skip` advances to
+/// the next line, `.rescan` sets a new position and re-reads the same
+/// line (payload capture or continue tail), and `.done` carries the
+/// bounded extent.
+const LoopLineStep = union(enum) {
+    skip,
+    rescan: AssignEffect,
+    done: ?BodyExtent,
+};
+
+/// The resume position past the header's paren group, or null when the
+/// header line cannot bound the scan.
+fn loopHeaderParenPos(
+    lines: []const []const u8,
+    func_line: usize,
+    header_line: usize,
+) ?AssignEffect {
+    if (header_line < func_line) return null;
+    const hidx = header_line - func_line;
+    if (hidx >= lines.len) return null;
+    const ht = mem.trim(u8, lines[hidx], " \t\r");
+    const open = mem.indexOfScalar(u8, ht, '(') orelse return null;
+    return parenGroupEnd(lines, hidx, open);
+}
+
+/// Classify one line of the loop-body extent scan (loopBodyLineExtent).
+/// Null fails the whole extent (fail open toward silence).
+fn loopBodyLineStep(
+    lines: []const []const u8,
+    idx: usize,
+    pos: AssignEffect,
+    func_line: usize,
+) ?LoopLineStep {
+    const t = mem.trim(u8, lines[idx], " \t\r");
+    if (isCommentOrMultilineString(t)) return .skip;
+    const code = stripLineComment(t);
+    const start: usize = if (idx == pos.line) @min(pos.col, code.len) else 0;
+    const rest = mem.trimStart(u8, code[start..], " \t");
+    if (rest.len == 0) return .skip;
+    const base = code.len - rest.len;
+    if (rest[0] == '|') {
+        // Payload capture: skip to its closing pipe and re-scan the line.
+        // Field writes, not a struct literal: literal braces would read
+        // as depth 4 to ZA302's brace counter.
+        const q = mem.indexOfScalar(u8, rest[1..], '|') orelse return null;
+        return .{ .rescan = .{ .line = idx, .col = base + q + 2 } };
+    }
+    if (rest[0] == ':') {
+        // While/for continue expression: skip its paren group and keep
+        // scanning for the body (EPH-I0749). The group can span lines;
+        // a missing paren yields no extent (fail open toward silence).
+        const g = continueTailEnd(lines, idx, base, rest) orelse return null;
+        return .{ .rescan = .{ .line = g.line, .col = g.col } };
+    }
+    if (rest[0] == '{') return .{ .done = bracedBodyExtent(lines, func_line, idx, base) };
+    // Brace-less body: its statement shares this line (fused) or is this
+    // next-line statement; either way the body spans this line only.
+    return .{ .done = .{ .first = func_line + idx, .last = func_line + idx } };
+}
+
 /// The textual line extent of the loop body whose header ends on
 /// header_line, or null when the extent cannot be bounded (the vote then
 /// stays silent rather than guessing). A braced body spans strictly between
@@ -11841,45 +11902,30 @@ fn loopBodyLineExtent(
     func_line: usize,
     header_line: usize,
 ) ?BodyExtent {
-    if (header_line < func_line) return null;
-    const hidx = header_line - func_line;
-    if (hidx >= lines.len) return null;
-    const ht = mem.trim(u8, lines[hidx], " \t\r");
-    const open = mem.indexOfScalar(u8, ht, '(') orelse return null;
-    var pos = parenGroupEnd(lines, hidx, open) orelse return null;
+    const pos = loopHeaderParenPos(lines, func_line, header_line) orelse return null;
+    return scanLoopBodyExtent(lines, func_line, pos);
+}
+
+/// Walk the body-extent scan from the header's resume position (the loop
+/// of loopBodyLineExtent): classify each line until the body extent
+/// bounds or the scan fails open toward silence.
+fn scanLoopBodyExtent(
+    lines: []const []const u8,
+    func_line: usize,
+    start: AssignEffect,
+) ?BodyExtent {
+    var pos = start;
     var idx = pos.line;
     while (idx < lines.len) : (idx += 1) {
-        const t = mem.trim(u8, lines[idx], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        const code = stripLineComment(t);
-        const start: usize = if (idx == pos.line) @min(pos.col, code.len) else 0;
-        const rest = mem.trimStart(u8, code[start..], " \t");
-        if (rest.len == 0) continue;
-        const base = code.len - rest.len;
-        if (rest[0] == '|') {
-            // Payload capture: skip to its closing pipe and re-scan the line.
-            // Field writes, not a struct literal: literal braces would read
-            // as depth 4 to ZA302's brace counter.
-            const q = mem.indexOfScalar(u8, rest[1..], '|') orelse return null;
-            pos.line = idx;
-            pos.col = base + q + 2;
-            idx -|= 1;
-            continue;
+        const step = loopBodyLineStep(lines, idx, pos, func_line) orelse return null;
+        switch (step) {
+            .skip => {},
+            .rescan => |p| {
+                pos = p;
+                idx -|= 1;
+            },
+            .done => |ext| return ext,
         }
-        if (rest[0] == ':') {
-            // While/for continue expression: skip its paren group and keep
-            // scanning for the body (EPH-I0749). The group can span lines;
-            // a missing paren yields no extent (fail open toward silence).
-            const g = continueTailEnd(lines, idx, base, rest) orelse return null;
-            pos.line = g.line;
-            pos.col = g.col;
-            idx -|= 1;
-            continue;
-        }
-        if (rest[0] == '{') return bracedBodyExtent(lines, func_line, idx, base);
-        // Brace-less body: its statement shares this line (fused) or is this
-        // next-line statement; either way the body spans this line only.
-        return .{ .first = func_line + idx, .last = func_line + idx };
     }
     return null;
 }
@@ -12685,6 +12731,24 @@ fn countBraceBalance(line: []const u8) i32 {
     return balance;
 }
 
+/// True when a candidate defer line at the alloc's indent actually cleans
+/// up: the joined line frees the alloc (real pattern, word-bounded name),
+/// and an errdefer form holds a handoff reference on the success path
+/// (EPH-I0349). The exit-between check ran in the caller.
+fn isValidCleanupLine(
+    joined: []const u8,
+    lines: []const []const u8,
+    check_idx: usize,
+    name: []const u8,
+) bool {
+    if (!hasRealCleanupPattern(joined) or
+        !containsIdentifier(joined, name)) return false;
+    const scan_line = mem.trim(u8, lines[check_idx], " \t\r");
+    if (mem.startsWith(u8, scan_line, "errdefer ") and
+        !hasHandoffReference(lines, check_idx, name)) return false;
+    return true;
+}
+
 /// Check nearby lines after allocation for a matching defer. The defer
 /// counts only when it dominates the alloc's exits: a scope-exit source
 /// (return or try) between the alloc and the defer skips the defer
@@ -12711,13 +12775,9 @@ fn hasNearbyDefer(
         if (check_indent < alloc_indent) break;
         if (!isDeferOrErrdefer(scan_line)) continue;
         if (check_indent != alloc_indent) continue;
-        const joined = joinParenContinuation(lines, check_idx, &join_buf);
-        if (!hasRealCleanupPattern(joined) or
-            !containsIdentifier(joined, name)) continue;
         if (hasExitBetween(lines, alloc_end_idx, check_idx)) continue;
-        if (mem.startsWith(u8, scan_line, "errdefer ") and
-            !hasHandoffReference(lines, check_idx, name)) continue;
-        return true;
+        const joined = joinParenContinuation(lines, check_idx, &join_buf);
+        if (isValidCleanupLine(joined, lines, check_idx, name)) return true;
     }
     return false;
 }
@@ -12751,6 +12811,71 @@ fn isHandoffReferenceLine(
     return containsIdentifier(code, name);
 }
 
+/// What the caller does after one line of the handoff scan
+/// (hasHandoffReference): run the plain reference check, skip it, or stop
+/// with a transfer found.
+const HandoffLineVerdict = enum { check, skip, handoff };
+
+/// Carried state for the handoff scan (hasHandoffReference): the blocked
+/// flag once a return construct closed, the open return construct's paren
+/// and brace depths, the join buffer for the occurrence walk, and the
+/// code-mask buffer.
+const HandoffScanState = struct {
+    blocked: bool = false,
+    ret_paren: i32 = 0,
+    ret_brace: usize = 0,
+    join_buf: [max_join_bytes]u8 = undefined,
+    blank_buf: [16 * 1024]u8 = undefined,
+};
+
+/// Advance the handoff scan across one masked line. Inside an open return
+/// construct the depths advance and a close sets blocked; on a return
+/// opener line the occurrence walk runs first (a direct call argument on
+/// `return try f(x)` transfers), then the construct tracking starts and
+/// the plain reference check is skipped. A blocked line skips the check
+/// too (EPH-I0349 corpus).
+fn advanceHandoffScanLine(
+    t: []const u8,
+    code: []const u8,
+    name: []const u8,
+    state: *HandoffScanState,
+) HandoffLineVerdict {
+    if (state.ret_paren > 0 or state.ret_brace > 0) {
+        state.ret_paren += parenBalance(t);
+        state.ret_brace = computeBraceDepth(t, state.ret_brace);
+        if (state.ret_paren <= 0 and state.ret_brace == 0) state.blocked = true;
+        return .check;
+    }
+    if (!hasRealReturnKeyword(code)) {
+        if (state.blocked) return .skip;
+        return .check;
+    }
+    if (handoffOccurrences("", code, name, &state.join_buf)) return .handoff;
+    state.ret_paren = parenBalance(t);
+    state.ret_brace = computeBraceDepth(t, 0);
+    if (state.ret_paren <= 0 and state.ret_brace == 0) state.blocked = true;
+    return .skip;
+}
+
+/// True when line `idx` hands the alloc off (hasHandoffReference): the
+/// return-construct state advances first, then the verdict routes the
+/// plain reference check.
+fn handoffScanLine(
+    lines: []const []const u8,
+    idx: usize,
+    name: []const u8,
+    state: *HandoffScanState,
+) bool {
+    const t = mem.trim(u8, lines[idx], " \t\r");
+    if (isCommentOrMultilineString(t)) return false;
+    const code = maskedCodeLine(lines[idx], &state.blank_buf);
+    return switch (advanceHandoffScanLine(t, code, name, state)) {
+        .handoff => true,
+        .skip => false,
+        .check => isHandoffReferenceLine(t, code, name),
+    };
+}
+
 /// True when a line after the errdefer mentions the alloc in a
 /// handoff-like position: the success path keeps or hands the value off,
 /// so the errdefer's error-path free covers a real cleanup split. A
@@ -12771,29 +12896,9 @@ fn hasHandoffReference(
     errdefer_idx: usize,
     name: []const u8,
 ) bool {
-    var blank_buf: [16 * 1024]u8 = undefined;
-    var join_buf: [max_join_bytes]u8 = undefined;
-    var blocked = false;
-    var ret_paren: i32 = 0;
-    var ret_brace: usize = 0;
+    var state = HandoffScanState{};
     for (errdefer_idx + 1..lines.len) |idx| {
-        const t = mem.trim(u8, lines[idx], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        const code = maskedCodeLine(lines[idx], &blank_buf);
-        if (ret_paren > 0 or ret_brace > 0) {
-            ret_paren += parenBalance(t);
-            ret_brace = computeBraceDepth(t, ret_brace);
-            if (ret_paren <= 0 and ret_brace == 0) blocked = true;
-        } else if (hasRealReturnKeyword(code)) {
-            if (handoffOccurrences("", code, name, &join_buf)) return true;
-            ret_paren = parenBalance(t);
-            ret_brace = computeBraceDepth(t, 0);
-            if (ret_paren <= 0 and ret_brace == 0) blocked = true;
-            continue;
-        } else if (blocked) {
-            continue;
-        }
-        if (isHandoffReferenceLine(t, code, name)) return true;
+        if (handoffScanLine(lines, idx, name, &state)) return true;
     }
     return false;
 }
@@ -13033,6 +13138,23 @@ fn extractDerefOwnerName(t: []const u8) ?[]const u8 {
     return if (end > 0) t[0..end] else null;
 }
 
+/// Apply one block line to the owner-variable set: a struct-literal owner
+/// binding joins the chain, and a deref-store name does too (EPH-I0900).
+fn trackOwnerLine(
+    ctx: *const DeferCoverageCtx,
+    line_num: usize,
+    owner_vars: *std.ArrayListUnmanaged(OwnerVar),
+) !void {
+    if (line_num < ctx.body.func_line) return;
+    const idx = line_num - ctx.body.func_line;
+    if (idx >= ctx.body.lines.len) return;
+    const t = mem.trim(u8, ctx.body.lines[idx], " \t\r");
+    try tryAddStructLiteralOwner(ctx.allocator, ctx.body.lines, idx, owner_vars);
+    if (!hasOwnerAppearance(owner_vars.items, t)) return;
+    if (extractDerefOwnerName(t)) |name|
+        try tryAddOwner(ctx.allocator, owner_vars, name);
+}
+
 fn trackOwnerVariables(
     ctx: *const DeferCoverageCtx,
     alloc_name: []const u8,
@@ -13043,17 +13165,53 @@ fn trackOwnerVariables(
     for (ctx.cfg.blocks.items) |block| {
         if (block.start_line == 0 or block.start_line > block.end_line) continue;
         for (block.start_line..block.end_line + 1) |line_num| {
-            if (line_num < ctx.body.func_line) continue;
-            const idx = line_num - ctx.body.func_line;
-            if (idx >= ctx.body.lines.len) continue;
-            const t = mem.trim(u8, ctx.body.lines[idx], " \t\r");
-            try tryAddStructLiteralOwner(ctx.allocator, ctx.body.lines, idx, &owner_vars);
-            if (!hasOwnerAppearance(owner_vars.items, t)) continue;
-            if (extractDerefOwnerName(t)) |name|
-                try tryAddOwner(ctx.allocator, &owner_vars, name);
+            try trackOwnerLine(ctx, line_num, &owner_vars);
         }
     }
     return owner_vars;
+}
+
+/// True when the line opens a multi-line return literal that transfers the
+/// tracked owner: `return .{ ... };` / `return Type{ ... };`. The opener
+/// carries no element names, so the continuation lines are scanned
+/// (EPH-I0349 corpus). Both probes are code-position-masked: a `{` inside
+/// a string must not arm the scan, and a `};` inside a comment must not
+/// hide a real opener (EPH-I0900).
+fn returnTupleLineTransfers(scan: DeferScanCtx, t: []const u8, idx: usize) bool {
+    if (mem.startsWith(u8, t, "return ") and
+        hasCodeChar(t, '{') and
+        findTagInCode(t, "};", 0) == null)
+    {
+        for (scan.owner_vars) |ov| {
+            if (returnTupleTransfersHere(scan.lines, idx, ov.name)) return true;
+        }
+    }
+    return false;
+}
+
+/// True when the line transfers the owner var: direct return, guard-style
+/// embedded return (EPH-I0273), labeled break, container/deref/field-store
+/// moves, and managed-pointer handoff (EPH-I0066).
+fn ownerVarTransfers(t: []const u8, scan: DeferScanCtx, idx: usize, ov: OwnerVar) bool {
+    if (!containsIdentifier(t, ov.name)) return false;
+
+    // Direct return of owner variable
+    if (mem.startsWith(u8, t, "return ")) return true;
+
+    // Guard-style embedded return: `if (cond) return ptr;` transfers
+    // ownership on that path (EPH-I0273).
+    if (hasEmbeddedReturnTransfer(t, ov.name)) return true;
+
+    // Labeled break transfers ownership out of a block
+    if (mem.startsWith(u8, t, "break :")) return true;
+
+    if (isContainerTransfer(t, ov.name)) return true;
+    if (isDerefTransfer(t, ov.name)) return true;
+    if (isFieldOrGlobalStore(t, ov.name)) return true;
+    // Managed-pointer handoff into a container method (EPH-I0066)
+    if (scan.managed_ptr and isContainerArgHandoff(t, scan.lines, idx, ov.name))
+        return true;
+    return false;
 }
 
 /// Check if ownership is transferred in a line using owner variables.
@@ -13076,34 +13234,10 @@ fn checkOwnershipInLine(
     // Both probes are code-position-masked: a `{` inside a string must
     // not arm the scan, and a `};` inside a comment must not hide a
     // real opener (EPH-I0900).
-    if (mem.startsWith(u8, t, "return ") and
-        hasCodeChar(t, '{') and
-        findTagInCode(t, "};", 0) == null)
-    {
-        for (scan.owner_vars) |ov| {
-            if (returnTupleTransfersHere(scan.lines, idx, ov.name)) return true;
-        }
-    }
+    if (returnTupleLineTransfers(scan, t, idx)) return true;
 
     for (scan.owner_vars) |ov| {
-        if (!containsIdentifier(t, ov.name)) continue;
-
-        // Direct return of owner variable
-        if (mem.startsWith(u8, t, "return ")) return true;
-
-        // Guard-style embedded return: `if (cond) return ptr;` transfers
-        // ownership on that path (EPH-I0273).
-        if (hasEmbeddedReturnTransfer(t, ov.name)) return true;
-
-        // Labeled break transfers ownership out of a block
-        if (mem.startsWith(u8, t, "break :")) return true;
-
-        if (isContainerTransfer(t, ov.name)) return true;
-        if (isDerefTransfer(t, ov.name)) return true;
-        if (isFieldOrGlobalStore(t, ov.name)) return true;
-        // Managed-pointer handoff into a container method (EPH-I0066)
-        if (scan.managed_ptr and isContainerArgHandoff(t, scan.lines, idx, ov.name))
-            return true;
+        if (ownerVarTransfers(t, scan, idx, ov)) return true;
     }
     return false;
 }
@@ -13178,6 +13312,48 @@ fn hasEmbeddedReturnTransfer(t: []const u8, name: []const u8) bool {
     return false;
 }
 
+/// Next `.free(`/`.destroy(` occurrence column at or after `pos`, or null
+/// when none remains before `code_end` (hasManagedFreeReceiver).
+fn nextManagedFreeDot(t: []const u8, pos: usize, code_end: usize) ?usize {
+    const free_rel = mem.indexOf(u8, t[pos..code_end], ".free(") orelse code_end;
+    const destroy_rel = mem.indexOf(u8, t[pos..code_end], ".destroy(") orelse code_end;
+    const rel = @min(free_rel, destroy_rel);
+    if (rel == code_end) return null;
+    return pos + rel;
+}
+
+/// Start column of the bare identifier before `dot` (the method receiver
+/// candidate), or `dot` when no identifier char precedes
+/// (hasManagedFreeReceiver).
+fn managedFreeReceiverStart(t: []const u8, dot: usize) usize {
+    var start = dot;
+    while (start > 0 and isIdent(t[start - 1])) start -= 1;
+    return start;
+}
+
+/// True when the trimmed line frees `name` through a custom free/destroy
+/// method on the value itself: a `.free(`/`.destroy(` occurrence whose
+/// receiver identifier is `name` and is bare (not `x.name.free(`).
+/// Masked against strings and trailing comments.
+fn managedFreeOnLine(t: []const u8, name: []const u8) bool {
+    const code_end = findCommentStart(t) orelse t.len;
+    var cls = LineClassifier.init(t);
+    var pos: usize = 0;
+    while (pos < code_end) {
+        const dot = nextManagedFreeDot(t, pos, code_end) orelse break;
+        pos = dot + 1;
+        if (cls.isInsideString(dot)) continue;
+        const start = managedFreeReceiverStart(t, dot);
+        if (start == dot) continue;
+        // The receiver must be a bare identifier: a field access
+        // (`x.link.free(`) frees another object's field, which says
+        // nothing about the local's type (review Q1).
+        if (start > 0 and t[start - 1] == '.') continue;
+        if (mem.eql(u8, t[start..dot], name)) return true;
+    }
+    return false;
+}
+
 /// True when the function frees `name` through a custom free/destroy
 /// METHOD on the value itself (`dst_link.free(self.page)`) — the
 /// managed-pointer signal: the value's type owns its memory and hands it
@@ -13190,26 +13366,7 @@ fn hasManagedFreeReceiver(lines: []const []const u8, name: []const u8) bool {
     if (name.len == 0) return false;
     for (lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
-        const code_end = findCommentStart(t) orelse t.len;
-        var cls = LineClassifier.init(t);
-        var pos: usize = 0;
-        while (pos < code_end) {
-            const free_rel = mem.indexOf(u8, t[pos..code_end], ".free(") orelse code_end;
-            const destroy_rel = mem.indexOf(u8, t[pos..code_end], ".destroy(") orelse code_end;
-            const rel = @min(free_rel, destroy_rel);
-            if (rel == code_end) break;
-            const dot = pos + rel;
-            pos = dot + 1;
-            if (cls.isInsideString(dot)) continue;
-            var start = dot;
-            while (start > 0 and isIdent(t[start - 1])) start -= 1;
-            if (start == dot) continue;
-            // The receiver must be a bare identifier: a field access
-            // (`x.link.free(`) frees another object's field, which says
-            // nothing about the local's type (review Q1).
-            if (start > 0 and t[start - 1] == '.') continue;
-            if (mem.eql(u8, t[start..dot], name)) return true;
-        }
+        if (managedFreeOnLine(t, name)) return true;
     }
     return false;
 }
@@ -13301,13 +13458,11 @@ fn handoffOccurrences(
     return false;
 }
 
-/// True when the occurrence at `pos` sits in the argument list of a method
-/// call on a dotted receiver (`x.y.method(`), outside any `{...}` literal
-/// group. The backward walk finds the enclosing call opener: the first
-/// `(` whose depth returns to zero, preceded by `.method` with a dotted
-/// receiver chain. A `{` opening at depth zero before that opener means
-/// the occurrence lives in a tuple literal — no transfer.
-fn enclosesDottedMethodCall(t: []const u8, pos: usize) bool {
+/// Column of the call opener `(` that encloses `pos` at paren/brace depth
+/// zero, or null when no such opener exists. A `{` opening at depth zero
+/// before that opener means the occurrence lives in a tuple literal — no
+/// transfer.
+fn enclosingCallOpener(t: []const u8, pos: usize) ?usize {
     var paren: usize = 0;
     var brace: usize = 0;
     var i = pos;
@@ -13322,7 +13477,7 @@ fn enclosesDottedMethodCall(t: []const u8, pos: usize) bool {
             continue;
         }
         if (t[i] == '{') {
-            if (brace == 0) return false;
+            if (brace == 0) return null;
             brace -= 1;
             continue;
         }
@@ -13331,16 +13486,42 @@ fn enclosesDottedMethodCall(t: []const u8, pos: usize) bool {
             paren -= 1;
             continue;
         }
-        var m = i;
-        while (m > 0 and isIdent(t[m - 1])) m -= 1;
-        if (m == i) return false;
-        if (m == 0 or t[m - 1] != '.') return false;
-        var r = m - 1;
-        while (r > 0 and (isIdent(t[r - 1]) or t[r - 1] == '.')) r -= 1;
-        if (r == m - 1) return false;
-        return mem.indexOf(u8, t[r .. m - 1], ".") != null;
+        return i;
     }
-    return false;
+    return null;
+}
+
+/// Start column of the receiver chain before the `.method` name ending at
+/// `m` (the column before the dot). Nothing walks means no receiver chain:
+/// the start equals `m - 1`.
+fn receiverChainStart(t: []const u8, m: usize) usize {
+    var r = m - 1;
+    while (r > 0 and (isIdent(t[r - 1]) or t[r - 1] == '.')) r -= 1;
+    return r;
+}
+
+/// True when the call opener at column `open` sits on a dotted method
+/// receiver: `x.y.method(` — a bare ident preceded by `.`, whose receiver
+/// chain itself holds at least one `.`. A plain `.method(` fails.
+fn openerHasDottedReceiver(t: []const u8, open: usize) bool {
+    var m = open;
+    while (m > 0 and isIdent(t[m - 1])) m -= 1;
+    if (m == open) return false;
+    if (m == 0 or t[m - 1] != '.') return false;
+    const r = receiverChainStart(t, m);
+    if (r == m - 1) return false;
+    return mem.indexOf(u8, t[r .. m - 1], ".") != null;
+}
+
+/// True when the occurrence at `pos` sits in the argument list of a method
+/// call on a dotted receiver (`x.y.method(`), outside any `{...}` literal
+/// group. The backward walk finds the enclosing call opener: the first
+/// `(` whose depth returns to zero, preceded by `.method` with a dotted
+/// receiver chain. A `{` opening at depth zero before that opener means
+/// the occurrence lives in a tuple literal — no transfer.
+fn enclosesDottedMethodCall(t: []const u8, pos: usize) bool {
+    const open = enclosingCallOpener(t, pos) orelse return false;
+    return openerHasDottedReceiver(t, open);
 }
 
 /// Container ownership transfer: .append(data), .put(key, data)
@@ -13606,6 +13787,111 @@ fn trackDeferBlockDepthLine(is_block_start: bool, t: []const u8, depth: *usize) 
     }
 }
 
+/// Which defer keyword opens on a trimmed line, if any (scanSingleBlock).
+const LineDeferKind = enum { none, defer_kw, errdefer_kw };
+
+fn classifyDeferLine(t: []const u8) LineDeferKind {
+    if (mem.startsWith(u8, t, "errdefer ") or mem.startsWith(u8, t, "errdefer{"))
+        return .errdefer_kw;
+    if (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "defer{"))
+        return .defer_kw;
+    return .none;
+}
+
+/// One line's precomputed defer context for recordFreeLattices.
+const DeferLineFacts = struct {
+    t: []const u8,
+    in_defer_block: bool,
+    in_errdefer_block: bool,
+    has_free: bool,
+};
+
+/// Carried per-line scan state for scanSingleBlock: the two multi-line
+/// defer depths and the block's freed/return-after lattice flags.
+const BlockLineScan = struct {
+    freed: bool = false,
+    return_after: bool = false,
+    defer_depth: usize = 0,
+    errdefer_depth: usize = 0,
+
+    /// Advance the two defer depths from this line's keyword. The opener
+    /// line restarts its depth; every following line contributes its brace
+    /// balance (EPH-I0883, EPH-I0894). The two keywords differ in which
+    /// exit paths their frees cover, so the depths stay separate
+    /// (EPH-I0349).
+    fn applyDeferDepths(self: *BlockLineScan, t: []const u8, kind: LineDeferKind) void {
+        trackDeferBlockDepthLine(
+            kind == .errdefer_kw and hasCodeChar(t, '{'),
+            t,
+            &self.errdefer_depth,
+        );
+        trackDeferBlockDepthLine(
+            kind == .defer_kw and hasCodeChar(t, '{'),
+            t,
+            &self.defer_depth,
+        );
+    }
+
+    /// Record a defer-covered free and a direct free on the block lattices
+    /// (scanSingleBlock). An errdefer free runs only on error exits: it
+    /// covers neither the defer lattice nor the direct-free lattice for
+    /// ZA101/102 (EPH-I0349). A guarded defer keyword on the
+    /// comment-stripped line means the free is a conditional defer: it
+    /// covers only the branch path, so the block must not read as
+    /// directly freed. Comment text is stripped first — a trailing
+    /// comment mentioning `defer` must not flip the verdict (EPH-I0682,
+    /// F6b; review r1 fix 1).
+    fn recordFreeLattices(
+        self: *BlockLineScan,
+        state: *BlockCoverageState,
+        bid: usize,
+        f: DeferLineFacts,
+    ) void {
+        if (f.in_defer_block and f.has_free) state.has_defer[bid] = true;
+        if (!f.in_defer_block and !f.in_errdefer_block and
+            !hasGuardedDeferKeyword(stripLineComment(f.t)) and f.has_free)
+        {
+            self.freed = true;
+            state.has_direct_free[bid] = true;
+        }
+    }
+
+    /// Apply one block line to the defer/free/return/ownership lattices
+    /// (scanSingleBlock).
+    fn apply(
+        self: *BlockLineScan,
+        state: *BlockCoverageState,
+        bid: usize,
+        scan: DeferScanCtx,
+        idx: usize,
+    ) void {
+        const t = mem.trim(u8, scan.lines[idx], " \t\r");
+        const kind = classifyDeferLine(t);
+        self.applyDeferDepths(t, kind);
+        // Join buffer for zig-fmt wrapped frees: the freed var of a
+        // wrapped free sits on a continuation line (EPH-I0351).
+        var join_buf: [max_join_bytes]u8 = undefined;
+        const has_free = lineFreesAlloc(scan, idx, &join_buf);
+        self.recordFreeLattices(state, bid, .{
+            .t = t,
+            .in_defer_block = kind == .defer_kw or self.defer_depth > 0,
+            .in_errdefer_block = kind == .errdefer_kw or self.errdefer_depth > 0,
+            .has_free = has_free,
+        });
+        if (self.freed and mem.startsWith(u8, t, "return")) self.return_after = true;
+        if (checkOwnershipInLine(t, scan, idx))
+            state.ownership_transferred[bid] = true;
+    }
+};
+
+/// True when the joined continuation line frees the tracked alloc
+/// (scanSingleBlock): a real free pattern on the wrapped-joined line with
+/// the alloc's name present (EPH-I0351).
+fn lineFreesAlloc(scan: DeferScanCtx, idx: usize, join_buf: []u8) bool {
+    const ft = joinParenContinuation(scan.lines, idx, join_buf);
+    return hasRealFreePattern(ft) and containsIdentifier(ft, scan.alloc_name);
+}
+
 /// Scan a single CFG block for defer/free/return/ownership patterns
 fn scanSingleBlock(
     state: *BlockCoverageState,
@@ -13613,61 +13899,14 @@ fn scanSingleBlock(
     bid: usize,
     scan: DeferScanCtx,
 ) void {
-    var freed = false;
-    var return_after = false;
-    var defer_depth: usize = 0;
-    var errdefer_depth: usize = 0;
-    // Join buffer for zig-fmt wrapped frees: the freed var of a wrapped
-    // free sits on a continuation line (EPH-I0351).
-    var join_buf: [max_join_bytes]u8 = undefined;
-
+    var line_scan = BlockLineScan{};
     for (block.start_line..block.end_line + 1) |line_num| {
         if (line_num < scan.func_line) continue;
         const idx = line_num - scan.func_line;
         if (idx >= scan.lines.len) continue;
-        const t = mem.trim(u8, scan.lines[idx], " \t\r");
-        const is_errdefer = mem.startsWith(u8, t, "errdefer ") or
-            mem.startsWith(u8, t, "errdefer{");
-        const is_defer = !is_errdefer and
-            (mem.startsWith(u8, t, "defer ") or mem.startsWith(u8, t, "defer{"));
-        // Track multi-line defer/errdefer blocks in separate depths: the
-        // two keywords differ in which exit paths their frees cover
-        // (EPH-I0349).
-        trackDeferBlockDepthLine(
-            is_errdefer and hasCodeChar(t, '{'),
-            t,
-            &errdefer_depth,
-        );
-        trackDeferBlockDepthLine(
-            is_defer and hasCodeChar(t, '{'),
-            t,
-            &defer_depth,
-        );
-        const in_defer_block = is_defer or defer_depth > 0;
-        const in_errdefer_block = is_errdefer or errdefer_depth > 0;
-        const ft = joinParenContinuation(scan.lines, idx, &join_buf);
-        const has_free = hasRealFreePattern(ft) and containsIdentifier(ft, scan.alloc_name);
-
-        if (in_defer_block and has_free) state.has_defer[bid] = true;
-        // An errdefer free runs only on error exits: it covers neither the
-        // defer lattice nor the direct-free lattice for ZA101/102
-        // (EPH-I0349). A guarded defer keyword on the comment-stripped
-        // line means the free is a conditional defer: it covers only the
-        // branch path, so the block must not read as directly freed.
-        // Comment text is stripped first — a trailing comment mentioning
-        // `defer` must not flip the verdict (EPH-I0682, F6b; review r1
-        // fix 1).
-        if (!in_defer_block and !in_errdefer_block and
-            !hasGuardedDeferKeyword(stripLineComment(t)) and has_free)
-        {
-            freed = true;
-            state.has_direct_free[bid] = true;
-        }
-        if (freed and mem.startsWith(u8, t, "return")) return_after = true;
-        if (checkOwnershipInLine(t, scan, idx))
-            state.ownership_transferred[bid] = true;
+        line_scan.apply(state, bid, scan, idx);
     }
-    if (freed and return_after) state.free_and_return[bid] = true;
+    if (line_scan.freed and line_scan.return_after) state.free_and_return[bid] = true;
 }
 
 /// Per-block exit-free-loop marks for the defer-coverage fixpoint
@@ -14471,6 +14710,65 @@ fn propagationCatchAt(t: []const u8, pos: usize) bool {
     return end < t.len and t[end] == ';';
 }
 
+/// Control-brace depth at the alloc's own line, counted from the function
+/// signature line on masked code (strings, char literals, `\\` tails, and
+/// comments never carry braces — EPH-I0369). The scan position resets per
+/// line: scanBraceDepth advances cumulatively and must see each line from
+/// its start (review r1 fix 1).
+fn allocBraceDepth(
+    lines: []const []const u8,
+    alloc_idx: usize,
+    blank_buf: []u8,
+) ?usize {
+    var scan = TransferBraceScan{};
+    for (lines[0 .. alloc_idx + 1]) |line| {
+        const code = maskedCodeLine(line, blank_buf);
+        scan.pos = 0;
+        _ = scanBraceDepth(&scan, code, code.len) orelse return null;
+    }
+    return scan.depth;
+}
+
+/// Carried state for the errdefer transfer walk
+/// (checkErrdeferOwnershipTransfer): the alloc whose coverage the walk
+/// decides, its own brace depth, and the carried brace/tuple scans.
+const ErrdeferWalk = struct {
+    alloc: *TryAlloc,
+    alloc_depth: usize,
+    scan: TransferBraceScan,
+    tuple_scan: ReturnTupleScan,
+
+    /// Apply one post-alloc line: true ends the walk with the coverage
+    /// decided — either a transfer covered, or an uncovered exit found.
+    fn applyLine(self: *ErrdeferWalk, code: []const u8, t: []const u8) bool {
+        const line_depth = self.scan.depth;
+        // A same-line try plus a transfer anchor is an uncovered error exit
+        // whichever comes first: the store form propagates before the store
+        // executes, and the wrapped form (`try list.append(x)`) took
+        // nothing on its error path (EPH-I0307, EPH-I0068).
+        if (uncoveredTryTransferLine(code, t, self.alloc.name)) return true;
+        // A transfer inside a conditional block does not dominate the
+        // alloc's fall-through — keep scanning (EPH-I0368).
+        if (dominatingTransferAt(&self.scan, code, self.alloc.name, self.alloc_depth)) {
+            self.alloc.has_errdefer = true;
+            return true;
+        }
+        // Multi-line `return .{ ... };` tuple: the element transfers at
+        // the depth of the line that carries it (bounded scan).
+        if (checkReturnTupleLine(code, self.alloc.name, &self.tuple_scan) and
+            line_depth <= self.alloc_depth)
+        {
+            self.alloc.has_errdefer = true;
+            return true;
+        }
+        _ = scanBraceDepth(&self.scan, code, code.len) orelse return true;
+        // Error-path exit BEFORE any transfer: ownership has not moved on
+        // this path, so a later transfer cannot cover it. Stop without
+        // marking coverage — ZA103 emission decides from real triggers.
+        return isUncoveredErrorExit(t, self.alloc.name);
+    }
+};
+
 /// Check ownership transfer for errdefer analysis. A transfer covers the
 /// alloc only when it sits at brace depth <= the alloc's own depth: a
 /// transfer inside a deeper block covers only its branch path, so a later
@@ -14503,47 +14801,20 @@ fn checkErrdeferOwnershipTransfer(
     const start = alloc.stmt_end - func_line + 1;
     if (start >= lines.len) return;
 
-    // Control-brace depth at the alloc's own line, counted from the
-    // function signature line on masked code (strings, char literals,
-    // `\\` tails, and comments never carry braces — EPH-I0369). The scan
-    // position resets per line: scanBraceDepth advances cumulatively and
-    // must see each line from its start (review r1 fix 1).
+    // Control-brace depth at the alloc's own line (allocBraceDepth).
     var blank_buf: [16 * 1024]u8 = undefined;
-    var scan = TransferBraceScan{};
-    for (lines[0 .. alloc_idx + 1]) |line| {
-        const code = maskedCodeLine(line, &blank_buf);
-        scan.pos = 0;
-        _ = scanBraceDepth(&scan, code, code.len) orelse return;
-    }
-    const alloc_depth = scan.depth;
+    const alloc_depth = allocBraceDepth(lines, alloc_idx, &blank_buf) orelse return;
 
-    var tuple_scan: ReturnTupleScan = .{};
+    var walk = ErrdeferWalk{
+        .alloc = alloc,
+        .alloc_depth = alloc_depth,
+        .scan = .{},
+        .tuple_scan = .{},
+    };
     for (lines[start..]) |line| {
         const code = maskedCodeLine(line, &blank_buf);
-        scan.pos = 0;
-        const line_depth = scan.depth;
-        // A same-line try plus a transfer anchor is an uncovered error exit
-        // whichever comes first: the store form propagates before the store
-        // executes, and the wrapped form (`try list.append(x)`) took
-        // nothing on its error path (EPH-I0307, EPH-I0068).
-        if (uncoveredTryTransferLine(code, mem.trim(u8, line, " \t\r"), alloc.name)) return;
-        // A transfer inside a conditional block does not dominate the
-        // alloc's fall-through — keep scanning (EPH-I0368).
-        if (dominatingTransferAt(&scan, code, alloc.name, alloc_depth)) {
-            alloc.has_errdefer = true;
-            return;
-        }
-        // Multi-line `return .{ ... };` tuple: the element transfers at
-        // the depth of the line that carries it (bounded scan).
-        if (checkReturnTupleLine(code, alloc.name, &tuple_scan) and line_depth <= alloc_depth) {
-            alloc.has_errdefer = true;
-            return;
-        }
-        _ = scanBraceDepth(&scan, code, code.len) orelse return;
-        // Error-path exit BEFORE any transfer: ownership has not moved on
-        // this path, so a later transfer cannot cover it. Stop without
-        // marking coverage — ZA103 emission decides from real triggers.
-        if (isUncoveredErrorExit(mem.trim(u8, line, " \t\r"), alloc.name)) return;
+        walk.scan.pos = 0;
+        if (walk.applyLine(code, mem.trim(u8, line, " \t\r"))) return;
     }
 }
 
@@ -15998,6 +16269,16 @@ const ImportGraph = struct {
         });
     }
 
+    /// Try to record a const import at content[i], when the position really
+    /// opens a `const X = @import(...)` statement (extractImports).
+    fn recordConstImportAt(self: *ImportGraph, ctx: ConstImportCtx) !void {
+        const not_const = ctx.i + 6 >= ctx.content.len or
+            !mem.eql(u8, ctx.content[ctx.i .. ctx.i + 6], "const ");
+        if (not_const) return;
+        if (!isConstStatementStart(ctx.content, ctx.i)) return;
+        try self.tryRecordConstImport(ctx);
+    }
+
     fn extractImports(
         self: *ImportGraph,
         content: []const u8,
@@ -16006,43 +16287,28 @@ const ImportGraph = struct {
     ) !void {
         var line_num: usize = 1;
         var col: usize = 1;
-        var i: usize = 0;
         var in_comment = false;
 
-        while (i < content.len) : ({
-            col += 1;
-            i += 1;
-        }) {
-            if (content[i] == '\n') {
+        for (content, 0..) |ch, i| {
+            if (ch == '\n') {
                 line_num += 1;
-                // The loop's continue expression increments col before the
-                // first char of the new line, so reset to 0 here — the
-                // recorded column is the char's true column (EPH-I0013).
+                // The tail increment below restores col to 1, so the first
+                // char of the new line records its true column (EPH-I0013).
                 col = 0;
                 in_comment = false;
-                continue;
-            }
-            if (!in_comment and i + 1 < content.len and
-                content[i] == '/' and content[i + 1] == '/')
-            {
+            } else if (!in_comment and isLineCommentOpenerAt(content, i)) {
                 in_comment = true;
-                continue;
+            } else if (!in_comment) {
+                try self.recordConstImportAt(.{
+                    .content = content,
+                    .file_path = file_path,
+                    .analysis = analysis,
+                    .i = i,
+                    .line_num = line_num,
+                    .col = col,
+                });
             }
-            if (in_comment) continue;
-
-            const not_const = i + 6 >= content.len or
-                !mem.eql(u8, content[i .. i + 6], "const ");
-            if (not_const) continue;
-            if (!isConstStatementStart(content, i)) continue;
-
-            try self.tryRecordConstImport(.{
-                .content = content,
-                .file_path = file_path,
-                .analysis = analysis,
-                .i = i,
-                .line_num = line_num,
-                .col = col,
-            });
+            col += 1;
         }
 
         try self.extractBareImports(content, file_path, analysis);

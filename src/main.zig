@@ -1090,33 +1090,45 @@ fn detectCFPattern(t: []const u8) CFPattern {
 /// exclusive; comments and code live outside both.
 const QuoteMode = enum { none, str, char };
 
+/// Step the quote machine while a string literal is open: an escape skips
+/// its next char; the closing quote returns the machine to code position.
+fn stepStringQuote(mode: *QuoteMode, c: u8) ?usize {
+    if (c == '\\') return 1;
+    if (c == '"') mode.* = .none;
+    return 0;
+}
+
+/// Step the quote machine while a char literal is open: an escape skips
+/// its next char; the closing quote returns the machine to code position.
+fn stepCharQuote(mode: *QuoteMode, c: u8) ?usize {
+    if (c == '\\') return 1;
+    if (c == '\'') mode.* = .none;
+    return 0;
+}
+
+/// Step the quote machine in code position: an opening quote opens the
+/// matching literal; any other char is plain code.
+fn stepNoneQuote(mode: *QuoteMode, c: u8) ?usize {
+    if (c == '"') {
+        mode.* = .str;
+        return 0;
+    }
+    if (c == '\'') {
+        mode.* = .char;
+        return 0;
+    }
+    return null;
+}
+
 /// Advance quote state for one char. Returns chars to skip beyond the
 /// caller's own +1 (escape sequences), or null when the char is code
 /// outside any quote literal.
 fn scanQuoteStep(mode: *QuoteMode, c: u8) ?usize {
-    switch (mode.*) {
-        .str => {
-            if (c == '\\') return 1;
-            if (c == '"') mode.* = .none;
-            return 0;
-        },
-        .char => {
-            if (c == '\\') return 1;
-            if (c == '\'') mode.* = .none;
-            return 0;
-        },
-        .none => {
-            if (c == '"') {
-                mode.* = .str;
-                return 0;
-            }
-            if (c == '\'') {
-                mode.* = .char;
-                return 0;
-            }
-            return null;
-        },
-    }
+    return switch (mode.*) {
+        .str => stepStringQuote(mode, c),
+        .char => stepCharQuote(mode, c),
+        .none => stepNoneQuote(mode, c),
+    };
 }
 
 /// Return the line with any trailing `//` comment removed (quote-aware:
@@ -1373,6 +1385,28 @@ fn isPopDispatch(pattern: CFPattern) bool {
     };
 }
 
+/// Skip spaces and tabs backwards from j.
+fn backSkipWhitespace(code: []const u8, j: usize) usize {
+    var k = j;
+    while (k > 0 and (code[k - 1] == ' ' or code[k - 1] == '\t')) k -= 1;
+    return k;
+}
+
+/// Walk backwards from the `)` at code[j - 1] to its matching `(`;
+/// returns the `(` index, or 0 when the group never balances. Callers
+/// verify the `)` themselves.
+fn backSkipParenGroup(code: []const u8, j: usize) usize {
+    var k = j;
+    var depth: usize = 0;
+    while (k > 0) {
+        k -= 1;
+        if (code[k] == ')') depth += 1;
+        if (code[k] == '(') depth -= 1;
+        if (depth == 0) break;
+    }
+    return k;
+}
+
 /// True when the `{` at index i opens a signature container (`error{...}`
 /// set or an anonymous `struct`/`union`/`enum` return type) rather than a
 /// function body or control block. Same-line backward lookback, generalized
@@ -1381,21 +1415,10 @@ fn isPopDispatch(pattern: CFPattern) bool {
 /// not quote-aware; a mis-skip degrades to "not a container", which is the
 /// safe direction (fn-body/expression classification still applies).
 fn sigContainerOpen(code: []const u8, i: usize) bool {
-    var j = i;
-    while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t')) j -= 1;
-    if (j > 0 and code[j - 1] == ')') {
-        var depth: usize = 0;
-        while (j > 0) {
-            j -= 1;
-            if (code[j] == ')') depth += 1;
-            if (code[j] == '(') depth -= 1;
-            if (depth == 0) break;
-        }
-        while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t')) j -= 1;
-    }
-    const word_end = j;
-    while (j > 0 and isIdent(code[j - 1])) j -= 1;
-    const word = code[j..word_end];
+    var j = backSkipWhitespace(code, i);
+    if (j > 0 and code[j - 1] == ')')
+        j = backSkipWhitespace(code, backSkipParenGroup(code, j));
+    const word = identBefore(code, j);
     inline for (.{ "error", "struct", "union", "enum" }) |kw| {
         if (mem.eql(u8, word, kw)) return true;
     }
@@ -1596,29 +1619,44 @@ const CFGBuildCtx = struct {
             try self.brace_stack.append(self.allocator, .fn_body);
             return;
         }
-        const own_claim = line_scan.opener and !line_scan.claimed;
-        const else_claim = line_scan.else_open_pending;
-        const pending_claim = !line_scan.opener and !line_scan.suppress_pending and
-            self.clearTopPending();
-        if (own_claim or else_claim or pending_claim) {
-            // A body brace claimed after the line's else keyword means the
-            // else body is on this line: the pending mark must not survive
-            // (EPH-I0089). An if's own `{` before the else keyword keeps it.
-            if (line_scan.last_else_col) |else_col| {
-                if (i > else_col) line_scan.out.saw_else_pending = false;
-            }
-            line_scan.claimed = true;
-            line_scan.else_open_pending = false;
-            line_scan.out.saw_control_open = true;
-            line_scan.last_control_open = i;
-            try self.brace_stack.append(self.allocator, .control);
-            try self.event_scratch.append(self.allocator, .{
-                .kind = .open_control,
-                .col = i,
-            });
+        if (self.claimsControlBrace(line_scan)) {
+            try self.openControlBrace(i, line_scan);
             return;
         }
         try self.brace_stack.append(self.allocator, .expr);
+    }
+
+    /// True when the `{` at i is claimed as a control brace: the line's
+    /// own opener claim, an else keyword's block claim, or a pending
+    /// entry claim. The pending claim consumes the top entry's pending
+    /// mark only when reached (short-circuit order is load-bearing).
+    fn claimsControlBrace(self: *CFGBuildCtx, line_scan: *LineScanCtx) bool {
+        if (line_scan.opener) {
+            if (!line_scan.claimed) return true;
+            return line_scan.else_open_pending;
+        }
+        if (line_scan.else_open_pending) return true;
+        return !line_scan.suppress_pending and self.clearTopPending();
+    }
+
+    /// Record the control-brace claim at i and emit its open event
+    /// (EPH-I0089, EPH-I0094). A body brace claimed after the line's
+    /// else keyword means the else body is on this line: the pending
+    /// mark must not survive (EPH-I0089). An if's own `{` before the
+    /// else keyword keeps it.
+    fn openControlBrace(self: *CFGBuildCtx, i: usize, line_scan: *LineScanCtx) !void {
+        if (line_scan.last_else_col) |else_col| {
+            if (i > else_col) line_scan.out.saw_else_pending = false;
+        }
+        line_scan.claimed = true;
+        line_scan.else_open_pending = false;
+        line_scan.out.saw_control_open = true;
+        line_scan.last_control_open = i;
+        try self.brace_stack.append(self.allocator, .control);
+        try self.event_scratch.append(self.allocator, .{
+            .kind = .open_control,
+            .col = i,
+        });
     }
 
     /// Classify one `}` at index i: pop the brace stack; emit `.close_control`
@@ -1751,49 +1789,64 @@ const CFGBuildCtx = struct {
     /// `else` eats the remaining 3).
     fn scanCodeChar(self: *CFGBuildCtx, i: usize, line_scan: *LineScanCtx) !usize {
         const c = line_scan.code[i];
-        if (c == 'e' and self.lastEventIsClose() and isElseWordAt(line_scan.code, i)) {
-            try self.event_scratch.append(self.allocator, .{
-                .kind = .else_keyword,
-                .col = i,
-            });
-            line_scan.last_else_col = i;
-            const else_body = peekElseBody(line_scan.code, i + 4);
-            if (else_body == .statement) {
-                line_scan.else_virtual = true;
-            } else {
-                line_scan.else_open_pending = true;
-                // An Allman else (no body on this line) marks the entry
-                // pending for the next line's claim (EPH-I0119, EPH-I0089).
-                if (else_body == .none) line_scan.out.saw_else_pending = true;
-            }
-            return 3;
-        }
+        if (c == 'e' and self.lastEventIsClose() and isElseWordAt(line_scan.code, i))
+            return self.scanElseKeyword(i, line_scan);
         if (c == ';' and self.paren_depth == 0) {
-            if (line_scan.virtual_open) {
-                try self.closeVirtualBody(i, line_scan);
-                return 0;
-            }
-            if (line_scan.else_virtual) {
-                try self.closeElseVirtual(i, line_scan);
-                return 0;
-            }
-        }
-        if (c == '(') {
-            self.paren_depth += 1;
+            try self.closeOpenVirtuals(i, line_scan);
             return 0;
         }
-        if (c == ')') {
-            const was_open = self.paren_depth > 0;
-            self.paren_depth -|= 1;
-            if (was_open and self.paren_depth == 0)
-                try self.tryVirtualBodyOpen(i, line_scan);
-            return 0;
+        return self.foldStructuralChar(c, i, line_scan);
+    }
+
+    /// Handle a whole-word `else` keyword at i: emit the event, classify
+    /// the same-line body, and return the extra chars consumed (3).
+    fn scanElseKeyword(self: *CFGBuildCtx, i: usize, line_scan: *LineScanCtx) !usize {
+        try self.event_scratch.append(self.allocator, .{
+            .kind = .else_keyword,
+            .col = i,
+        });
+        line_scan.last_else_col = i;
+        const else_body = peekElseBody(line_scan.code, i + 4);
+        if (else_body == .statement) {
+            line_scan.else_virtual = true;
+        } else {
+            line_scan.else_open_pending = true;
+            // An Allman else (no body on this line) marks the entry
+            // pending for the next line's claim (EPH-I0119, EPH-I0089).
+            if (else_body == .none) line_scan.out.saw_else_pending = true;
         }
-        if (c == '{') {
-            try self.classifyOpenBrace(i, line_scan);
-            return 0;
+        return 3;
+    }
+
+    /// Close an open virtual body on `;`: a body statement ended, or a
+    /// same-line virtual else body ended.
+    fn closeOpenVirtuals(self: *CFGBuildCtx, i: usize, line_scan: *LineScanCtx) !void {
+        if (line_scan.virtual_open) {
+            try self.closeVirtualBody(i, line_scan);
+            return;
         }
-        if (c == '}') try self.classifyCloseBrace(i, line_scan);
+        if (line_scan.else_virtual) try self.closeElseVirtual(i, line_scan);
+    }
+
+    /// Close one `)`: only a paren-depth return to 0 may open a virtual
+    /// body (the condition's closing paren was reached).
+    fn closeParen(self: *CFGBuildCtx, i: usize, line_scan: *LineScanCtx) !void {
+        const was_open = self.paren_depth > 0;
+        self.paren_depth -|= 1;
+        if (was_open and self.paren_depth == 0)
+            try self.tryVirtualBodyOpen(i, line_scan);
+    }
+
+    /// Fold one non-keyword structural char into the brace/paren state
+    /// and return 0 (no extra chars consumed).
+    fn foldStructuralChar(self: *CFGBuildCtx, c: u8, i: usize, line_scan: *LineScanCtx) !usize {
+        switch (c) {
+            '(' => self.paren_depth += 1,
+            ')' => try self.closeParen(i, line_scan),
+            '{' => try self.classifyOpenBrace(i, line_scan),
+            '}' => try self.classifyCloseBrace(i, line_scan),
+            else => {},
+        }
         return 0;
     }
 
@@ -2280,54 +2333,92 @@ const CFGBuildCtx = struct {
         }
     }
 
+    /// A pending brace-less if/else opener whose next line is a statement
+    /// (not an Allman `{`, not a labeled block) takes that line as its
+    /// virtual body. A multi-line condition still open is not a body. A
+    /// pending while/for is excluded here: a same-line brace-less while
+    /// body takes its virtual body through virtualOkFor (EPH-I0129),
+    /// while the pending next-line while form and every brace-less for
+    /// keep the pre-B2 attribution.
+    fn nextLineIsVirtualBody(self: *CFGBuildCtx, code: []const u8) bool {
+        if (!self.topIsPendingIfElse()) return false;
+        if (self.paren_depth != 0) return false;
+        return classifyLineStart(code) == .statement;
+    }
+
+    /// Settle the deferred-else state of one line: report whether the
+    /// line claims the deferral (a line-start else — the closed arm's
+    /// span must end at its close line, not extend over the claiming
+    /// line, EPH-I1063), and close the saved entry as no-else when the
+    /// line neither claims nor carries one. Comment lines never reach
+    /// here; blank lines carry no code, so they must not clear the
+    /// deferral.
+    fn settleDeferredElse(
+        self: *CFGBuildCtx,
+        line: usize,
+        code: []const u8,
+        virtual_else: bool,
+        claims_deferred: bool,
+    ) !bool {
+        if (self.pending_else == null) return false;
+        if (code.len == 0) return false;
+        if (virtual_else) return false;
+        if (!claims_deferred) try self.finishPendingElse(line);
+        return claims_deferred;
+    }
+
+    /// Opener whose control `{` is on a later line (Allman, multi-line
+    /// condition); an inline-return else has no brace coming at all.
+    fn markOpenerPending(
+        self: *CFGBuildCtx,
+        pattern: CFPattern,
+        scan: BraceScanOut,
+        code: []const u8,
+    ) void {
+        if (!isControlOpener(pattern)) return;
+        if (scan.saw_control_open) return;
+        if (hasInlineElseReturn(code)) return;
+        self.markTopPending();
+    }
+
+    /// An else whose body is pending on a later line (Allman `else`,
+    /// payload-else with nothing after the payload): mark the else entry
+    /// pending so the next line's `{` claims it as a control open or its
+    /// statement becomes the virtual body (EPH-I0119, EPH-I0089). A body
+    /// claim after the else keyword already cleared the flag; an
+    /// inline-return else has no body line at all.
+    fn markElsePending(self: *CFGBuildCtx, scan: BraceScanOut, code: []const u8) void {
+        if (!scan.saw_else_pending) return;
+        if (hasInlineElseReturn(code)) return;
+        const items = self.block_stack.items;
+        if (items.len == 0) return;
+        const top = items[items.len - 1];
+        if (top.block_type != .else_block and top.block_type != .else_if_block) return;
+        self.markTopPending();
+    }
+
     /// Process one comment-stripped, non-comment line of a function body.
     fn processCFGLine(self: *CFGBuildCtx, code: []const u8, line: usize) !void {
         try self.extendWhileCondition(code);
-        // A pending brace-less if/else opener whose next line is a
-        // statement (not an Allman `{`, not a labeled block) takes that
-        // line as its virtual body. A multi-line condition still open is
-        // not a body. A pending while/for is excluded here: a same-line
-        // brace-less while body takes its virtual body through
-        // virtualOkFor (EPH-I0129), while the pending next-line while
-        // form and every brace-less for keep the pre-B2 attribution.
-        const next_body = self.topIsPendingIfElse() and self.paren_depth == 0 and
-            classifyLineStart(code) == .statement;
+        const next_body = self.nextLineIsVirtualBody(code);
         const virtual_else = self.pending_else != null and isVirtualElseLine(code);
         const pattern = detectCFPattern(code);
         const paren_at_start = self.paren_depth;
         const scan = try self.scanLineBraces(code, pattern, next_body);
         // The line claims a deferred close (a line-start else): the
         // closed arm's span must end at its close line, not extend over
-        // the claiming line (EPH-I1063).
+        // the claiming line (EPH-I1063). A deferred close with no else
+        // claiming it closes as no-else before this line is attributed.
         const claims_deferred = self.pending_else != null and code.len > 0 and
             !virtual_else and scanClaimsElse(pattern, scan.events);
-        // A deferred close with no else claiming it closes as no-else
-        // before this line is attributed. Comment lines never reach here;
-        // blank lines carry no code, so they must not clear the deferral.
-        if (self.pending_else != null and code.len > 0 and !virtual_else and
-            !scanClaimsElse(pattern, scan.events))
-            try self.finishPendingElse(line);
+        const settled = try self.settleDeferredElse(line, code, virtual_else, claims_deferred);
         if (virtual_else) try self.handleElse(code, line, 0);
-        self.attributeLineSpan(line, paren_at_start, claims_deferred);
+        self.attributeLineSpan(line, paren_at_start, settled);
         if (self.paren_depth == 0) self.cond_origin = null;
         try self.finishWhileCondition();
         try self.walkLineEvents(pattern, code, line);
-        // Opener whose control `{` is on a later line (Allman, multi-line
-        // condition); an inline-return else has no brace coming at all.
-        if (isControlOpener(pattern) and !scan.saw_control_open and
-            !hasInlineElseReturn(code)) self.markTopPending();
-        // An else whose body is pending on a later line (Allman `else`,
-        // payload-else with nothing after the payload): mark the else
-        // entry pending so the next line's `{` claims it as a control
-        // open or its statement becomes the virtual body (EPH-I0119,
-        // EPH-I0089). A body claim after the else keyword already cleared
-        // the flag; an inline-return else has no body line at all.
-        if (scan.saw_else_pending and !hasInlineElseReturn(code)) {
-            const items = self.block_stack.items;
-            if (items.len > 0 and (items[items.len - 1].block_type == .else_block or
-                items[items.len - 1].block_type == .else_if_block))
-                self.markTopPending();
-        }
+        self.markOpenerPending(pattern, scan, code);
+        self.markElsePending(scan, code);
         // The virtual body lived in the true block; close the opener at
         // this line's end. A body line that opened its own construct
         // (nested if, braced loop) leaves the opener lingering as pre-B2 —
@@ -2900,6 +2991,21 @@ fn hasRealKeyword(t: []const u8, kw: []const u8) bool {
     return false;
 }
 
+/// The identifier immediately before the `.` of a `.alloc(`/`.create(` at
+/// alloc_pos: past whitespace, a type-parameter group (`Type(T)`), and
+/// `.` separators.
+fn allocCallerWord(t: []const u8, alloc_pos: usize) []const u8 {
+    var end = alloc_pos;
+    // Skip any whitespace before .alloc(
+    while (end > 0 and t[end - 1] == ' ') end -= 1;
+    // Skip past type parameters like ([]const u8) before .alloc(
+    // Pattern: Type(T).alloc() - need to skip the (T) part
+    if (end > 0 and t[end - 1] == ')') end = backSkipParenGroup(t, end);
+    // Now find the identifier immediately before (or at position after skipping parens)
+    while (end > 0 and (t[end - 1] == '.' or t[end - 1] == ' ')) end -= 1;
+    return identBefore(t, end);
+}
+
 /// Check if the caller before .alloc() or .create() is a Type (starts uppercase)
 /// Type.alloc() is a factory method, not an allocator call
 /// Handles patterns like: Type.alloc(), module.Type.alloc(), Type(T).alloc()
@@ -2909,32 +3015,10 @@ fn hasRealKeyword(t: []const u8, kw: []const u8) bool {
 /// for code following standard Zig naming conventions.
 fn isTypeAllocFactory(t: []const u8, alloc_pos: usize) bool {
     if (alloc_pos == 0) return false;
-    var end = alloc_pos;
-    // Skip any whitespace before .alloc(
-    while (end > 0 and t[end - 1] == ' ') end -= 1;
-    // Skip past type parameters like ([]const u8) before .alloc(
-    // Pattern: Type(T).alloc() - need to skip the (T) part
-    if (end > 0 and t[end - 1] == ')') {
-        var paren_depth: usize = 1;
-        end -= 1;
-        while (end > 0 and paren_depth > 0) {
-            end -= 1;
-            if (t[end] == ')') paren_depth += 1;
-            if (t[end] == '(') paren_depth -= 1;
-        }
-    }
-    // Now find the identifier immediately before (or at position after skipping parens)
-    while (end > 0 and (t[end - 1] == '.' or t[end - 1] == ' ')) end -= 1;
-    // Walk backwards to find the full identifier chain
-    const id_end = end;
-    var id_start = end;
-    while (id_start > 0 and isIdent(t[id_start - 1])) {
-        id_start -= 1;
-    }
-    if (id_start >= id_end) return false;
+    const word = allocCallerWord(t, alloc_pos);
+    if (word.len == 0) return false;
     // Check if this identifier starts with uppercase (Type name)
-    const first_char = t[id_start];
-    return first_char >= 'A' and first_char <= 'Z';
+    return word[0] >= 'A' and word[0] <= 'Z';
 }
 
 /// Check if the first argument after an opening paren looks like a Zig type.
@@ -3527,32 +3611,37 @@ fn isElementWriteThrough(after: []const u8) bool {
 /// the old value.
 fn isAssignmentTarget(t: []const u8, name: []const u8, pos: usize) bool {
     if (pos + name.len >= t.len) return false;
-    const after = t[pos + name.len ..];
-    const trimmed = mem.trimStart(u8, after, " \t");
+    const trimmed = mem.trimStart(u8, t[pos + name.len ..], " \t");
     if (isAssignmentOp(trimmed)) return true;
 
     // Field chain: name.field = value or name.field.sub = value. The
     // quoted form (`name.@"f" = v`) assigns through the chain the same
     // as a plain field (EPH-I0778).
-    if (mem.startsWith(u8, trimmed, ".")) {
-        var j: usize = 0;
-        while (j < trimmed.len and trimmed[j] == '.') {
-            j += 1;
-            j = skipFieldName(trimmed, j);
-        }
-        const after_fields = mem.trimStart(u8, trimmed[j..], " \t");
-        if (isAssignmentOp(after_fields)) return true;
-        if (mem.startsWith(u8, after_fields, "["))
-            return hasAssignmentAfterBracket(after_fields) orelse false;
-        if (mem.startsWith(u8, after_fields, "*"))
-            return isAssignmentOp(mem.trimStart(u8, after_fields[1..], " \t"));
-    }
+    if (mem.startsWith(u8, trimmed, ".")) return isFieldChainAssignment(trimmed);
 
     // Subscript: name[i] = value or name[i][j] = value
     if (mem.startsWith(u8, trimmed, "[")) {
         return hasAssignmentAfterBracket(trimmed) orelse false;
     }
 
+    return false;
+}
+
+/// True when the field chain after the occurrence ends in an assignment
+/// (`name.field = v`), a chain subscript (`name.f[i] = v`), or a chain
+/// dereference (`name.f.* = v`).
+fn isFieldChainAssignment(after: []const u8) bool {
+    var j: usize = 0;
+    while (j < after.len and after[j] == '.') {
+        j += 1;
+        j = skipFieldName(after, j);
+    }
+    const after_fields = mem.trimStart(u8, after[j..], " \t");
+    if (isAssignmentOp(after_fields)) return true;
+    if (mem.startsWith(u8, after_fields, "["))
+        return hasAssignmentAfterBracket(after_fields) orelse false;
+    if (mem.startsWith(u8, after_fields, "*"))
+        return isAssignmentOp(mem.trimStart(u8, after_fields[1..], " \t"));
     return false;
 }
 
@@ -4086,25 +4175,33 @@ const CondNesting = struct {
     /// Fold one quote-free, comment-free char into the nesting state.
     fn scanChar(self: *CondNesting, code: []const u8, i: usize) void {
         switch (code[i]) {
-            '(', '[' => {
-                if (self.paren_depth == 0) {
-                    const kw = identBefore(code, i);
-                    self.paren_container = isContainerKeyword(kw);
-                    self.paren_container_switch = mem.eql(u8, kw, "switch");
-                    self.container_age = 0;
-                }
-                self.paren_depth += 1;
-            },
+            '(', '[' => self.openParen(code, i),
             ')', ']' => self.paren_depth -|= 1,
             '{' => self.openBrace(code, i),
-            '}' => {
-                if (self.first_close == null and self.pending_expr == 0 and
-                    self.depth > 0)
-                    self.first_close = .{ .col = i, .depth_before = self.depth };
-                self.closeBrace();
-            },
+            '}' => self.closeBraceAt(i),
             else => {},
         }
+    }
+
+    /// Record an opening `(`/`[`: on the 0-to-1 transition, capture the
+    /// header keyword's flags (EPH-I0106, EPH-I0334, EPH-I0128).
+    fn openParen(self: *CondNesting, code: []const u8, i: usize) void {
+        if (self.paren_depth == 0) {
+            const kw = identBefore(code, i);
+            self.paren_container = isContainerKeyword(kw);
+            self.paren_container_switch = mem.eql(u8, kw, "switch");
+            self.container_age = 0;
+        }
+        self.paren_depth += 1;
+    }
+
+    /// Close one `}`: record the first depth-paying close mark before the
+    /// depth drops, then pay off the brace (EPH-I0111, EPH-I0334).
+    fn closeBraceAt(self: *CondNesting, i: usize) void {
+        if (self.first_close == null and self.pending_expr == 0 and
+            self.depth > 0)
+            self.first_close = .{ .col = i, .depth_before = self.depth };
+        self.closeBrace();
     }
 
     /// Fold one `{` into the nesting state: an expression brace, an else
@@ -4194,6 +4291,40 @@ const CondNesting = struct {
     }
 };
 
+/// A fill occurrence on one line and the nesting depth to judge it at.
+const FillOccurrence = struct {
+    col: ?usize,
+    depth: usize,
+};
+
+/// The line's fill occurrence (assignment or fill call) and the nesting
+/// depth to judge it at. A fill textually before the line's first
+/// depth-paying close ran inside the arm (`x = 1; }`), so judge it at
+/// the depth open before the close, not at the end-of-line depth
+/// (EPH-I0111).
+fn fillOccurrence(
+    check_line: []const u8,
+    name: []const u8,
+    nesting: *CondNesting,
+) FillOccurrence {
+    const assign_col = findAssignmentOccurrence(check_line, name);
+    const call_col = findFillCallOccurrence(check_line, name);
+    const fill_col = assign_col orelse call_col;
+    var fill_depth = nesting.depth;
+    if (nesting.first_close) |fc| {
+        if (fill_col != null and fill_col.? < fc.col)
+            fill_depth = @max(fill_depth, fc.depth_before);
+    }
+    return .{ .col = fill_col, .depth = fill_depth };
+}
+
+/// True when the fill-before-use scan stops at this line: an
+/// unconditional return, or the block's closing brace.
+fn endsFillScan(check_line: []const u8) bool {
+    if (mem.startsWith(u8, check_line, "return ")) return true;
+    return mem.eql(u8, check_line, "}");
+}
+
 /// True when a fill of the var runs before any use on every path.
 /// A genuine read before the fill ends the scan with false.
 fn hasUnconditionalFillBeforeUse(
@@ -4210,21 +4341,10 @@ fn hasUnconditionalFillBeforeUse(
             continue;
         }
         nesting.update(check_line);
-        // A fill textually before the line's first depth-paying close ran
-        // inside the arm (`x = 1; }`), so judge it at the depth open
-        // before the close, not at the end-of-line depth (EPH-I0111).
-        const assign_col = findAssignmentOccurrence(check_line, name);
-        const call_col = findFillCallOccurrence(check_line, name);
-        const fill_col = assign_col orelse call_col;
-        var fill_depth = nesting.depth;
-        if (nesting.first_close) |fc| {
-            if (fill_col != null and fill_col.? < fc.col)
-                fill_depth = @max(fill_depth, fc.depth_before);
-        }
-        if (scan.classifyLine(check_line, name, fill_depth, fill_col)) |verdict| return verdict;
+        const fill = fillOccurrence(check_line, name, &nesting);
+        if (scan.classifyLine(check_line, name, fill.depth, fill.col)) |verdict| return verdict;
         if (isRealUseOfVar(check_line, name) and nesting.depth == 0) return false;
-        if (mem.startsWith(u8, check_line, "return ")) break;
-        if (mem.eql(u8, check_line, "}")) break;
+        if (endsFillScan(check_line)) break;
     }
     return false;
 }
@@ -4256,6 +4376,22 @@ fn effectCoversRead(effect: AssignEffect, idx: usize, col: usize) bool {
     return effect.col <= col;
 }
 
+/// True when a `//` line-comment opener starts at t[i].
+fn isLineCommentOpenerAt(t: []const u8, i: usize) bool {
+    if (t[i] != '/') return false;
+    if (i + 1 >= t.len) return false;
+    return t[i + 1] == '/';
+}
+
+/// Advance a carried bracket depth across one char.
+fn foldBracketDepth(depth: *usize, c: u8) void {
+    if (c == '(' or c == '[' or c == '{') {
+        depth.* += 1;
+        return;
+    }
+    if (c == ')' or c == ']' or c == '}') depth.* -|= 1;
+}
+
 /// Scan one trimmed line for the statement-terminating `;`, starting at
 /// column `start`. Returns the column just past a depth-0 `;`, or null when
 /// the statement continues past this line. Bracket depth and quote mode
@@ -4277,9 +4413,8 @@ fn scanLineForStatementEnd(
         }
         if (mode.* != .none) continue;
         if (types.isMultilineOpenerAt(t, i)) break;
-        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
-        if (c == '(' or c == '[' or c == '{') depth.* += 1;
-        if (c == ')' or c == ']' or c == '}') depth.* -|= 1;
+        if (isLineCommentOpenerAt(t, i)) break;
+        foldBracketDepth(depth, c);
         if (c == ';' and depth.* == 0) return i + 1;
     }
     return null;

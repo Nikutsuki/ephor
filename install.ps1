@@ -68,6 +68,27 @@ $installExitCode = & {
     # archives stay available.
     $EPHOR_0_15_COMMIT = "60145fe05a2b91e7dd32d1c671d98239cd19aea6"
 
+    # EPH-I0287 (WP-6.5): the minisign public key of the ephor release
+    # signing keypair. The release pipeline fills this constant when the
+    # keypair is minted; it is empty until then, and the signature check
+    # stays inactive. EPH-I0205: tests override it through
+    # EPHOR_RELEASE_PUBKEY, gated by EPHOR_TEST_MODE like the other
+    # trust-anchor overrides (install.sh parity).
+    $ReleasePubkey = ""
+    if ($testModeActive -and $env:EPHOR_RELEASE_PUBKEY) {
+        $ReleasePubkey = $env:EPHOR_RELEASE_PUBKEY
+    } elseif ($env:EPHOR_RELEASE_PUBKEY) {
+        Write-Stderr "warning: EPHOR_RELEASE_PUBKEY is ignored without EPHOR_TEST_MODE=1."
+    }
+    # EPH-I0287: byte caps for the verification downloads (install.sh
+    # parity). The tarball cap is 32 MiB: the largest published archive
+    # measures 436,635 bytes (main, verified 2026-08-27), so the cap
+    # holds 77x headroom and still bounds a hostile stream. The
+    # signature cap matches the tags-API cap; a minisig file measures
+    # 282 bytes (verified 2026-08-27).
+    $TarballCap = 33554432
+    $SigCap = 1048576
+
     # EPH-I0643: refuse when zig is missing before any file is created or
     # changed (install.sh EPH-I0631). Without this guard, a fetch of a
     # missing command leaves $LASTEXITCODE at the caller's last exit code:
@@ -433,6 +454,139 @@ error: no build.zig found in current directory
             }
             $EPHOR_URL = "$REPO/archive/$EPHOR_TAG.tar.gz"
         }
+    }
+
+    # EPH-I0287 (WP-6.5): download $Url into $OutPath with a $MaxBytes
+    # byte cap (EPH-I0207; install.sh fetch_bounded parity). The bounded
+    # read mirrors the tags-API fetch: TimeoutSec bounds duration, the
+    # cap bounds bytes, and an over-cap download warns and fails, so the
+    # caller fails closed. The non-http arm keeps the operator-picked
+    # test channel: Invoke-WebRequest serves file:// URLs, and the
+    # bytes are local.
+    function Get-BoundedFile {
+        param([string]$Url, [string]$OutPath, [long]$MaxBytes)
+        if ($Url.StartsWith("https://") -or $Url.StartsWith("http://")) {
+            $handler = [System.Net.Http.HttpClientHandler]::new()
+            if ($Url.StartsWith("https://")) { $handler.MaxAutomaticRedirections = 0 }
+            $client = [System.Net.Http.HttpClient]::new($handler)
+            $response = $null
+            $stream = $null
+            $fileStream = $null
+            try {
+                $client.Timeout = [TimeSpan]::FromSeconds(30)
+                $response = $client.GetAsync(
+                    $Url,
+                    [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
+                ).GetAwaiter().GetResult()
+                $response.EnsureSuccessStatusCode()
+                $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                $bytes = New-Object byte[] 8192
+                $fileStream = [System.IO.File]::Create($OutPath)
+                $total = [long]0
+                while ($total -lt $MaxBytes) {
+                    $remaining = [int][Math]::Min([long]$bytes.Length, $MaxBytes - $total)
+                    $n = $stream.Read($bytes, 0, $remaining)
+                    if ($n -le 0) { break }
+                    $fileStream.Write($bytes, 0, $n)
+                    $total += $n
+                }
+                if ($total -ge $MaxBytes -and $stream.ReadByte() -ne -1) {
+                    Write-Stderr "warning: the download exceeds the $MaxBytes byte cap."
+                    return $false
+                }
+                return $true
+            } catch {
+                return $false
+            } finally {
+                if ($null -ne $fileStream) { $fileStream.Dispose() }
+                if ($null -ne $stream) { $stream.Dispose() }
+                if ($null -ne $response) { $response.Dispose() }
+                $client.Dispose()
+            }
+        }
+        Invoke-WebRequest -Uri $Url -OutFile $OutPath -TimeoutSec 30
+        return $true
+    }
+
+    # EPH-I0287 (WP-6.5): download the release tarball and its minisign
+    # signature, and verify the signature before zig fetch downloads
+    # the artifact again (install.sh parity). Two states:
+    # - Inactive: no release public key is embedded yet (no release is
+    #   signed). The check warns and the install continues on the
+    #   recorded-hash model.
+    # - Active: the key is embedded, so every release must be signed. A
+    #   missing minisign binary, a failed download, or a bad signature
+    #   fails the install closed.
+    function Test-EphorReleaseSignature {
+        if (-not $ReleasePubkey) {
+            Write-Stderr "warning: release signature verification is inactive. This installer embeds no release public key yet. The first signed release activates the check."
+            return $true
+        }
+        if (-not (Get-Command minisign -CommandType Application -ErrorAction SilentlyContinue)) {
+            Write-Stderr @"
+error: minisign is not installed or not on PATH.
+
+  This release is signed. Install minisign, then re-run the install.
+"@
+            return $false
+        }
+        # EPH-I0280: the verification files live in a fresh temp dir, so
+        # nothing in the project dir is read or written here.
+        $verifyDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ephor-verify-" + [System.IO.Path]::GetRandomFileName())
+        New-Item -ItemType Directory -Path $verifyDir | Out-Null
+        $tarballPath = Join-Path $verifyDir "ephor.tar.gz"
+        $sigPath = "$tarballPath.minisig"
+        $pubkeyPath = Join-Path $verifyDir "ephor.pub"
+        try {
+            if (-not (Get-BoundedFile -Url $EPHOR_URL -OutPath $tarballPath -MaxBytes $TarballCap)) {
+                Write-Stderr "error: could not download the release tarball for verification."
+                Write-Stderr "Check the network connection, then re-run the install."
+                return $false
+            }
+            if (-not (Get-BoundedFile -Url $SIG_URL -OutPath $sigPath -MaxBytes $SigCap)) {
+                Write-Stderr "error: could not download the release signature."
+                Write-Stderr "This release carries no signature. The install stops."
+                return $false
+            }
+            Set-Content -Path $pubkeyPath -Value $ReleasePubkey -Encoding ASCII
+            # EPH-I0645: capture the exit code under "Continue" like the
+            # fetch steps, or PowerShell 7.4+ throws before this code
+            # reads $LASTEXITCODE.
+            $prevEAP = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            $verifyOut = (& minisign -Vm $tarballPath -p $pubkeyPath 2>&1 | Out-String)
+            $verifyRc = $LASTEXITCODE
+            $ErrorActionPreference = $prevEAP
+            if ($null -eq $verifyRc) { $verifyRc = 1 }
+            if ($verifyRc -ne 0) {
+                Write-Stderr $verifyOut
+                Write-Stderr "error: the release signature check failed."
+                Write-Stderr "The downloaded artifact may be tampered with. The install stops."
+                return $false
+            }
+        } catch {
+            Write-Stderr "error: could not verify the release signature."
+            return $false
+        } finally {
+            Remove-Item -Path $verifyDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host "Release signature verified."
+        return $true
+    }
+
+    # EPH-I0287 (WP-6.5): verify the release signature before zig fetch.
+    # EPH-I0205: tests override the signature URL through EPHOR_SIG_URL,
+    # gated by EPHOR_TEST_MODE like the other trust-anchor overrides.
+    # The check covers every $EPHOR_URL shape, the pinned 0.15-era
+    # commit archive included.
+    $SIG_URL = "$EPHOR_URL.minisig"
+    if ($testModeActive -and $env:EPHOR_SIG_URL) {
+        $SIG_URL = $env:EPHOR_SIG_URL
+    } elseif ($env:EPHOR_SIG_URL) {
+        Write-Stderr "warning: EPHOR_SIG_URL is ignored without EPHOR_TEST_MODE=1."
+    }
+    if (-not (Test-EphorReleaseSignature)) {
+        return 1
     }
 
     Write-Host "Adding ephor dependency..."

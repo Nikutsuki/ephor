@@ -1628,15 +1628,18 @@ const CFGBuildCtx = struct {
 
     /// True when the `{` at i is claimed as a control brace: the line's
     /// own opener claim, an else keyword's block claim, or a pending
-    /// entry claim. The pending claim consumes the top entry's pending
-    /// mark only when reached (short-circuit order is load-bearing).
+    /// entry claim. On a non-opener line the pending claim evaluates
+    /// before the else claim is consulted: clearTopPending consumes the
+    /// top entry's pending mark even when the else keyword claims the
+    /// brace, so a lingering non-if pending entry cannot claim a later
+    /// `{` (B112 r1 F2 — the consumption order is load-bearing).
     fn claimsControlBrace(self: *CFGBuildCtx, line_scan: *LineScanCtx) bool {
         if (line_scan.opener) {
             if (!line_scan.claimed) return true;
             return line_scan.else_open_pending;
         }
-        if (line_scan.else_open_pending) return true;
-        return !line_scan.suppress_pending and self.clearTopPending();
+        const pending_claim = !line_scan.suppress_pending and self.clearTopPending();
+        return line_scan.else_open_pending or pending_claim;
     }
 
     /// Record the control-brace claim at i and emit its open event
@@ -54276,6 +54279,16 @@ test "ZA101: third-arg allocator tracks realPathFileAlloc with arena suppression
     }
     try std.testing.expect(gpa_line);
     try std.testing.expect(!arena_line);
+}
+
+test "isTypeAllocFactory tab-separated type stays a factory (EPH-I1201)" {
+    // B112 r1 F1 pin (the batch's explained A/B entry): allocCallerWord's
+    // identBefore skips tabs, so `Type\t.alloc(T)` reads as a type
+    // factory method. The pre-B112 walk stopped at the tab and classified
+    // the call as an allocator call — a ZA101 false positive. The
+    // lowercase receiver keeps its non-factory verdict on both paths.
+    try std.testing.expect(isTypeAllocFactory("Type\t.alloc(T)", 5));
+    try std.testing.expect(!isTypeAllocFactory("x\t.alloc(T)", 2));
 }
 
 test "ZA101: .prepend( transfers ownership (ghostty list_keybinds shape)" {

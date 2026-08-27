@@ -89,8 +89,9 @@ signature before zig fetch. They download the tarball and its signature,
 and check the pair with minisign against the release public key embedded
 in the installer (EPH-I0287). The tarball download is capped at 32 MiB
 and the signature download at 1 MiB. Each fetch times out after 30 s.
-On a signed release, the install fails closed when the signature is
-missing, when minisign is not installed, or when the check fails.
+On a signed release, the install fails closed when the signature
+download fails, when minisign is not installed, or when the check
+fails.
 
 Signature verification is inactive while the installer embeds no release
 public key. No signed release exists yet. The first signed release

@@ -519,7 +519,9 @@ error: no build.zig found in current directory
     #   fails the install closed.
     function Test-EphorReleaseSignature {
         if (-not $ReleasePubkey) {
-            Write-Stderr "warning: release signature verification is inactive. This installer embeds no release public key yet. The first signed release activates the check."
+            Write-Stderr "warning: release signature verification is inactive."
+            Write-Stderr "This installer embeds no release public key yet."
+            Write-Stderr "The first signed release activates the check."
             return $true
         }
         if (-not (Get-Command minisign -CommandType Application -ErrorAction SilentlyContinue)) {
@@ -532,20 +534,22 @@ error: minisign is not installed or not on PATH.
         }
         # EPH-I0280: the verification files live in a fresh temp dir, so
         # nothing in the project dir is read or written here.
-        $verifyDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ephor-verify-" + [System.IO.Path]::GetRandomFileName())
+        $verifyName = "ephor-verify-" + [System.IO.Path]::GetRandomFileName()
+        $verifyDir = Join-Path ([System.IO.Path]::GetTempPath()) $verifyName
         New-Item -ItemType Directory -Path $verifyDir | Out-Null
         $tarballPath = Join-Path $verifyDir "ephor.tar.gz"
         $sigPath = "$tarballPath.minisig"
         $pubkeyPath = Join-Path $verifyDir "ephor.pub"
         try {
-            if (-not (Get-BoundedFile -Url $EPHOR_URL -OutPath $tarballPath -MaxBytes $TarballCap)) {
+            if (-not (Get-BoundedFile -Url $EPHOR_URL `
+                -OutPath $tarballPath -MaxBytes $TarballCap)) {
                 Write-Stderr "error: could not download the release tarball for verification."
                 Write-Stderr "Check the network connection, then re-run the install."
                 return $false
             }
             if (-not (Get-BoundedFile -Url $SIG_URL -OutPath $sigPath -MaxBytes $SigCap)) {
                 Write-Stderr "error: could not download the release signature."
-                Write-Stderr "This release carries no signature. The install stops."
+                Write-Stderr "Check the network connection, then re-run the install."
                 return $false
             }
             Set-Content -Path $pubkeyPath -Value $ReleasePubkey -Encoding ASCII

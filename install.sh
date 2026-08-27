@@ -207,7 +207,9 @@ fetch_bounded() {
 #   fails the install closed.
 verify_ephor_release() {
     if [ -z "$RELEASE_PUBKEY" ]; then
-        echo "warning: release signature verification is inactive. This installer embeds no release public key yet. The first signed release activates the check." >&2
+        echo "warning: release signature verification is inactive." >&2
+        echo "This installer embeds no release public key yet." >&2
+        echo "The first signed release activates the check." >&2
         return 0
     fi
     if ! command -v minisign >/dev/null 2>&1; then
@@ -226,14 +228,15 @@ verify_ephor_release() {
     }
     fetch_bounded "$SIG_URL" "$VERIFY_DIR/ephor.tar.gz.minisig" "$SIG_CAP" || {
         echo "error: could not download the release signature." >&2
-        echo "This release carries no signature. The install stops." >&2
+        echo "Check the network connection, then re-run the install." >&2
         exit 1
     }
     printf '%s\n' "$RELEASE_PUBKEY" > "$VERIFY_DIR/ephor.pub"
     # minisign reads the signature from <file>.minisig next to the
     # file, so both downloads share the dir and the base name above.
-    VERIFY_OUT=$(minisign -Vm "$VERIFY_DIR/ephor.tar.gz" -p "$VERIFY_DIR/ephor.pub" 2>&1) && VERIFY_RC=0 || VERIFY_RC=$?
-    if [ "$VERIFY_RC" -ne 0 ]; then
+    # The if guard keeps set -e from aborting on the failing status.
+    if ! VERIFY_OUT=$(minisign -Vm "$VERIFY_DIR/ephor.tar.gz" -p \
+        "$VERIFY_DIR/ephor.pub" 2>&1); then
         printf '%s\n' "$VERIFY_OUT" >&2
         echo "error: the release signature check failed." >&2
         echo "The downloaded artifact may be tampered with. The install stops." >&2

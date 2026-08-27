@@ -29941,7 +29941,7 @@ fn analyzeCFGFile(
         const t = mem.trim(u8, line, " \t\r");
         const is_comment = isCommentOrMultilineString(t);
 
-        try handleCFGTestLine(file, scan, t, line_num);
+        try handleCFGTestLine(file, scan, line, line_num);
         if (!is_comment) try handleCFGFuncDetection(file, scan, t, line_num);
         if (!state.in_func) continue;
         try func_lines.append(allocator, line);
@@ -29996,10 +29996,17 @@ fn finishCFGFunction(file: CFGFileCtx, scan: CFGScanCtx) !void {
 fn handleCFGTestLine(
     file: CFGFileCtx,
     scan: CFGScanCtx,
-    t: []const u8,
+    line: []const u8,
     line_num: usize,
 ) !void {
     const state = scan.state;
+    // The collection stores the UNTRIMMED line, mirroring func_lines: the
+    // pairing detectors re-trim for token matching but read REAL
+    // indentation for their scope guards (hasFallibleStatementAfter's
+    // shallower-indent stop, the FreeSpan min_indent). A trimmed feed
+    // zeroed every indent, the stop never fired, and an else-arm fallible
+    // was wrongly credited as a post-free error exit (EPH-I1211).
+    const t = mem.trim(u8, line, " \t\r");
     if (!isCommentOrMultilineString(t)) {
         const was_in_test = state.in_test_block;
         const ts = trackTestBlock(t, state.in_test_block, state.test_brace_depth);
@@ -30016,7 +30023,7 @@ fn handleCFGTestLine(
             scan.test_lines.clearRetainingCapacity();
         }
     }
-    if (state.in_test_block) try scan.test_lines.append(file.allocator, t);
+    if (state.in_test_block) try scan.test_lines.append(file.allocator, line);
 }
 
 /// True when the test-block pairing pass must skip: an over-cap line
@@ -60993,6 +61000,43 @@ test "ZA106: test-block errdefer plus transfer stays silent (EPH-I1200 lock)" {
     defer run.deinit(allocator);
 
     const file = "test_eb_transfer.zig";
+    try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
+}
+
+test "ZA106: test-block else-arm fallible stays silent (EPH-I1211)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The trimmed-feed FP: hasFallibleStatementAfter's shallower-indent
+    // stop reads the stored line's real indentation. The first pass
+    // stored trimmed lines, so every indent read zero, the stop never
+    // fired, and the else-arm `try` was credited as a post-free error
+    // exit — the pairing fired on a shape with no double-free path (the
+    // direct free runs only on the c-true path, which has no error exit
+    // after it; the else arm never runs the free). The untrimmed feed
+    // restores the stop, and the fn-side twin of this shape was always
+    // silent (EPH-I1211).
+    const content =
+        \\test "else-arm fallible" {
+        \\    const allocator = std.testing.allocator;
+        \\    const buf = try allocator.alloc(u8, 64);
+        \\    errdefer allocator.free(buf);
+        \\    if (c) {
+        \\        allocator.free(buf);
+        \\    } else {
+        \\        try write(buf);
+        \\    }
+        \\}
+        \\fn write(l: []const u8) !void {
+        \\    _ = l;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_eb_elsearm.zig", content);
+    defer run.deinit(allocator);
+
+    const file = "test_eb_elsearm.zig";
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 0);
 }
 

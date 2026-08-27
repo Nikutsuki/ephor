@@ -6511,8 +6511,9 @@ const LoopWalkCtx = struct {
 };
 
 /// End line (exclusive) of a braced loop body: the close-first line whose
-/// leading closes bring the body depth to zero. A tail after the close
-/// sits outside the body; a counter write there breaks the guard's
+/// leading closes bring the body depth to zero, or the non-close-first
+/// line whose trailing `}` closes the body (EPH-I1209). A tail after the
+/// close sits outside the body; a counter write there breaks the guard's
 /// zero-reading correlation, so the walk fails closed (EPH-I1191) — the
 /// exact-equality walk missed the close on a tail-carrying line and
 /// swallowed the write into the span. Nested blocks keep the walk open:
@@ -6520,8 +6521,9 @@ const LoopWalkCtx = struct {
 /// continues, with the opens adding unconditionally after the closes
 /// (the EPH-I1190 convention). Non-close-first lines count with the
 /// net-zero convention, so one-line blocks and struct literals leave the
-/// depth unchanged. found_inc carries the increment-seen state
-/// (EPH-I1177).
+/// depth unchanged. Line comments are masked before the brace
+/// accounting, so a comment brace never opens or closes the body
+/// (EPH-I1213). found_inc carries the increment-seen state (EPH-I1177).
 fn bracedLoopBodyEnd(
     ctx: LoopWalkCtx,
     loop_idx: usize,
@@ -6533,19 +6535,24 @@ fn bracedLoopBodyEnd(
         const body = mem.trim(u8, ctx.lines[j], " \t\r");
         if (isCommentOrMultilineString(body)) continue;
         if (lineHasIncrement(body, ctx.counter)) found_inc.* = true;
-        if (body.len == 0 or body[0] != '}') {
-            depth = foldNonCloseLine(body, depth);
-            continue;
+        // Comment text is data: mask it before the brace accounting so a
+        // comment brace never opens or closes the body (EPH-I1213).
+        const code = stripLineComment(body);
+        if (code.len == 0 or code[0] != '}') {
+            const before = depth;
+            depth = foldNonCloseLine(code, depth);
+            if (depth != 0) continue;
+            // The trailing `}` on this line closes the body
+            // (EPH-I1209): the former walk kept going to the next
+            // close-first line and swallowed the post-loop lines
+            // into the span.
+            const close_pos = trailingClosePos(code, before) orelse return null;
+            return closeLineVerdict(code[close_pos..], ctx.counter, found_inc.*, j + 1);
         }
-        const run = leadingCloseRun(body);
-        if (run.closes >= depth) {
-            // The loop body closes on this line; the tail is outside
-            // the loop and a counter write there breaks the
-            // correlation (EPH-I1191).
-            if (tailWritesCounter(body[run.len..], ctx.counter)) return null;
-            return endOrNull(found_inc.*, j + 1);
-        }
-        const bc = braceCountOnLine(body);
+        const run = leadingCloseRun(code);
+        if (run.closes >= depth)
+            return closeLineVerdict(code[run.len..], ctx.counter, found_inc.*, j + 1);
+        const bc = braceCountOnLine(code);
         depth = (depth -| bc.closes) + bc.opens;
     }
     return null;
@@ -6562,6 +6569,46 @@ fn foldNonCloseLine(t: []const u8, depth: usize) usize {
     if (bc.opens >= bc.closes) d += bc.opens;
     if (bc.closes >= bc.opens) d -|= bc.closes;
     return d;
+}
+
+/// Byte index past the first code-position `}` that brings the running
+/// depth (from `depth`, at least 1) to zero, or null when the line never
+/// closes (EPH-I1209). The caller invokes it after the net fold reached
+/// zero; a mixed line whose interspersed opens keep the running depth
+/// above zero diverges from the fold (the EPH-I1208 convention) and
+/// fails the walk closed.
+fn trailingClosePos(code: []const u8, depth: usize) ?usize {
+    var d = depth;
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    while (i < code.len) : (i += 1) {
+        const c = code[i];
+        if (scanQuoteStep(&mode, c)) |skip| {
+            i += skip;
+            continue;
+        }
+        if (c == '{') d += 1;
+        if (c == '}') {
+            d -= 1;
+            if (d == 0) return i + 1;
+        }
+    }
+    return null;
+}
+
+/// Verdict for a line whose close ends the loop body (EPH-I1191,
+/// EPH-I1209): the tail past the close sits outside the body, so a
+/// counter write there breaks the guard's zero-reading correlation —
+/// null. A clean tail returns the exclusive end when the increment was
+/// seen, else the fail-closed null.
+fn closeLineVerdict(
+    tail: []const u8,
+    counter: []const u8,
+    found_inc: bool,
+    end_line: usize,
+) ?usize {
+    if (tailWritesCounter(tail, counter)) return null;
+    return endOrNull(found_inc, end_line);
 }
 
 /// Leading `}` run of a close-first line: the count of close braces
@@ -74681,6 +74728,187 @@ test "ZA607: nested else inside a braced loop keeps the span walk open (EPH-I119
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_zt_braced_nested.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: trailing-close body end exposes the post-loop write (EPH-I1209)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The EPH-I1187 class in trailing-close form: the body's own `}`
+    // trails the last body line (`x = 1; }`). The former walk kept going
+    // to the next close-first line — the enclosing block's `}` — and
+    // swallowed the post-loop write into the span, so the suppressor
+    // silenced a read the zero-trip path reaches unfilled. The walk now
+    // reads the trailing close as the body end, and the outside write
+    // breaks the correlation (EPH-I1209).
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn bracedTrailingTail(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    {
+        \\        while (c) : (count += 1) {
+        \\            x = 1; }
+        \\        count = 7;
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_trailing_tail.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_zt_trailing_tail.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: trailing-close clean body keeps the suppressor (EPH-I1209 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The tail-free twin: the trailing `}` on the last body line ends
+    // the span at the body's own close, and the guard proves the fill
+    // covers the read (EPH-I1209 lock side).
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn bracedTrailingClean(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    {
+        \\        while (c) : (count += 1) {
+        \\            x = 1; }
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_trailing_clean.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_zt_trailing_clean.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: trailing-close same-line tail write fails closed (EPH-I1209)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The tail write past the close position on the SAME line
+    // (`x = 1; } count = 7;`): the body ends at the trailing close, the
+    // tail write is outside the loop and breaks the correlation, and the
+    // walk fails closed (EPH-I1209).
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn bracedTrailingSameLine(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    {
+        \\        while (c) : (count += 1) {
+        \\            x = 1; } count = 7;
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_trailing_same.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_zt_trailing_same.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: comment-brace close line keeps the suppression silent (EPH-I1213)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A nested close-first line whose trailing comment carries an open
+    // brace (`} // {`): the comment-blind count inflated the depth, the
+    // loop's own close was consumed as a nested close, and the walk ran
+    // to the guard — the correct suppression converted to a false
+    // definite-assignment warning. The walk masks the comment, so the
+    // suppression stays silent (EPH-I1213).
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn bracedCommentOpenNested(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    while (c) : (count += 1) {
+        \\        x = 1;
+        \\        if (count > 1) {
+        \\            x = 2;
+        \\        } // {
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_comment_open.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_zt_comment_open.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: comment-close on a body line never collapses the depth (EPH-I1213)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A close brace in a trailing comment (`doNothing(); // }`)
+    // collapsed the depth early, the nested block's close ended the
+    // walk before the body fill, and the correct suppression converted
+    // to a false definite-assignment warning. The walk masks the
+    // comment, so the fill stays inside the span (EPH-I1213).
+    const content =
+        \\fn useArr(v: u32) void {
+        \\    _ = v;
+        \\}
+        \\fn doNothing() void {}
+        \\fn bracedCommentClose(c: bool) void {
+        \\    var count: u8 = 0;
+        \\    var x: u32 = undefined;
+        \\    while (c) : (count += 1) {
+        \\        doNothing(); // }
+        \\        if (c) {
+        \\        }
+        \\        x = 2;
+        \\    }
+        \\    if (count == 0) return;
+        \\    useArr(x);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_zt_comment_close.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_zt_comment_close.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

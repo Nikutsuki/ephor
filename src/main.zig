@@ -7703,16 +7703,8 @@ fn findEnclosingIfLine(
 /// Extract the condition text from an if-statement line.
 /// "if (big) {" -> "big", "if (minWindow) |other| {" -> "minWindow"
 fn extractIfCondition(t: []const u8) ?[]const u8 {
-    // Must start with "if " or "} else if " or "if("
-    var rest: []const u8 = undefined;
-    if (mem.startsWith(u8, t, "if ") or mem.startsWith(u8, t, "if(")) {
-        rest = t[2..];
-    } else if (mem.startsWith(u8, t, "} else if ") or mem.startsWith(u8, t, "} else if(")) {
-        rest = t[9..];
-    } else {
-        return null;
-    }
-    rest = mem.trimStart(u8, rest, " \t");
+    const after_keyword = ifKeywordRest(t) orelse return null;
+    const rest = mem.trimStart(u8, after_keyword, " \t");
     if (rest.len == 0 or rest[0] != '(') return null;
     // Find matching close paren
     var paren_depth: usize = 0;
@@ -7725,6 +7717,15 @@ fn extractIfCondition(t: []const u8) ?[]const u8 {
         paren_depth -= 1;
         if (paren_depth == 0) return mem.trim(u8, rest[1..ci], " \t");
     }
+    return null;
+}
+
+/// The text after the if keyword on an if-statement line, or null when the
+/// line does not start one. The keyword forms: "if ", "if(", "} else if ",
+/// and "} else if(".
+fn ifKeywordRest(t: []const u8) ?[]const u8 {
+    if (mem.startsWith(u8, t, "if ") or mem.startsWith(u8, t, "if(")) return t[2..];
+    if (mem.startsWith(u8, t, "} else if ") or mem.startsWith(u8, t, "} else if(")) return t[9..];
     return null;
 }
 
@@ -7999,6 +8000,20 @@ const BraceZeroResult = struct {
     depth: usize,
     found_open: bool,
     touched_zero: bool,
+
+    /// Apply one open brace: depth grows and the open flag latches.
+    fn open(self: *BraceZeroResult) void {
+        self.depth += 1;
+        self.found_open = true;
+    }
+
+    /// Apply one close brace: a positive depth steps down, and the first
+    /// return to zero after an open brace touches zero.
+    fn close(self: *BraceZeroResult) void {
+        if (self.depth == 0) return;
+        self.depth -= 1;
+        if (self.found_open and self.depth == 0) self.touched_zero = true;
+    }
 };
 
 /// Track braces through a line, detecting if depth passes through 0.
@@ -8009,9 +8024,11 @@ fn trackBracesWithZeroDetect(
     initial_depth: usize,
     initial_open: bool,
 ) BraceZeroResult {
-    var depth = initial_depth;
-    var found_open = initial_open;
-    var touched_zero = false;
+    var state = BraceZeroResult{
+        .depth = initial_depth,
+        .found_open = initial_open,
+        .touched_zero = false,
+    };
     var mode: QuoteMode = .none;
     var i: usize = 0;
     while (i < t.len) : (i += 1) {
@@ -8024,20 +8041,10 @@ fn trackBracesWithZeroDetect(
         // A trailing comment's braces are data: they never open, close, or
         // touch zero (EPH-I0081).
         if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
-        if (c == '{') {
-            depth += 1;
-            if (!found_open) found_open = true;
-        }
-        if (c == '}' and depth > 0) {
-            depth -= 1;
-            if (found_open and depth == 0) touched_zero = true;
-        }
+        if (c == '{') state.open();
+        if (c == '}' and state.depth > 0) state.close();
     }
-    return .{
-        .depth = depth,
-        .found_open = found_open,
-        .touched_zero = touched_zero,
-    };
+    return state;
 }
 
 /// Try to continue an if/else chain from the next line after a block closes.
@@ -8168,25 +8175,29 @@ fn branchAssignsVar(
     for (@min(start, lines.len)..@min(actual_end + 1, lines.len)) |i| {
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        // Check for assignment at any code position in the line
-        // (EPH-I0870): one classifier walk plus one comment-start walk
-        // per line (EPH-I0153), candidates ascend.
-        var cls = LineClassifier.init(t);
-        const comment_start = findCommentStart(t);
-        var s: usize = 0;
-        while (mem.indexOfPos(u8, t, s, var_name)) |vpos| {
-            s = vpos + var_name.len;
-            if (vpos > 0 and isIdent(t[vpos - 1])) continue;
-            if (vpos + var_name.len < t.len and isIdent(t[vpos + var_name.len])) continue;
-            if (cls.isInsideString(vpos)) continue;
-            if (comment_start != null and vpos >= comment_start.?) break;
-            if (!isAssignmentTarget(t, var_name, vpos)) continue;
-            // The branch-body top level only (EPH-I0117): the branch's own
-            // brace puts its statements at depth 1, a nested braced
-            // conditional at 2+; a braceless branch body sits at depth 0.
-            if (braceDepthAt(t, vpos, depth) <= 1) return true;
-        }
+        if (lineAssignsVarAtBranchTop(t, var_name, depth)) return true;
         depth = computeBraceDepth(t, depth);
+    }
+    return false;
+}
+
+/// True when the line carries a var_name assignment at the branch-body top
+/// level (EPH-I0117): an identifier occurrence outside string and comment
+/// content (EPH-I0870), at relative brace depth 0 or 1 — the branch's own
+/// brace puts its statements at depth 1, a nested braced conditional at
+/// 2+, and a braceless branch body sits at depth 0. One classifier walk
+/// plus one comment-start walk per line (EPH-I0153), candidates ascend.
+fn lineAssignsVarAtBranchTop(t: []const u8, var_name: []const u8, depth: usize) bool {
+    var cls = LineClassifier.init(t);
+    const comment_start = findCommentStart(t);
+    var s: usize = 0;
+    while (mem.indexOfPos(u8, t, s, var_name)) |vpos| {
+        s = vpos + var_name.len;
+        if (hasIdentNeighbor(t, vpos, var_name.len)) continue;
+        if (cls.isInsideString(vpos)) continue;
+        if (comment_start != null and vpos >= comment_start.?) break;
+        if (!isAssignmentTarget(t, var_name, vpos)) continue;
+        if (braceDepthAt(t, vpos, depth) <= 1) return true;
     }
     return false;
 }
@@ -8281,29 +8292,45 @@ const LastStmtScan = struct {
     /// conditional statement, never an exit).
     fn step(self: *LastStmtScan, c: u8, j: usize) void {
         switch (c) {
-            '{' => {
-                self.depth += 1;
-                if (self.depth == 1) self.stmt_start = j;
-            },
-            '}' => {
-                if (self.depth == 1) {
-                    self.last_start = self.stmt_start;
-                    self.last_end = j + 1;
-                    self.found = true;
-                }
-                if (self.depth > 0) self.depth -= 1;
-                self.stmt_start = j + 1;
-            },
-            ';' => {
-                if (self.depth == 0) {
-                    self.last_start = self.stmt_start;
-                    self.last_end = j + 1;
-                    self.found = true;
-                    self.stmt_start = j + 1;
-                }
-            },
+            '{' => self.openBrace(j),
+            '}' => self.closeBrace(j),
+            ';' => self.semicolon(j),
             else => {},
         }
+    }
+
+    /// One open brace: depth grows, and the first brace starts the
+    /// statement at the brace column — the whole construct is the
+    /// statement.
+    fn openBrace(self: *LastStmtScan, j: usize) void {
+        self.depth += 1;
+        if (self.depth == 1) self.stmt_start = j;
+    }
+
+    /// One close brace: a depth-1 close completes the statement, the depth
+    /// steps down, and the next statement starts after the brace.
+    fn closeBrace(self: *LastStmtScan, j: usize) void {
+        if (self.depth == 1) self.recordStmt(j);
+        if (self.depth > 0) self.depth -= 1;
+        self.stmt_start = j + 1;
+    }
+
+    /// One depth-0 semicolon: the current statement completes and the next
+    /// starts after the semicolon. A nested semicolon belongs to the
+    /// enclosing construct.
+    fn semicolon(self: *LastStmtScan, j: usize) void {
+        if (self.depth == 0) {
+            self.recordStmt(j);
+            self.stmt_start = j + 1;
+        }
+    }
+
+    /// Record the statement ending at column j as the last completed
+    /// statement.
+    fn recordStmt(self: *LastStmtScan, j: usize) void {
+        self.last_start = self.stmt_start;
+        self.last_end = j + 1;
+        self.found = true;
     }
 };
 
@@ -9197,23 +9224,32 @@ fn captureCloseLine(
         const t = mem.trim(u8, lines[idx], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         const code = stripLineComment(t);
-        var mode: QuoteMode = .none;
-        var i: usize = if (idx == start_idx) open_col else 0;
-        while (i < code.len) : (i += 1) {
-            const c = code[i];
-            // Quote data never reaches the brace counter: a brace inside a
-            // string or char literal would corrupt the depth walk. The flat
-            // form keeps ZA302 nesting at 3 here (EPH-I0792).
-            i += scanQuoteStep(&mode, c) orelse 0;
-            if (mode != .none) continue;
-            if (types.isMultilineOpenerAt(code, i)) break;
-            if (c == '{') depth += 1;
-            if (c != '}' or depth == 0) continue;
-            depth -= 1;
-            if (depth == 0) return idx;
-        }
+        const start: usize = if (idx == start_idx) open_col else 0;
+        if (lineClosesBraceGroup(code, start, &depth)) return idx;
     }
     return null;
+}
+
+/// Scan one line's code from `start` for the close of the brace group
+/// carried in `depth`. True when the group closes on the line: a `}` at
+/// depth 1. Quote data never reaches the brace counter — a brace inside a
+/// string or char literal would corrupt the depth walk — and a `\\`
+/// opener's tail is string data, so it ends the scan. The flat form keeps
+/// ZA302 nesting at 3 here (EPH-I0792).
+fn lineClosesBraceGroup(code: []const u8, start: usize, depth: *usize) bool {
+    var mode: QuoteMode = .none;
+    var i: usize = start;
+    while (i < code.len) : (i += 1) {
+        const c = code[i];
+        i += scanQuoteStep(&mode, c) orelse 0;
+        if (mode != .none) continue;
+        if (types.isMultilineOpenerAt(code, i)) return false;
+        if (c == '{') depth.* += 1;
+        if (c != '}' or depth.* == 0) continue;
+        depth.* -= 1;
+        if (depth.* == 0) return true;
+    }
+    return false;
 }
 
 /// The textual line extent of the body belonging to the payload capture
@@ -9240,11 +9276,25 @@ fn captureBodyExtent(
         const base = code.len - rest.len;
         if (rest[0] == ':') return null; // while/for continue expression
         if (rest[0] != '{') return .{ .first = func_line + idx, .last = func_line + idx };
-        const close = captureCloseLine(lines, idx, base) orelse return null;
-        if (close <= idx) return null; // fused single-line brace group
-        return .{ .first = func_line + idx + 1, .last = func_line + close - 1 };
+        return bracedCaptureExtent(lines, func_line, idx, base);
     }
     return null;
+}
+
+/// The body extent of a braced capture scope whose `{` sits at (idx,
+/// base), or null when the braces never balance or the body shares one
+/// line with the brace (`{ ... }` fused: no inner lines). The close walks
+/// through captureCloseLine, so an `} else {` tail ends the scope at the
+/// else boundary.
+fn bracedCaptureExtent(
+    lines: []const []const u8,
+    func_line: usize,
+    idx: usize,
+    base: usize,
+) ?BodyExtent {
+    const close = captureCloseLine(lines, idx, base) orelse return null;
+    if (close <= idx) return null; // fused single-line brace group
+    return .{ .first = func_line + idx + 1, .last = func_line + close - 1 };
 }
 
 /// Mark every line inside the scope of a `|name|` payload capture found on
@@ -10004,29 +10054,45 @@ fn elseTokenBetween(t: []const u8, from: usize, to: usize) bool {
     return false;
 }
 
+/// The line's trimmed text for the free scan, or null when the line is
+/// skipped: out of range, a defer/errdefer line, comment or string
+/// content, or a line inside a capture scope — a free/rebind of the name
+/// there releases the per-iteration element or payload, not the tracked
+/// binding (EPH-I0748, EPH-I0780).
+fn scannableLineText(scan: *const VarFreeCtx, ln: usize) ?[]const u8 {
+    if (ln < scan.func_line) return null;
+    const idx = ln - scan.func_line;
+    if (idx >= scan.lines.len) return null;
+    const t = mem.trim(u8, scan.lines[idx], " \t\r");
+    if (shouldSkipForFreeAnalysis(t, idx, scan.in_defer, scan.in_errdefer)) return null;
+    if (scan.capture_shadowed[idx]) return null;
+    return t;
+}
+
+/// True when the line holds a direct free of var_name or an alias. The
+/// paren join supplies the wrapped free's argument (EPH-I0351).
+fn isFreeOfVarOrAliasLine(
+    scan: *const VarFreeCtx,
+    ln: usize,
+    t: []const u8,
+    buf: []u8,
+) bool {
+    if (!hasRealFreePattern(t)) return false;
+    return isDirectFreeOfVarOrAlias(
+        joinParenContinuation(scan.lines, ln - scan.func_line, buf),
+        scan.var_name,
+        scan.aliases,
+    );
+}
+
 fn scanBlockForFreeOp(scan: *const VarFreeCtx, block: BasicBlock) BlockScanResult {
     var r = BlockScanResult{};
     // Join buffer for zig-fmt wrapped frees: the argument of a wrapped
     // free sits on a continuation line (EPH-I0351).
     var join_buf: [max_join_bytes]u8 = undefined;
     for (block.start_line..block.end_line + 1) |ln| {
-        if (ln < scan.func_line) continue;
-        const idx = ln - scan.func_line;
-        if (idx >= scan.lines.len) continue;
-        const t = mem.trim(u8, scan.lines[idx], " \t\r");
-        if (shouldSkipForFreeAnalysis(t, idx, scan.in_defer, scan.in_errdefer))
-            continue;
-        // A free/rebind of the name inside a capture's scope releases the
-        // per-iteration element or payload, not the tracked binding
-        // (EPH-I0748, EPH-I0780).
-        if (scan.capture_shadowed[idx]) continue;
-        if (hasRealFreePattern(t) and
-            isDirectFreeOfVarOrAlias(
-                joinParenContinuation(scan.lines, idx, &join_buf),
-                scan.var_name,
-                scan.aliases,
-            ))
-        {
+        const t = scannableLineText(scan, ln) orelse continue;
+        if (isFreeOfVarOrAliasLine(scan, ln, t, &join_buf)) {
             r.free_seen = true;
             r.free_line = ln;
             r.op = freeOpForFree(scan, block, ln);
@@ -10440,21 +10506,8 @@ fn checkSameBlockFree(
     // Join buffer for zig-fmt wrapped frees (EPH-I0351).
     var join_buf: [max_join_bytes]u8 = undefined;
     for (block_start..actual_line) |cl| {
-        if (cl < scan.func_line) continue;
-        const ci = cl - scan.func_line;
-        if (ci >= scan.lines.len) continue;
-        const ct = mem.trim(u8, scan.lines[ci], " \t\r");
-        if (shouldSkipForFreeAnalysis(ct, ci, scan.in_defer, scan.in_errdefer))
-            continue;
-        // A capture-scope free rebinds the name to the element or payload:
-        // it never frees the tracked binding, so it sets no freed state
-        // (EPH-I0748, EPH-I0780).
-        if (scan.capture_shadowed[ci]) continue;
-        if (hasRealFreePattern(ct) and isDirectFreeOfVarOrAlias(
-            joinParenContinuation(scan.lines, ci, &join_buf),
-            scan.var_name,
-            scan.aliases,
-        )) {
+        const ct = scannableLineText(scan, cl) orelse continue;
+        if (isFreeOfVarOrAliasLine(scan, cl, ct, &join_buf)) {
             freed = true;
             freed_line = cl;
         }
@@ -10492,24 +10545,15 @@ fn checkAliasBlockFree(
     // Join buffer for zig-fmt wrapped frees (EPH-I0351).
     var join_buf: [max_join_bytes]u8 = undefined;
     for (block_start..actual_line) |cl| {
-        if (cl < scan.func_line) continue;
-        const ci = cl - scan.func_line;
-        if (ci >= scan.lines.len) continue;
-        const ct = mem.trim(u8, scan.lines[ci], " \t\r");
-        if (shouldSkipForFreeAnalysis(ct, ci, scan.in_defer, scan.in_errdefer)) continue;
-        if (scan.capture_shadowed[ci]) continue;
-        if (cl > scan.alloc_info.alloc_line and hasDirectReassignment(ct, scan.var_name)) {
+        const ct = scannableLineText(scan, cl) orelse continue;
+        if (isRootRebindLine(scan, cl, ct)) {
             root_rebound = true;
             continue;
         }
-        if (hasRealFreePattern(ct) and
-            isDirectFreeOfVarOrAlias(
-                joinParenContinuation(scan.lines, ci, &join_buf),
-                scan.var_name,
-                scan.aliases,
-            ))
-        {
-            if (isDirectFreeOfVar(ct, scan.var_name) and root_rebound) continue;
+        // A vetoed root free contributes nothing: no free state, no exit
+        // vote (EPH-I0835).
+        if (isVetoedAliasFreeLine(scan, cl, root_rebound, &join_buf)) continue;
+        if (isFreeOfVarOrAliasLine(scan, cl, ct, &join_buf)) {
             freed = true;
             freed_line = cl;
         }
@@ -10521,6 +10565,34 @@ fn checkAliasBlockFree(
         .rebound = false,
         .freed_line = freed_line,
     };
+}
+
+/// True when the line past the alloc line rebinds the root (EPH-I0835):
+/// the root's first rebind hands the name to new memory, so a later root
+/// free neither frees the alias's target nor resurrects it.
+fn isRootRebindLine(scan: *const VarFreeCtx, cl: usize, ct: []const u8) bool {
+    return cl > scan.alloc_info.alloc_line and hasDirectReassignment(ct, scan.var_name);
+}
+
+/// True when the line's free must be ignored entirely: a root free after
+/// the root's rebind (EPH-I0835). The line then contributes nothing — no
+/// free state, no exit vote.
+fn isVetoedAliasFreeLine(
+    scan: *const VarFreeCtx,
+    ln: usize,
+    root_rebound: bool,
+    buf: []u8,
+) bool {
+    if (!root_rebound) return false;
+    const idx = ln - scan.func_line;
+    const ct = mem.trim(u8, scan.lines[idx], " \t\r");
+    if (!hasRealFreePattern(ct)) return false;
+    if (!isDirectFreeOfVar(ct, scan.var_name)) return false;
+    return isDirectFreeOfVarOrAlias(
+        joinParenContinuation(scan.lines, idx, buf),
+        scan.var_name,
+        scan.aliases,
+    );
 }
 
 /// Same-block verdict for one alias use (EPH-I0835, EPH-I0837): the alias's
@@ -11563,24 +11635,51 @@ fn analyzePredFreeState(
 /// block count: the visited set caps the walk at one visit per block.
 fn cfgPathExists(allocator: Allocator, cfg: *const ControlFlowGraph, from: usize, to: usize) !bool {
     if (from == to) return true;
-    var visited = try std.DynamicBitSetUnmanaged.initEmpty(allocator, cfg.blocks.items.len);
-    defer visited.deinit(allocator);
-    var stack: std.ArrayListUnmanaged(usize) = .empty;
-    defer stack.deinit(allocator);
-    try stack.append(allocator, from);
-    visited.set(from);
-    while (stack.pop()) |cur| {
+    var search = CfgReachSearch{
+        .allocator = allocator,
+        .cfg = cfg,
+        .to = to,
+        .visited = try std.DynamicBitSetUnmanaged.initEmpty(allocator, cfg.blocks.items.len),
+        .stack = .empty,
+    };
+    defer search.deinit();
+    try search.stack.append(allocator, from);
+    search.visited.set(from);
+    while (search.stack.pop()) |cur| {
         for (cfg.edges.items) |edge| {
-            if (edge.from != cur) continue;
-            if (edge.to == to) return true;
-            if (edge.to >= cfg.blocks.items.len) continue;
-            if (visited.isSet(edge.to)) continue;
-            visited.set(edge.to);
-            try stack.append(allocator, edge.to);
+            if (try search.exploreEdge(cur, edge)) return true;
         }
     }
     return false;
 }
+
+/// Bounded walk state for cfgPathExists: the visited set and block stack
+/// for the path search, with the target block held for the edge check.
+const CfgReachSearch = struct {
+    allocator: Allocator,
+    cfg: *const ControlFlowGraph,
+    to: usize,
+    visited: std.DynamicBitSetUnmanaged,
+    stack: std.ArrayListUnmanaged(usize),
+
+    fn deinit(self: *CfgReachSearch) void {
+        self.visited.deinit(self.allocator);
+        self.stack.deinit(self.allocator);
+    }
+
+    /// Explore one edge out of the current block. True when the edge
+    /// reaches the target block; otherwise unseen successors push onto
+    /// the stack and the walk continues.
+    fn exploreEdge(self: *CfgReachSearch, cur: usize, edge: CFGEdge) !bool {
+        if (edge.from != cur) return false;
+        if (edge.to == self.to) return true;
+        if (edge.to >= self.cfg.blocks.items.len) return false;
+        if (self.visited.isSet(edge.to)) return false;
+        self.visited.set(edge.to);
+        try self.stack.append(self.allocator, edge.to);
+        return false;
+    }
+};
 
 /// The loop body's furthest line extent over every back-edge into the
 /// header: a mid-body `continue` source ends the region early, and the

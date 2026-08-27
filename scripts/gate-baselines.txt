@@ -6,5 +6,5 @@
 # tests: the minimum test count from `zig build test --summary all`
 #   (the test ratchet). Update this line only in the commit that changes
 #   the test count (tests added or legitimately deleted).
-dogfood 13
+dogfood 0
 tests 2768

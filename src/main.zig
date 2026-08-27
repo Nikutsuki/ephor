@@ -28018,10 +28018,19 @@ fn processComplexityLine(
     state.* = .{ .cyclomatic = 1 };
 }
 
+/// Issue sink for the complexity analyzers plus the EPH-I0758 pin's
+/// scan-count channel. `scanned_lines` is test-only observability: a
+/// non-null pointer receives one count per walked line — the skip
+/// gate's observable, since a skipped file walks zero lines.
+const ComplexitySink = struct {
+    issues: *std.ArrayListUnmanaged(Issue),
+    scanned_lines: ?*usize = null,
+};
+
 /// Analyze complexity of a single file
 fn analyzeFileComplexity(
     allocator: Allocator,
-    issues: *std.ArrayListUnmanaged(Issue),
+    sink: ComplexitySink,
     a: FileAnalysis,
     th: Thresholds,
 ) !void {
@@ -28034,7 +28043,7 @@ fn analyzeFileComplexity(
     var line_start: usize = 0;
     const content = a.content;
     const reporter: ComplexityReporter = .{
-        .issues = issues,
+        .issues = sink.issues,
         .allocator = allocator,
         .path = a.path,
         .th = th,
@@ -28045,6 +28054,10 @@ fn analyzeFileComplexity(
             // Advance past this line (or past the end to terminate the loop).
             line_start = if (newline == content.len) content.len + 1 else newline + 1;
             line_num += 1;
+            // EPH-I0758 pin channel: one count per walked line, padding
+            // lines included, so the pin can assert full-file coverage
+            // exactly (count('\n') + 1 iterations).
+            if (sink.scanned_lines) |counter| counter.* += 1;
         }
         const line = content[line_start..newline];
         const lead = skipLeadingWhitespace(line);
@@ -28076,7 +28089,7 @@ fn analyzeComplexity(
     errdefer deinitIssues(&issues, allocator);
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
-        try analyzeFileComplexity(allocator, &issues, entry.value_ptr.*, th);
+        try analyzeFileComplexity(allocator, .{ .issues = &issues }, entry.value_ptr.*, th);
     }
     return issues;
 }
@@ -40698,29 +40711,48 @@ fn isInlineDisabled(content: []const u8, line_num: usize, rule: []const u8) bool
             prev_line = line;
             current_line += 1;
         }
-        const is_target = current_line == line_num;
-        const prev_ignores = if (prev_line) |pl| isIgnoreCommentLine(pl, rule) else false;
-
-        if (scope.active) {
-            if (consumeIgnoredScopeLine(&scope, line, is_target)) return true;
-            continue;
-        }
-
-        // A comment-only ignore line suppresses the next line; when that line
-        // opens a brace scope the suppression extends over the whole scope.
-        if (prev_ignores and hasCodeOpenBrace(line)) {
-            scope.depth = unmatchedOpenBraces(line);
-            scope.active = scope.depth > 0;
-            if (is_target) return true;
-            continue;
-        }
-
-        if (!is_target) continue;
-        if (checkLineIgnore(line, rule)) return true;
-        if (prev_ignores) return true;
-        break;
+        const ctx: InlineLineCtx = .{
+            .is_target = current_line == line_num,
+            .prev_ignores = if (prev_line) |pl| isIgnoreCommentLine(pl, rule) else false,
+        };
+        if (consumeInlineLine(&scope, line, ctx, rule)) |verdict| return verdict;
     }
     return false;
+}
+
+/// One line's inputs to the inline-ignore scan (isInlineDisabled): whether
+/// the line is the target and whether the previous line carries an
+/// ignore/disable directive for the rule.
+const InlineLineCtx = struct {
+    is_target: bool,
+    prev_ignores: bool,
+};
+
+/// One line's answer to the inline-ignore scan (isInlineDisabled):
+/// null — keep scanning; true — the target line is suppressed; false —
+/// the target line is not suppressed and the scan ends. While a scope is
+/// active every line is suppressed (including the one that closes it).
+/// A comment-only ignore line suppresses the next line; when that line
+/// opens a brace scope the suppression extends over the whole scope.
+fn consumeInlineLine(
+    scope: *ScopeIgnore,
+    line: []const u8,
+    ctx: InlineLineCtx,
+    rule: []const u8,
+) ?bool {
+    if (scope.active) {
+        if (consumeIgnoredScopeLine(scope, line, ctx.is_target)) return true;
+        return null;
+    }
+    if (ctx.prev_ignores and hasCodeOpenBrace(line)) {
+        scope.depth = unmatchedOpenBraces(line);
+        scope.active = scope.depth > 0;
+        if (ctx.is_target) return true;
+        return null;
+    }
+    if (!ctx.is_target) return null;
+    if (checkLineIgnore(line, rule)) return true;
+    return ctx.prev_ignores;
 }
 
 /// Suppressed-line set for one (file, rule) pair.
@@ -40761,25 +40793,41 @@ fn buildRuleFacts(allocator: Allocator, content: []const u8, rule: []const u8) !
     var lines = mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| : (line_num += 1) {
         const prev_ignores = if (prev_line) |pl| isIgnoreCommentLine(pl, rule) else false;
-        var suppressed = false;
-        if (scope.active) {
-            // consumeIgnoredScopeLine returns is_target, so true here means the
-            // line is suppressed; the call's purpose is the scope tracking.
-            _ = consumeIgnoredScopeLine(&scope, line, true);
-            suppressed = true;
-        } else if (prev_ignores and hasCodeOpenBrace(line)) {
-            scope.depth = unmatchedOpenBraces(line);
-            scope.active = scope.depth > 0;
-            suppressed = true;
-        } else if (checkLineIgnore(line, rule) or prev_ignores) {
-            suppressed = true;
-        }
-        // Brace-less if: a `{}` literal nested deeper would read as extra
-        // nesting depth to ZA302's brace counter.
-        if (suppressed) try facts.lines.put(allocator, line_num, {});
+        if (ruleLineSuppressed(&scope, line, prev_ignores, rule) == .suppressed)
+            try facts.lines.put(allocator, line_num, {});
         prev_line = line;
     }
     return facts;
+}
+
+/// One line's suppression answer for the fact-building scan
+/// (buildRuleFacts): `suppressed` — the line joins the suppressed set;
+/// `clean` — it does not. Mirrors consumeInlineLine's decision tree
+/// branch-for-branch, one line per call with the same scope tracking:
+/// a line entered while a scope is active is suppressed (including the
+/// line that closes it), a scope-opening line is always suppressed, and
+/// a directive-carrying or prev-ignored line is suppressed.
+const RuleLineVerdict = enum { suppressed, clean };
+
+fn ruleLineSuppressed(
+    scope: *ScopeIgnore,
+    line: []const u8,
+    prev_ignores: bool,
+    rule: []const u8,
+) RuleLineVerdict {
+    if (scope.active) {
+        // consumeIgnoredScopeLine returns is_target, so true here means the
+        // line is suppressed; the call's purpose is the scope tracking.
+        _ = consumeIgnoredScopeLine(scope, line, true);
+        return .suppressed;
+    }
+    if (prev_ignores and hasCodeOpenBrace(line)) {
+        scope.depth = unmatchedOpenBraces(line);
+        scope.active = scope.depth > 0;
+        return .suppressed;
+    }
+    if (checkLineIgnore(line, rule) or prev_ignores) return .suppressed;
+    return .clean;
 }
 
 /// Per-(file, rule) cache of directive suppression facts.
@@ -43035,20 +43083,29 @@ fn findPathDirInContent(content: []const u8) ?[]const u8 {
     while (lines.next()) |line| {
         const t = mem.trimStart(u8, line, " \t\r");
         if (mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\")) continue;
-        const code = stripLineComment(t);
-        for (patterns) |pattern| {
-            const pat_idx = mem.indexOf(u8, code, pattern) orelse continue;
-            const rest = code[pat_idx..];
-            const q1 = mem.indexOf(u8, rest, "\"") orelse continue;
-            const after_q1 = q1 + 1;
-            if (after_q1 >= rest.len) continue;
-            const q2 = mem.indexOf(u8, rest[after_q1..], "\"") orelse continue;
-            const path = rest[after_q1 .. after_q1 + q2];
-            if (!mem.endsWith(u8, path, ".zig")) continue;
-            if (!isSafeDetectedPath(path)) continue;
-            if (std.fs.path.dirname(path)) |dir| return dir;
-            return ".";
-        }
+        if (findPathDirInLine(stripLineComment(t), &patterns)) |dir| return dir;
+    }
+    return null;
+}
+
+/// Scan one masked build.zig line for a root_source_file / .root_src
+/// pattern and return the dir portion of the first valid match, or null
+/// (findPathDirInContent). The first valid match per line wins; the
+/// callers' first-valid-match rule spans lines. A rejected match never
+/// selects a value and never aborts detection.
+fn findPathDirInLine(code: []const u8, patterns: []const []const u8) ?[]const u8 {
+    for (patterns) |pattern| {
+        const pat_idx = mem.indexOf(u8, code, pattern) orelse continue;
+        const rest = code[pat_idx..];
+        const q1 = mem.indexOf(u8, rest, "\"") orelse continue;
+        const after_q1 = q1 + 1;
+        if (after_q1 >= rest.len) continue;
+        const q2 = mem.indexOf(u8, rest[after_q1..], "\"") orelse continue;
+        const path = rest[after_q1 .. after_q1 + q2];
+        if (!mem.endsWith(u8, path, ".zig")) continue;
+        if (!isSafeDetectedPath(path)) continue;
+        if (std.fs.path.dirname(path)) |dir| return dir;
+        return ".";
     }
     return null;
 }
@@ -43086,7 +43143,9 @@ fn collectInstallEntries(
     var added = std.StringHashMap(void).init(allocator);
     defer added.deinit();
 
-    // Add standard entry from root_source_file detection
+    // Add standard entry from root_source_file detection. The joined path
+    // stays owned by `entries` after a successful append; the caller-level
+    // errdefer frees it on a later failure.
     const main_path = if (mem.eql(u8, root_dir, "."))
         try allocator.dupe(u8, "main.zig")
     else
@@ -43104,16 +43163,27 @@ fn collectInstallEntries(
         allocator.free(main_path);
     }
 
-    // Always add build.zig as entry
+    try addBuildZigInstallEntry(allocator, &entries, &added);
+
+    return entries;
+}
+
+/// Always add build.zig as an entry, deduped against the set
+/// (collectInstallEntries). Ownership shape matches the main entry:
+/// the slice joins `entries` on append, and the caller-level errdefer
+/// frees it on a later failure.
+fn addBuildZigInstallEntry(
+    allocator: Allocator,
+    entries: *std.ArrayListUnmanaged([]const u8),
+    added: *std.StringHashMap(void),
+) !void {
     const build_zig = try allocator.dupe(u8, "build.zig");
     if (!added.contains(build_zig)) {
-        try appendOwnedEntry(&entries, allocator, build_zig);
+        try appendOwnedEntry(entries, allocator, build_zig);
         try added.put(build_zig, {});
     } else {
         allocator.free(build_zig);
     }
-
-    return entries;
 }
 
 /// Create ephor.json during install with auto-detected path_dir and entries.
@@ -45396,6 +45466,20 @@ fn detectFileTargetEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !
     // first: one fallible call, so the move loop cannot fail with
     // ownership half-moved.
     try cfg.entries.ensureUnusedCapacity(allocator, kept.items.len);
+    const remaining = reappendKeptEntries(cfg, &kept);
+    // Moved entries sit past the new length, so the deferred cleanup
+    // frees only the duplicates.
+    kept.shrinkRetainingCapacity(remaining);
+}
+
+/// Compact `kept` to the entries the load did not re-discover and append
+/// them to cfg.entries, returning the kept count (detectFileTargetEntries).
+/// The caller reserved capacity first, so the append is infallible: the
+/// move cannot fail with ownership half-moved.
+fn reappendKeptEntries(
+    cfg: *Config,
+    kept: *std.ArrayListUnmanaged([]const u8),
+) usize {
     var remaining: usize = 0;
     for (kept.items) |e| {
         if (containsEntry(cfg.entries.items, e)) {
@@ -45405,9 +45489,7 @@ fn detectFileTargetEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !
         }
         cfg.entries.appendAssumeCapacity(e);
     }
-    // Moved entries sit past the new length, so the deferred cleanup
-    // frees only the duplicates.
-    kept.shrinkRetainingCapacity(remaining);
+    return remaining;
 }
 
 /// Extract entry points from build.zig by parsing common patterns.
@@ -45457,35 +45539,52 @@ fn extractBuildZigEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !v
 fn extractPathFromLine(ctx: EntryScanCtx, line: []const u8) !void {
     if (types.LiteralState.forLine(line) == null) return;
     // Pattern: .path("...") - matches b.path("..."), dep.path("..."), dep.builder.path("...")
-    if (findTagInCode(line, ".path(\"", 0)) |idx| {
-        const start = idx + 7; // len of '.path("'
-        if (extractQuotedPath(line, start)) |path|
-            try addEntryIfValid(ctx, path);
-    }
-    // Pattern: .path = "..." or .root_src = "..." or .root_source_file = "..."
-    const path_patterns = [_]struct { tag: []const u8, len: usize }{
+    if (findTagInCode(line, ".path(\"", 0)) |idx|
+        try tryAddQuotedPathAt(ctx, line, idx, 7); // len of '.path("'
+    try scanPathTagPatterns(ctx, line);
+    try scanImportTags(ctx, line);
+}
+
+/// Add the entry for a quoted .zig path found at `idx + offset`, when the
+/// line holds one (extractPathFromLine). The offset is the tag length.
+fn tryAddQuotedPathAt(ctx: EntryScanCtx, line: []const u8, idx: usize, offset: usize) !void {
+    if (extractQuotedPath(line, idx + offset)) |path|
+        try addEntryIfValid(ctx, path);
+}
+
+/// One tag-and-length pair for the build.zig path-tag table scan
+/// (scanPathTagPatterns).
+const PathTagPattern = struct {
+    tag: []const u8,
+    len: usize,
+};
+
+/// Scan the `.path = "..."` / `.root_src = "..."` /
+/// `.root_source_file = "..."` tag table of one build.zig line
+/// (extractPathFromLine). Each tag queries from the line start; the
+/// first match per tag adds its path.
+fn scanPathTagPatterns(ctx: EntryScanCtx, line: []const u8) !void {
+    const path_patterns = [_]PathTagPattern{
         .{ .tag = ".path = \"", .len = 9 },
         .{ .tag = ".root_src = \"", .len = 13 },
         .{ .tag = ".root_source_file = \"", .len = 20 },
     };
     for (path_patterns) |pat| {
-        if (findTagInCode(line, pat.tag, 0)) |idx| {
-            const start = idx + pat.len;
-            if (extractQuotedPath(line, start)) |path|
-                try addEntryIfValid(ctx, path);
-        }
+        if (findTagInCode(line, pat.tag, 0)) |idx|
+            try tryAddQuotedPathAt(ctx, line, idx, pat.len);
     }
-    // Pattern: @import("...") in build.zig (build module imports, entry points)
+}
+
+/// Scan every @import("...") of one build.zig line for entries
+/// (extractPathFromLine). Caller-held line state: one walk per line
+/// across all tag queries (EPH-I0306).
+fn scanImportTags(ctx: EntryScanCtx, line: []const u8) !void {
     var search_pos: usize = 0;
-    // Caller-held line state: one walk per line across all tag queries
-    // (EPH-I0306).
     var cls = LineClassifier.init(line);
     const comment_start = findCommentStart(line);
     while (findTagInCodeScan("@import(\"", search_pos, &cls, comment_start)) |idx| {
-        const start = idx + 9; // len of '@import("'
-        search_pos = start;
-        if (extractQuotedPath(line, start)) |path|
-            try addEntryIfValid(ctx, path);
+        search_pos = idx + 9; // len of '@import("'
+        try tryAddQuotedPathAt(ctx, line, idx, 9);
     }
 }
 
@@ -45883,19 +45982,38 @@ fn scanDirForEntries(ctx: EntryScanCtx, dir_path: []const u8) !void {
     defer dir.close(ctx.diag.io);
     var iter = dir.iterate();
     while (try iter.next(ctx.diag.io)) |entry| {
-        // EPH-I0526: an addDirEntry OOM (allocPrint/append/put) must
-        // abort the scan like the sibling `try` calls do, not silently
-        // drop the entry while the rest of the binary keeps allocating.
-        if (entry.kind == .file and isEntryPointFile(entry.name)) {
-            try addDirEntry(ctx, dir_path, entry.name);
+        switch (try scanDirEntryBody(ctx, dir_path, entry)) {
+            .skip => continue,
+            .descended => {},
         }
-        if (entry.kind != .directory) continue;
-        const subdir = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ dir_path, entry.name });
-        defer ctx.allocator.free(subdir);
-        var child = ctx;
-        child.depth += 1;
-        try scanDirForEntries(child, subdir);
     }
+}
+
+/// One directory entry's disposition in the entry scan
+/// (scanDirForEntries): `skip` — the entry is a file and the walk
+/// continues; `descended` — a subdirectory was scanned recursively.
+const DirEntryDisposition = enum { skip, descended };
+
+/// One entry of the scanDirForEntries walk: an entry-point file joins
+/// the entries list, a subdirectory recurses one depth deeper, and any
+/// other entry skips. An addDirEntry OOM (allocPrint/append/put) must
+/// abort the scan like the sibling `try` calls do, not silently drop
+/// the entry while the rest of the binary keeps allocating (EPH-I0526).
+fn scanDirEntryBody(
+    ctx: EntryScanCtx,
+    dir_path: []const u8,
+    entry: std.Io.Dir.Entry,
+) anyerror!DirEntryDisposition {
+    if (entry.kind == .file and isEntryPointFile(entry.name)) {
+        try addDirEntry(ctx, dir_path, entry.name);
+    }
+    if (entry.kind != .directory) return .skip;
+    const subdir = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ dir_path, entry.name });
+    defer ctx.allocator.free(subdir);
+    var child = ctx;
+    child.depth += 1;
+    try scanDirForEntries(child, subdir);
+    return .descended;
 }
 
 fn detectStandardEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
@@ -45903,6 +46021,28 @@ fn detectStandardEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !vo
     var added = std.StringHashMap(void).init(allocator);
     defer added.deinit();
 
+    try addStandardEntries(diag, allocator, cfg, &added);
+
+    // Parse build.zig for additional entry points
+    try extractBuildZigEntries(diag, allocator, cfg);
+
+    // Update added set with build.zig entries
+    for (cfg.entries.items) |e| try added.put(e, {});
+
+    try scanCwdMultiEntryDirs(diag, allocator, cfg, &added);
+    try addSrcTestFiles(diag, allocator, cfg, &added);
+}
+
+/// Add the conventional entry points that exist in the cwd
+/// (detectStandardEntries): src/main.zig, src/lib.zig, src/root.zig,
+/// and build.zig. Missing candidates skip silently; the access probe is
+/// best-effort on the operator's own tree.
+fn addStandardEntries(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    cfg: *Config,
+    added: *std.StringHashMap(void),
+) !void {
     const entries = [_][]const u8{ "src/main.zig", "src/lib.zig", "src/root.zig", "build.zig" };
     for (entries) |e| {
         Fs.cwd(diag.io).access(e, .{}) catch continue;
@@ -45915,14 +46055,19 @@ fn detectStandardEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !vo
         try appendOwnedEntry(&cfg.entries, allocator, duped);
         try added.put(duped, {});
     }
+}
 
-    // Parse build.zig for additional entry points
-    try extractBuildZigEntries(diag, allocator, cfg);
-
-    // Update added set with build.zig entries
-    for (cfg.entries.items) |e| try added.put(e, {});
-
-    // Scan common multi-entry directories
+/// Scan the conventional multi-entry directories from the cwd
+/// (detectStandardEntries). EPH-I0195 exempt: cwd dir walk over the
+/// operator's own tree, so gate_containment and check_access stay off
+/// (defaults) — the target-tree variant (scanMultiEntryDirs) turns
+/// both on and walks cfg.path-prefixed dirs instead.
+fn scanCwdMultiEntryDirs(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    cfg: *Config,
+    added: *std.StringHashMap(void),
+) !void {
     // Based on patterns found in community projects
     const multi_entry_dirs = [_][]const u8{
         "examples",  "example", "samples", "experiments",
@@ -45931,20 +46076,25 @@ fn detectStandardEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !vo
         "clients",   "drivers", "apps",    "cmd",
         "bin",       "ci",      "user",
     };
-    // EPH-I0195 exempt: cwd dir walk over the operator's own tree, so
-    // gate_containment stays off (default).
     const scan_ctx = EntryScanCtx{
         .diag = diag,
         .allocator = allocator,
         .cfg = cfg,
-        .added = &added,
+        .added = added,
     };
     for (multi_entry_dirs) |dir| {
         try scanDirForEntries(scan_ctx, dir);
     }
+}
 
-    // Auto-discover test files in src/
-    // RED4-7 (EPH-I0210): no-follow like the main walk's descent.
+/// Auto-discover test files in src/ (detectStandardEntries).
+/// RED4-7 (EPH-I0210): no-follow like the main walk's descent.
+fn addSrcTestFiles(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    cfg: *Config,
+    added: *std.StringHashMap(void),
+) !void {
     var dir = Fs.cwd(diag.io).openDir(
         "src",
         .{ .iterate = true, .follow_symlinks = false },
@@ -45952,21 +46102,36 @@ fn detectStandardEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !vo
     defer dir.close(diag.io);
     var iter = dir.iterate();
     while (try iter.next(diag.io)) |entry| {
-        const is_test_file = entry.kind == .file and mem.endsWith(u8, entry.name, "_test.zig");
-        if (!is_test_file) continue;
-        const path = try std.fmt.allocPrint(allocator, "src/{s}", .{entry.name});
-        if (added.contains(path)) {
-            allocator.free(path);
-            continue;
+        switch (try addSrcTestEntry(allocator, cfg, added, entry)) {
+            .skip => continue,
+            .added => {},
         }
-        // EPH-I1037: appendOwnedEntry is the first fallible op after the
-        // join — on append OOM the list never takes ownership and the
-        // helper frees the slice. A failed map put keeps the list slot
-        // (the map references the list-owned slice, it never owns —
-        // Config.deinit frees the list items).
-        try appendOwnedEntry(&cfg.entries, allocator, path);
-        try added.put(path, {});
     }
+}
+
+/// One src/ entry's disposition in the test-file discovery
+/// (addSrcTestFiles): `skip` — not a test file or already added;
+/// `added` — a new *_test.zig entry joined the list.
+const SrcTestDisposition = enum { skip, added };
+
+/// Add one src/ *_test.zig entry when new (addSrcTestFiles). Ownership
+/// shape matches addStandardEntries (EPH-I1037).
+fn addSrcTestEntry(
+    allocator: Allocator,
+    cfg: *Config,
+    added: *std.StringHashMap(void),
+    entry: std.Io.Dir.Entry,
+) !SrcTestDisposition {
+    const is_test_file = entry.kind == .file and mem.endsWith(u8, entry.name, "_test.zig");
+    if (!is_test_file) return .skip;
+    const path = try std.fmt.allocPrint(allocator, "src/{s}", .{entry.name});
+    if (added.contains(path)) {
+        allocator.free(path);
+        return .skip;
+    }
+    try appendOwnedEntry(&cfg.entries, allocator, path);
+    try added.put(path, {});
+    return .added;
 }
 
 /// Command scope of one command-scoped flag: the commands that honor it
@@ -47048,8 +47213,7 @@ fn loadKnownIssuesOnce(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void
     // RED3-7: the auto-detected .ephor-ignore discloses its load. An
     // explicit --known-issues path stays silent (the user asked for it).
     const explicit = cfg.known_issues_path != null;
-    const path = cfg.known_issues_path orelse
-        (try detectKnownIssuesPath(diag, allocator, cfg)) orelse return;
+    const path = (try resolveKnownIssuesPath(diag, allocator, cfg)) orelse return;
 
     const content = (try readKnownIssuesContent(diag, allocator, path, explicit)) orelse return;
     defer allocator.free(content);
@@ -47064,6 +47228,28 @@ fn loadKnownIssuesOnce(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void
         cfg.known_issues.shrinkRetainingCapacity(0);
     }
 
+    try loadKnownIssueKeys(allocator, cfg, content, &keys_added);
+
+    if (!explicit) try noteKnownIssuesAutoload(diag, allocator, path, keys_added);
+}
+
+/// Resolve the known-issues path: the explicit --known-issues path wins;
+/// otherwise auto-detect the .ephor-ignore. Null means no file to load.
+fn resolveKnownIssuesPath(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !?[]const u8 {
+    return cfg.known_issues_path orelse (try detectKnownIssuesPath(diag, allocator, cfg));
+}
+
+/// Parse the file:line keys of one known-issues file into
+/// cfg.known_issues (loadKnownIssuesOnce). `keys_added` counts through
+/// the caller's variable, not a return value: the caller's errdefer must
+/// see the partial count when a parse fails mid-way, so it frees exactly
+/// the keys this load appended.
+fn loadKnownIssueKeys(
+    allocator: Allocator,
+    cfg: *Config,
+    content: []const u8,
+    keys_added: *usize,
+) !void {
     var iter = mem.splitScalar(u8, content, '\n');
     while (iter.next()) |line| {
         const trimmed = mem.trim(u8, line, " \t\r");
@@ -47074,22 +47260,29 @@ fn loadKnownIssuesOnce(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void
         const key = try allocator.dupe(u8, trimmed);
         errdefer allocator.free(key);
         try cfg.known_issues.append(allocator, key);
-        keys_added += 1;
+        keys_added.* += 1;
     }
+}
 
-    if (!explicit) {
-        // path_dir can steer cfg.path into an attacker-named directory.
-        var safe_path = try types.sanitizeTerminal(allocator, path);
-        defer safe_path.deinit(allocator);
-        // B13-21 (EPH-I0520): count only after the fallible sanitize
-        // succeeded — an OOM before the note prints must not count it.
-        diag.known_issues_autoload_count += 1;
-        cliDiag(diag, "note: loaded {d} known-issue {s} from {s}\n", .{
-            keys_added,
-            if (keys_added == 1) @as([]const u8, "entry") else "entries",
-            safe_path.slice,
-        });
-    }
+/// Print the auto-detected known-issues disclosure note
+/// (loadKnownIssuesOnce). The path can derive from a hostile cfg.path
+/// (path_dir), so it crosses the terminal sanitizer (EPH-I0212).
+fn noteKnownIssuesAutoload(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    path: []const u8,
+    keys_added: usize,
+) !void {
+    var safe_path = try types.sanitizeTerminal(allocator, path);
+    defer safe_path.deinit(allocator);
+    // B13-21 (EPH-I0520): count only after the fallible sanitize
+    // succeeded — an OOM before the note prints must not count it.
+    diag.known_issues_autoload_count += 1;
+    cliDiag(diag, "note: loaded {d} known-issue {s} from {s}\n", .{
+        keys_added,
+        if (keys_added == 1) @as([]const u8, "entry") else "entries",
+        safe_path.slice,
+    });
 }
 
 /// Auto-detect a `.ephor-ignore` and adopt it as the known-issues
@@ -106033,18 +106226,15 @@ test "analyzeFileComplexity runs on a string-only marker file (EPH-I0758)" {
 }
 
 test "analyzeFileComplexity does not skip main.zig itself (EPH-I0758)" {
-    var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The real file carries the markers only as string-literal data (this
-    // predicate, its tests), so the dogfood target must be analyzed.
-    const max_main_bytes = 16 * 1024 * 1024;
     // Self-analysis pin (EPH-I0575): the repo's own src/main.zig is the
     // dogfood target, so the test only runs where the repo root is the
     // cwd. A foreign cwd skips it: a tmpDir stand-in would pin the
     // stand-in, not the real file.
+    const max_main_bytes = 16 * 1024 * 1024;
     const content = Fs.cwd(std.testing.io).readFileAlloc(
         allocator,
         "src/main.zig",
@@ -106052,22 +106242,75 @@ test "analyzeFileComplexity does not skip main.zig itself (EPH-I0758)" {
     ) catch
         return error.SkipZigTest;
     defer allocator.free(content);
+    // The real file carries its C-import markers ("__builtin_",
+    // "enum_unnamed_", "@cImport") only as string-literal data, so the
+    // skip gate must classify it as analyzable.
     try std.testing.expect(!isCImportFile("src/main.zig", content));
 
-    var graph = ImportGraph.init(allocator, &diag);
-    defer graph.deinit();
-    const analysis = try createTestFileAnalysis(allocator, "src/main.zig", content);
-    try graph.files.put(analysis.path, analysis);
-    try graph.reachable.put(try allocator.dupe(u8, "src/main.zig"), {});
+    var analysis = try createTestFileAnalysis(allocator, "src/main.zig", content);
+    defer analysis.deinit(allocator);
 
-    // Durable basis for a positive count: the analyzer does not consult
-    // inline suppressions or the config disable list (the CLI filters
-    // those findings later), and main.zig's prong-heavy fns measure over
-    // the default ZA305/ZA306 limits — 130 findings on this file when this
-    // test was written. Those findings survive an I0760 main() split.
-    var issues = try analyzeComplexity(allocator, &graph, .{});
+    // Coverage pin, re-aimed 2026-08-27: the finding-count proxy
+    // (issues.items.len > 0) died when the B123 burn took main.zig's
+    // complexity findings to zero. The mechanism this pin protects is
+    // the EPH-I0758 skip gate, whose observable is the walk itself — a
+    // skipped file walks zero lines. The scan count lands one per line,
+    // padding lines included, so the pin asserts full-file coverage
+    // exactly: one walk iteration per '\n' plus the final line.
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, allocator);
-    try std.testing.expect(issues.items.len > 0);
+    var scanned_lines: usize = 0;
+    try analyzeFileComplexity(allocator, .{
+        .issues = &issues,
+        .scanned_lines = &scanned_lines,
+    }, analysis, .{});
+    try std.testing.expectEqual(mem.count(u8, content, "\n") + 1, scanned_lines);
+
+    // Discrimination companion: a known over-limit file through the same
+    // path must still fire a complexity finding. Without this leg a
+    // broken reporter could green the scan-count pin while the analyzer
+    // stays silent. 25 flat ifs read CCN 26, over the default 10 (and
+    // over the 20 flat-chain allowance), so the finding is unconditional
+    // under the default thresholds.
+    const over_limit =
+        \\fn overLimitFixtures(x: u32) u32 {
+        \\    if (x == 0) return 0;
+        \\    if (x == 1) return 1;
+        \\    if (x == 2) return 2;
+        \\    if (x == 3) return 3;
+        \\    if (x == 4) return 4;
+        \\    if (x == 5) return 5;
+        \\    if (x == 6) return 6;
+        \\    if (x == 7) return 7;
+        \\    if (x == 8) return 8;
+        \\    if (x == 9) return 9;
+        \\    if (x == 10) return 10;
+        \\    if (x == 11) return 11;
+        \\    if (x == 12) return 12;
+        \\    if (x == 13) return 13;
+        \\    if (x == 14) return 14;
+        \\    if (x == 15) return 15;
+        \\    if (x == 16) return 16;
+        \\    if (x == 17) return 17;
+        \\    if (x == 18) return 18;
+        \\    if (x == 19) return 19;
+        \\    if (x == 20) return 20;
+        \\    if (x == 21) return 21;
+        \\    if (x == 22) return 22;
+        \\    if (x == 23) return 23;
+        \\    if (x == 24) return 24;
+        \\    return 0;
+        \\}
+    ;
+    var over_analysis = try createTestFileAnalysis(allocator, "over_limit_fixture.zig", over_limit);
+    defer over_analysis.deinit(allocator);
+    var over_issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&over_issues, allocator);
+    try analyzeFileComplexity(allocator, .{ .issues = &over_issues }, over_analysis, .{});
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(over_issues.items, "over_limit_fixture.zig", RULE_CYCLOMATIC),
+    );
 }
 
 // ============================================================================
@@ -118084,29 +118327,50 @@ fn runConfigLoadSweepIteration(
     diag.entries_reject_count = 0;
     diag.entries_reject_note_count = 0;
     if (fail_at == total) {
-        // No induced failure: the load commits saved_path, absolutizes the
-        // surviving entry, and drops the unresolvable one with one note.
-        try loadConfigFromTargetPath(diag, failing.allocator(), &cfg, root_path);
-        try std.testing.expectEqualStrings(root_path, cfg.path);
-        try std.testing.expect(cfg.path_owned);
-        try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
-        const want_entry = try std.fmt.allocPrint(parent, "{s}/inside.zig", .{root_path});
-        defer parent.free(want_entry);
-        try std.testing.expectEqualStrings(want_entry, cfg.entries.items[0]);
-        try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_count);
-        try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_note_count);
+        try runLoadSweepNoFailure(diag, &failing, &cfg, root_path);
     } else {
-        // A readFileAlloc OOM reads as "no config" (catch return false), so
-        // the sweep tolerates a clean return here as well as OutOfMemory.
-        // Both outcomes must stay byte-balanced below.
-        loadConfigFromTargetPath(diag, failing.allocator(), &cfg, root_path) catch |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-        };
+        try runLoadSweepInducedFailure(diag, &failing, &cfg, root_path);
     }
     cfg.deinit(failing.allocator());
     // Byte balance is the leak proof. A double-free panics the parent
     // DebugAllocator before this line runs.
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
+/// The no-induced-failure arm of runConfigLoadSweepIteration: the load
+/// commits saved_path, absolutizes the surviving entry, and drops the
+/// unresolvable one with one note.
+fn runLoadSweepNoFailure(
+    diag: *DiagCtx,
+    failing: *std.testing.FailingAllocator,
+    cfg: *Config,
+    root_path: []const u8,
+) !void {
+    const parent = std.testing.allocator;
+    try loadConfigFromTargetPath(diag, failing.allocator(), cfg, root_path);
+    try std.testing.expectEqualStrings(root_path, cfg.path);
+    try std.testing.expect(cfg.path_owned);
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    const want_entry = try std.fmt.allocPrint(parent, "{s}/inside.zig", .{root_path});
+    defer parent.free(want_entry);
+    try std.testing.expectEqualStrings(want_entry, cfg.entries.items[0]);
+    try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_count);
+    try std.testing.expectEqual(@as(usize, 1), diag.entries_reject_note_count);
+}
+
+/// The induced-failure arm of runConfigLoadSweepIteration: a
+/// readFileAlloc OOM reads as "no config" (catch return false), so the
+/// sweep tolerates a clean return here as well as OutOfMemory. Both
+/// outcomes must stay byte-balanced below.
+fn runLoadSweepInducedFailure(
+    diag: *DiagCtx,
+    failing: *std.testing.FailingAllocator,
+    cfg: *Config,
+    root_path: []const u8,
+) !void {
+    loadConfigFromTargetPath(diag, failing.allocator(), cfg, root_path) catch |err| {
+        try std.testing.expectEqual(error.OutOfMemory, err);
+    };
 }
 
 test "loadConfigFromTargetPath OOM sweep frees saved_path exactly once (EPH-I0689)" {

@@ -54,6 +54,9 @@ pub const RULE_UNUSED_VAR = "ZA403";
 // ZA5xx - Structure
 pub const RULE_ORPHAN_FILE = "ZA501";
 pub const RULE_FILE_TOO_LARGE = "ZA502";
+// ZA503 (parse-error) carries no registry constant: it lives with the
+// AST-tier helpers (EPH-I0742, see the ZA503 section below).
+pub const RULE_DUPLICATED_BLOCK = "ZA504";
 
 // ZA6xx - Formatting (ZA607 is a semantic definite-assignment check that kept
 // its ZA6xx ID for backward compatibility with existing inline-ignores)

@@ -509,6 +509,19 @@ ZA305 and ZA306 are off by default. To enable them, remove `"ZA305"` and `"ZA306
 | **ZA501** | warning | ON | Orphan file (not imported from entry points) |
 | **ZA502** | warning | ON | File reaches or exceeds the 10 MiB source read cap and is skipped from analysis (split the file into smaller units) |
 | **ZA503** | warning | ON | File does not parse (the AST tier's host-parser check rejected it): one finding per file, located at the first parse error, naming the error. The line tier still scans the file, but `zig build` cannot compile it (EPH-I0742) |
+| **ZA504** | warning | OFF | Duplicated block: a run of 6 or more normalized lines that repeats within one file or across files (copy-paste duplication, EPH-I1076). Off by default until the zero-line cleanup wave burns ephor's own duplicated blocks; flips ON at the same commit (EPH-I1232) |
+
+**ZA504 and normalization:** the normalized form of a line strips `//`
+comments (quote-aware), trims surrounding whitespace, and drops blank
+and comment-only lines. Consecutive duplicated windows merge into one
+finding per maximal run, so a 30-line copy reports once with its full
+span. Three deliberate-duplication surfaces never join the comparison:
+lines inside test bodies (test scaffolding repeats by design), `\\`
+multiline-string content (help text and fixtures are data, not code),
+and cross-file pairs whose files both sit under a directory named
+`compat` (version-mirror trees). The analyzer re-verifies hash-collision
+candidates byte-for-byte before reporting, so a finding is never a hash
+collision.
 
 **ZA501 and the build graph:** build.zig contributes reachability
 through its `b.path("...")` references — test roots and tools that
@@ -1198,7 +1211,7 @@ This section documents the internal detection architecture. Understanding these 
 
 ### Architecture Overview
 
-Ephor has four analysis entry points:
+Ephor has five analysis entry points:
 
 | Entry Point | Scope | Rules | Context |
 |-------------|-------|-------|---------|
@@ -1206,6 +1219,7 @@ Ephor has four analysis entry points:
 | `analyzeIgnoredErrorsInFile` | Full file, line-by-line | ZA205 (in `checkIgnoredError`) | `TypeContext` via `parseFileTypeContext(content)` |
 | `analyzeCFGFile` | Full file, per-function CFG | ZA101-ZA106, ZA110, ZA607, ZA8xx, ZA901/ZA903 (ZA904 runs standalone) | `CFGState` with file-level `no_free_fields` |
 | `analyzeAstTier` | Project import graph, per-file AST | ZA111, ZA503 | `std.Ast` parse per file (`src/ast_tier.zig`); files with parse errors are skipped for ZA111 and reported as ZA503 (EPH-I0742) |
+| `analyzeClones` | Project import graph, normalized-line stream per file | ZA504 | Windowed hash matching over comment-stripped, trimmed lines; test bodies, multiline-string content, and versioned-compat mirror pairs excluded (EPH-I1076) |
 
 Error analysis (`analyzeFileErrors`, `analyzeIgnoredErrorsInFile`) uses `TypeContext` for type-aware method return resolution. Memory analysis (`analyzeCFGFile`) uses CFG-based control flow analysis with type-based allocator suppression. ZA103 is the one exception: its errdefer verdict uses a line-interval model, not the CFG (see the Memory Analysis Path section).
 

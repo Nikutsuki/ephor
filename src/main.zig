@@ -622,6 +622,7 @@ const RULE_UNUSED_CONST = types.RULE_UNUSED_CONST;
 const RULE_UNUSED_VAR = types.RULE_UNUSED_VAR;
 const RULE_ORPHAN_FILE = types.RULE_ORPHAN_FILE;
 const RULE_FILE_TOO_LARGE = types.RULE_FILE_TOO_LARGE;
+const RULE_DUPLICATED_BLOCK = types.RULE_DUPLICATED_BLOCK;
 const RULE_NEEDS_FORMAT = types.RULE_NEEDS_FORMAT;
 const RULE_DEFINITE_ASSIGNMENT = types.RULE_DEFINITE_ASSIGNMENT;
 const RULE_LINE_TOO_LONG = types.RULE_LINE_TOO_LONG;
@@ -26814,6 +26815,379 @@ fn analyzeUnused(
 }
 
 // ============================================================================
+// Duplication Analysis (ZA504) — EPH-I1076
+// ============================================================================
+// Serves REL-ZERO-1 (closing EPH-I1076), REL-GATE-2 (the dogfood ratchet
+// must hold at 0 on ephor's own src), and REL-AB-5 (the corpus A/B matrix
+// must stay byte-identical-or-explained).
+// Clone detection over normalized lines: a "block" is a window of
+// MIN_CLONE_LINES consecutive normalized lines, and a block that occurs
+// twice or more (within one file or across files) is a duplicated block.
+// Normalization keeps structural identity while tolerating type-2
+// variation: trailing whitespace and `//` comments are stripped, and
+// blank/comment-only lines never join the stream. The stream also drops
+// two deliberate-duplication surfaces (see buildCloneStream): lines
+// inside test bodies (scaffolding repeats by design) and `\\` multiline
+// string content (help text and fixtures are data, not code). Cross-file
+// pairs whose files both sit under a directory named `compat` are
+// version mirrors by convention and never reported (hasCompatComponent).
+// Consecutive duplicated windows merge into one finding per maximal run,
+// so a 30-line copy reports once, not 25 times.
+
+/// Minimum normalized lines in one reported duplicated block. Untyped
+/// (comptime_int): the same constant participates in u32 window
+/// arithmetic and usize slice indexing.
+const MIN_CLONE_LINES = 6;
+
+/// Sentinel for the end of one bucket's occurrence chain. The chain links
+/// through indices into CloneScan.occs, so an out-of-range marker must
+/// never alias a real index.
+const clone_occ_none: u32 = std.math.maxInt(u32);
+
+/// One normalized line: the byte range into the file content plus the
+/// original 1-based line number.
+const CloneLine = struct {
+    start: usize,
+    end: usize,
+    line: usize,
+};
+
+/// One file in the clone scan. path/content borrow the graph's storage;
+/// the stream owns only its array.
+const CloneFile = struct {
+    path: []const u8,
+    content: []const u8,
+    stream: std.ArrayListUnmanaged(CloneLine),
+
+    fn hashWindow(self: CloneFile, stream_start: usize) u64 {
+        var h = std.hash.Wyhash.init(0);
+        inline for (0..MIN_CLONE_LINES) |k| {
+            const ln = self.stream.items[stream_start + k];
+            h.update(self.content[ln.start..ln.end]);
+            h.update(&.{'\n'});
+        }
+        return h.final();
+    }
+};
+
+/// One duplicated-window occurrence: file index, stream index, and the
+/// next link in the bucket's chain.
+const CloneOccurrence = struct {
+    file: u32,
+    stream: u32,
+    next: u32,
+};
+
+/// One hash bucket: head of the occurrence chain and the chain length.
+const CloneBucket = struct {
+    head: u32 = clone_occ_none,
+    len: u32 = 0,
+};
+
+/// Scan-wide clone state. Every member outlives the per-file loop, so the
+/// report pass can re-read streams and buckets.
+const CloneScan = struct {
+    files: std.ArrayListUnmanaged(CloneFile) = .empty,
+    occs: std.ArrayListUnmanaged(CloneOccurrence) = .empty,
+    buckets: std.AutoHashMapUnmanaged(u64, CloneBucket) = .empty,
+
+    fn deinit(self: *CloneScan, allocator: Allocator) void {
+        for (self.files.items) |*f| f.stream.deinit(allocator);
+        self.files.deinit(allocator);
+        self.occs.deinit(allocator);
+        self.buckets.deinit(allocator);
+    }
+};
+
+/// One duplicated window position in the flattened duplicate set.
+const DupWindow = struct {
+    file: u32,
+    stream: u32,
+
+    fn lessThan(_: void, a: DupWindow, b: DupWindow) bool {
+        if (a.file != b.file) return a.file < b.file;
+        return a.stream < b.stream;
+    }
+};
+
+/// One maximal run of duplicated windows in one file.
+const CloneRun = struct {
+    file: u32,
+    head: u32,
+    windows: u32,
+    /// Index just past this run in the sorted duplicate list.
+    next: usize,
+};
+
+/// Drive ZA504: build the per-file line streams, hash every window,
+/// collect the duplicated positions, and report one finding per maximal
+/// duplicated run.
+fn analyzeClones(
+    allocator: Allocator,
+    graph: *ImportGraph,
+) !std.ArrayListUnmanaged(Issue) {
+    var scan: CloneScan = .{};
+    defer scan.deinit(allocator);
+    var iter = graph.files.iterator();
+    while (iter.next()) |entry| {
+        const a = entry.value_ptr.*;
+        if (isCImportFile(a.path, a.content)) continue;
+        // The errdefer lives in this inner block: it covers only the
+        // append. A hash failure after the transfer must not free the
+        // stream a second time (scan.deinit owns it by then).
+        {
+            var stream = try buildCloneStream(allocator, a.content);
+            errdefer stream.deinit(allocator);
+            try scan.files.append(allocator, .{
+                .path = a.path,
+                .content = a.content,
+                .stream = stream,
+            });
+        }
+        try hashCloneWindows(allocator, &scan, @intCast(scan.files.items.len - 1));
+    }
+    var dup = try collectDuplicateWindows(allocator, &scan);
+    defer dup.deinit(allocator);
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&issues, allocator);
+    try reportCloneRuns(allocator, &scan, dup.items, &issues);
+    return issues;
+}
+
+/// Build one file's normalized-line stream. Lines inside test bodies and
+/// comment/multiline-string-only lines never join; code lines enter as
+/// trimmed, comment-stripped byte ranges. The test-body walk mirrors
+/// collectFileTestBlocks so both passes agree on block membership.
+fn buildCloneStream(
+    allocator: Allocator,
+    content: []const u8,
+) !std.ArrayListUnmanaged(CloneLine) {
+    var stream: std.ArrayListUnmanaged(CloneLine) = .empty;
+    errdefer stream.deinit(allocator);
+    var state = TestBlockScanState{};
+    var lines = mem.splitScalar(u8, content, '\n');
+    var line_num: usize = 0;
+    var offset: usize = 0;
+    while (lines.next()) |raw| : (line_num += 1) {
+        const line_no = line_num + 1;
+        defer offset += raw.len + 1;
+        const t = mem.trim(u8, raw, " \t\r");
+        const is_data = isCommentOrMultilineString(t);
+        if (!is_data) {
+            const code_end = findCommentStart(raw) orelse raw.len;
+            const code = raw[0..code_end];
+            const was_in_test = state.in_test;
+            const opener = resolveTestOpener(&state.pending, t, was_in_test, line_no);
+            const neutral = mem.trim(u8, blankLiteralContents(code, &state.blank_buf), " \t\r");
+            const ts = trackTestBlock(neutral, state.in_test or opener.pending_open, state.depth);
+            state.in_test = ts.in_test;
+            state.depth = ts.depth;
+        }
+        if (state.in_test or is_data) continue;
+        const norm = mem.trim(u8, stripLineComment(raw), " \t\r");
+        if (norm.len == 0) continue;
+        const start = offset + (norm.ptr - raw.ptr);
+        try stream.append(allocator, .{
+            .start = start,
+            .end = start + norm.len,
+            .line = line_no,
+        });
+    }
+    return stream;
+}
+
+/// Hash every MIN_CLONE_LINES window of `file` into the scan's buckets.
+fn hashCloneWindows(allocator: Allocator, scan: *CloneScan, file: u32) !void {
+    const f = &scan.files.items[file];
+    if (f.stream.items.len < MIN_CLONE_LINES) return;
+    const end = f.stream.items.len - (MIN_CLONE_LINES - 1);
+    for (0..end) |s| {
+        const digest = f.hashWindow(s);
+        const gop = try scan.buckets.getOrPut(allocator, digest);
+        if (!gop.found_existing) {
+            // getOrPut leaves a fresh value undefined: the chain head must
+            // start as the sentinel or the first occurrence links to
+            // garbage (0xAA fill) and the walk indexes out of bounds.
+            gop.value_ptr.* = .{ .head = clone_occ_none, .len = 0 };
+        }
+        const occ_idx: u32 = @intCast(scan.occs.items.len);
+        try scan.occs.append(allocator, .{
+            .file = file,
+            .stream = @intCast(s),
+            .next = gop.value_ptr.head,
+        });
+        gop.value_ptr.head = occ_idx;
+        gop.value_ptr.len += 1;
+    }
+}
+
+/// Flatten every window whose bucket holds two or more occurrences into a
+/// sorted duplicate list. The sort makes run merging one linear pass.
+fn collectDuplicateWindows(
+    allocator: Allocator,
+    scan: *const CloneScan,
+) !std.ArrayListUnmanaged(DupWindow) {
+    var dup: std.ArrayListUnmanaged(DupWindow) = .empty;
+    errdefer dup.deinit(allocator);
+    var bit = scan.buckets.iterator();
+    while (bit.next()) |entry| {
+        if (entry.value_ptr.len < 2) continue;
+        var cur = entry.value_ptr.head;
+        while (cur != clone_occ_none) {
+            const occ = scan.occs.items[cur];
+            try dup.append(allocator, .{ .file = occ.file, .stream = occ.stream });
+            cur = occ.next;
+        }
+    }
+    std.mem.sort(DupWindow, dup.items, {}, DupWindow.lessThan);
+    return dup;
+}
+
+/// Report one finding per maximal duplicated run. A run without a witness
+/// outside itself (a self-repeating block) reports against a second
+/// offset inside the run.
+fn reportCloneRuns(
+    allocator: Allocator,
+    scan: *const CloneScan,
+    dup: []const DupWindow,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    var i: usize = 0;
+    while (i < dup.len) {
+        const run = findCloneRun(dup, i);
+        try reportCloneRun(allocator, scan, run, issues);
+        i = run.next;
+    }
+}
+
+/// Measure one maximal run of consecutive duplicated windows starting at
+/// dup[start].
+fn findCloneRun(dup: []const DupWindow, start: usize) CloneRun {
+    const f = dup[start].file;
+    const head = dup[start].stream;
+    var windows: u32 = 1;
+    var idx = start + 1;
+    while (idx < dup.len and dup[idx].file == f and dup[idx].stream == head + windows) {
+        windows += 1;
+        idx += 1;
+    }
+    return .{ .file = f, .head = head, .windows = windows, .next = idx };
+}
+
+/// Report one duplicated run after witness selection and byte verification.
+fn reportCloneRun(
+    allocator: Allocator,
+    scan: *const CloneScan,
+    run: CloneRun,
+    issues: *std.ArrayListUnmanaged(Issue),
+) !void {
+    const file = scan.files.items[run.file];
+    const witness = findCloneWitness(scan, run) orelse return;
+    if (!cloneWindowsMatch(scan, run.file, run.head, witness)) return;
+    // Pairs whose two files both sit in a versioned-compat directory are
+    // deliberate mirrors (EPH-I1076), never duplication.
+    if (witness.file != run.file) {
+        const witness_path = scan.files.items[witness.file].path;
+        if (hasCompatComponent(file.path) and hasCompatComponent(witness_path)) return;
+    }
+    const span = run.windows + MIN_CLONE_LINES - 1;
+    const line = file.stream.items[run.head].line;
+    const witness_file = scan.files.items[witness.file];
+    const witness_line = witness_file.stream.items[witness.stream].line;
+    const message = if (witness.file == run.file)
+        try std.fmt.allocPrint(
+            allocator,
+            "duplicated block: {d} lines also appear at line {d}",
+            .{ span, witness_line },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "duplicated block: {d} lines also appear at {s}:{d}",
+            .{ span, witness_file.path, witness_line },
+        );
+    errdefer allocator.free(message);
+    try issues.append(allocator, .{
+        .file = file.path,
+        .line = line,
+        .col = 1,
+        .severity = .warning,
+        .rule = RULE_DUPLICATED_BLOCK,
+        .message = message,
+        .message_owned = true,
+        .help = "extract the shared code into one function or constant",
+    });
+}
+
+/// The witness for one run: the smallest (file, stream) occurrence of the
+/// head window's content outside the run, or a second in-run offset when
+/// the run is self-contained. Bucket lookups are by hash; the caller
+/// re-verifies the bytes (cloneWindowsMatch) before reporting.
+fn findCloneWitness(scan: *const CloneScan, run: CloneRun) ?CloneOccurrence {
+    const digest = scan.files.items[run.file].hashWindow(run.head);
+    const bucket = scan.buckets.get(digest) orelse return null;
+    var best: ?CloneOccurrence = null;
+    var cur = bucket.head;
+    while (cur != clone_occ_none) {
+        const occ = scan.occs.items[cur];
+        if (!cloneInRun(occ, run)) {
+            if (best == null or occBefore(occ, best.?)) best = occ;
+        }
+        cur = occ.next;
+    }
+    if (best) |b| return b;
+    cur = bucket.head;
+    while (cur != clone_occ_none) {
+        const occ = scan.occs.items[cur];
+        if (occ.file == run.file and occ.stream != run.head) return occ;
+        cur = occ.next;
+    }
+    return null;
+}
+
+/// True when `occ` sits inside `run`'s window range.
+fn cloneInRun(occ: CloneOccurrence, run: CloneRun) bool {
+    return occ.file == run.file and occ.stream >= run.head and
+        occ.stream < run.head + run.windows;
+}
+
+/// Order two occurrences by (file, stream): the deterministic "first
+/// seen" order for witness selection.
+fn occBefore(a: CloneOccurrence, b: CloneOccurrence) bool {
+    if (a.file != b.file) return a.file < b.file;
+    return a.stream < b.stream;
+}
+
+/// Byte-verify that two windows carry identical normalized content. The
+/// bucket match is a 64-bit hash; this recheck guards hash collisions.
+fn cloneWindowsMatch(
+    scan: *const CloneScan,
+    a_file: u32,
+    a_stream: u32,
+    b: CloneOccurrence,
+) bool {
+    const fa = scan.files.items[a_file];
+    const fb = scan.files.items[b.file];
+    for (0..MIN_CLONE_LINES) |k| {
+        const la = fa.stream.items[a_stream + k];
+        const lb = fb.stream.items[b.stream + k];
+        if (!mem.eql(u8, fa.content[la.start..la.end], fb.content[lb.start..lb.end])) return false;
+    }
+    return true;
+}
+
+/// True when a path component is exactly "compat". Component-wise, like
+/// excludePatternMatchesPath: "x/compat/y" matches, "compatibility" does
+/// not.
+fn hasCompatComponent(path: []const u8) bool {
+    var it = mem.splitScalar(u8, path, '/');
+    while (it.next()) |comp| {
+        if (mem.eql(u8, comp, "compat")) return true;
+    }
+    return false;
+}
+
+// ============================================================================
 // Complexity Analysis Helpers
 // ============================================================================
 
@@ -41155,6 +41529,10 @@ const Config = struct {
         if (mem.eql(u8, rule, RULE_FILE_TOO_LONG)) return true;
         if (mem.eql(u8, rule, RULE_CYCLOMATIC)) return true;
         if (mem.eql(u8, rule, RULE_COGNITIVE)) return true;
+        // ZA504 lands OFF until the zero-line cleanup wave burns ephor's
+        // own duplicated blocks (EPH-I1232); the flip commit removes this
+        // line and turns the README row ON.
+        if (mem.eql(u8, rule, RULE_DUPLICATED_BLOCK)) return true;
         for (off_by_default_prefixes) |prefix| {
             if (mem.startsWith(u8, rule, prefix)) return true;
         }
@@ -47436,7 +47814,7 @@ fn printHelp() void {
         \\  ZA4xx  Unused     (ZA401: unused-import, ZA402: unused-const,
         \\                     ZA403: unused-var)
         \\  ZA5xx  Structure  (ZA501: orphan-file, ZA502: file-too-large,
-        \\                     ZA503: parse-error)
+        \\                     ZA503: parse-error, ZA504: duplicated-block)
         \\  ZA6xx  Format     (ZA601: needs-format,
         \\                     ZA607: read-before-assign, semantic check)
         \\  ZA7xx  Style      (ZA701: line-too-long,
@@ -49835,7 +50213,7 @@ fn collectCheckFindings(ctx: *const RunCtx, g: *ImportGraph) !CheckFindings {
         .cfg = &cfg_mem_issues,
         .structure = &orphan_issues,
     });
-    sortIssuesByFile(orphan_issues.items);
+    try mergeCloneIssues(alloc, g, &orphan_issues);
     var err_issues = try analyzeErrors(alloc, g);
     errdefer deinitIssues(&err_issues, alloc);
     var unused_issues = try analyzeUnused(alloc, g);
@@ -49887,6 +50265,22 @@ fn mergeIntCastIssues(
     try moveIssues(alloc, into, &cast_issues);
     cast_issues.deinit(alloc);
     cast_issues = .empty;
+}
+
+/// ZA504 duplicated-block findings join the structure list (the ZA503
+/// pattern) before its final sort so the merged list stays file-ordered
+/// (EPH-I0742 pattern, EPH-I1076).
+fn mergeCloneIssues(
+    alloc: Allocator,
+    g: *ImportGraph,
+    into: *std.ArrayListUnmanaged(Issue),
+) !void {
+    var clone_issues = try analyzeClones(alloc, g);
+    errdefer deinitIssues(&clone_issues, alloc);
+    try moveIssues(alloc, into, &clone_issues);
+    clone_issues.deinit(alloc);
+    clone_issues = .empty;
+    sortIssuesByFile(into.items);
 }
 
 /// Sink pair for mergeAstTierIssues (EPH-I0742): ZA111 findings merge
@@ -85946,6 +86340,8 @@ fn runCheckAnalysisBattery(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !
     defer deinitIssues(&naming_issues, allocator);
     var test_issues = try analyzeTests(allocator, &g, null);
     defer deinitIssues(&test_issues, allocator);
+    var clone_issues = try analyzeClones(allocator, &g);
+    defer deinitIssues(&clone_issues, allocator);
     var conc_issues = try analyzeConcurrency(allocator, &g);
     defer deinitIssues(&conc_issues, allocator);
     var ast_stats = ast_tier.Stats{};
@@ -123877,4 +124273,274 @@ test "scanRootRealpath roots a file scan at the file's directory" {
     try std.testing.expect(
         scanRootRealpath(std.testing.io, "/nonexistent-ephor-test", &buf) == null,
     );
+}
+
+// ============================================================================
+// ZA504 Tests — duplicated-block detection (EPH-I1076)
+// ============================================================================
+
+/// One in-memory file for a clone test: path plus content.
+const CloneTestFile = struct {
+    path: []const u8,
+    content: []const u8,
+};
+
+/// Clone analysis result: the graph (which owns the borrowed paths the
+/// issues reference) plus the findings. Both live until deinit, so the
+/// test consumes the issues before the graph frees.
+const CloneTestRun = struct {
+    graph: ImportGraph,
+    issues: std.ArrayListUnmanaged(Issue),
+
+    fn deinit(self: *CloneTestRun, allocator: Allocator) void {
+        self.graph.deinit();
+        deinitIssues(&self.issues, allocator);
+    }
+};
+
+/// Test helper: run analyzeClones over the given in-memory files.
+fn runCloneTest(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    files: []const CloneTestFile,
+) !CloneTestRun {
+    var graph = ImportGraph.init(allocator, diag);
+    errdefer graph.deinit();
+    for (files) |f| {
+        const analysis = try createTestFileAnalysis(allocator, f.path, f.content);
+        try graph.files.put(analysis.path, analysis);
+    }
+    var issues = try analyzeClones(allocator, &graph);
+    errdefer deinitIssues(&issues, allocator);
+    return .{ .graph = graph, .issues = issues };
+}
+
+test "ZA504 normalization: comment and whitespace differences still duplicate" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // Copy A and copy B differ only in leading whitespace, a trailing
+    // comment, and an interleaved comment-only line: normalization must
+    // map both copies to the same six normalized lines.
+    const content =
+        \\const alpha = 1;
+        \\const beta = 2;
+        \\const gamma = 3;
+        \\const delta = 4;
+        \\const epsilon = 5;
+        \\const zeta = 6;
+        \\
+        \\const separator = true;
+        \\
+        \\  const alpha = 1;
+        \\  const beta = 2; // copied
+        \\  // a stray comment line
+        \\  const gamma = 3;
+        \\  const delta = 4;
+        \\  const epsilon = 5;
+        \\  const zeta = 6;
+    ;
+    var run = try runCloneTest(&diag, allocator, &.{
+        .{ .path = "normalize.zig", .content = content },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), run.issues.items.len);
+    for (run.issues.items) |issue| {
+        try std.testing.expectEqualStrings("normalize.zig", issue.file);
+        try std.testing.expectEqualStrings(RULE_DUPLICATED_BLOCK, issue.rule);
+        try std.testing.expect(mem.indexOf(u8, issue.message, "6 lines") != null);
+    }
+}
+
+test "ZA504 threshold: five duplicated lines stay silent" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const five =
+        \\const alpha = 1;
+        \\const beta = 2;
+        \\const gamma = 3;
+        \\const delta = 4;
+        \\const epsilon = 5;
+    ;
+    var run = try runCloneTest(&diag, allocator, &.{
+        .{ .path = "five_a.zig", .content = five },
+        .{ .path = "five_b.zig", .content = five },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZA504 threshold: six duplicated lines fire" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const six =
+        \\const alpha = 1;
+        \\const beta = 2;
+        \\const gamma = 3;
+        \\const delta = 4;
+        \\const epsilon = 5;
+        \\const zeta = 6;
+    ;
+    var run = try runCloneTest(&diag, allocator, &.{
+        .{ .path = "six_a.zig", .content = six },
+        .{ .path = "six_b.zig", .content = six },
+    });
+    defer run.deinit(allocator);
+    // Each side of the cross-file pair reports once.
+    try std.testing.expectEqual(@as(usize, 2), run.issues.items.len);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "six_a.zig", RULE_DUPLICATED_BLOCK),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "six_b.zig", RULE_DUPLICATED_BLOCK),
+    );
+}
+
+test "ZA504 compat mirrors: versioned-compat pairs stay silent" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const mirrored =
+        \\pub const Pattern = struct {
+        \\    name: []const u8,
+        \\    rank: u32,
+        \\    entry: Entry,
+        \\    flags: u32,
+        \\    index: u32,
+        \\};
+    ;
+    // Both files sit under a directory named "compat": a deliberate
+    // version-mirror pair, excluded by design (EPH-I1076).
+    var run = try runCloneTest(&diag, allocator, &.{
+        .{ .path = "src/compat/v0_15.zig", .content = mirrored },
+        .{ .path = "src/compat/v0_16.zig", .content = mirrored },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZA504 same-file and cross-file duplication both report" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const six =
+        \\const alpha = 1;
+        \\const beta = 2;
+        \\const gamma = 3;
+        \\const delta = 4;
+        \\const epsilon = 5;
+        \\const zeta = 6;
+    ;
+    // one.zig carries two separated copies (same-file pair); two.zig and
+    // three.zig carry one each (cross-file pair).
+    const doubled = six ++ "\nconst separator = true;\n" ++ six;
+    var run = try runCloneTest(&diag, allocator, &.{
+        .{ .path = "one.zig", .content = doubled },
+        .{ .path = "two.zig", .content = six },
+        .{ .path = "three.zig", .content = six },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countRuleIssues(run.issues.items, "one.zig", RULE_DUPLICATED_BLOCK),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "two.zig", RULE_DUPLICATED_BLOCK),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "three.zig", RULE_DUPLICATED_BLOCK),
+    );
+    // The cross-file message names the other side of the pair.
+    for (run.issues.items) |issue| {
+        if (mem.eql(u8, issue.file, "two.zig"))
+            try std.testing.expect(mem.indexOf(u8, issue.message, "three.zig") != null);
+    }
+}
+
+test "ZA504 test bodies: scaffolding inside test blocks stays silent" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // Both test blocks share the same six-line scaffolding. Test-body
+    // lines never join the clone stream, so the pair must stay silent.
+    const content =
+        \\test "one" {
+        \\    const a = std.testing.allocator;
+        \\    var issues = buildList(a);
+        \\    defer issues.deinit(a);
+        \\    try expectLen(issues, 1);
+        \\    try expectFirst(issues, 'x');
+        \\}
+        \\
+        \\test "two" {
+        \\    const a = std.testing.allocator;
+        \\    var issues = buildList(a);
+        \\    defer issues.deinit(a);
+        \\    try expectLen(issues, 1);
+        \\    try expectFirst(issues, 'y');
+        \\}
+    ;
+    var run = try runCloneTest(&diag, allocator, &.{
+        .{ .path = "tests_inline.zig", .content = content },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZA504 multiline strings: fixture data never duplicates" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // Identical `\\`-string content in two places is data, not code: the
+    // multiline-string lines leave the stream via stripLineComment.
+    const content =
+        \\const help_a =
+        \\    \\alpha help
+        \\    \\beta help
+        \\    \\gamma help
+        \\    \\delta help
+        \\    \\epsilon help
+        \\    \\zeta help
+        \\;
+        \\
+        \\const help_b =
+        \\    \\alpha help
+        \\    \\beta help
+        \\    \\gamma help
+        \\    \\delta help
+        \\    \\epsilon help
+        \\    \\zeta help
+        \\;
+    ;
+    var run = try runCloneTest(&diag, allocator, &.{
+        .{ .path = "help_text.zig", .content = content },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZA504 run merge: a ten-line copy reports once with the full span" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // A ten-identical-line block copied twice: five overlapping windows
+    // per copy would flood five findings each without run merging.
+    const ten =
+        "const cell = record();\n" ++
+        "const cell = record();\n" ++
+        "const cell = record();\n" ++
+        "const cell = record();\n" ++
+        "const cell = record();\n" ++
+        "const cell = record();\n" ++
+        "const cell = record();\n" ++
+        "const cell = record();\n" ++
+        "const cell = record();\n" ++
+        "const cell = record();\n";
+    var run = try runCloneTest(&diag, allocator, &.{
+        .{ .path = "run_a.zig", .content = ten },
+        .{ .path = "run_b.zig", .content = ten },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), run.issues.items.len);
+    for (run.issues.items) |issue| {
+        try std.testing.expect(mem.indexOf(u8, issue.message, "10 lines") != null);
+    }
 }

@@ -3,7 +3,7 @@
 # batch B66: EPH-I0631 through EPH-I0636; batch B67: EPH-I0637 through
 # EPH-I0642; batch B85: EPH-I0205; batch B86f: EPH-I1104/I1106/I1107/
 # I1110/I1111; batch B93p: EPH-I0717/I0720; batch B94: EPH-I0060/I0284;
-# batch B93a: EPH-I1159; batch B106: EPH-I0715).
+# batch B93a: EPH-I1159; batch B106: EPH-I0715; batch B132: EPH-I1220).
 # Runs the real installer against planted fixtures in scratch dirs under
 # .tmp/install-sh-tests. Hermetic: the fake zig on PATH answers version
 # and fetch, and the tags API is a local file, so no network is touched.
@@ -171,6 +171,23 @@ assert_unchanged() { # file, original, label
 assert_empty() { # file, label
     [ ! -s "$1" ] || fail "$2 (expected empty, got $(wc -c < "$1" | tr -d ' ') bytes)"
 }
+
+# EPH-I1220: while no release public key is embedded (the current
+# shipped state), every install that reaches verify_ephor_release
+# prints this trio to stderr and continues on the recorded-hash model
+# (install.sh:208-214). The strict-stderr tests below expect exactly
+# the trio and nothing else, so a changed installer stderr surface
+# fails them instead of drifting past an assert_empty.
+INACTIVE_TRIO='warning: release signature verification is inactive.
+This installer embeds no release public key yet.
+The first signed release activates the check.'
+
+assert_stderr_trio() { # file, label
+    want=$(printf '%s\n' "$INACTIVE_TRIO")
+    got=$(cat "$1")
+    [ "$want" = "$got" ] || fail "$2 (want the inactive-verification trio, got $(wc -c < "$1" | tr -d ' ') bytes)"
+}
+
 count_of() { # file, pattern -> count on stdout
     grep -cF "$2" "$1" | cat
 }
@@ -254,7 +271,7 @@ run_installer "$D"
 assert_rc 0
 assert_grep "$D/build.zig" '/// See:' 'the doc comment was deleted'
 assert_eq 1 "$(count_of "$D/build.zig" '    // Ephor static analysis')" 'marker count wrong'
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 pass "t01 doc comment quoting the marker (F-1)"
 
 # --- t02 (EPH-I0626): a comment mentioning the end marker above a real
@@ -277,7 +294,7 @@ run_installer "$D"
 assert_rc 0
 assert_eq 1 "$(count_of "$D/build.zig" 'pub fn build')" 'build function duplicated'
 assert_grep "$D/build.zig" '// ephor_upgrade_step.dependOn' 'the mention comment was deleted'
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 pass "t02 comment mentioning the end marker (F-2)"
 
 # --- t03 (EPH-I0628): a block that lost its end marker must refuse
@@ -420,7 +437,7 @@ write_fresh_build_zig "$D"
 run_installer "$D"
 assert_rc 0
 assert_grep "$D/build.zig.zon" '.name = .proj_ok,' 'zon name wrong'
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 pass "t12 valid directory name unchanged (F-5 positive)"
 
 # --- t13 (EPH-I0630): garbage zig version text warns and takes the
@@ -445,7 +462,7 @@ write_fresh_build_zig "$D"
 run_installer_with_zig "0.16.0" "$D"
 assert_rc 0
 assert_grep "$D/out.log" 'v0.99.1' 'latest tag not chosen'
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 pass "t14 zig 0.16.0 takes latest tag (F-6 positive)"
 
 # --- t15 (EPH-I0630, positive): a Zig 0.15 version keeps the pin path.
@@ -456,7 +473,7 @@ run_installer_with_zig "0.15.0" "$D"
 assert_rc 0
 assert_grep "$D/out.log" 'v0.11.13' '0.15 pin not chosen'
 assert_not_grep "$D/out.log" 'v0.99.1' 'latest tag chosen for 0.15'
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 pass "t15 zig 0.15.0 keeps the pin (F-6 positive)"
 
 # --- t16 (EPH-I0626, positive): a fresh install with a one-line
@@ -467,7 +484,7 @@ write_fresh_build_zig "$D"
 run_installer "$D"
 assert_rc 0
 assert_grep "$D/out.log" 'Done!' 'no Done! summary'
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 install_line=$(line_of "$D/build.zig" 'b.installArtifact(exe)')
 marker_line=$(line_of "$D/build.zig" '    // Ephor static analysis')
 [ "$marker_line" -gt "$install_line" ] \
@@ -493,7 +510,7 @@ mkdir -p "$D"
 run_installer "$D"
 assert_rc 0
 assert_grep "$D/build.zig" 'b.installArtifact(exe, .{' 'statement opener lost'
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 close_line=$(line_of "$D/build.zig" '});')
 marker_line=$(line_of "$D/build.zig" '    // Ephor static analysis')
 [ "$marker_line" -gt "$close_line" ] \
@@ -555,7 +572,7 @@ mkdir -p "$D"
 run_installer "$D"
 assert_rc 0
 assert_grep "$D/out.log" 'migrated from v0.11.x snippet' 'no migration message'
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 assert_eq 0 "$(count_of "$D/build.zig" '=== Ephor Static Analysis ===')" 'legacy marker remains'
 assert_eq 1 "$(count_of "$D/build.zig" '    // Ephor static analysis')" 'canonical marker missing'
 assert_not_grep "$D/build.zig" 'ephor_exe' 'legacy symbol remains'
@@ -628,7 +645,7 @@ assert_rc 0
 assert_grep "$D/out.log" 'Done!' 'install did not complete'
 assert_grep "$D/build.zig.zon" '.name = .t24,' 'zon not created'
 assert_grep "$D/build.zig" '    // Ephor static analysis' 'block not added'
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 pass "t24 strict umask completes (F-8)"
 
 # --- t25 (EPH-I0633): a TERM while a temp file is live must still clean
@@ -686,7 +703,7 @@ assert_not_grep "$D/build.zig.zon" '0xbeefcafe' 'second hint leaked into the zon
 if [ -e "$D/build.zig.zon.bak" ]; then
     fail "sed backup left behind"
 fi
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 pass "t26 first fingerprint hint wins (F-10)"
 
 # --- t27 (EPH-I0634): a hint with a bare 0x (no hex digits) must refuse
@@ -736,7 +753,7 @@ chmod 600 "$D/build.zig"
 run_installer "$D"
 assert_rc 0
 [ "$(stat -f '%Lp' "$D/build.zig")" = "600" ] || fail "build.zig mode not preserved"
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 pass "t29 splice preserves mode (F-12, BSD stat arm)"
 
 # --- t30 (EPH-I0636): the GNU-dialect arm. A fake uname selects the
@@ -769,7 +786,7 @@ chmod 600 "$D/build.zig"
 run_installer_with_bin "$BINDIR" "$D"
 assert_rc 0
 [ "$(stat -f '%Lp' "$D/build.zig")" = "600" ] || fail "build.zig mode not preserved (GNU arm)"
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 pass "t30 splice preserves mode (F-12, GNU stat arm)"
 
 # --- t31 (EPH-I0641, EPH-I1106): a comment that mentions the dependency
@@ -791,7 +808,7 @@ assert_rc 0
 assert_grep "$D/out.log" 'Installing ephor v0.99.1' 'fresh install labeled as upgrade'
 assert_not_grep "$D/out.log" 'Upgrading' 'comment triggered the upgrade label'
 assert_grep "$D/build.zig" '    // Ephor static analysis' 'block not added (layout branch taken)'
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 pass "t31 comment mentioning the dependency stays Installing (F-17, EPH-I1106)"
 
 # --- t32 (EPH-I0641): a real zon dependency entry must label the run
@@ -816,7 +833,7 @@ EOF
 run_installer "$D"
 assert_rc 0
 assert_grep "$D/out.log" 'Upgrading ephor v0.99.1' 'zon dependency not detected'
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 pass "t32 zon dependency entry labels the run Upgrading (F-17)"
 
 # --- t33 (EPH-I0637): the tags request asks for the API's per-page
@@ -840,7 +857,7 @@ run_installer_with_tags "$TEST_ROOT/tags-t34.json" "$D"
 assert_rc 0
 assert_grep "$D/out.log" 'v0.99.1' 'semver max not chosen'
 assert_not_grep "$D/out.log" 'v0.13.0' 're-dated old tag won'
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 pass "t34 re-dated old tag loses to the semver max (F-13)"
 
 # --- t35 (EPH-I0637): when every resolved tag sorts below the pinned
@@ -1177,7 +1194,7 @@ pub fn build(b: *std.Build) !void {
 EOF
 run_installer "$D"
 assert_rc 0
-assert_empty "$D/err.log" 'stderr not empty'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
 install_line=$(line_of "$D/build.zig" 'b.installArtifact(exe)')
 marker_line=$(line_of "$D/build.zig" '    // Ephor static analysis')
 [ "$marker_line" -eq "$((install_line + 2))" ] \

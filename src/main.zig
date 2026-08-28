@@ -41147,7 +41147,7 @@ const Config = struct {
     }
 
     /// Rules/prefixes that are OFF by default
-    const off_by_default_prefixes = [_][]const u8{ "ZAV", "ZA8", "ZA9" };
+    const off_by_default_prefixes = [_][]const u8{ "ZA8", "ZA9" };
 
     /// Check if a rule is off by default (prefix or exact match)
     fn isOffByDefault(self: *const Config, rule: []const u8) bool {
@@ -45901,7 +45901,7 @@ fn scanPathTagPatterns(ctx: EntryScanCtx, line: []const u8) !void {
     const path_patterns = [_]PathTagPattern{
         .{ .tag = ".path = \"", .len = 9 },
         .{ .tag = ".root_src = \"", .len = 13 },
-        .{ .tag = ".root_source_file = \"", .len = 20 },
+        .{ .tag = ".root_source_file = \"", .len = 21 }, // start past the quote (EPH-I1222)
     };
     for (path_patterns) |pat| {
         if (findTagInCode(line, pat.tag, 0)) |idx|
@@ -46113,7 +46113,7 @@ fn extractPathTagEntries(ctx: EntryScanCtx, line: []const u8) !void {
     const path_tags = [_]struct { tag: []const u8, len: usize }{
         .{ .tag = ".path = \"", .len = 9 },
         .{ .tag = ".root_src = \"", .len = 13 },
-        .{ .tag = ".root_source_file = \"", .len = 20 },
+        .{ .tag = ".root_source_file = \"", .len = 21 }, // start past the quote (EPH-I1222)
     };
     for (path_tags) |pat| {
         if (findTagInCode(line, pat.tag, 0)) |idx| {
@@ -52959,6 +52959,73 @@ test "build.zig entry extractors ignore refs on multiline-string lines (EPH-I022
     const want = try std.fmt.allocPrint(allocator, "{s}/real.zig", .{root});
     defer allocator.free(want);
     try std.testing.expectEqualStrings(want, cfg.entries.items[0]);
+}
+
+test "pathTag extractor lands a .root_source_file entry (EPH-I1222)" {
+    // Positive control for the tag-len fix: pre-fix the len-20 tag left
+    // the extraction start on the opening quote, extractQuotedPath read
+    // an empty path, and the suffix gate dropped it, so no entry landed.
+    // The entry must land in the table, not just run the scan.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/tag_root.zig", .data = "" });
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var added = std.StringHashMap(void).init(allocator);
+    defer added.deinit();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+
+    const ctx = EntryScanCtx{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .added = &added,
+        .prefix = root,
+    };
+    try extractPathTagEntries(ctx, "    .root_source_file = \"src/tag_root.zig\"");
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    const want = try std.fmt.allocPrint(allocator, "{s}/src/tag_root.zig", .{root});
+    defer allocator.free(want);
+    try std.testing.expectEqualStrings(want, cfg.entries.items[0]);
+}
+
+test "cwd pathTag scan lands a .root_source_file entry (EPH-I1222)" {
+    // The same dead-arm fix on the cwd install-entry table.
+    // addEntryIfValid resolves against the process cwd, so the test
+    // chdirs into the fixture; the defer restores before the test ends.
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "src");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "src/cwd_root.zig", .data = "" });
+
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    var old_buf: [Fs.max_path_bytes]u8 = undefined;
+    const old_cwd = try Fs.cwd(std.testing.io).realpath(".", &old_buf);
+    try std.Io.Threaded.chdir(dir_path);
+    defer std.Io.Threaded.chdir(old_cwd) catch {};
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var added = std.StringHashMap(void).init(allocator);
+    defer added.deinit();
+    const ctx = EntryScanCtx{
+        .diag = &diag,
+        .allocator = allocator,
+        .cfg = &cfg,
+        .added = &added,
+    };
+    try scanPathTagPatterns(ctx, "    .root_source_file = \"src/cwd_root.zig\"");
+    try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
+    try std.testing.expectEqualStrings("src/cwd_root.zig", cfg.entries.items[0]);
 }
 
 test "build.zig entry extractors ignore refs in // comments (EPH-I0299)" {

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ephor Layer-1 gate (EPH-I1074; serves REL-GATE-2 and REL-AB-5).
 #
-# Steps: fmt, installer tag resolution, ReleaseSafe build, test ratchet,
-# per-test capture + discovery cross-check, dogfood ratchet (fail_on:
-# warning posture), coverage gate, corpus A/B (zls/ghostty/sig/tigerbeetle).
+# Steps: fmt, installer tag resolution, install-sh suite, ReleaseSafe
+# build, test ratchet, per-test capture + discovery cross-check, dogfood
+# ratchet (fail_on: warning posture), coverage gate, corpus A/B
+# (zls/ghostty/sig/tigerbeetle).
 #
 # Shape rules (core-rules gate lessons):
 # - Every step writes its command output to a named file under .tmp/gate/.
@@ -143,6 +144,33 @@ case "$IEE_RUN" in
             fail "installer e2e ($IEE_RUN checks, $IEE_FAILED failed, exit $IEE_EXIT; see $GATE_DIR/install-e2e.log)"
         else
             ok "installer e2e ($IEE_RUN checks, 0 failed)"
+        fi
+        ;;
+esac
+
+# --- 1d. install-sh regression suite (EPH-I1220; REL-ZERO-1, REL-RELEASE-6) -
+# The suite drives the real installer through the splice/refusal scenarios
+# with a fake zig and file:// fixtures, shell-only, in seconds (16s
+# measured at wiring, 2026-08-28). EPH-I1220: the WP-6.5
+# inactive-verification trio means every successful run warns on stderr, so
+# the strict-stderr tests expect exactly that trio. A changed installer
+# stderr surface fails this leg without a suite edit — the drift this leg
+# exists to catch. No ps1 leg exists: the same limitation as 1b's.
+ISS_EXIT=0
+sh "$REPO_ROOT/tests/install-sh-tests.sh" > "$GATE_DIR/install-suite.log" 2>&1 || ISS_EXIT=$?
+# The tally line is the suite's own verdict ("install-sh tests: N
+# passed"). Its absence means the suite aborted before the verdict (a
+# fail() trip or a fixture break), which is a leg failure, not a pass.
+ISS_PASSED="$(sed -nE 's/^install-sh tests: ([0-9]+) passed$/\1/p' "$GATE_DIR/install-suite.log" | tail -1 || true)"
+case "$ISS_PASSED" in
+    '' | *[!0-9]*)
+        fail "install-sh suite (no tally line; see $GATE_DIR/install-suite.log)"
+        ;;
+    *)
+        if [ "$ISS_EXIT" -ne 0 ]; then
+            fail "install-sh suite (aborted, exit $ISS_EXIT; see $GATE_DIR/install-suite.log)"
+        else
+            ok "install-sh suite ($ISS_PASSED tests passed)"
         fi
         ;;
 esac

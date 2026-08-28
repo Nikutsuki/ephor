@@ -654,8 +654,8 @@ test "vocabulary all_init_patterns includes MemoryPool and omits the removed 0.1
     var found_threadsafe = false;
     for (all_init_patterns) |p| {
         if (std.mem.eql(u8, p, "MemoryPool(")) found_pool = true;
-        // 0.16 removed both names from std.heap; they exist only as
-        // deprecated patterns (ZAV202/ZAV208).
+        // 0.16 removed both names from std.heap; no pattern table
+        // carries them (the deprecated-patterns table was deleted).
         if (std.mem.eql(u8, p, "GeneralPurposeAllocator(")) found_gpa = true;
         if (std.mem.eql(u8, p, "ThreadSafeAllocator.init(")) found_threadsafe = true;
     }

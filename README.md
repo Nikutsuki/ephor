@@ -84,25 +84,32 @@ gigabytes inside that window. The 1 MiB cap stops the stream. An over-cap
 response fails the resolution, and the installer uses the pinned fallback
 tag.
 
-**Release signatures (minisign).** The installers verify the release
-signature before zig fetch. They download the tarball and its signature,
-and check the pair with minisign against the release public key embedded
-in the installer (EPH-I0287). The tarball download is capped at 32 MiB
-and the signature download at 1 MiB. Each fetch times out after 30 s.
-On a signed release, the install fails closed when the signature
-download fails, when minisign is not installed, or when the check
-fails.
+**Release signatures (minisign).** The installers and the `ephor upgrade`
+command verify the release signature before zig fetch. They download the
+tarball and its signature, and check the pair with minisign against the
+release public key embedded in the installer or the ephor binary
+(EPH-I0287). The tarball download is capped at 32 MiB and the signature
+download at 1 MiB. Each fetch times out after 30 s. On a signed release,
+the install or upgrade fails closed when the signature download fails,
+when minisign is not installed, or when the check fails.
 
-Signature verification is inactive while the installer embeds no release
-public key. No signed release exists yet. The first signed release
-activates the check. Signed releases need the minisign binary on PATH.
+Signature verification is inactive while the installer and the binary
+embed no release public key. No signed release exists yet. The first
+signed release activates the check. Signed releases need the minisign
+binary on PATH.
+
+The channel never hands a local file to zig fetch (EPH-I1215). zig
+0.16.0 crashes on `file://` URLs (upstream SIGBUS), so the installers
+and the upgrade command keep zig fetch on the canonical `https` archive
+URL. Only the curl-side download touches a local path, and curl alone
+reads it.
 
 One window remains. zig fetch downloads the artifact again after the
-installer verifies it. A network attacker who swaps bytes between the
-two downloads defeats the check. The recorded hash in `build.zig.zon`
-limits this window: every later fetch verifies the artifact against the
-recorded hash, and ephor prints the hash after every fetch. Compare it
-across upgrades to catch a changed artifact.
+installer or the upgrade command verifies it. A network attacker who
+swaps bytes between the two downloads defeats the check. The recorded
+hash in `build.zig.zon` limits this window: every later fetch verifies
+the artifact against the recorded hash, and ephor prints the hash after
+every fetch. Compare it across upgrades to catch a changed artifact.
 
 - Upgrades refuse to move below the running binary's version. Pass
   `--force` to override.

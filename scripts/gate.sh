@@ -121,6 +121,32 @@ case "$ITR_RUN" in
         ;;
 esac
 
+# --- 1c. installer e2e (EPH-I0287; REL-RELEASE-6) --------------------------
+# The full fail-closed path: the suite drives the real install.sh through
+# the six signature-verification states with local HTTP redirect servers
+# and a fresh test keypair, and pins the file:// byte cap. Slower than
+# the 1b harness (it runs real installs), so it runs once per gate. The
+# no-ps1-leg limitation is the same as 1b's.
+IEE_EXIT=0
+sh "$SCRIPT_DIR/test-install-e2e.sh" > "$GATE_DIR/install-e2e.log" 2>&1 || IEE_EXIT=$?
+# The tally line is the harness's own verdict ("wp65 e2e: N checks, M
+# failed"). Its absence means the harness aborted before the verdict (a
+# missing tool or a dead redirect server), which is a leg failure.
+IEE_RUN="$(sed -nE 's/^wp65 e2e: ([0-9]+) checks, ([0-9]+) failed$/\1/p' "$GATE_DIR/install-e2e.log" | tail -1 || true)"
+IEE_FAILED="$(sed -nE 's/^wp65 e2e: ([0-9]+) checks, ([0-9]+) failed$/\2/p' "$GATE_DIR/install-e2e.log" | tail -1 || true)"
+case "$IEE_RUN" in
+    '' | *[!0-9]*)
+        fail "installer e2e (no tally line; see $GATE_DIR/install-e2e.log)"
+        ;;
+    *)
+        if [ "$IEE_EXIT" -ne 0 ] || [ "$IEE_FAILED" != "0" ]; then
+            fail "installer e2e ($IEE_RUN checks, $IEE_FAILED failed, exit $IEE_EXIT; see $GATE_DIR/install-e2e.log)"
+        else
+            ok "installer e2e ($IEE_RUN checks, 0 failed)"
+        fi
+        ;;
+esac
+
 # --- 2. build (ReleaseSafe) ------------------------------------------------
 # Fail-fast: every later leg runs the freshly built binary. A failed build
 # must not let the dogfood or corpus legs scan a stale binary.

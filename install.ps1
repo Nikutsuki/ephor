@@ -174,7 +174,13 @@ error: zig is not installed or not on PATH.
                     $TAGS_API,
                     [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead
                 ).GetAwaiter().GetResult()
-                $response.EnsureSuccessStatusCode()
+                # EPH-I1219 pin run: on .NET 5+ EnsureSuccessStatusCode
+                # returns the response message, and a bare method call
+                # emits its return value, so the function output carried
+                # the response beside the resolved tag and
+                # Test-VersionOlder died converting it. Discard the
+                # return explicitly, like the ast-check capture below.
+                $null = $response.EnsureSuccessStatusCode()
                 $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
                 $bytes = New-Object byte[] 1048576
                 $buffer = [System.IO.MemoryStream]::new()

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ephor Layer-1 gate (EPH-I1074; serves REL-GATE-2 and REL-AB-5).
 #
-# Steps: fmt, installer tag resolution, install-sh suite, ReleaseSafe
-# build, test ratchet, per-test capture + discovery cross-check, dogfood
-# ratchet (fail_on: warning posture), coverage gate, corpus A/B
-# (zls/ghostty/sig/tigerbeetle).
+# Steps: fmt, installer tag resolution, install-sh suite, install-ps1
+# anchor pin, ReleaseSafe build, test ratchet, per-test capture +
+# discovery cross-check, dogfood ratchet (fail_on: warning posture),
+# coverage gate, corpus A/B (zls/ghostty/sig/tigerbeetle).
 #
 # Shape rules (core-rules gate lessons):
 # - Every step writes its command output to a named file under .tmp/gate/.
@@ -99,9 +99,9 @@ fi
 # The installer surface changes often (tag clamp, 1 MiB body cap, fallback
 # pairing), and the harness drives the real shipped functions with a fake
 # curl and file:// fixtures in seconds. A regression must not land
-# gate-green. No ps1 leg exists: pwsh is absent on the dev machine, so the
-# install.ps1 bounded-read arm (EPH-I0207) stays manual — the recorded
-# limitation.
+# gate-green. The install.ps1 bounded-read arm (EPH-I0207) has no ps1
+# coverage: the 1e anchor leg pins one anchor scenario, so the
+# bounded-read port stays manual — the recorded limitation.
 ITR_EXIT=0
 sh "$SCRIPT_DIR/test-install-tag-resolution.sh" > "$GATE_DIR/install-tag.log" 2>&1 || ITR_EXIT=$?
 # The tally line is the harness's own verdict ("N tests, M failed"). Its
@@ -127,7 +127,8 @@ esac
 # the six signature-verification states with local HTTP redirect servers
 # and a fresh test keypair, and pins the file:// byte cap. Slower than
 # the 1b harness (it runs real installs), so it runs once per gate. The
-# no-ps1-leg limitation is the same as 1b's.
+# ps1 e2e-state gap is the same as 1b's: the 1e anchor leg runs one
+# scenario.
 IEE_EXIT=0
 sh "$SCRIPT_DIR/test-install-e2e.sh" > "$GATE_DIR/install-e2e.log" 2>&1 || IEE_EXIT=$?
 # The tally line is the harness's own verdict ("wp65 e2e: N checks, M
@@ -155,7 +156,8 @@ esac
 # inactive-verification trio means every successful run warns on stderr, so
 # the strict-stderr tests expect exactly that trio. A changed installer
 # stderr surface fails this leg without a suite edit — the drift this leg
-# exists to catch. No ps1 leg exists: the same limitation as 1b's.
+# exists to catch. The 1e anchor leg pins one scenario on the ps1 side;
+# the full splice/refusal suite has no ps1 companion.
 ISS_EXIT=0
 sh "$REPO_ROOT/tests/install-sh-tests.sh" > "$GATE_DIR/install-suite.log" 2>&1 || ISS_EXIT=$?
 # The tally line is the suite's own verdict ("install-sh tests: N
@@ -174,6 +176,37 @@ case "$ISS_PASSED" in
         fi
         ;;
 esac
+
+# --- 1e. install-ps1 anchor pin (EPH-I1219; REL-ZERO-1, REL-RELEASE-6) -----
+# The B136 t48-mirror pin: the ps1 anchor walk must skip the comment,
+# string, and case-variant mention shapes and land the block right after
+# the real call. Runs only when pwsh is on PATH; machines without pwsh
+# skip the leg without a failure (the installer surface stays sh-gated
+# there).
+if command -v pwsh > /dev/null 2>&1; then
+    IPA_EXIT=0
+    pwsh -NoProfile -NonInteractive -File "$SCRIPT_DIR/test-install-ps1-anchor.ps1" > "$GATE_DIR/install-ps1-anchor.log" 2>&1 || IPA_EXIT=$?
+    # The tally line is the suite's own verdict ("ps1 anchor: N checks, M
+    # failed"). Its absence means the suite aborted before the verdict (a
+    # fixture break or a missing install.ps1 function), which is a leg
+    # failure, not a pass.
+    IPA_RUN="$(sed -nE 's/^ps1 anchor: ([0-9]+) checks, ([0-9]+) failed$/\1/p' "$GATE_DIR/install-ps1-anchor.log" | tail -1 || true)"
+    IPA_FAILED="$(sed -nE 's/^ps1 anchor: ([0-9]+) checks, ([0-9]+) failed$/\2/p' "$GATE_DIR/install-ps1-anchor.log" | tail -1 || true)"
+    case "$IPA_RUN" in
+        '' | *[!0-9]*)
+            fail "install-ps1 anchor pin (no tally line; see $GATE_DIR/install-ps1-anchor.log)"
+            ;;
+        *)
+            if [ "$IPA_EXIT" -ne 0 ] || [ "$IPA_FAILED" != "0" ]; then
+                fail "install-ps1 anchor pin ($IPA_RUN checks, $IPA_FAILED failed, exit $IPA_EXIT; see $GATE_DIR/install-ps1-anchor.log)"
+            else
+                ok "install-ps1 anchor pin ($IPA_RUN checks, 0 failed)"
+            fi
+            ;;
+    esac
+else
+    note "install-ps1 anchor pin (skipped: pwsh not on PATH)"
+fi
 
 # --- 2. build (ReleaseSafe) ------------------------------------------------
 # Fail-fast: every later leg runs the freshly built binary. A failed build

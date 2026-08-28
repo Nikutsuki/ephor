@@ -84,11 +84,11 @@ gigabytes inside that window. The 1 MiB cap stops the stream. An over-cap
 response fails the resolution, and the installer uses the pinned fallback
 tag.
 
-**Release signatures (minisign).** The installers and the `ephor upgrade`
-command verify the release signature before zig fetch. They download the
-tarball and its signature, and check the pair with minisign against the
-release public key embedded in the installer or the ephor binary
-(EPH-I0287). The tarball download is capped at 32 MiB and the signature
+**Release signatures (minisign).** The installers and the `ephor
+install` and `ephor upgrade` commands verify the release signature
+before zig fetch. They download the tarball and its signature, and check
+the pair with minisign against the release public key embedded in the
+installer or the ephor binary (EPH-I0287). The tarball download is capped at 32 MiB and the signature
 download at 1 MiB. Each fetch times out after 30 s. On a signed release,
 the install or upgrade fails closed when the signature download fails,
 when minisign is not installed, or when the check fails.
@@ -98,11 +98,10 @@ embed no release public key. No signed release exists yet. The first
 signed release activates the check. Signed releases need the minisign
 binary on PATH.
 
-The channel never hands a local file to zig fetch (EPH-I1215). zig
-0.16.0 crashes on `file://` URLs (upstream SIGBUS), so the installers
-and the upgrade command keep zig fetch on the canonical `https` archive
-URL. Only the curl-side download touches a local path, and curl alone
-reads it.
+The installers and the binary keep zig fetch on the canonical `https`
+archive URL. They never hand a local file to zig fetch (EPH-I1215): zig
+0.16.0 crashes on `file://` URLs (upstream SIGBUS). Only the curl-side
+download touches a local path, and curl alone reads it.
 
 One window remains. zig fetch downloads the artifact again after the
 installer or the upgrade command verifies it. A network attacker who

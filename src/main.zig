@@ -43563,10 +43563,13 @@ fn requireZigFloor(diag: *DiagCtx, allocator: Allocator) error{ZigTooOld}!void {
 /// --version returns error.InvalidVersion before any project check
 /// (EPH-I0155). Every other failure path returns error.InstallFailed
 /// (EPH-I0235): a CI step doing `ephor install && zig build ephor` must
-/// not proceed on a failed install. The zig-fetch spawn must stay after
-/// the version, prerequisite, and Zig-version gates: the hermetic tests
-/// rely on that order (band-T05 F5, EPH-I0572 — the pin lives at
-/// runZigFetchSave).
+/// not proceed on a failed install. The release-signature verification
+/// (EPH-I1225, EPH-I0287) runs after the Zig-version gate and before the
+/// fetch, mirroring the upgrade path; it does no network I/O while the
+/// embedded key is empty. The zig-fetch spawn must stay after
+/// the version, prerequisite, Zig-version, and verification gates: the
+/// hermetic tests rely on that order (band-T05 F5, EPH-I0572 — the pin
+/// lives at runZigFetchSave).
 fn runInstallCommand(
     diag: *DiagCtx,
     allocator: Allocator,
@@ -43589,6 +43592,15 @@ fn runInstallCommand(
     defer allocator.free(package_url);
 
     std.debug.print("Installing ephor v{s}...\n", .{ver});
+
+    // EPH-I1225: verify the release signature before the first fetch,
+    // the same check the upgrade path runs (EPH-I0287, WP-6.5). With
+    // the empty embedded key the check is inactive: it warns and
+    // continues with no network I/O, so the hermetic install tests
+    // stay offline (band-T05 F5, EPH-I0572). A failure maps to
+    // InstallFailed like every install error (EPH-I0235).
+    verifyReleaseSignature(diag, allocator, release_pubkey, package_url) catch
+        return error.InstallFailed;
 
     const url_z = try allocator.dupeZ(u8, package_url);
     defer allocator.free(url_z);
@@ -44253,7 +44265,7 @@ const UpgradeRun = struct {
         // fetch (install.sh's order). Inactive while the embedded key is
         // empty: warns and continues with no network I/O, so the hermetic
         // upgrade tests stay offline (band-T05 F5, EPH-I0572).
-        try verifyUpgradeRelease(self.diag, self.allocator, release_pubkey, package_url);
+        try verifyReleaseSignature(self.diag, self.allocator, release_pubkey, package_url);
 
         const url_z = try self.allocator.dupeZ(u8, package_url);
         defer self.allocator.free(url_z);
@@ -44301,12 +44313,12 @@ fn upgradeFetchOutcome(diag: *DiagCtx, exited: u8, ver: []const u8) !void {
 
 /// Embedded release-signing public key (EPH-I0287, WP-6.5). Two states,
 /// mirroring install.sh's RELEASE_PUBKEY:
-/// - Empty (today): no release is signed. The upgrade path warns that
-///   signature verification is inactive and continues on the
+/// - Empty (today): no release is signed. The install and upgrade paths
+///   warn that signature verification is inactive and continue on the
 ///   recorded-hash model.
 /// - Set: the WP-7 release pipeline fills this constant when it mints
-///   the release keypair. Every upgrade then verifies the signed
-///   tarball before the zig fetch and fails closed on any miss.
+///   the release keypair. Every install and upgrade then verifies the
+///   signed tarball before the zig fetch and fails closed on any miss.
 const release_pubkey: []const u8 = "";
 
 /// Temp base for the release-verification files (EPH-I0287): install.sh's
@@ -44337,15 +44349,17 @@ fn signatureUrlFor(allocator: Allocator, package_url: []const u8) ![]const u8 {
 }
 
 /// EPH-I0287 (WP-6.5): verify the signed release before the zig fetch,
-/// mirroring install.sh's verify_ephor_release. Two states:
+/// mirroring install.sh's verify_ephor_release. Install and upgrade
+/// share the one check (EPH-I1225). Two states:
 /// - Inactive (empty key): warn and continue with no network I/O. The
-///   hermetic upgrade tests rest on this (band-T05 F5, EPH-I0572).
+///   hermetic install and upgrade tests rest on this (band-T05 F5,
+///   EPH-I0572).
 /// - Active (key set): the tarball and its signature download into a
 ///   fresh temp dir, minisign checks the pair, and a missing binary, a
-///   failed download, or a bad signature fails the upgrade closed. The
+///   failed download, or a bad signature fails the command closed. The
 ///   zig fetch keeps the canonical https URL, so zig never receives a
 ///   local file or a file:// URL (EPH-I1215).
-fn verifyUpgradeRelease(
+fn verifyReleaseSignature(
     diag: *DiagCtx,
     allocator: Allocator,
     pubkey: []const u8,
@@ -44363,7 +44377,7 @@ fn verifyUpgradeRelease(
     try verifySignedRelease(diag, allocator, pubkey, package_url);
 }
 
-/// The active half of verifyUpgradeRelease (EPH-I0287): download the
+/// The active half of verifyReleaseSignature (EPH-I0287): download the
 /// tarball and its signature into a fresh temp dir, then verify with
 /// minisign. The order mirrors install.sh: the minisign presence check
 /// precedes the downloads, so a missing binary reports before any
@@ -44404,7 +44418,7 @@ fn verifySignedRelease(
     downloadReleaseFile(diag.io, package_url, tarball_path, release_tarball_cap_bytes) catch {
         cliDiag(diag,
             \\error: could not download the release tarball for verification.
-            \\Check the network connection, then re-run the upgrade.
+            \\Check the network connection, then re-run the command.
             \\
         , .{});
         return error.UpgradeFailed;
@@ -44412,7 +44426,7 @@ fn verifySignedRelease(
     downloadReleaseFile(diag.io, sig_url, sig_path, release_sig_cap_bytes) catch {
         cliDiag(diag,
             \\error: could not download the release signature.
-            \\Check the network connection, then re-run the upgrade.
+            \\Check the network connection, then re-run the command.
             \\
         , .{});
         return error.UpgradeFailed;
@@ -44466,11 +44480,12 @@ fn minisignAvailable(io: std.Io) bool {
 }
 
 /// The missing-minisign fail-closed path (EPH-I0287): install.sh's
-/// message pair, with the upgrade command named.
+/// message pair. The pair serves install and upgrade (EPH-I1225), so
+/// the remedy names the command generically.
 fn missingMinisignFailure(diag: *DiagCtx) error{UpgradeFailed} {
     cliDiag(diag,
         \\error: minisign is not installed or not on PATH.
-        \\This release is signed. Install minisign, then re-run the upgrade.
+        \\This release is signed. Install minisign, then re-run the command.
         \\
     , .{});
     return error.UpgradeFailed;
@@ -44520,7 +44535,7 @@ fn reportSignatureFailure(diag: *DiagCtx, verdict: []const u8) error{UpgradeFail
     if (verdict.len > 0) cliDiag(diag, "{s}", .{verdict});
     cliDiag(diag,
         \\error: the release signature check failed.
-        \\The downloaded artifact may be tampered with. The upgrade stops.
+        \\The downloaded artifact may be tampered with. The command stops.
         \\
     , .{});
     return error.UpgradeFailed;
@@ -44529,11 +44544,17 @@ fn reportSignatureFailure(diag: *DiagCtx, verdict: []const u8) error{UpgradeFail
 /// Download one verification file with the scheme clamp and the byte cap
 /// (EPH-I0287, install.sh's fetch_bounded shape): curl writes the body
 /// to dest_path, and any spawn failure or nonzero exit fails the call.
-/// The release URLs are https, so the =https clamps apply (EPH-I0156).
+/// The flags mirror install.sh's -fsSL minus -S: -f turns an HTTP error
+/// status (404/500/403) into a nonzero exit, so the download-failure
+/// message pair fires instead of minisign misdiagnosing an error body
+/// as tampering (EPH-I1226); -s silences the progress meter; -L follows
+/// redirects. The -S error display stays dropped because the spawn
+/// discards both streams (install.sh's 2>/dev/null shape). The release
+/// URLs are https, so the =https clamps apply (EPH-I0156).
 fn downloadReleaseFile(io: std.Io, url: []const u8, dest_path: []const u8, cap: []const u8) !void {
     var child = try std.process.spawn(io, .{
         .argv = &.{
-            tool_curl_path,   "-sL",    "--max-time",    "30",
+            tool_curl_path,   "-fsL",   "--max-time",    "30",
             "--proto",        "=https", "--proto-redir", "=https",
             "--max-filesize", cap,      "-o",            dest_path,
             url,
@@ -121270,7 +121291,7 @@ test "upgrade release verification is inactive without an embedded key (EPH-I028
     // The empty embedded key is the inactive state: the run warns and
     // continues with no network I/O and no spawns, so the hermetic
     // upgrade tests stay offline (band-T05 F5, EPH-I0572).
-    try verifyUpgradeRelease(
+    try verifyReleaseSignature(
         &diag,
         std.testing.allocator,
         release_pubkey,
@@ -121282,6 +121303,53 @@ test "upgrade release verification is inactive without an embedded key (EPH-I028
     try std.testing.expect(
         std.mem.indexOf(u8, capture.slice(), "no release public key yet") != null,
     );
+}
+
+test "install verifies the release signature before the fetch (EPH-I1225)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig",
+        .data = "pub fn build(b: *std.Build) void {\n    _ = b;\n}\n",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig.zon",
+        .data = ".{ .name = .demo, .version = \"0.1.0\" }\n",
+    });
+    // The fake curl and minisign record any spawn in marker files: the
+    // empty embedded key must keep the verification away from both.
+    const fakes = try installVerifyFakes(&tmp, allocator, .ok);
+    defer fakes.deinit(allocator);
+    // The fake zig reports a floor-compliant version and fails the
+    // fetch, so the run reaches the verification, then fails after the
+    // inactive warning printed (EPH-I0235 maps it to InstallFailed).
+    const fake_path = try installFakeZig(
+        &tmp,
+        allocator,
+        "#!/bin/sh\ncase \"$1\" in\n  version) echo 0.16.0 ;;\n  *) exit 1 ;;\nesac\n",
+    );
+    defer allocator.free(fake_path);
+    const saved_zig_path = tool_zig_path;
+    defer tool_zig_path = saved_zig_path;
+    tool_zig_path = fake_path;
+    try std.testing.expectError(
+        error.InstallFailed,
+        runInstallCommand(&diag, allocator, tmp.dir, null),
+    );
+    // The inactive warning printed before the fetch, and the
+    // verification made no tool spawns, so the hermetic install tests
+    // stay offline (band-T05 F5, EPH-I0572). The test covers the
+    // empty-key state the WP-7 pipeline later replaces with the key.
+    try std.testing.expect(
+        std.mem.indexOf(u8, capture.slice(), "release signature verification is inactive") != null,
+    );
+    try std.testing.expect(!tmpHasEntry(&tmp, "curl-ran"));
+    try std.testing.expect(!tmpHasEntry(&tmp, "minisign-ran"));
 }
 
 test "signatureUrlFor appends .minisig to the package URL (EPH-I0287)" {
@@ -121305,7 +121373,7 @@ test "upgrade release verification succeeds with a valid signature (EPH-I0287)" 
     try writeVerifyFixtures(&tmp);
     const fakes = try installVerifyFakes(&tmp, allocator, .ok);
     defer fakes.deinit(allocator);
-    try verifyUpgradeRelease(
+    try verifyReleaseSignature(
         &diag,
         allocator,
         test_release_pubkey,
@@ -121340,7 +121408,7 @@ test "upgrade release verification fails closed when minisign is missing (EPH-I0
     tool_minisign_path = "/nonexistent/ephor-i0287-minisign";
     try std.testing.expectError(
         error.UpgradeFailed,
-        verifyUpgradeRelease(
+        verifyReleaseSignature(
             &diag,
             allocator,
             test_release_pubkey,
@@ -121366,7 +121434,7 @@ test "upgrade release verification fails closed on a bad signature (EPH-I0287)" 
     defer fakes.deinit(allocator);
     try std.testing.expectError(
         error.UpgradeFailed,
-        verifyUpgradeRelease(
+        verifyReleaseSignature(
             &diag,
             allocator,
             test_release_pubkey,
@@ -121396,7 +121464,7 @@ test "upgrade release verification fails closed on a failed tarball download (EP
     defer fakes.deinit(allocator);
     try std.testing.expectError(
         error.UpgradeFailed,
-        verifyUpgradeRelease(
+        verifyReleaseSignature(
             &diag,
             allocator,
             test_release_pubkey,
@@ -121490,7 +121558,9 @@ fn installVerifyFakes(
         if (mode == .curl_fails) "#!/bin/sh\nexit 1\n" else curl_body,
     );
     errdefer allocator.free(curl_path);
-    const minisign_body = try fakeMinisignBody(allocator, mode == .bad_signature);
+    const minisign_ran = try tmpFilePath(allocator, tmp, "minisign-ran");
+    defer allocator.free(minisign_ran);
+    const minisign_body = try fakeMinisignBody(allocator, minisign_ran, mode == .bad_signature);
     defer allocator.free(minisign_body);
     const minisign_path = try installFakeTool(tmp, allocator, "fakeminisign", minisign_body);
     errdefer allocator.free(minisign_path);
@@ -121537,14 +121607,16 @@ fn fakeCurlBody(allocator: Allocator, marker: []const u8, base: []const u8) ![]c
     );
 }
 
-/// The fake minisign script body (EPH-I0287): answers the -v presence
-/// probe, parses -Vm/-p like the real tool, checks the files the real
-/// minisign requires, and prints the verdict to the stream the real
-/// tool uses, then exits 0 or 1 per the scenario.
-fn fakeMinisignBody(allocator: Allocator, fail: bool) ![]const u8 {
+/// The fake minisign script body (EPH-I0287): records every spawn in
+/// the marker file, answers the -v presence probe, parses -Vm/-p like
+/// the real tool, checks the files the real minisign requires, and
+/// prints the verdict to the stream the real tool uses, then exits 0
+/// or 1 per the scenario.
+fn fakeMinisignBody(allocator: Allocator, marker: []const u8, fail: bool) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
         "#!/bin/sh\n" ++
+            "echo ran > \"{s}\"\n" ++
             "case \"$1\" in -v) exit 0 ;; esac\n" ++
             "tarball=\"\"\npubkey=\"\"\n" ++
             "while [ $# -gt 0 ]; do\n" ++
@@ -121564,7 +121636,7 @@ fn fakeMinisignBody(allocator: Allocator, fail: bool) ![]const u8 {
             "fi\n" ++
             "echo \"Signature and comment signature verified\"\n" ++
             "exit 0\n",
-        .{if (fail) "1" else "0"},
+        .{ marker, if (fail) "1" else "0" },
     );
 }
 

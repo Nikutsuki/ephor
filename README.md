@@ -101,9 +101,10 @@ binary on PATH.
 
 The installers and the binary keep zig fetch on the canonical `https`
 archive URL. They never hand a local file to zig fetch (EPH-I1215): zig
-0.16.0 crashes on `file://` URLs (upstream SIGBUS). Only curl writes the
-downloads to a local path. Minisign reads the pair there, and zig never
-touches a local file.
+0.16.0 crashes on `file://` URLs (upstream SIGBUS). The bounded
+downloader writes the tarball and the signature to the temp dir: curl on
+install.sh and the binary, the .NET client in install.ps1. Minisign
+reads them there, and zig fetch never touches a local file.
 
 One window remains. zig fetch downloads the artifact again after the
 installer or the upgrade command verifies it. A network attacker who

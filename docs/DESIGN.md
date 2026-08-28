@@ -106,9 +106,6 @@ No separate modes. All checks available. Configure what you want via `ephor.json
 | **ZA901** stack pointer escapes | Expensive analysis | `"enable": ["ZA901"]` |
 | **ZA902** allocator mismatch | Expensive analysis | `"enable": ["ZA902"]` |
 | **ZA903** resource not closed | Expensive analysis | `"enable": ["ZA903"]` |
-| **ZAV01** deprecated API | Version-specific | `"enable": ["ZAV"]` + set target version |
-| **ZAV02** breaking API changes | Version-specific | `"enable": ["ZAV"]` + set target version |
-| **ZAV03** new API available | Version-specific | `"enable": ["ZAV"]` + set target version |
 
 ---
 
@@ -129,7 +126,6 @@ ZA6xx  Format      Formatting checks (delegates to zig fmt)
 ZA7xx  Style       Style and naming conventions
 ZA8xx  Optional    Null safety checks
 ZA9xx  Lifetime    Resource and lifetime tracking
-ZAVxx  Version     Zig API version compatibility
 ```
 
 ### Performance Expectations
@@ -229,43 +225,6 @@ These checks require more expensive analysis. Enable them if you want deeper saf
 | ZA902 | OFF | Allocator mismatch (alloc/free use different allocators) | `"enable": ["ZA902"]` |
 | ZA903 | OFF | Resource (File, etc.) not closed on all paths | `"enable": ["ZA903"]` |
 
-### ZAVxx Version Compatibility (OFF by default)
-
-Check for Zig API changes between versions. Helps developers assess upgrade effort.
-
-| Rule | Default | Description | How to Enable |
-|------|---------|-------------|---------------|
-| ZAV01 | OFF | Deprecated API usage for target version | `"enable": ["ZAV01"]` |
-| ZAV02 | OFF | Breaking API changes for target version | `"enable": ["ZAV02"]` |
-| ZAV03 | OFF | New API available in target version | `"enable": ["ZAV03"]` |
-
-**Configuration**:
-```json
-{
-  "enable": ["ZAV"],
-  "version": {
-    "current": "0.15.2",
-    "target": "0.16.0"
-  }
-}
-```
-
-**Example output**:
-```
-src/main.zig:45:12: warning[ZAV02]: ArrayList.init() API changed in 0.16.0
-  help: Change 'ArrayList(T).init(allocator)' to 'ArrayList(T){}'
-  see: https://ziglang.org/download/0.16.0/release-notes.html#breaking-changes
-
-ephor version-check summary:
-  Breaking changes:  12
-  Deprecated APIs:   3
-  New APIs available: 5
-
-  Estimated upgrade effort: MODERATE (12 breaking changes)
-```
-
-This helps developers decide if upgrading is a quick task or a major undertaking.
-
 ---
 
 ## Configuration
@@ -340,9 +299,6 @@ ephor unused [path]
 ephor complexity [path]
 ephor fmt-check [path]
 ephor stats [path]
-
-# Version compatibility
-ephor version-check [path] --from=0.15.2 --to=0.16.0
 ```
 
 ### Options

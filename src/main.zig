@@ -46996,14 +46996,17 @@ fn printHelp() void {
         \\                          PATH. A poisoned PATH is code execution, so pin
         \\                          these in a hostile environment.
         \\SUBPROCESS BOUNDARY: the check and fmt-check commands spawn one
-        \\                          child process per run: 'zig fmt --check' on
-        \\                          the scanned path. The child is read-only
-        \\                          (no build, no test, no execution of scanned
-        \\                          code), its output is byte-capped, and its
-        \\                          paths gate on the scan root. Ephor resolves
-        \\                          the zig binary to an absolute path at
-        \\                          startup, so the spawned binary is fixed
-        \\                          before any scan input is read.
+        \\                          analysis child per run: 'zig fmt --check'
+        \\                          on the scanned path. The update check may
+        \\                          add a capped curl fetch when its 24h cache
+        \\                          is stale; EPHOR_NO_UPDATE_CHECK skips it
+        \\                          entirely. The child is read-only (no build,
+        \\                          no test, no execution of scanned code), its
+        \\                          output is byte-capped, and its paths gate on
+        \\                          the scan root. Ephor resolves the zig
+        \\                          binary to an absolute path at startup, so
+        \\                          the spawned binary is fixed before any scan
+        \\                          input is read.
         \\
         \\INSTALL/UPGRADE EXAMPLES:
         \\  ephor install                    # Install current binary version
@@ -47145,7 +47148,8 @@ fn printHelp() void {
         \\                     ZA305: cyclomatic (off by default), ZA306: cognitive (off by default))
         \\  ZA4xx  Unused     (ZA401: unused-import, ZA402: unused-const,
         \\                     ZA403: unused-var)
-        \\  ZA5xx  Structure  (ZA501: orphan-file, ZA502: file-too-large)
+        \\  ZA5xx  Structure  (ZA501: orphan-file, ZA502: file-too-large,
+        \\                     ZA503: parse-error)
         \\  ZA6xx  Format     (ZA601: needs-format,
         \\                     ZA607: read-before-assign, semantic check)
         \\  ZA7xx  Style      (ZA701: line-too-long,

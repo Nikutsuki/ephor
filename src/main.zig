@@ -13075,23 +13075,72 @@ fn isValidCleanupLine(
     return true;
 }
 
-/// Check nearby lines after allocation for a matching defer. The defer
-/// counts only when it dominates the alloc's exits: a scope-exit source
-/// (return or try) between the alloc and the defer skips the defer
-/// registration and leaks on that path (EPH-I0348). An errdefer counts
-/// only when the success path also references the alloc after it — the
-/// error/success cleanup split — a discard-only tail leaks on success
-/// (EPH-I0349). The name check runs on the joined logical line, so a
-/// zig-fmt wrapped defer free stays visible (EPH-I0351). The name match is
-/// word-bounded (containsIdentifier): a defer freeing `buffer` must not
-/// cover an alloc named `buf` (EPH-I0357, band-B02 F17).
-fn hasNearbyDefer(
+/// The defer scan's fixed inputs (hasCoveringDefer): the function
+/// slice, the alloc's statement end, the alloc's name, and the shared
+/// join buffer. The candidate line's index and trimmed text vary per
+/// line and pass separately.
+const DeferScanBase = struct {
+    lines: []const []const u8,
+    alloc_end_idx: usize,
+    name: []const u8,
+    join_buf: *[max_join_bytes]u8,
+};
+
+/// True when a nearby-window candidate defer line cleans up the alloc
+/// (hasCoveringDefer): a defer/errdefer at the alloc's own indent with
+/// no scope-exit source between the alloc and the line. The defer
+/// counts only when it dominates the alloc's exits: a return or try
+/// between the alloc and the defer skips the defer registration and
+/// leaks on that path (EPH-I0348).
+fn nearbyCandidateCleans(base: DeferScanBase, check_idx: usize, scan_line: []const u8) bool {
+    if (!isDeferOrErrdefer(scan_line)) return false;
+    if (hasExitBetween(base.lines, base.alloc_end_idx, check_idx)) return false;
+    const joined = joinParenContinuation(base.lines, check_idx, base.join_buf);
+    return isValidCleanupLine(joined, base.lines, check_idx, base.name);
+}
+
+/// True when an outer-scope candidate defer line cleans up the alloc
+/// (hasCoveringDefer): a defer/errdefer below the alloc's indent whose
+/// joined line matches the name in a cleanup pattern, with no
+/// scope-exit source between the alloc and the line, and an errdefer
+/// form holding a handoff reference on the success path (EPH-I0349).
+fn outerCandidateCleans(base: DeferScanBase, check_idx: usize, scan_line: []const u8) bool {
+    if (!isDeferOrErrdefer(scan_line)) return false;
+    const joined = joinParenContinuation(base.lines, check_idx, base.join_buf);
+    if (!hasRealCleanupPattern(joined) or
+        !containsIdentifier(joined, base.name)) return false;
+    if (check_idx > base.alloc_end_idx and
+        hasExitBetween(base.lines, base.alloc_end_idx, check_idx)) return false;
+    if (mem.startsWith(u8, scan_line, "errdefer ") and
+        !hasHandoffReference(base.lines, check_idx, base.name)) return false;
+    return true;
+}
+
+/// True when a defer that cleans up the alloc exists. Two domains
+/// count. A nearby defer: at the alloc's own indent within six lines
+/// after the alloc, with no scope-exit source between the alloc and the
+/// defer. An outer-scope defer: at an indent below the alloc's, anywhere
+/// in the function — a defer textually before the alloc always
+/// dominates. An errdefer counts only when the success path also
+/// references the alloc after it, and a discard-only tail leaks on
+/// success (EPH-I0348, EPH-I0349). The name check runs on the joined
+/// logical line, so a zig-fmt wrapped defer free stays visible
+/// (EPH-I0351). The name match is word-bounded (containsIdentifier): a
+/// defer freeing `buffer` must not cover an alloc named `buf`
+/// (EPH-I0357, band-B02 F17).
+fn hasCoveringDefer(
     lines: []const []const u8,
     alloc_end_idx: usize,
     alloc_indent: usize,
     name: []const u8,
 ) bool {
     var join_buf: [max_join_bytes]u8 = undefined;
+    const base = DeferScanBase{
+        .lines = lines,
+        .alloc_end_idx = alloc_end_idx,
+        .name = name,
+        .join_buf = &join_buf,
+    };
     const search_end = @min(alloc_end_idx + 6, lines.len);
     for (alloc_end_idx + 1..search_end) |check_idx| {
         const raw_line = lines[check_idx];
@@ -13099,11 +13148,14 @@ fn hasNearbyDefer(
         if (scan_line.len == 0) continue;
         const check_indent = countIndent(raw_line);
         if (check_indent < alloc_indent) break;
-        if (!isDeferOrErrdefer(scan_line)) continue;
         if (check_indent != alloc_indent) continue;
-        if (hasExitBetween(lines, alloc_end_idx, check_idx)) continue;
-        const joined = joinParenContinuation(lines, check_idx, &join_buf);
-        if (isValidCleanupLine(joined, lines, check_idx, name)) return true;
+        if (nearbyCandidateCleans(base, check_idx, scan_line)) return true;
+    }
+    for (0..lines.len) |check_idx| {
+        const raw_line = lines[check_idx];
+        const scan_line = mem.trim(u8, raw_line, " \t\r");
+        if (countIndent(raw_line) >= alloc_indent) continue;
+        if (outerCandidateCleans(base, check_idx, scan_line)) return true;
     }
     return false;
 }
@@ -13291,40 +13343,7 @@ fn hasGuardToken(seg: []const u8) bool {
         hasRealKeyword(seg, "=>");
 }
 
-/// Scan for a defer at an OUTER scope that frees this variable. The defer
-/// counts only when it dominates the alloc's exits: a scope-exit source
-/// (return or try) between the alloc and the defer skips the defer
-/// registration and leaks on that path (EPH-I0348). A defer textually
-/// before the alloc always dominates. An errdefer counts only when the
-/// success path also references the alloc after it (EPH-I0349). The name
-/// check runs on the joined logical line, so a zig-fmt wrapped defer free
-/// stays visible (EPH-I0351). The name match is word-bounded
-/// (containsIdentifier): a defer freeing `buffer` must not cover an alloc
-/// named `buf` (EPH-I0357, band-B02 F17).
-fn hasOuterScopeDefer(
-    lines: []const []const u8,
-    alloc_end_idx: usize,
-    alloc_indent: usize,
-    name: []const u8,
-) bool {
-    var join_buf: [max_join_bytes]u8 = undefined;
-    for (0..lines.len) |check_idx| {
-        const raw_line = lines[check_idx];
-        const scan_line = mem.trim(u8, raw_line, " \t\r");
-        if (!isDeferOrErrdefer(scan_line)) continue;
-        if (countIndent(raw_line) >= alloc_indent) continue;
-        const joined = joinParenContinuation(lines, check_idx, &join_buf);
-        if (!hasRealCleanupPattern(joined) or
-            !containsIdentifier(joined, name)) continue;
-        if (check_idx > alloc_end_idx and
-            hasExitBetween(lines, alloc_end_idx, check_idx)) continue;
-        if (mem.startsWith(u8, scan_line, "errdefer ") and
-            !hasHandoffReference(lines, check_idx, name)) continue;
-        return true;
-    }
-    return false;
-}
-
+/// Scan for a defer that covers the alloc; see hasCoveringDefer.
 fn hasImmediateDefer(
     alloc: *CFGAlloc,
     lines: []const []const u8,
@@ -13334,8 +13353,7 @@ fn hasImmediateDefer(
     if (alloc_idx >= lines.len) return false;
     const alloc_indent = countIndent(lines[alloc_idx]);
     const alloc_end_idx = findAllocStatementEnd(lines, alloc_idx);
-    if (hasNearbyDefer(lines, alloc_end_idx, alloc_indent, alloc.name)) return true;
-    return hasOuterScopeDefer(lines, alloc_end_idx, alloc_indent, alloc.name);
+    return hasCoveringDefer(lines, alloc_end_idx, alloc_indent, alloc.name);
 }
 
 /// Remove allocations that have immediate defer (marked with line = 0)
@@ -31439,14 +31457,8 @@ fn overAllocCapEmitsNote(
     alloc_count: usize,
 ) !bool {
     if (alloc_count <= max_mem_family_allocs) return false;
-    try appendMemFamilyCapNote(.{
-        .a = p.a,
-        .out = p.out,
-        .file_path = p.file_path,
-        .func_line = p.func_line,
-        .rule = p.rule,
-        .cap_noun = mem_alloc_cap_noun,
-    });
+    // The callers build p with cap_noun = mem_alloc_cap_noun already.
+    try appendMemFamilyCapNote(p);
     return true;
 }
 
@@ -31458,15 +31470,20 @@ fn overErrdeferCapEmitsNote(
     try_alloc_count: usize,
 ) !bool {
     if (try_alloc_count <= max_mem_family_allocs) return false;
-    try appendErrdeferTailCapNote(.{
-        .a = p.a,
-        .out = p.out,
-        .file_path = p.file_path,
-        .func_line = p.func_line,
-        .rule = p.rule,
-        .cap_noun = mem_alloc_cap_noun,
-    });
+    // The caller builds p with cap_noun = mem_alloc_cap_noun already.
+    try appendErrdeferTailCapNote(p);
     return true;
+}
+
+/// The function-body ctx built from a CFG run (EPH-I1232): the shared
+/// head of the memory-family analyses (runDeferredTailAnalyses,
+/// runCFGMemoryAnalyses).
+fn runBodyCtx(run: CFGRunCtx) FuncBodyCtx {
+    return .{
+        .lines = run.func.lines,
+        .func_line = run.func.start,
+        .file_path = run.file.file_path,
+    };
 }
 
 /// The memory-family tail: ZA103 errdefer coverage and the must-return-ref
@@ -31475,11 +31492,7 @@ fn overErrdeferCapEmitsNote(
 fn runDeferredTailAnalyses(run: CFGRunCtx, is_no_free_recipient: bool) !void {
     const a = run.file.allocator;
     const out = run.file.issues;
-    const body: FuncBodyCtx = .{
-        .lines = run.func.lines,
-        .func_line = run.func.start,
-        .file_path = run.file.file_path,
-    };
+    const body = runBodyCtx(run);
     // ZA110 runs before the line cap: checkMustReturnRef is a single
     // linear pass with no per-alloc rescan, so an over-cap function keeps
     // its ZA110 coverage (review r1 F1).
@@ -31535,11 +31548,7 @@ fn runDeferredTailAnalyses(run: CFGRunCtx, is_no_free_recipient: bool) !void {
 fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
     const a = run.file.allocator;
     const out = run.file.issues;
-    const body: FuncBodyCtx = .{
-        .lines = run.func.lines,
-        .func_line = run.func.start,
-        .file_path = run.file.file_path,
-    };
+    const body = runBodyCtx(run);
     // Check if this function receives a no-free allocator via call-site propagation
     const is_no_free_recipient = if (run.func.no_free_param_fns) |fns|
         fns.contains(run.func.name)
@@ -32005,6 +32014,14 @@ fn scanDeferRegion(
     return null;
 }
 
+/// Stash an unfinished defer region into the scan state
+/// (collectDeferDeinitPaths, EPH-I0477): the statement runs past the
+/// line end, so the next line resumes the region scan.
+fn stashDeferRegion(state: *DeferScanState, depth: usize) void {
+    state.active = true;
+    state.depth = depth;
+}
+
 /// Collect every defer-release receiver path on `t` into `paths`. Each
 /// `.deinit(`/`.close(` is collected only inside the defer statement that
 /// contains it: the scan starts at the defer keyword (never before it, so
@@ -32031,8 +32048,7 @@ fn collectDeferDeinitPaths(
         state.active = false;
         depth = state.depth;
         const end = scanDeferRegion(t, 0, &depth, &s) orelse {
-            state.active = true;
-            state.depth = depth;
+            stashDeferRegion(state, depth);
             return;
         };
         from = end;
@@ -32040,8 +32056,7 @@ fn collectDeferDeinitPaths(
     while (nextRealDeferPos(t, &s.cls, from)) |dpos| {
         depth = 0;
         const end = scanDeferRegion(t, dpos + "defer".len, &depth, &s) orelse {
-            state.active = true;
-            state.depth = depth;
+            stashDeferRegion(state, depth);
             return;
         };
         from = end;
@@ -32785,6 +32800,24 @@ fn joinSplitDeclRhs(
     return buf[0 .. t.len + 1 + alloc.len];
 }
 
+/// First code-position column of `pattern` on the line, or null: the
+/// pattern is absent, inside a string literal, or at/after the line's
+/// `//` comment start (EPH-I0990). `comment_start` caches the comment
+/// scan across calls — a lazy scan only a candidate match pays for.
+fn patternColInCode(
+    t: []const u8,
+    pattern: []const u8,
+    comment_start: *?usize,
+) ?usize {
+    const col = mem.indexOf(u8, t, pattern) orelse return null;
+    if (isPatternInString(t, col)) return null;
+    if (comment_start.* == null) comment_start.* = findCommentStart(t);
+    if (comment_start.*) |cs| {
+        if (col >= cs) return null;
+    }
+    return col;
+}
+
 /// Check if line contains allocation call using vocab from compat layer.
 /// For .create(), uses tracked allocator set to verify receiver is an allocator
 /// (common method name on non-allocator types). All other alloc methods are
@@ -32798,12 +32831,7 @@ fn findAllocCall(
     // Lazy: only a candidate pattern match pays for the comment scan.
     var comment_start: ?usize = null;
     for (compat.getAllocMethodPatterns()) |pattern| {
-        const col = mem.indexOf(u8, t, pattern) orelse continue;
-        if (isPatternInString(t, col)) continue;
-        if (comment_start == null) comment_start = findCommentStart(t);
-        if (comment_start) |cs| {
-            if (col >= cs) continue;
-        }
+        const col = patternColInCode(t, pattern, &comment_start) orelse continue;
         if (isTypeAllocFactory(t, col)) continue;
 
         const is_create = mem.eql(u8, pattern, ".create(");
@@ -32823,12 +32851,7 @@ fn findAllocCall(
 
     // Check qualified function patterns (e.g. "mem.concat(", "mem.join(")
     for (compat.getQualifiedAllocFnPatterns()) |pattern| {
-        const col = mem.indexOf(u8, t, pattern) orelse continue;
-        if (isPatternInString(t, col)) continue;
-        if (comment_start == null) comment_start = findCommentStart(t);
-        if (comment_start) |cs| {
-            if (col >= cs) continue;
-        }
+        const col = patternColInCode(t, pattern, &comment_start) orelse continue;
         return .{ .col = col, .is_create = false };
     }
 
@@ -33317,14 +33340,39 @@ fn initFilteredIntersection(
     }
 }
 
-/// Remove intersection entries the pred's edge-visible set does not carry
-fn narrowFilteredIntersection(
+/// The null-meet pred filter's collect callback shape (runPredFilter).
+const NullRmCollect = fn (
+    NullMeetCtx,
+    *std.StringHashMapUnmanaged(void),
+    NullPredInfo,
+    *std.ArrayListUnmanaged([]const u8),
+) anyerror!void;
+
+/// Run one null-meet pred filter pass (EPH-I1232): `collect` appends
+/// each removable key to the removal queue, and the queue removes them
+/// from the intersection after the pass — the map iteration never
+/// mutates under the iterator.
+fn runPredFilter(
     ctx: NullMeetCtx,
     intersection: *std.StringHashMapUnmanaged(void),
     pred: NullPredInfo,
+    comptime collect: NullRmCollect,
 ) !void {
     var rm = std.ArrayListUnmanaged([]const u8).empty;
     defer rm.deinit(ctx.allocator);
+    try collect(ctx, intersection, pred, &rm);
+    for (rm.items) |key| _ = intersection.remove(key);
+}
+
+/// Collect the intersection entries the pred's edge-visible set does
+/// not carry (runPredFilter): keys the pred holds but the connecting
+/// edge drops.
+fn narrowCollectKeys(
+    ctx: NullMeetCtx,
+    intersection: *std.StringHashMapUnmanaged(void),
+    pred: NullPredInfo,
+    rm: *std.ArrayListUnmanaged([]const u8),
+) !void {
     var it = intersection.iterator();
     while (it.next()) |e| {
         const key = e.key_ptr.*;
@@ -33332,7 +33380,6 @@ fn narrowFilteredIntersection(
             predFactFlows(&ctx.polarity[pred.block], key, pred.kind)) continue;
         try rm.append(ctx.allocator, key);
     }
-    for (rm.items) |key| _ = intersection.remove(key);
 }
 
 /// True when a pred may vote in the null-check meet: a block with a
@@ -33349,17 +33396,17 @@ fn predCarriesFact(ctx: NullMeetCtx, pred: NullPredInfo) bool {
     return ctx.checked[pred.block].count() > 0;
 }
 
-/// Remove the vars an empty inline-arm pred violates: a var whose fact is
-/// true_edge at a block the arm is reached from via branch_false. The
-/// arm's path is that guard's null side, where the fact does not hold;
-/// every other fact stays valid on the arm's path (EPH-I0863).
-fn removeInlineArmViolations(
+/// Collect the vars an empty inline-arm pred violates (runPredFilter):
+/// a var whose fact is true_edge at a block the arm is reached from via
+/// branch_false. The arm's path is that guard's null side, where the
+/// fact does not hold; every other fact stays valid on the arm's path
+/// (EPH-I0863).
+fn violationCollectKeys(
     ctx: NullMeetCtx,
     intersection: *std.StringHashMapUnmanaged(void),
     pred: NullPredInfo,
+    rm: *std.ArrayListUnmanaged([]const u8),
 ) !void {
-    var rm = std.ArrayListUnmanaged([]const u8).empty;
-    defer rm.deinit(ctx.allocator);
     for (ctx.cfg.edges.items) |edge| {
         if (edge.to != pred.block or edge.kind != .branch_false) continue;
         if (edge.from >= ctx.cfg.blocks.items.len) continue;
@@ -33369,7 +33416,6 @@ fn removeInlineArmViolations(
             if (pol.get(key.*) == .true_edge) try rm.append(ctx.allocator, key.*);
         }
     }
-    for (rm.items) |key| _ = intersection.remove(key);
 }
 
 /// Intersect predecessor null-check sets into a block, filtering each
@@ -33421,12 +33467,12 @@ fn buildNullIntersection(
             init_done = true;
             try initFilteredIntersection(ctx, intersection, pred);
         } else {
-            try narrowFilteredIntersection(ctx, intersection, pred);
+            try runPredFilter(ctx, intersection, pred, narrowCollectKeys);
         }
     }
     for (preds) |pred| {
         if (predCarriesFact(ctx, pred)) continue;
-        try removeInlineArmViolations(ctx, intersection, pred);
+        try runPredFilter(ctx, intersection, pred, violationCollectKeys);
     }
 }
 
@@ -33882,13 +33928,10 @@ fn findCallSiteLine(t: []const u8, preceding_lines: ?[]const []const u8) ?[]cons
     if (depth >= 0) return t;
     // Unmatched closes → call started on a preceding line. Walk back.
     const prev = preceding_lines orelse return null;
-    var idx = prev.len;
-    while (idx > 0) {
-        idx -= 1;
-        const pl = mem.trim(u8, prev[idx], " \t\r");
-        if (isCommentOrMultilineString(pl)) continue;
-        depth += parenBalance(pl);
-        if (depth >= 0) return pl;
+    var walk = LineWalk.backward(prev, prev.len, 0);
+    while (walk.nextLineBack()) |step| {
+        depth += parenBalance(step.text);
+        if (depth >= 0) return step.text;
     }
     return null;
 }
@@ -33968,20 +34011,17 @@ fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u
     // class on the fallback path).
     const prev = preceding_lines orelse return false;
     var depth: isize = parenBalance(t);
-    var idx = prev.len;
-    while (idx > 0) {
-        idx -= 1;
-        const pl = mem.trim(u8, prev[idx], " \t\r");
-        if (isCommentOrMultilineString(pl)) continue;
-        depth += parenBalance(pl);
-        if (depth > 0 and lineHasTypeOfOpenerInCode(pl)) return true;
+    var walk = LineWalk.backward(prev, prev.len, 0);
+    while (walk.nextLineBack()) |step| {
+        depth += parenBalance(step.text);
+        if (depth > 0 and lineHasTypeOfOpenerInCode(step.text)) return true;
         // Stop at statement boundaries (no paren nesting left to resolve).
         // Judge the boundary on the comment-stripped code. A trailing
         // comment hides the terminator on the raw line. The walk then
         // crosses a closed statement into an earlier @TypeOf opener
         // (EPH-I0783).
-        const comment_start = findCommentStart(pl) orelse pl.len;
-        const code = mem.trimEnd(u8, pl[0..comment_start], " \t");
+        const comment_start = findCommentStart(step.text) orelse step.text.len;
+        const code = mem.trimEnd(u8, step.text[0..comment_start], " \t");
         if (depth <= 0 and (mem.endsWith(u8, code, ";") or mem.endsWith(u8, code, "{"))) break;
     }
     return false;
@@ -34178,6 +34218,21 @@ fn isStreamWriteCall(t: []const u8) bool {
     return false;
 }
 
+/// The ZA203 orelse-unreachable issue (EPH-I1232): the emission body
+/// shared by the CFG and line-based tiers (checkOrelseUnreachable,
+/// checkLineOrelseUnreachable).
+fn orelseUnreachableIssue(file_path: []const u8, line: usize, col: usize) Issue {
+    return .{
+        .file = file_path,
+        .line = line,
+        .col = col + 1,
+        .severity = .warning,
+        .rule = RULE_ORELSE_UNREACHABLE,
+        .message = "orelse unreachable will panic",
+        .help = "use explicit null handling",
+    };
+}
+
 /// ZA203: orelse unreachable will panic on null
 /// Lines/func_line/file_path come from the CFG run context; t is the
 /// caller-trimmed line at idx (line_num is its 1-based source line).
@@ -34201,15 +34256,7 @@ fn checkOrelseUnreachable(
         // (EPH-I0864).
         if (hasNullGuard(run.func.lines, idx, 0, name)) return null;
     }
-    return .{
-        .file = run.file.file_path,
-        .line = line_num,
-        .col = col + 1,
-        .severity = .warning,
-        .rule = RULE_ORELSE_UNREACHABLE,
-        .message = "orelse unreachable will panic",
-        .help = "use explicit null handling",
-    };
+    return orelseUnreachableIssue(run.file.file_path, line_num, col);
 }
 
 /// ZA203 (line-based): orelse unreachable without null guard analysis
@@ -34239,15 +34286,7 @@ fn checkLineOrelseUnreachable(ctx: LineOrelseCtx) ?Issue {
         if (extractOrelseVar(ctx.t, col)) |name| {
             if (hasNullGuard(ctx.lines, ctx.line_idx, ctx.func_start, name)) return null;
         }
-        return .{
-            .file = ctx.file_path,
-            .line = ctx.line_num,
-            .col = col + 1,
-            .severity = .warning,
-            .rule = RULE_ORELSE_UNREACHABLE,
-            .message = "orelse unreachable will panic",
-            .help = "use explicit null handling",
-        };
+        return orelseUnreachableIssue(ctx.file_path, ctx.line_num, col);
     }
     return null;
 }
@@ -34823,13 +34862,12 @@ fn startsWithElseWord(t: []const u8) bool {
     return code.len == "else".len or !isIdent(code["else".len]);
 }
 
-/// True when the trimmed text is a direct exit statement without the
-/// terminating semicolon: `return null`, `break`, `continue` — the
-/// else-terminated arm form (`if (q) return null else { ... }`). The
-/// exit keyword must stand as a whole word (EPH-I0861).
-fn isExitStatementStart(t: []const u8) bool {
-    const code = mem.trim(u8, stripLineComment(t), " \t\r");
-    if (code.len == 0) return false;
+/// The exit keyword the comment-stripped code starts with — `return`,
+/// `break`, or `continue` — as a whole word: null when the code starts
+/// with none, or when the keyword merges into a longer identifier.
+/// The two sibling predicates share this classifier (EPH-I0488,
+/// EPH-I0861).
+fn exitKeywordLen(code: []const u8) ?usize {
     const kw = if (mem.startsWith(u8, code, "return"))
         "return"
     else if (mem.startsWith(u8, code, "break"))
@@ -34837,9 +34875,19 @@ fn isExitStatementStart(t: []const u8) bool {
     else if (mem.startsWith(u8, code, "continue"))
         "continue"
     else
-        return false;
-    if (code.len > kw.len and isIdent(code[kw.len])) return false;
-    return true;
+        return null;
+    if (code.len > kw.len and isIdent(code[kw.len])) return null;
+    return kw.len;
+}
+
+/// True when the trimmed text is a direct exit statement without the
+/// terminating semicolon: `return null`, `break`, `continue` — the
+/// else-terminated arm form (`if (q) return null else { ... }`). The
+/// exit keyword must stand as a whole word (EPH-I0861).
+fn isExitStatementStart(t: []const u8) bool {
+    const code = mem.trim(u8, stripLineComment(t), " \t\r");
+    if (code.len == 0) return false;
+    return exitKeywordLen(code) != null;
 }
 
 /// True when the arm body holds an unconditional exit statement at the
@@ -36363,16 +36411,8 @@ fn firstExitKeywordPos(t: []const u8) ?usize {
 fn isUnconditionalExitLine(ctx: []const u8) bool {
     const code = mem.trim(u8, stripLineComment(ctx), " \t\r");
     if (code.len == 0) return false;
-    const kw = if (mem.startsWith(u8, code, "return"))
-        "return"
-    else if (mem.startsWith(u8, code, "break"))
-        "break"
-    else if (mem.startsWith(u8, code, "continue"))
-        "continue"
-    else
-        return false;
-    if (code.len > kw.len and isIdent(code[kw.len])) return false;
-    const rest = mem.trim(u8, code[kw.len..], " \t\r");
+    const kw_len = exitKeywordLen(code) orelse return false;
+    const rest = mem.trim(u8, code[kw_len..], " \t\r");
     return rest.len > 0 and rest[rest.len - 1] == ';';
 }
 
@@ -37382,6 +37422,27 @@ const SubBracket = struct {
     inside: []const u8,
 };
 
+/// The next subtraction-bearing bracket at or after the carried
+/// position, or null past the line end (EPH-I1232): the bracket walk
+/// the bracket extract helpers share. `i` advances past every closed
+/// bracket — with or without a subtraction — so each bracket examines
+/// once.
+fn nextSubBracket(t: []const u8, i: *usize) ?SubBracket {
+    while (i.* < t.len) : (i.* += 1) {
+        if (t[i.*] != '[') continue;
+        const end = findMatchingBracket(t, i.*) orelse continue;
+        const inside = t[i.* + 1 .. end];
+        if (findIndexSubtraction(inside) == null) {
+            i.* = end;
+            continue;
+        }
+        const b = SubBracket{ .open = i.*, .close = end, .inside = inside };
+        i.* = end;
+        return b;
+    }
+    return null;
+}
+
 /// The first subtraction-bearing bracket on the line, or null
 /// (EPH-I1232): the scan the bracket extract helpers share. A later
 /// subtraction-bearing bracket stays unexamined — the first-match
@@ -37389,17 +37450,7 @@ const SubBracket = struct {
 /// own all-brackets walk.
 fn findFirstSubBracket(t: []const u8) ?SubBracket {
     var i: usize = 0;
-    while (i < t.len) : (i += 1) {
-        if (t[i] != '[') continue;
-        const end = findMatchingBracket(t, i) orelse continue;
-        const inside = t[i + 1 .. end];
-        if (findIndexSubtraction(inside) == null) {
-            i = end;
-            continue;
-        }
-        return .{ .open = i, .close = end, .inside = inside };
-    }
-    return null;
+    return nextSubBracket(t, &i);
 }
 
 /// The `x` and `N` of a `[0 .. x - N]` slice-end subtraction on `t`,
@@ -37452,21 +37503,12 @@ fn everyLaterBracketWitnessed(
 ) bool {
     var i: usize = 0;
     var past_first = false;
-    while (i < t.len) : (i += 1) {
-        if (t[i] != '[') continue;
-        const end = findMatchingBracket(t, i) orelse continue;
-        const inside = t[i + 1 .. end];
-        if (findIndexSubtraction(inside) == null) {
-            i = end;
-            continue;
-        }
+    while (nextSubBracket(t, &i)) |b| {
         if (!past_first) {
             past_first = true;
-            i = end;
             continue;
         }
-        if (!laterBracketWitnessed(lines, current_idx, inside, scan_end)) return false;
-        i = end;
+        if (!laterBracketWitnessed(lines, current_idx, b.inside, scan_end)) return false;
     }
     return true;
 }
@@ -37789,6 +37831,28 @@ const AllmanHeaderCtx = struct {
     var_name: []const u8,
 };
 
+/// The judged line of the Allman header walk (EPH-I1232): the first
+/// line above open_idx that allmanWalkJudgesLine accepts, or null when
+/// the walk breaks at a brace/statement end first or reaches stop.
+/// Comment/multiline lines skip. A multi-line header's continuation
+/// lines carry no brace and no statement end, so the walk keeps going
+/// up to the header's own opener line (EPH-I1018, EPH-I1013).
+fn findAllmanJudgeLine(
+    lines: []const []const u8,
+    stop: usize,
+    open_idx: usize,
+) ?usize {
+    var k = open_idx;
+    while (k > stop) {
+        k -= 1;
+        const above = mem.trim(u8, lines[k], " \t\r");
+        if (isCommentOrMultilineString(above)) continue;
+        if (allmanWalkJudgesLine(above)) return k;
+        if (lineCarriesOpenBrace(above) or lineCarriesStatementEnd(above)) break;
+    }
+    return null;
+}
+
 /// True when the Allman header above the bare `{` body open at
 /// `ctx.open_idx` guards `ctx.var_name`. The header is the first
 /// conditional/loop opener line above; it must carry no `{` and no
@@ -37804,21 +37868,8 @@ const AllmanHeaderCtx = struct {
 /// requirement; its arm's own condition still guards the body below
 /// (EPH-I1019).
 fn allmanHeaderGuardHasVar(ctx: AllmanHeaderCtx, amount: ?usize) bool {
-    var k = ctx.open_idx;
-    while (k > ctx.stop) {
-        k -= 1;
-        const above = mem.trim(u8, ctx.lines[k], " \t\r");
-        if (isCommentOrMultilineString(above)) continue;
-        if (allmanWalkJudgesLine(above)) {
-            if (allmanHeaderGuardsVar(ctx.lines, k, ctx.var_name, amount)) return true;
-            break;
-        }
-        if (lineCarriesOpenBrace(above) or lineCarriesStatementEnd(above)) break;
-        // A continuation line of a multi-line header carries no brace
-        // and no statement end: keep walking up to the header's own
-        // opener line (EPH-I1018).
-    }
-    return false;
+    const judged = findAllmanJudgeLine(ctx.lines, ctx.stop, ctx.open_idx) orelse return false;
+    return allmanHeaderGuardsVar(ctx.lines, judged, ctx.var_name, amount);
 }
 
 /// True when the Allman header above the bare `{` body open at
@@ -37834,50 +37885,8 @@ fn allmanHeaderGuardHasBound(
     stop: usize,
     open_idx: usize,
 ) bool {
-    var k = open_idx;
-    while (k > stop) {
-        k -= 1;
-        const above = mem.trim(u8, bctx.lines[k], " \t\r");
-        if (isCommentOrMultilineString(above)) continue;
-        if (allmanWalkJudgesLine(above)) {
-            if (allmanOpenerCoversBound(bctx, k)) return true;
-            break;
-        }
-        if (lineCarriesOpenBrace(above) or lineCarriesStatementEnd(above)) break;
-        // A continuation line of a multi-line header carries no brace
-        // and no statement end: keep walking up to the header's own
-        // opener line (EPH-I1013).
-    }
-    return false;
-}
-
-/// True when the Allman header's proven bound clears the decrement
-/// amount; a null amount keeps the shape-only verdict. A header that
-/// proves no bound does not cover — the body can run unguarded
-/// (EPH-I0961, EPH-I0995). A multi-line header condition joins through
-/// the shared judge (EPH-I1000). The judge reads the header's arm
-/// region: on a mid-line else-open header the condition before the
-/// `else` is the negated antecedent, and a closed antecedent group on
-/// the line would hijack the span parse — the region offset keeps the
-/// join on the arm's own `if` (EPH-I1000, EPH-I1019).
-fn allmanHeaderCoversAmount(
-    lines: []const []const u8,
-    header_idx: usize,
-    var_name: []const u8,
-    amount: ?usize,
-) bool {
-    if (amount == null) return true;
-    const raw = mem.trim(u8, lines[header_idx], " \t\r");
-    const region = elseArmRegion(raw);
-    return guardLineCoversAmountWithJoin(
-        .{
-            .lines = lines,
-            .line_idx = header_idx,
-            .first_offset = raw.len - region.len,
-        },
-        var_name,
-        amount.?,
-    );
+    const judged = findAllmanJudgeLine(bctx.lines, stop, open_idx) orelse return false;
+    return allmanOpenerCoversBound(bctx, judged);
 }
 
 /// True when the opener line's guard condition relates a comparison to
@@ -37918,7 +37927,7 @@ fn allmanHeaderGuardsVar(
     amount: ?usize,
 ) bool {
     if (!headerConditionGuardsVar(lines, header_idx, var_name)) return false;
-    return allmanHeaderCoversAmount(lines, header_idx, var_name, amount);
+    return guardRegionCovers(lines, header_idx, var_name, amount);
 }
 
 /// True when the opener line above a multi-line continuation tail
@@ -37968,26 +37977,33 @@ fn hasEnclosingGuardForVar(
         .amount = amount,
     };
     var state = EnclosingWalkState{};
-    return EnclosingWalk(GuardCrossingCtx).run(gctx, &state, judgeEnclosingGuardWalkLine);
+    return EnclosingWalk(GuardCrossingCtx).run(gctx, &state, .{
+        .crossing = judgeGuardDepthNegativeCrossing,
+        .make_line = EnclosingElseOpenLine.make,
+        .else_open = judgeEnclosingGuardElseOpen,
+    });
 }
 
 /// Drive one enclosing backward walk (EPH-I1232): the shared loop the
-/// guard and bound twins duplicate. `judge` answers one line — `skip`
-/// resumes above, `found` answers true, `boundary` answers false. The
-/// walk ctx carries the lines and the anchor index.
+/// guard and bound twins duplicate. `judges` carries the crossing and
+/// else-open judges plus the else-open line constructor (see
+/// judgeEnclosingWalkLine); a line's verdict — `skip` resumes above,
+/// `found` answers true, `boundary` answers false. The walk ctx
+/// carries the lines and the anchor index.
 fn EnclosingWalk(comptime Ctx: type) type {
     return struct {
         fn run(
             walk_ctx: Ctx,
             state: *EnclosingWalkState,
-            comptime judge: fn (Ctx, usize, []const u8, *EnclosingWalkState) EnclosingWalkVerdict,
+            comptime judges: anytype,
         ) bool {
             const stop = walk_ctx.current_idx -| enclosing_block_lookback;
             var i = walk_ctx.current_idx;
             while (i > stop) {
                 i -= 1;
                 const ctx = mem.trim(u8, walk_ctx.lines[i], " \t\r");
-                switch (judge(walk_ctx, i, ctx, state)) {
+                const inputs = .{ .walk_ctx = walk_ctx, .i = i, .ctx = ctx };
+                switch (judgeEnclosingWalkLine(inputs, state, judges)) {
                     .skip => continue,
                     .found => return true,
                     .boundary => return false,
@@ -38024,44 +38040,79 @@ fn foldWalkLine(ctx: []const u8, state: *EnclosingWalkState) ?ElseOpenKind {
     return if (depth_before == 0 and line_balance >= 0) elseOpenKind(ctx) else null;
 }
 
+/// Judge one trimmed line of the enclosing walk (EPH-I1232): the
+/// shared skeleton the guard and bound twins duplicated. Fold the
+/// line's brace balance into the walk depth, judge a depth-negative
+/// crossing through `judges.crossing`, then judge the line's else-open
+/// kind through `judges.else_open` — the else-open line builds through
+/// `judges.make_line` because the two walks carry different ctx types
+/// (EPH-I0963, EPH-I0965, EPH-I0995).
+fn judgeEnclosingWalkLine(
+    inputs: anytype,
+    state: *EnclosingWalkState,
+    comptime judges: anytype,
+) EnclosingWalkVerdict {
+    const walk_ctx = inputs.walk_ctx;
+    const i = inputs.i;
+    const ctx = inputs.ctx;
+    if (isCommentOrMultilineString(ctx)) return .skip;
+    const kind = foldWalkLine(ctx, state);
+    const line = judges.make_line(walk_ctx, i, ctx, kind);
+    if (state.brace_depth < 0) {
+        if (judges.crossing(walk_ctx, i, ctx, state.skip_antecedent)) return .found;
+        state.skip_antecedent = false;
+        state.brace_depth = 0;
+    }
+    return judges.else_open(line, state);
+}
+
+/// The else-open line's verdict core shared by the guard and bound
+/// judges (EPH-I1232): a covering chain arm answers found, a classic
+/// else-open arms the antecedent skip, a function boundary closes the
+/// walk, and anything else skips (EPH-I0963, EPH-I0965).
+fn elseOpenVerdict(
+    state: *EnclosingWalkState,
+    line: anytype,
+    comptime chain_covers: fn (@TypeOf(line)) bool,
+) EnclosingWalkVerdict {
+    if (line.kind) |k| {
+        if (!state.skip_antecedent and k == .chain and chain_covers(line)) return .found;
+        if (isClassicElseOpen(line.ctx)) state.skip_antecedent = true;
+    }
+    if (isFuncBoundary(line.ctx)) return .boundary;
+    return .skip;
+}
+
 /// One walk line's else-open judgment inputs (hasEnclosingGuardForVar).
 const EnclosingElseOpenLine = struct {
     gctx: GuardCrossingCtx,
     i: usize,
     ctx: []const u8,
     kind: ?ElseOpenKind,
+
+    /// Build the guard else-open line bundle (judgeEnclosingWalkLine).
+    fn make(
+        gctx: GuardCrossingCtx,
+        i: usize,
+        ctx: []const u8,
+        kind: ?ElseOpenKind,
+    ) EnclosingElseOpenLine {
+        return .{ .gctx = gctx, .i = i, .ctx = ctx, .kind = kind };
+    }
 };
 
-/// Judge one trimmed line of the ZA901 enclosing-guard walk: fold the
-/// line's brace balance into the walk depth, judge a depth-negative
-/// crossing, then judge the line's else-open kind against the
-/// candidate's own arm (EPH-I0963, EPH-I0965, EPH-I0995).
-fn judgeEnclosingGuardWalkLine(
-    gctx: GuardCrossingCtx,
-    i: usize,
-    ctx: []const u8,
-    state: *EnclosingWalkState,
-) EnclosingWalkVerdict {
-    if (isCommentOrMultilineString(ctx)) return .skip;
-    const kind = foldWalkLine(ctx, state);
-    if (state.brace_depth < 0) {
-        if (judgeGuardDepthNegativeCrossing(gctx, i, ctx, state.skip_antecedent)) return .found;
-        state.skip_antecedent = false;
-        state.brace_depth = 0;
-    }
-    return judgeEnclosingGuardElseOpen(.{
-        .gctx = gctx,
-        .i = i,
-        .ctx = ctx,
-        .kind = kind,
-    }, state);
+/// The guard chain arm covers the candidate when its own condition
+/// carries the var and the amount agrees (EPH-I0963, EPH-I0965).
+fn guardElseOpenChainCovers(line: EnclosingElseOpenLine) bool {
+    return hasConditionalGuardForVar(elseArmRegion(line.ctx), line.gctx.var_name) and
+        guardRegionCovers(line.gctx.lines, line.i, line.gctx.var_name, line.gctx.amount);
 }
 
-/// Judge the else-open kind of one walk line (hasEnclosingGuardForVar):
-/// the chain arm's own condition covers the candidate, and the line's
-/// boundary verdict closes the walk. The else-open is the arm's opener
-/// only when the walk crosses it at depth 0 — the arm's `{` then opens
-/// the candidate's own container. A crossing at depth > 0 sits below a
+/// Judge the else-open kind of one guard walk line: the chain arm's own
+/// condition covers the candidate, and the line's boundary verdict
+/// closes the walk. The else-open is the arm's opener only when the
+/// walk crosses it at depth 0 — the arm's `{` then opens the
+/// candidate's own container. A crossing at depth > 0 sits below a
 /// closed arm (its close `}` was crossed first): the arm's condition
 /// does not guard the candidate. A closed same-line arm
 /// (`} else { x(); }`) nets -1, so line_balance < 0 rejects it: the
@@ -38076,15 +38127,7 @@ fn judgeEnclosingGuardElseOpen(
     line: EnclosingElseOpenLine,
     state: *EnclosingWalkState,
 ) EnclosingWalkVerdict {
-    if (line.kind) |k| {
-        if (!state.skip_antecedent and k == .chain and
-            hasConditionalGuardForVar(elseArmRegion(line.ctx), line.gctx.var_name) and
-            guardRegionCovers(line.gctx.lines, line.i, line.gctx.var_name, line.gctx.amount))
-            return .found;
-        if (isClassicElseOpen(line.ctx)) state.skip_antecedent = true;
-    }
-    if (isFuncBoundary(line.ctx)) return .boundary;
-    return .skip;
+    return elseOpenVerdict(state, line, guardElseOpenChainCovers);
 }
 
 /// The ZA901 depth-crossing judge's fixed context: the function slice,
@@ -38462,15 +38505,7 @@ fn topLevelKeywordPos(
         .comment_start = findCommentStart(t),
     };
     const q = TopLevelKeywordQuery{ .t = t, .needle = needle, .end = end };
-    var i = start;
-    while (i < end) : (i += 1) {
-        switch (topLevelKeywordStep(q, &state, i)) {
-            .skip => continue,
-            .abort => return null,
-            .found => return i,
-        }
-    }
-    return null;
+    return state.run(start, end, q, topLevelKeywordStep);
 }
 
 /// State carried across a top-level scan: the position-tracked string
@@ -38480,6 +38515,28 @@ const TopLevelScanState = struct {
     cls: LineClassifier,
     comment_start: ?usize,
     depth: usize = 0,
+
+    /// Run the scan from start to end, stepping each byte until a
+    /// verdict decides (EPH-I1232): the shared driver of the keyword
+    /// and comparison scans. `step` answers one byte — `skip` resumes,
+    /// `abort` answers null, `found` answers the byte.
+    fn run(
+        self: *TopLevelScanState,
+        start: usize,
+        end: usize,
+        step_ctx: anytype,
+        comptime step: fn (@TypeOf(step_ctx), *TopLevelScanState, usize) TopLevelScanVerdict,
+    ) ?usize {
+        var i = start;
+        while (i < end) : (i += 1) {
+            switch (step(step_ctx, self, i)) {
+                .skip => continue,
+                .abort => return null,
+                .found => return i,
+            }
+        }
+        return null;
+    }
 };
 
 /// The keyword scan's per-position answer (topLevelKeywordPos): `skip`
@@ -38611,15 +38668,7 @@ fn topLevelComparisonOp(t: []const u8, s: usize, e: usize) ?usize {
         .cls = LineClassifier.init(t),
         .comment_start = findCommentStart(t),
     };
-    var i = s;
-    while (i < e) : (i += 1) {
-        switch (comparisonOpStep(t, &state, i)) {
-            .skip => continue,
-            .abort => return null,
-            .found => return i,
-        }
-    }
-    return null;
+    return state.run(s, e, t, comparisonOpStep);
 }
 
 /// Track the paren and bracket depth and judge the operator for one
@@ -38762,7 +38811,11 @@ fn hasEnclosingBoundForVar(
         .min_bound = min_bound,
     };
     var state = EnclosingWalkState{};
-    return EnclosingWalk(EnclosingBoundCtx).run(bctx, &state, judgeEnclosingBoundWalkLine);
+    return EnclosingWalk(EnclosingBoundCtx).run(bctx, &state, .{
+        .crossing = judgeBoundDepthNegativeCrossing,
+        .make_line = EnclosingBoundElseOpenLine.make,
+        .else_open = judgeEnclosingBoundElseOpen,
+    });
 }
 
 /// One walk line's else-open judgment inputs (hasEnclosingBoundForVar).
@@ -38771,32 +38824,22 @@ const EnclosingBoundElseOpenLine = struct {
     i: usize,
     ctx: []const u8,
     kind: ?ElseOpenKind,
+
+    /// Build the bound else-open line bundle (judgeEnclosingWalkLine).
+    fn make(
+        bctx: EnclosingBoundCtx,
+        i: usize,
+        ctx: []const u8,
+        kind: ?ElseOpenKind,
+    ) EnclosingBoundElseOpenLine {
+        return .{ .bctx = bctx, .i = i, .ctx = ctx, .kind = kind };
+    }
 };
 
-/// Judge one trimmed line of the ZA903 enclosing-bound walk: the
-/// amount-aware twin of judgeEnclosingGuardWalkLine — fold the line's
-/// brace balance into the walk depth, judge a depth-negative crossing,
-/// then judge the line's else-open kind (EPH-I0963, EPH-I0965,
-/// EPH-I0959).
-fn judgeEnclosingBoundWalkLine(
-    bctx: EnclosingBoundCtx,
-    i: usize,
-    ctx: []const u8,
-    state: *EnclosingWalkState,
-) EnclosingWalkVerdict {
-    if (isCommentOrMultilineString(ctx)) return .skip;
-    const kind = foldWalkLine(ctx, state);
-    if (state.brace_depth < 0) {
-        if (judgeBoundDepthNegativeCrossing(bctx, i, ctx, state.skip_antecedent)) return .found;
-        state.skip_antecedent = false;
-        state.brace_depth = 0;
-    }
-    return judgeEnclosingBoundElseOpen(.{
-        .bctx = bctx,
-        .i = i,
-        .ctx = ctx,
-        .kind = kind,
-    }, state);
+/// The bound chain arm covers the candidate when its own condition
+/// proves the bound (EPH-I0963, EPH-I0965).
+fn boundElseOpenChainCovers(line: EnclosingBoundElseOpenLine) bool {
+    return openerCoversBound(line.bctx, line.i);
 }
 
 /// Judge the else-open kind of one enclosing-bound walk line: the
@@ -38812,13 +38855,7 @@ fn judgeEnclosingBoundElseOpen(
     line: EnclosingBoundElseOpenLine,
     state: *EnclosingWalkState,
 ) EnclosingWalkVerdict {
-    if (line.kind) |k| {
-        if (!state.skip_antecedent and k == .chain and openerCoversBound(line.bctx, line.i))
-            return .found;
-        if (isClassicElseOpen(line.ctx)) state.skip_antecedent = true;
-    }
-    if (isFuncBoundary(line.ctx)) return .boundary;
-    return .skip;
+    return elseOpenVerdict(state, line, boundElseOpenChainCovers);
 }
 
 /// Judge the depth-negative crossing of the enclosing-bound walk: the
@@ -47226,21 +47263,27 @@ fn extractPathJoin(allocator: Allocator, line: []const u8, start: usize) !?[]con
     return joinPathSegments(allocator, segments[0..result.count], result.total_len);
 }
 
-/// Add entry if the file exists and is not already added
-fn addEntryIfValid(ctx: EntryScanCtx, path: []const u8) !void {
-    if (ctx.added.contains(path)) return;
-    Fs.cwd(ctx.diag.io).access(path, .{}) catch return;
+/// Dupe and commit an entry path to the config (EPH-I1024): the dupe
+/// and its errdefer stay together in this fn so the coverage analyzers
+/// see the same-function free. The append is the first fallible op
+/// after the dupe. On append OOM the list never takes ownership and the
+/// slice must free. The flag disarms after the append: a failed map put
+/// keeps the list slot (the map references the list-owned slice, it
+/// never owns — Config.deinit frees the list items).
+fn addOwnedEntryCopy(ctx: EntryScanCtx, path: []const u8) !void {
     const duped = try ctx.allocator.dupe(u8, path);
-    // EPH-I1024: the append is the first fallible op after the dupe.
-    // On append OOM the list never takes ownership and the slice must
-    // free. The flag disarms after the append: a failed map put keeps
-    // the list slot (the map references the list-owned slice, it never
-    // owns — Config.deinit frees the list items).
     var entry_owned = true;
     errdefer if (entry_owned) ctx.allocator.free(duped);
     try ctx.cfg.entries.append(ctx.allocator, duped);
     entry_owned = false;
     try ctx.added.put(duped, {});
+}
+
+/// Add entry if the file exists and is not already added
+fn addEntryIfValid(ctx: EntryScanCtx, path: []const u8) !void {
+    if (ctx.added.contains(path)) return;
+    Fs.cwd(ctx.diag.io).access(path, .{}) catch return;
+    try addOwnedEntryCopy(ctx, path);
 }
 
 /// Shared context for entry-point detection scans (build.zig parsing and
@@ -47293,17 +47336,7 @@ fn addEntryWithPrefix(ctx: EntryScanCtx, path: []const u8) !void {
         return;
     }
     Fs.cwd(ctx.diag.io).access(full_path, .{}) catch return;
-    const duped = try ctx.allocator.dupe(u8, full_path);
-    // EPH-I1024: the append is the first fallible op after the dupe.
-    // On append OOM the list never takes ownership and the slice must
-    // free. The flag disarms after the append: a failed map put keeps
-    // the list slot (the map references the list-owned slice, it never
-    // owns — Config.deinit frees the list items).
-    var entry_owned = true;
-    errdefer if (entry_owned) ctx.allocator.free(duped);
-    try ctx.cfg.entries.append(ctx.allocator, duped);
-    entry_owned = false;
-    try ctx.added.put(duped, {});
+    try addOwnedEntryCopy(ctx, full_path);
 }
 
 /// Extract path-tag based entries from a build.zig line. Matches are
@@ -64303,9 +64336,10 @@ test "ZA101: outer-scope defer freeing a prefix-colliding name does not cover (E
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Same collision through hasOuterScopeDefer: the defer textually
-    // before the alloc always dominates, but it frees a different name, so
-    // the inner alloc stays uncovered and ZA101 fires.
+    // Same collision through the outer-scope leg of hasCoveringDefer:
+    // the defer textually before the alloc always dominates, but it
+    // frees a different name, so the inner alloc stays uncovered and
+    // ZA101 fires.
     const content =
         \\fn outer_colliding_defer(allocator: std.mem.Allocator, c: bool) !void {
         \\    defer allocator.free(buffer);

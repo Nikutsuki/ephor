@@ -25744,9 +25744,12 @@ fn scanConcurrencyCalls(state: *ConcurrencyScanState, lc: ConcLineCtx) !void {
 }
 
 /// Struct name of a `Name = struct` declaration (EPH-I1228): the
-/// identifier token immediately before `= struct` in the blanked line,
-/// sliced from the original code (blanked bytes live in a reused
-/// buffer). A word boundary after `struct` rejects `= structName`.
+/// identifier token immediately before `= struct` in the UNtrimmed
+/// literal-blanked line — the search space must be byte-aligned with
+/// `code`, where the name walk-back runs (EPH-I1234: a trimmed form
+/// shifts the match index past the leading whitespace and the walk
+/// reads the wrong bytes) — sliced from the original code. A word
+/// boundary after `struct` rejects `= structName`.
 fn findStructDeclName(code: []const u8, blanked: []const u8) ?[]const u8 {
     const eq = mem.indexOf(u8, blanked, "= struct") orelse return null;
     if (eq + 8 < blanked.len and isIdent(blanked[eq + 8])) return null;
@@ -25825,8 +25828,10 @@ const LockStructWalk = struct {
 /// the literal-blanked text, so string and comment braces are data.
 /// One field per line contributes (a line holding several fields is a
 /// disclosed miss — only the first is checked, the suppression-side
-/// conservative direction), and a struct body whose opener sits on a
-/// later line waits for it (the Allman shape).
+/// conservative direction), a struct body whose opener sits on a
+/// later line waits for it (the Allman shape), and a struct decl
+/// nested inside another struct body is never indexed (the outer walk
+/// owns the line — disclosed FN-side miss, the safe direction).
 fn buildLockStructIndex(
     allocator: Allocator,
     index: *LockStructIndex,
@@ -25839,16 +25844,23 @@ fn buildLockStructIndex(
         if (isCommentOrMultilineString(t)) continue;
         const code_end = findCommentStart(line) orelse line.len;
         const code = line[0..code_end];
-        const trimmed = mem.trim(u8, blankLiteralContents(code, &blank_buf), " \t\r");
-        try scanLockStructLine(allocator, index, &walk, .{ .code = code, .trimmed = trimmed });
+        const blanked = blankLiteralContents(code, &blank_buf);
+        const trimmed = mem.trim(u8, blanked, " \t\r");
+        try scanLockStructLine(allocator, index, &walk, .{
+            .code = code,
+            .blanked = blanked,
+            .trimmed = trimmed,
+        });
     }
 }
 
-/// One comment-stripped struct-scan line (EPH-I1228): the raw code and
-/// its literal-blanked trimmed form (the blanked bytes live in a reused
-/// buffer — callers never store them).
+/// One comment-stripped struct-scan line (EPH-I1228): the raw code, its
+/// literal-blanked form (byte-aligned with the code), and the trimmed
+/// blanked form (the blanked bytes live in a reused buffer — callers
+/// never store them).
 const ConcLineForms = struct {
     code: []const u8,
+    blanked: []const u8,
     trimmed: []const u8,
 };
 
@@ -25861,7 +25873,7 @@ fn scanLockStructLine(
     forms: ConcLineForms,
 ) !void {
     if (!walk.in_struct) {
-        if (findStructDeclName(forms.code, forms.trimmed)) |nm| {
+        if (findStructDeclName(forms.code, forms.blanked)) |nm| {
             walk.in_struct = true;
             walk.depth = 0;
             walk.lock_field = false;
@@ -113092,6 +113104,70 @@ test "ZC101: domain lock under a wrapped signature is silent (EPH-I1228)" {
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: indented lock-less struct domain lock is silent (EPH-I1234)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The indented-decl FN arm: a lock-less struct declared inside a
+    // test block carries leading whitespace on its decl line. Pre-fix
+    // the match index came from the trimmed blanked form while the
+    // name walk-back read the untrimmed code, so the extracted name
+    // was a suffix ("Gu") and the suppression never resolved — the
+    // domain lock fired a phantom ZC101.
+    const content =
+        \\test "nested decl" {
+        \\    const Guard = struct {
+        \\        is_ready: bool = false,
+        \\
+        \\        pub fn enter(self: *Guard) void {
+        \\            self.lock();
+        \\            const x = 1;
+        \\            _ = x;
+        \\        }
+        \\
+        \\        pub fn lock(self: *Guard) void {}
+        \\    };
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_indented.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: bare lock on an undeclared struct param still fires (EPH-I1234)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The FP arm and the cross-file must-fire control in one fixture:
+    // Gu is never declared in this file (only the indented Guard is),
+    // so the bare lock must stay live. Pre-fix the indented Guard decl
+    // extracted the phantom key "Gu" from the coordinate mix, resolved
+    // the *Gu param lock-less, and silenced the genuine ZC101.
+    const content =
+        \\comptime {
+        \\    const Guard = struct {
+        \\        is_ready: bool = false,
+        \\    };
+        \\    _ = Guard{};
+        \\}
+        \\
+        \\fn hold(g: *Gu) void {
+        \\    g.lock();
+        \\    const x = 1;
+        \\    _ = x;
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_undeclared.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
 }
 
 // ============================================================================

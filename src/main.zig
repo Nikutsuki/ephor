@@ -9536,6 +9536,33 @@ fn isExitStatementLine(t: []const u8) bool {
     return false;
 }
 
+/// Bounds-guard the free-line index (EPH-I1232 C1a, REL-GATE-2): the
+/// pair-form free checks share this head. Null means the pair's line
+/// numbers fall outside the body slice.
+fn freeLineIndex(lines: []const []const u8, func_line: usize, free_line: usize) ?usize {
+    if (free_line < func_line) return null;
+    const f_idx = free_line - func_line;
+    if (f_idx >= lines.len) return null;
+    return f_idx;
+}
+
+/// Shared head of the single-line if-form free checks (EPH-I1232 C1a):
+/// bounds guard, the `if` opener, the real free pattern, and the
+/// both-arms escape. The caller's verdict fn grades the surviving site.
+fn ifFormFreeVerdict(
+    lines: []const []const u8,
+    func_line: usize,
+    free_line: usize,
+    comptime verdict: fn ([]const u8, usize) bool,
+) bool {
+    const f_idx = freeLineIndex(lines, func_line, free_line) orelse return false;
+    const t = mem.trim(u8, lines[f_idx], " \t\r");
+    if (!mem.startsWith(u8, t, "if ")) return false;
+    const free_pos = firstFreePatternPos(t) orelse return false;
+    if (elsePrecedesSecondFree(t, free_pos)) return false;
+    return verdict(t, free_pos);
+}
+
 /// True when the free at free_line sits in the arm of an inline catch
 /// whose construct shares the enclosing CFG block: the arm's `catch` sits
 /// at a code position before the free on the same line (`opt catch
@@ -9554,9 +9581,7 @@ fn isInlineCatchArmFree(
     func_line: usize,
     free_line: usize,
 ) bool {
-    if (free_line < func_line) return false;
-    const f_idx = free_line - func_line;
-    if (f_idx >= lines.len) return false;
+    const f_idx = freeLineIndex(lines, func_line, free_line) orelse return false;
     const free_t = mem.trim(u8, lines[f_idx], " \t\r");
     const free_pos = firstFreePatternPos(free_t) orelse return false;
     if (codeCatchBefore(free_t, free_pos)) return true;
@@ -9631,16 +9656,7 @@ fn isBraceLessIfFormFree(
     func_line: usize,
     free_line: usize,
 ) bool {
-    if (free_line < func_line) return false;
-    const f_idx = free_line - func_line;
-    if (f_idx >= lines.len) return false;
-    const t = mem.trim(u8, lines[f_idx], " \t\r");
-    if (!mem.startsWith(u8, t, "if ")) return false;
-    const free_pos = firstFreePatternPos(t) orelse return false;
-    // A both-arms if-else frees on every path: `if (c) free(buf) else
-    // free(buf);` is definite, never line-conditional (EPH-I1005 F1).
-    if (elsePrecedesSecondFree(t, free_pos)) return false;
-    return braceLessIfBodyFree(t, free_pos);
+    return ifFormFreeVerdict(lines, func_line, free_line, braceLessIfBodyFree);
 }
 
 /// Verdict of the same-line both-arms escape for one pair line: whether
@@ -10010,14 +10026,7 @@ fn isInlineBracedIfFormFree(
     func_line: usize,
     free_line: usize,
 ) bool {
-    if (free_line < func_line) return false;
-    const f_idx = free_line - func_line;
-    if (f_idx >= lines.len) return false;
-    const t = mem.trim(u8, lines[f_idx], " \t\r");
-    if (!mem.startsWith(u8, t, "if ")) return false;
-    const free_pos = firstFreePatternPos(t) orelse return false;
-    if (elsePrecedesSecondFree(t, free_pos)) return false;
-    return bracedIfBodyContainsFree(t, free_pos);
+    return ifFormFreeVerdict(lines, func_line, free_line, bracedIfBodyContainsFree);
 }
 
 /// True when the free at free_pos sits inside an arm group of the
@@ -111562,6 +111571,19 @@ fn runConcurrencyCheck(
     return .{ .graph = graph, .issues = issues };
 }
 
+/// Assert the exact warning and note counts for one rule (EPH-I1232 C1a,
+/// REL-GATE-2): the four ZC1xx count helpers share this shape and differ
+/// only in the rule constant.
+fn expectRuleCounts(
+    issues: []const Issue,
+    warnings: usize,
+    notes: usize,
+    rule: []const u8,
+) !void {
+    try std.testing.expectEqual(warnings, countBySeverity(issues, rule, .warning));
+    try std.testing.expectEqual(notes, countBySeverity(issues, rule, .note));
+}
+
 /// Assert the exact ZC101 warning/note counts (both — a silent analyzer
 /// passes a warnings==0 check vacuously, so every silent test also has a
 /// firing sibling elsewhere in this section).
@@ -111570,14 +111592,7 @@ fn expectZC101Counts(
     warnings: usize,
     notes: usize,
 ) !void {
-    try std.testing.expectEqual(
-        warnings,
-        countBySeverity(issues, RULE_LOCK_NO_DEFER_UNLOCK, .warning),
-    );
-    try std.testing.expectEqual(
-        notes,
-        countBySeverity(issues, RULE_LOCK_NO_DEFER_UNLOCK, .note),
-    );
+    try expectRuleCounts(issues, warnings, notes, RULE_LOCK_NO_DEFER_UNLOCK);
 }
 
 // ZC101 family note (band-T05 F10, EPH-I0578): the per-case bodies stay
@@ -113331,14 +113346,7 @@ fn expectZC102Counts(
     warnings: usize,
     notes: usize,
 ) !void {
-    try std.testing.expectEqual(
-        warnings,
-        countBySeverity(issues, RULE_DOUBLE_LOCK, .warning),
-    );
-    try std.testing.expectEqual(
-        notes,
-        countBySeverity(issues, RULE_DOUBLE_LOCK, .note),
-    );
+    try expectRuleCounts(issues, warnings, notes, RULE_DOUBLE_LOCK);
 }
 
 test "ZC102: lock twice on the same receiver is a warning" {
@@ -113959,14 +113967,7 @@ fn expectZC103Counts(
     warnings: usize,
     notes: usize,
 ) !void {
-    try std.testing.expectEqual(
-        warnings,
-        countBySeverity(issues, RULE_UNLOCK_WITHOUT_LOCK, .warning),
-    );
-    try std.testing.expectEqual(
-        notes,
-        countBySeverity(issues, RULE_UNLOCK_WITHOUT_LOCK, .note),
-    );
+    try expectRuleCounts(issues, warnings, notes, RULE_UNLOCK_WITHOUT_LOCK);
 }
 
 test "ZC103: unlock with no lock evidence in the file is silent (EPH-I0903)" {
@@ -114259,14 +114260,7 @@ fn expectZC104Counts(
     warnings: usize,
     notes: usize,
 ) !void {
-    try std.testing.expectEqual(
-        warnings,
-        countBySeverity(issues, RULE_THREAD_NO_JOIN, .warning),
-    );
-    try std.testing.expectEqual(
-        notes,
-        countBySeverity(issues, RULE_THREAD_NO_JOIN, .note),
-    );
+    try expectRuleCounts(issues, warnings, notes, RULE_THREAD_NO_JOIN);
 }
 
 test "ZC104: spawn with no join or detach is a warning" {

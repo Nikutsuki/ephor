@@ -26957,7 +26957,11 @@ fn analyzeClones(
 /// Build one file's normalized-line stream. Lines inside test bodies and
 /// comment/multiline-string-only lines never join; code lines enter as
 /// trimmed, comment-stripped byte ranges. The test-body walk mirrors
-/// collectFileTestBlocks so both passes agree on block membership.
+/// collectFileTestBlocks so both passes agree on block membership, plus
+/// one deliberate superset: the closing brace of each test block leaves
+/// the stream too (it flips the state before the skip runs), so stacked
+/// blank-separated test blocks never self-report as duplicated brace
+/// runs (EPH-I1233).
 fn buildCloneStream(
     allocator: Allocator,
     content: []const u8,
@@ -26973,17 +26977,20 @@ fn buildCloneStream(
         defer offset += raw.len + 1;
         const t = mem.trim(u8, raw, " \t\r");
         const is_data = isCommentOrMultilineString(t);
+        // Snapshot the test-body state before this line can close a
+        // block: a test block's closing brace flips in_test false, and
+        // the skip below must still exclude that closer (EPH-I1233).
+        const was_in_test = state.in_test;
         if (!is_data) {
             const code_end = findCommentStart(raw) orelse raw.len;
             const code = raw[0..code_end];
-            const was_in_test = state.in_test;
             const opener = resolveTestOpener(&state.pending, t, was_in_test, line_no);
             const neutral = mem.trim(u8, blankLiteralContents(code, &state.blank_buf), " \t\r");
             const ts = trackTestBlock(neutral, state.in_test or opener.pending_open, state.depth);
             state.in_test = ts.in_test;
             state.depth = ts.depth;
         }
-        if (state.in_test or is_data) continue;
+        if (was_in_test or state.in_test or is_data) continue;
         const norm = mem.trim(u8, stripLineComment(raw), " \t\r");
         if (norm.len == 0) continue;
         const start = offset + (norm.ptr - raw.ptr);
@@ -124451,10 +124458,16 @@ test "ZA504 same-file and cross-file duplication both report" {
         @as(usize, 1),
         countRuleIssues(run.issues.items, "three.zig", RULE_DUPLICATED_BLOCK),
     );
-    // The cross-file message names the other side of the pair.
+    // The cross-file message names the other side of the pair. The
+    // witness is the smallest (file, stream) occurrence outside the
+    // run, and file order is hashmap iteration order, so either
+    // one.zig or three.zig is admissible (EPH-I1233).
     for (run.issues.items) |issue| {
         if (mem.eql(u8, issue.file, "two.zig"))
-            try std.testing.expect(mem.indexOf(u8, issue.message, "three.zig") != null);
+            try std.testing.expect(
+                mem.indexOf(u8, issue.message, "one.zig") != null or
+                    mem.indexOf(u8, issue.message, "three.zig") != null,
+            );
     }
 }
 
@@ -124482,6 +124495,53 @@ test "ZA504 test bodies: scaffolding inside test blocks stays silent" {
     ;
     var run = try runCloneTest(&diag, allocator, &.{
         .{ .path = "tests_inline.zig", .content = content },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZA504 stacked test blocks: closing braces never self-report" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // Eight blank-separated test blocks: pre-fix, each closing brace
+    // joined the clone stream, and the consecutive `}` lines reported
+    // an 8-line duplicated block (EPH-I1233). The closer exclusion must
+    // keep the stream empty.
+    const content =
+        \\test "one" {
+        \\    try expectTrue(1 + 1 == 2);
+        \\}
+        \\
+        \\test "two" {
+        \\    try expectTrue(1 + 1 == 2);
+        \\}
+        \\
+        \\test "three" {
+        \\    try expectTrue(1 + 1 == 2);
+        \\}
+        \\
+        \\test "four" {
+        \\    try expectTrue(1 + 1 == 2);
+        \\}
+        \\
+        \\test "five" {
+        \\    try expectTrue(1 + 1 == 2);
+        \\}
+        \\
+        \\test "six" {
+        \\    try expectTrue(1 + 1 == 2);
+        \\}
+        \\
+        \\test "seven" {
+        \\    try expectTrue(1 + 1 == 2);
+        \\}
+        \\
+        \\test "eight" {
+        \\    try expectTrue(1 + 1 == 2);
+        \\}
+    ;
+    var run = try runCloneTest(&diag, allocator, &.{
+        .{ .path = "stacked_tests.zig", .content = content },
     });
     defer run.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);

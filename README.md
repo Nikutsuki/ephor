@@ -516,10 +516,11 @@ comments (quote-aware), trims surrounding whitespace, and drops blank
 and comment-only lines. Consecutive duplicated windows merge into one
 finding per maximal run, so a 30-line copy reports once with its full
 span. Three deliberate-duplication surfaces never join the comparison:
-lines inside test bodies (test scaffolding repeats by design), `\\`
-multiline-string content (help text and fixtures are data, not code),
-and cross-file pairs whose files both sit under a directory named
-`compat` (version-mirror trees). The analyzer re-verifies hash-collision
+lines inside test bodies, including each test block's closing brace
+(test scaffolding repeats by design), `\\` multiline-string content
+(help text and fixtures are data, not code), and cross-file pairs whose
+files both sit under a directory named `compat` (version-mirror trees).
+The analyzer re-verifies hash-collision
 candidates byte-for-byte before reporting, so a finding is never a hash
 collision.
 

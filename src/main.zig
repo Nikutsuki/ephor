@@ -5088,14 +5088,23 @@ fn recordGenEffect(ctx: *const DefAssignCtx, occ: GenOccurrence, gen_sets: *GenS
 /// Column of the bracketed occurrence of var_name whose bracket span
 /// contains the fill-call open paren at `col`, or null. In
 /// `hash_buf[0..formatHashHex(&hash_buf, x)]` the fill-call sits inside
-/// the slice bounds, and Zig evaluates the bound or index expression
-/// before the bracketed read — the fill completes first (EPH-I1230;
-/// serves REL-ZERO-1, the RT-1 zero-warning sweep, and REL-AB-5, the
-/// corpus A/B byte-identity).
+/// the slice bounds; the analyzer assumes the slice is taken after both
+/// bound expressions complete, so the fill completes first and the
+/// bracketed read observes the filled value (EPH-I1230; serves
+/// REL-ZERO-1, the RT-1 zero-warning sweep, and REL-AB-5, the corpus
+/// A/B byte-identity). The langref does not pin the bounds' evaluation
+/// order, so that assumption is a documented approximation in the
+/// EPH-I0123 style.
 /// Callers move the fill's effect point to the bracketed occurrence,
-/// which covers the read at its exact column: a same-line read BEFORE
-/// the bracketed occurrence still observes the pre-fill value and keeps
-/// firing. A fill-call outside every bracket span of the var keeps its
+/// which covers the read at that column AND every later same-line read
+/// (effectCoversRead uses effect.col <= col): a same-line read BEFORE
+/// the occurrence still observes the pre-fill value and keeps firing,
+/// but a read nested inside the bracket span after the occurrence is
+/// covered too. The first-read-per-line model (firstVarReadPos) checks
+/// only the first read, so covering the bracketed occurrence silences
+/// the nested in-span reads — the documented residual of the effect-
+/// point design (EPH-I1230, pinned by test da_i1230_residual).
+/// A fill-call outside every bracket span of the var keeps its
 /// close-paren effect (EPH-I0102).
 fn bracketedSpanContainingFill(
     t: []const u8,
@@ -80471,7 +80480,9 @@ test "ZA607: read before the bracketed span still fires (EPH-I1230 control)" {
     // bracketed occurrence: `use(buf[0])` before the slice on the same
     // line still reads undefined memory, so the control must keep firing.
     // A whole-line coverage effect (col 0) would silence it — this pin
-    // holds the tight-effect design of the EPH-I1230 arm.
+    // holds the tight-effect design against BEFORE-the-occurrence reads
+    // only. Reads nested inside the bracket span stay silent (the
+    // EPH-I1230 documented residual, pinned by da_i1230_residual).
     const content =
         \\fn formatLen(out: *[16]u8) usize {
         \\    out[0] = 1;
@@ -80492,6 +80503,42 @@ test "ZA607: read before the bracketed span still fires (EPH-I1230 control)" {
     try std.testing.expectEqual(
         1,
         countRuleIssues(run.issues.items, "da_i1230_control.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: nested in-span read before the fill stays silent (EPH-I1230, documented residual)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // `x[x[0] .. fill(&x)]`: the fill call sits inside the slice bounds,
+    // so its effect point moves to the bracketed occurrence, and the
+    // first-read-per-line model reads the line at that occurrence — the
+    // nested start-bound read `x[0]` stays silent though it genuinely
+    // may observe pre-fill state (the langref does not pin the bounds'
+    // evaluation order). Accepted residual of the EPH-I1230 effect-point
+    // design; this pin locks the current verdict.
+    const content =
+        \\fn fill(p: *[4]u8) usize {
+        \\    p.* = .{ 1, 2, 3, 4 };
+        \\    return 4;
+        \\}
+        \\fn use(v: usize) void {
+        \\    _ = v;
+        \\}
+        \\fn nestedInSpanRead() void {
+        \\    var x: [4]u8 = undefined;
+        \\    const s = x[x[0] .. fill(&x)];
+        \\    use(s.len);
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1230_residual.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1230_residual.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

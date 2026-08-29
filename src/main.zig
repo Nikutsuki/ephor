@@ -1185,6 +1185,193 @@ const QuoteWalk = struct {
     }
 };
 
+/// One yielded line from LineWalk: the trimmed text, the line's index in
+/// the body slice, and the effective scan-start column for this line (the
+/// caller's start column on the origin line, 0 on every later line).
+const LineStep = struct {
+    idx: usize,
+    text: []const u8,
+    start: usize,
+};
+
+/// Line-level iteration over a function-body line slice (EPH-I1232 C3,
+/// REL-GATE-2, REL-AB-5): the trim + comment-skip line prologue shared by
+/// the line-walk family, with the per-site body as the varying part.
+/// `forward` yields lines start_idx..end_idx in order; `backward` yields
+/// (from_idx-1) down to stop_idx — the pre-migration `while (i > stop) {
+/// i -= 1; ... }` shape; comment-only and multiline-opener lines never
+/// yield either way. `nextCodeLineBack` also strips the trailing comment
+/// and skips lines whose code part is empty (EPH-I0095). `nextChar` is
+/// the walk's inner step: the C2c carriedScanStep head folded in, so the
+/// statement-end and paren-close scans ride the same line walk with the
+/// caller-carried quote mode.
+const LineWalk = struct {
+    lines: []const []const u8,
+    line_idx: usize,
+    end_idx: usize,
+    first_idx: usize,
+    start_col: usize,
+    back_idx: usize,
+    stop_idx: usize,
+    text: []const u8 = "",
+    cur_idx: usize = 0,
+    char_i: usize = 0,
+
+    /// Forward walk over lines start_idx..end_idx; `start_col` applies on
+    /// the first yielded line whose index is start_idx (a skipped origin
+    /// line loses the column, like the pre-migration walks).
+    fn forward(
+        lines: []const []const u8,
+        start_idx: usize,
+        start_col: usize,
+        end_idx: usize,
+    ) LineWalk {
+        return .{
+            .lines = lines,
+            .line_idx = start_idx,
+            .end_idx = end_idx,
+            .first_idx = start_idx,
+            .start_col = start_col,
+            .back_idx = start_idx,
+            .stop_idx = start_idx,
+        };
+    }
+
+    /// Backward walk over lines (from_idx-1) down to stop_idx.
+    fn backward(lines: []const []const u8, from_idx: usize, stop_idx: usize) LineWalk {
+        return .{
+            .lines = lines,
+            .line_idx = from_idx,
+            .end_idx = from_idx,
+            .first_idx = from_idx,
+            .start_col = 0,
+            .back_idx = from_idx,
+            .stop_idx = stop_idx,
+        };
+    }
+
+    /// One-line scan from column `start` (the per-line form): nextChar and
+    /// nextClosure run on this line only, with the caller's mode passed
+    /// per call. The line-iteration fields stay zeroed: nextLine yields
+    /// nothing past the single line.
+    fn initLine(line: []const u8, start: usize) LineWalk {
+        return .{
+            .lines = &[_][]const u8{},
+            .line_idx = 0,
+            .end_idx = 0,
+            .first_idx = 0,
+            .start_col = 0,
+            .back_idx = 0,
+            .stop_idx = 0,
+            .text = line,
+            .char_i = start,
+        };
+    }
+
+    /// Next forward line step, or null past end_idx.
+    fn nextLine(self: *LineWalk) ?LineStep {
+        while (self.line_idx < self.end_idx) {
+            const idx = self.line_idx;
+            self.line_idx += 1;
+            const t = mem.trim(u8, self.lines[idx], " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+            const start: usize = if (idx == self.first_idx) self.start_col else 0;
+            return .{ .idx = idx, .text = t, .start = start };
+        }
+        return null;
+    }
+
+    /// Next backward line step, or null at stop_idx. The cursor is a
+    /// public field: the break-guard walk resumes it at a passed opener
+    /// (priorLineWalkVerdict, EPH-I0498).
+    fn nextLineBack(self: *LineWalk) ?LineStep {
+        while (self.back_idx > self.stop_idx) {
+            self.back_idx -= 1;
+            const t = mem.trim(u8, self.lines[self.back_idx], " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+            return .{ .idx = self.back_idx, .text = t, .start = 0 };
+        }
+        return null;
+    }
+
+    /// Next backward code line step: nextLineBack plus the trailing
+    /// comment strip, skipping lines whose code part is empty. Braces
+    /// inside a trailing comment are not block structure — a commented
+    /// `{` must not read as opening an enclosing block (EPH-I0095).
+    fn nextCodeLineBack(self: *LineWalk) ?LineStep {
+        while (self.back_idx > self.stop_idx) {
+            self.back_idx -= 1;
+            const t = mem.trim(u8, self.lines[self.back_idx], " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+            const code = stripLineComment(t);
+            if (code.len == 0) continue;
+            return .{ .idx = self.back_idx, .text = code, .start = 0 };
+        }
+        return null;
+    }
+
+    /// Next code-position char across the walk's lines: quote content
+    /// skips, and a `\\` multiline opener or a `//` comment opener cuts
+    /// the line — the walk moves to the next line (EPH-I0751). Yields
+    /// the column within the current trimmed line; the caller's loop
+    /// carries `: (walk.advanceChar())`. The current line's index is
+    /// cur_idx, its text `text`. The caller-owned `mode` carries across
+    /// lines, like the C2c carriedScanStep head this folds.
+    fn nextChar(self: *LineWalk, mode: *QuoteMode) ?usize {
+        while (true) {
+            if (self.char_i >= self.text.len) {
+                const step = self.nextLine() orelse return null;
+                self.text = step.text;
+                self.cur_idx = step.idx;
+                self.char_i = step.start;
+                continue;
+            }
+            const c = self.text[self.char_i];
+            if (scanQuoteStep(mode, c)) |skip| {
+                self.char_i += skip + 1;
+                continue;
+            }
+            if (types.isMultilineOpenerAt(self.text, self.char_i) or
+                isLineCommentOpenerAt(self.text, self.char_i))
+            {
+                self.char_i = self.text.len;
+                continue;
+            }
+            return self.char_i;
+        }
+    }
+
+    /// Step past the char nextChar most recently yielded.
+    fn advanceChar(self: *LineWalk) void {
+        self.char_i += 1;
+    }
+
+    /// Scan the walk's current line from its char position for the first
+    /// char the caller's closure accepts: the column just past it, or
+    /// null at the line end or a `\\`/`//` cut. The closure owns the
+    /// bracket-depth fold, so the statement and paren shapes keep their
+    /// own predicates (the C2c per-line scans, EPH-I1232 C3).
+    fn nextClosure(
+        self: *LineWalk,
+        comptime closes: fn (depth: *usize, c: u8) bool,
+        depth: *usize,
+        mode: *QuoteMode,
+    ) ?usize {
+        while (self.nextChar(mode)) |i| : (self.advanceChar()) {
+            if (closes(depth, self.text[i])) return i + 1;
+        }
+        return null;
+    }
+};
+
+/// The statement-end closure for LineWalk.nextClosure: fold the bracket
+/// depth and accept a depth-0 `;` (the scanLineForStatementEnd body,
+/// EPH-I1232 C3).
+fn statementCloseAt(depth: *usize, c: u8) bool {
+    foldBracketDepth(depth, c);
+    return c == ';' and depth.* == 0;
+}
+
 /// Return the line with any trailing `//` comment removed (quote-aware:
 /// `//` inside string/char literals is kept). A `\\` multiline opener in
 /// code position cuts the line at the opener: its tail is string data, so
@@ -3869,7 +4056,8 @@ fn classifyFillLine(check_line: []const u8, name: []const u8) FillVerdict {
         // through the FillScan pending path instead (EPH-I0103).
         var depth: usize = 1;
         var mode: QuoteMode = .none;
-        const close_col = scanLineForParenClose(check_line, fill_col + 1, &depth, &mode) orelse
+        var walk = LineWalk.initLine(check_line, fill_col + 1);
+        const close_col = walk.nextClosure(bracketGroupClosed, &depth, &mode) orelse
             return .self_read_use;
         if (read_col < close_col) return .self_read_use;
     }
@@ -3890,7 +4078,8 @@ const FillScan = struct {
     fn start(self: *FillScan, check_line: []const u8) bool {
         self.depth = 0;
         self.mode = .none;
-        if (scanLineForStatementEnd(check_line, 0, &self.depth, &self.mode) != null)
+        var walk = LineWalk.initLine(check_line, 0);
+        if (walk.nextClosure(statementCloseAt, &self.depth, &self.mode) != null)
             return true;
         self.active = true;
         return false;
@@ -3903,7 +4092,8 @@ const FillScan = struct {
     fn step(self: *FillScan, check_line: []const u8, name: []const u8) ?bool {
         if (isCommentOrMultilineString(check_line)) return null;
         const read_col = firstVarReadPos(check_line, name);
-        const end_col = scanLineForStatementEnd(check_line, 0, &self.depth, &self.mode);
+        var walk = LineWalk.initLine(check_line, 0);
+        const end_col = walk.nextClosure(statementCloseAt, &self.depth, &self.mode);
         if (end_col) |ec| {
             if (read_col) |rc| {
                 if (rc < ec) return false;
@@ -4019,7 +4209,8 @@ fn skipLoopContinuation(t: []const u8, j: usize) usize {
     if (k >= t.len or t[k] != '(') return j;
     var depth: usize = 1;
     var mode: QuoteMode = .none;
-    const close = scanLineForParenClose(t, k + 1, &depth, &mode) orelse return j;
+    var walk = LineWalk.initLine(t, k + 1);
+    const close = walk.nextClosure(bracketGroupClosed, &depth, &mode) orelse return j;
     var after = close;
     while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
     return after;
@@ -4433,50 +4624,6 @@ fn foldBracketDepth(depth: *usize, c: u8) void {
     if (c == ')' or c == ']' or c == '}') depth.* -|= 1;
 }
 
-/// One code-position char from a carried scan (EPH-I1232 C2c, REL-GATE-2,
-/// REL-AB-5): the index at or after i.* with the caller-carried quote mode
-/// stepped, or null when the scan ends at the line end, a `\\` multiline
-/// opener, or a `//` comment opener (EPH-I0751). The pointer head shared
-/// by scanLineForStatementEnd and scanLineForParenClose: the callers own
-/// the quote mode and the bracket depth, so the state survives across
-/// lines. The caller's loop carries `: (i += 1)`, stepping past each
-/// yielded char.
-fn carriedScanStep(t: []const u8, i: *usize, mode: *QuoteMode) ?usize {
-    while (i.* < t.len) : (i.* += 1) {
-        const c = t[i.*];
-        if (scanQuoteStep(mode, c)) |skip| {
-            i.* += skip;
-            continue;
-        }
-        if (types.isMultilineOpenerAt(t, i.*)) return null;
-        if (isLineCommentOpenerAt(t, i.*)) return null;
-        return i.*;
-    }
-    return null;
-}
-
-/// Scan one trimmed line for the statement-terminating `;`, starting at
-/// column `start`. Returns the column just past a depth-0 `;`, or null when
-/// the statement continues past this line. Bracket depth and quote mode
-/// carry across lines through the pointers; the walk head is
-/// carriedScanStep (EPH-I1232 C2c). A `\\` multiline opener cuts the scan:
-/// its tail is string data, so the statement continues on a later line
-/// (EPH-I0751).
-fn scanLineForStatementEnd(
-    t: []const u8,
-    start: usize,
-    depth: *usize,
-    mode: *QuoteMode,
-) ?usize {
-    var i: usize = start;
-    while (carriedScanStep(t, &i, mode)) |_| : (i += 1) {
-        const c = t[i];
-        foldBracketDepth(depth, c);
-        if (c == ';' and depth.* == 0) return i + 1;
-    }
-    return null;
-}
-
 /// Scan forward from (start_idx, start_col) for the `;` that terminates the
 /// statement. Multi-line statements (`x = create(\n ... \n);`) end at the
 /// `;` on the LAST line, so a read inside the statement's own span is not
@@ -4489,13 +4636,12 @@ fn statementEffectPos(
 ) AssignEffect {
     var depth: usize = 0;
     var mode: QuoteMode = .none;
-    var idx = start_idx;
-    while (idx < lines.len) : (idx += 1) {
-        const t = mem.trim(u8, lines[idx], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        const start: usize = if (idx == start_idx) start_col else 0;
-        const col = scanLineForStatementEnd(t, start, &depth, &mode) orelse continue;
-        return .{ .line = idx, .col = col };
+    var walk = LineWalk.forward(lines, start_idx, start_col, lines.len);
+    while (walk.nextChar(&mode)) |col| : (walk.advanceChar()) {
+        const c = walk.text[col];
+        foldBracketDepth(&depth, c);
+        if (c == ';' and depth == 0)
+            return .{ .line = walk.cur_idx, .col = col + 1 };
     }
     return no_assign_effect;
 }
@@ -4514,25 +4660,6 @@ fn bracketGroupClosed(depth: *usize, c: u8) bool {
     return false;
 }
 
-/// Scan one trimmed line for the closing bracket that brings `depth` to
-/// zero, starting at column `start`. Returns the column just past it, or
-/// null when the expression continues past this line. Bracket depth and
-/// quote mode carry across lines through the pointers; the walk head is
-/// carriedScanStep (EPH-I1232 C2c). A `\\` multiline opener cuts the scan:
-/// its tail is string data, so the group closes on a later line (EPH-I0751).
-fn scanLineForParenClose(
-    t: []const u8,
-    start: usize,
-    depth: *usize,
-    mode: *QuoteMode,
-) ?usize {
-    var i: usize = start;
-    while (carriedScanStep(t, &i, mode)) |_| : (i += 1) {
-        if (bracketGroupClosed(depth, t[i])) return i + 1;
-    }
-    return null;
-}
-
 /// Effect point of a fill-CALL: the column just past the call's closing
 /// `)`. A call's side effects complete when it returns, so a read after
 /// the `)` observes the filled value while a read in an earlier argument
@@ -4545,17 +4672,7 @@ fn fillCallEffectPos(
     start_idx: usize,
     open_col: usize,
 ) AssignEffect {
-    var depth: usize = 1;
-    var mode: QuoteMode = .none;
-    var idx = start_idx;
-    while (idx < lines.len) : (idx += 1) {
-        const t = mem.trim(u8, lines[idx], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        const start: usize = if (idx == start_idx) open_col + 1 else 0;
-        const col = scanLineForParenClose(t, start, &depth, &mode) orelse continue;
-        return .{ .line = idx, .col = col };
-    }
-    return no_assign_effect;
+    return parenGroupEnd(lines, start_idx, open_col) orelse no_assign_effect;
 }
 
 /// Quote-aware assignment-occurrence scan inputs for one line: the
@@ -5892,12 +6009,14 @@ fn payloadBracelessEnd(lines: []const []const u8, from_idx: usize) ?usize {
             return braceCloseLine(lines, j, 0);
         var pdepth: usize = 0;
         var mode: QuoteMode = .none;
-        if (scanLineForStatementEnd(body, 0, &pdepth, &mode) != null) return j;
+        var walk = LineWalk.initLine(body, 0);
+        if (walk.nextClosure(statementCloseAt, &pdepth, &mode) != null) return j;
         var k = j + 1;
         while (k < lines.len) : (k += 1) {
             const bk = mem.trim(u8, lines[k], " \t\r");
             if (isCommentOrMultilineString(bk)) continue;
-            if (scanLineForStatementEnd(bk, 0, &pdepth, &mode) != null) return k;
+            walk = LineWalk.initLine(bk, 0);
+            if (walk.nextClosure(statementCloseAt, &pdepth, &mode) != null) return k;
         }
         return null;
     }
@@ -6745,7 +6864,8 @@ fn bracelessLoopBodyEnd(
         if (isCommentOrMultilineString(body)) continue;
         if (mem.startsWith(u8, body, "{")) return null;
         if (lineHasIncrement(body, ctx.counter)) found_inc.* = true;
-        const stmt_end = scanLineForStatementEnd(body, 0, &depth, &mode) orelse
+        var walk = LineWalk.initLine(body, 0);
+        const stmt_end = walk.nextClosure(statementCloseAt, &depth, &mode) orelse
             continue;
         // A counter write in the statement line's tail (after the `;`)
         // breaks the correlation: the body ends at the statement, so
@@ -6761,7 +6881,8 @@ fn bracelessLoopBodyEnd(
 fn statementEndsOnLine(t: []const u8, start: usize) bool {
     var depth: usize = 0;
     var mode: QuoteMode = .none;
-    return scanLineForStatementEnd(t, start, &depth, &mode) != null;
+    var walk = LineWalk.initLine(t, start);
+    return walk.nextClosure(statementCloseAt, &depth, &mode) != null;
 }
 
 /// True when a word-bounded occurrence of `name` in `t` is a one-step
@@ -7175,21 +7296,14 @@ fn enclosingConditionalLines(
 ) usize {
     var depth: usize = 0;
     var count: usize = 0;
-    var i = idx;
-    while (i > stop) {
-        i -= 1;
-        const t = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        // Braces inside a trailing comment are not block structure
-        // (EPH-I0095).
-        const code = stripLineComment(t);
-        if (code.len == 0) continue;
-        const braces = trackBackwardBraces(code, depth);
+    var walk = LineWalk.backward(lines, idx, stop);
+    while (walk.nextCodeLineBack()) |step| {
+        const braces = trackBackwardBraces(step.text, depth);
         depth = braces.depth;
         if (!braces.opens_enclosing_block) continue;
-        if (isConditionalOpenerLine(code)) {
+        if (isConditionalOpenerLine(step.text)) {
             if (count >= out.len) return count;
-            out[count] = i;
+            out[count] = step.idx;
             count += 1;
         }
     }
@@ -7253,17 +7367,12 @@ fn findEnclosingLoopLine(lines: []const []const u8, idx: usize) ?usize {
     const stop = idx -| enclosing_block_lookback;
     var depth: usize = 0;
     var outermost: ?usize = null;
-    var i = idx;
-    while (i > stop) {
-        i -= 1;
-        const t = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        const code = stripLineComment(t);
-        if (code.len == 0) continue;
-        const braces = trackBackwardBraces(code, depth);
+    var walk = LineWalk.backward(lines, idx, stop);
+    while (walk.nextCodeLineBack()) |step| {
+        const braces = trackBackwardBraces(step.text, depth);
         depth = braces.depth;
         if (!braces.opens_enclosing_block) continue;
-        if (isLoopOpenerLine(code)) outermost = i;
+        if (isLoopOpenerLine(step.text)) outermost = step.idx;
     }
     return outermost;
 }
@@ -7663,9 +7772,34 @@ const or_guard_body_window = 20;
 /// sits inside the body braces; a condition read before the `{` is not
 /// enclosed — the condition evaluates before the body runs (EPH-I0846/49).
 ///
-/// The walk stops enclosing_block_lookback lines back (EPH-I0225). A block
-/// opener sits above its whole body, so this walk gets the widest window.
-/// An opener beyond the window is missed (accepted false negative).
+/// One backward-walk hit: the line of the nearest enclosing if and its
+/// condition text (a slice of the comment-stripped line).
+const EnclosingIfHit = struct { idx: usize, cond: []const u8 };
+
+/// The nearest enclosing if above read_idx inside the lookback window:
+/// its line index and its condition text, or null when the walk finds no
+/// opener. The backward walk and the brace accounting are the
+/// findEnclosingIfCondition/findEnclosingIfLine head (EPH-I1232 C3); the
+/// two callers read the slice and the line respectively.
+fn findEnclosingIfHit(lines: []const []const u8, read_idx: usize) ?EnclosingIfHit {
+    const stop = read_idx -| enclosing_block_lookback;
+    var depth: usize = 0;
+    var walk = LineWalk.backward(lines, read_idx, stop);
+    while (walk.nextCodeLineBack()) |step| {
+        const braces = trackBackwardBraces(step.text, depth);
+        depth = braces.depth;
+        if (!braces.opens_enclosing_block) continue;
+        if (extractIfCondition(step.text)) |cond| return .{ .idx = step.idx, .cond = cond };
+    }
+    return null;
+}
+
+/// Condition of the nearest enclosing if above the read, or null. The
+/// one-line body form answers from the read's own line; otherwise the
+/// backward walk finds the opener line and its condition
+/// (findEnclosingIfHit). The walk stops enclosing_block_lookback lines
+/// back (EPH-I0225). An opener beyond the window is missed (accepted
+/// false negative).
 fn findEnclosingIfCondition(
     lines: []const []const u8,
     read_idx: usize,
@@ -7673,26 +7807,8 @@ fn findEnclosingIfCondition(
 ) ?[]const u8 {
     if (onelineIfBodyCondition(mem.trim(u8, lines[read_idx], " \t\r"), read_col)) |cond|
         return cond;
-    // Walk backwards to find the nearest enclosing if
-    const stop = read_idx -| enclosing_block_lookback;
-    var depth: usize = 0;
-    var i = read_idx;
-    while (i > stop) {
-        i -= 1;
-        const t = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        // Braces inside a trailing comment are not block structure — a
-        // commented `{` must not read as opening an enclosing block
-        // (EPH-I0095).
-        const code = stripLineComment(t);
-        if (code.len == 0) continue;
-
-        const braces = trackBackwardBraces(code, depth);
-        depth = braces.depth;
-        if (!braces.opens_enclosing_block) continue;
-        if (extractIfCondition(code)) |cond| return cond;
-    }
-    return null;
+    const hit = findEnclosingIfHit(lines, read_idx) orelse return null;
+    return hit.cond;
 }
 
 /// Condition of an if whose opener shares the read's line, when the read
@@ -7774,24 +7890,8 @@ fn findEnclosingIfLine(
     lines: []const []const u8,
     read_idx: usize,
 ) ?usize {
-    const stop = read_idx -| enclosing_block_lookback;
-    var depth: usize = 0;
-    var i = read_idx;
-    while (i > stop) {
-        i -= 1;
-        const t = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        // Braces inside a trailing comment are not block structure
-        // (EPH-I0095).
-        const code = stripLineComment(t);
-        if (code.len == 0) continue;
-
-        const braces = trackBackwardBraces(code, depth);
-        depth = braces.depth;
-        if (!braces.opens_enclosing_block) continue;
-        if (extractIfCondition(code) != null) return i;
-    }
-    return null;
+    const hit = findEnclosingIfHit(lines, read_idx) orelse return null;
+    return hit.idx;
 }
 
 /// Extract the condition text from an if-statement line.
@@ -8261,11 +8361,10 @@ fn branchAssignsVar(
     // of underflowing (EPH-I0341, band-B01b F-15).
     const actual_end = @min(end, lines.len -| 1);
     var depth: usize = 0;
-    for (@min(start, lines.len)..@min(actual_end + 1, lines.len)) |i| {
-        const t = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        if (lineAssignsVarAtBranchTop(t, var_name, depth)) return true;
-        depth = computeBraceDepth(t, depth);
+    var walk = LineWalk.forward(lines, @min(start, lines.len), 0, @min(actual_end + 1, lines.len));
+    while (walk.nextLine()) |step| {
+        if (lineAssignsVarAtBranchTop(step.text, var_name, depth)) return true;
+        depth = computeBraceDepth(step.text, depth);
     }
     return false;
 }
@@ -8301,16 +8400,15 @@ fn branchHasExit(
     // of underflowing (EPH-I0341, band-B01b F-15).
     const actual_end = @min(end, lines.len -| 1);
     var depth: usize = 0;
-    for (@min(start, lines.len)..@min(actual_end + 1, lines.len)) |i| {
-        const t = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        depth = computeBraceDepth(t, depth);
-        if (depth <= 1 and isExitStatement(t)) return true;
+    var walk = LineWalk.forward(lines, @min(start, lines.len), 0, @min(actual_end + 1, lines.len));
+    while (walk.nextLine()) |step| {
+        depth = computeBraceDepth(step.text, depth);
+        if (depth <= 1 and isExitStatement(step.text)) return true;
         // A one-line else arm carries its exit mid-line: `else { return 0; }`
         // starts with the arm keyword, so the line-leading check misses it
         // (EPH-I0846/49). The arm's last statement decides: a trailing
         // conditional (`else { if (q) return; }`) never exits.
-        if (depth <= 1 and oneLineElseArmTailExits(t)) return true;
+        if (depth <= 1 and oneLineElseArmTailExits(step.text)) return true;
     }
     return false;
 }
@@ -9267,6 +9365,26 @@ fn captureEndAfter(
     return null;
 }
 
+/// The closing line of the brace group opened at (start_idx, open_col),
+/// or null when the braces never balance: the forward line walk shared
+/// by captureCloseLine and braceGroupEndLine (EPH-I1232 C3). The per-line
+/// closure test differs — the capture form registers a mid-line close,
+/// the extent form folds the whole line — so the predicate passes in per
+/// call.
+fn braceGroupCloseLine(
+    lines: []const []const u8,
+    start_idx: usize,
+    open_col: usize,
+    comptime closes: fn (code: []const u8, start: usize, depth: *usize) bool,
+) ?usize {
+    var depth: usize = 0;
+    var walk = LineWalk.forward(lines, start_idx, open_col, lines.len);
+    while (walk.nextLine()) |step| {
+        if (closes(stripLineComment(step.text), step.start, &depth)) return step.idx;
+    }
+    return null;
+}
+
 /// The line whose scan first returns the brace depth to zero after the `{`
 /// at (start_idx, open_col), or null when the braces never balance. Unlike
 /// braceGroupEndLine the close registers mid-line, so an `} else {` tail
@@ -9277,16 +9395,7 @@ fn captureCloseLine(
     start_idx: usize,
     open_col: usize,
 ) ?usize {
-    var depth: usize = 0;
-    var idx = start_idx;
-    while (idx < lines.len) : (idx += 1) {
-        const t = mem.trim(u8, lines[idx], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        const code = stripLineComment(t);
-        const start: usize = if (idx == start_idx) open_col else 0;
-        if (lineClosesBraceGroup(code, start, &depth)) return idx;
-    }
-    return null;
+    return braceGroupCloseLine(lines, start_idx, open_col, lineClosesBraceGroup);
 }
 
 /// Scan one line's code from `start` for the close of the brace group
@@ -11800,13 +11909,10 @@ fn parenGroupEnd(
 ) ?AssignEffect {
     var depth: usize = 1;
     var mode: QuoteMode = .none;
-    var idx = start_idx;
-    while (idx < lines.len) : (idx += 1) {
-        const t = mem.trim(u8, lines[idx], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        const start: usize = if (idx == start_idx) open_col + 1 else 0;
-        const col = scanLineForParenClose(t, start, &depth, &mode) orelse continue;
-        return .{ .line = idx, .col = col };
+    var walk = LineWalk.forward(lines, start_idx, open_col + 1, lines.len);
+    while (walk.nextChar(&mode)) |col| : (walk.advanceChar()) {
+        if (bracketGroupClosed(&depth, walk.text[col]))
+            return .{ .line = walk.cur_idx, .col = col + 1 };
     }
     return null;
 }
@@ -11828,6 +11934,14 @@ fn braceDepthFrom(t: []const u8, start: usize, initial: usize) usize {
     return depth;
 }
 
+/// The brace-group-end line closure: fold the line's braces from `start`
+/// and accept when the depth returns to zero (the braceGroupEndLine
+/// per-line body, EPH-I1232 C3).
+fn braceGroupDepthClosed(code: []const u8, start: usize, depth: *usize) bool {
+    depth.* = braceDepthFrom(code, start, depth.*);
+    return depth.* == 0;
+}
+
 /// The line index whose text closes the brace group opened at
 /// (start_idx, open_col), or null when the braces never balance.
 fn braceGroupEndLine(
@@ -11835,17 +11949,7 @@ fn braceGroupEndLine(
     start_idx: usize,
     open_col: usize,
 ) ?usize {
-    var depth: usize = 0;
-    var idx = start_idx;
-    while (idx < lines.len) : (idx += 1) {
-        const t = mem.trim(u8, lines[idx], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        const code = stripLineComment(t);
-        const start: usize = if (idx == start_idx) open_col else 0;
-        depth = braceDepthFrom(code, start, depth);
-        if (depth == 0) return idx;
-    }
-    return null;
+    return braceGroupCloseLine(lines, start_idx, open_col, braceGroupDepthClosed);
 }
 
 /// Inclusive actual-line span of a loop body's text.
@@ -34813,11 +34917,9 @@ fn hasEarlyReturnNullGuard(
     var_name: []const u8,
 ) bool {
     const check_start = if (current_idx > 20) current_idx - 20 else 0;
-    var i = current_idx;
-    while (i > check_start) {
-        i -= 1;
-        const ctx = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(ctx)) continue;
+    var walk = LineWalk.backward(lines, current_idx, check_start);
+    while (walk.nextLineBack()) |step| {
+        const ctx = step.text;
         if (isFuncBoundary(ctx)) return false;
         const eq_pos = hasNullEqualityCheck(ctx, var_name) orelse continue;
         // The same-line exit is judged at the guard's own depth (EPH-I0859
@@ -34825,8 +34927,8 @@ fn hasEarlyReturnNullGuard(
         // (`{ if (q) return; }`) does not dominate the fall-through. The
         // judge anchors on the guard's own condition group (EPH-I0892).
         if (guardLineHasSameLineExit(ctx, eq_pos)) return true;
-        const check_end = @min(i + max_early_return_guard_body_lines, current_idx);
-        if (hasExitInFollowingBlock(lines, i + 1, check_end)) return true;
+        const check_end = @min(step.idx + max_early_return_guard_body_lines, current_idx);
+        if (hasExitInFollowingBlock(lines, step.idx + 1, check_end)) return true;
     }
     return false;
 }
@@ -36399,14 +36501,15 @@ fn hasBreakGuardOnPriorLines(
     // loop opener whose body closes below the candidate is an enclosing
     // loop and stops the walk.
     var depth: i32 = 0;
-    var i = current_idx;
-    while (i > check_start) {
-        i -= 1;
-        const ctx = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(ctx)) continue;
+    var walk = LineWalk.backward(lines, current_idx, check_start);
+    while (walk.nextLineBack()) |step| {
+        const ctx = step.text;
         if (isFuncBoundary(ctx)) return false;
-        if (priorLineWalkVerdict(judgeBreakGuardPriorLine(pctx, ctx, i, &depth), &i)) |verdict|
-            return verdict;
+        const verdict = priorLineWalkVerdict(
+            judgeBreakGuardPriorLine(pctx, ctx, step.idx, &depth),
+            &walk.back_idx,
+        );
+        if (verdict) |v| return v;
     }
     return false;
 }
@@ -36577,11 +36680,9 @@ fn judgeClosedBlockSpan(
 /// Comptime code is evaluated at compile time - the compiler catches overflow errors
 fn isInComptimeBlock(lines: []const []const u8, current_idx: usize) bool {
     var brace_depth: i32 = 0;
-    var i = current_idx;
-    while (i > 0) {
-        i -= 1;
-        const ctx = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(ctx)) continue;
+    var walk = LineWalk.backward(lines, current_idx, 0);
+    while (walk.nextLineBack()) |step| {
+        const ctx = step.text;
         // Count braces going backward; literal braces are data (EPH-I0949).
         brace_depth = trackBraceDepthBackward(ctx, brace_depth);
         // If we are at negative depth, we are inside an enclosing block
@@ -37334,16 +37435,14 @@ const EnclosingLoop = struct {
 
 fn findEnclosingLoop(lines: []const []const u8, current_idx: usize) ?EnclosingLoop {
     var brace_depth: i32 = 0;
-    var i = current_idx;
-    while (i > 0) {
-        i -= 1;
-        const ctx = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(ctx)) continue;
+    var walk = LineWalk.backward(lines, current_idx, 0);
+    while (walk.nextLineBack()) |step| {
+        const ctx = step.text;
         brace_depth = trackBraceDepthBackward(ctx, brace_depth);
         if (isFuncBoundary(ctx)) return null;
         if (isLoopOpenerLine(ctx) and brace_depth < 0) {
-            const close = loopBodyCloseLine(lines, i);
-            if (close > current_idx) return .{ .header = i, .close = close };
+            const close = loopBodyCloseLine(lines, step.idx);
+            if (close > current_idx) return .{ .header = step.idx, .close = close };
         }
     }
     return null;
@@ -73202,80 +73301,141 @@ test "buildCFG: multiline opener tail braces do not corrupt depth (EPH-I0671)" {
     try std.testing.expect(if_block.? != after.?);
 }
 
-test "scanLineForStatementEnd stops at a multiline opener (EPH-I0751)" {
+test "LineWalk.nextClosure statement scan stops at a multiline opener (EPH-I0751)" {
     var depth: usize = 0;
     var mode: QuoteMode = .none;
     // Target text: const s = \\ foo(); bar(); — the tail semicolons are
     // string data, so the statement continues on a later line.
-    try std.testing.expect(
-        scanLineForStatementEnd("const s = \\\\ foo(); bar();", 0, &depth, &mode) == null,
-    );
+    var walk = LineWalk.initLine("const s = \\\\ foo(); bar();", 0);
+    try std.testing.expect(walk.nextClosure(statementCloseAt, &depth, &mode) == null);
     try std.testing.expectEqual(@as(usize, 0), depth);
     // A real depth-0 semicolon still terminates the statement.
     depth = 0;
     mode = .none;
+    walk = LineWalk.initLine("foo();", 0);
     try std.testing.expectEqual(
         @as(?usize, 6),
-        scanLineForStatementEnd("foo();", 0, &depth, &mode),
+        walk.nextClosure(statementCloseAt, &depth, &mode),
     );
 }
 
-test "scanLineForParenClose stops at a multiline opener (EPH-I0751)" {
+test "LineWalk.nextClosure paren scan stops at a multiline opener (EPH-I0751)" {
     var depth: usize = 1;
     var mode: QuoteMode = .none;
     // Target text: a, \\ b); c); — the tail parens are string data, so the
     // group closes on a later line.
-    try std.testing.expect(scanLineForParenClose("a, \\\\ b); c);", 0, &depth, &mode) == null);
+    var walk = LineWalk.initLine("a, \\\\ b); c);", 0);
+    try std.testing.expect(walk.nextClosure(bracketGroupClosed, &depth, &mode) == null);
     try std.testing.expectEqual(@as(usize, 1), depth);
     // A real close paren still balances the group.
     depth = 1;
     mode = .none;
-    try std.testing.expectEqual(@as(?usize, 5), scanLineForParenClose("a, b);", 0, &depth, &mode));
+    walk = LineWalk.initLine("a, b);", 0);
+    try std.testing.expectEqual(
+        @as(?usize, 5),
+        walk.nextClosure(bracketGroupClosed, &depth, &mode),
+    );
 }
 
-test "carriedScanStep yields code chars and cuts at openers (EPH-I1232 C2c)" {
+test "LineWalk.nextChar yields code chars and cuts at openers (EPH-I1232 C3)" {
     // Code chars yield in order; string content is skipped, and the quote
     // state survives between steps through the caller's mode.
     var mode: QuoteMode = .none;
-    var i: usize = 0;
-    const s = "x = \"a b\";";
-    try std.testing.expectEqual(@as(?usize, 0), carriedScanStep(s, &i, &mode));
-    i += 1;
-    try std.testing.expectEqual(@as(?usize, 1), carriedScanStep(s, &i, &mode));
-    i += 1;
-    try std.testing.expectEqual(@as(?usize, 2), carriedScanStep(s, &i, &mode));
-    i += 1;
-    try std.testing.expectEqual(@as(?usize, 3), carriedScanStep(s, &i, &mode));
-    i += 1;
+    var walk = LineWalk.initLine("x = \"a b\";", 0);
+    try std.testing.expectEqual(@as(?usize, 0), walk.nextChar(&mode));
+    walk.advanceChar();
+    try std.testing.expectEqual(@as(?usize, 1), walk.nextChar(&mode));
+    walk.advanceChar();
+    try std.testing.expectEqual(@as(?usize, 2), walk.nextChar(&mode));
+    walk.advanceChar();
+    try std.testing.expectEqual(@as(?usize, 3), walk.nextChar(&mode));
+    walk.advanceChar();
     // The quote at 4 opens a string: the next code char is the `;` at 9.
-    try std.testing.expectEqual(@as(?usize, 9), carriedScanStep(s, &i, &mode));
-    i += 1;
-    try std.testing.expect(carriedScanStep(s, &i, &mode) == null);
+    try std.testing.expectEqual(@as(?usize, 9), walk.nextChar(&mode));
+    walk.advanceChar();
+    try std.testing.expect(walk.nextChar(&mode) == null);
     // A `//` comment opener cuts the scan: the first slash yields, the
     // tail returns null.
-    i = 0;
+    walk = LineWalk.initLine("x // c", 0);
     mode = .none;
-    try std.testing.expectEqual(@as(?usize, 0), carriedScanStep("x // c", &i, &mode));
-    i = 2;
+    try std.testing.expectEqual(@as(?usize, 0), walk.nextChar(&mode));
+    walk = LineWalk.initLine("x // c", 2);
     mode = .none;
-    try std.testing.expect(carriedScanStep("x // c", &i, &mode) == null);
+    try std.testing.expect(walk.nextChar(&mode) == null);
     // A `\\` multiline opener cuts the scan the same way.
-    i = 0;
+    walk = LineWalk.initLine("x \\\\ tail", 0);
     mode = .none;
-    try std.testing.expectEqual(@as(?usize, 0), carriedScanStep("x \\\\ tail", &i, &mode));
-    i = 2;
+    try std.testing.expectEqual(@as(?usize, 0), walk.nextChar(&mode));
+    walk = LineWalk.initLine("x \\\\ tail", 2);
     mode = .none;
-    try std.testing.expect(carriedScanStep("x \\\\ tail", &i, &mode) == null);
+    try std.testing.expect(walk.nextChar(&mode) == null);
 }
 
-test "scanLineForStatementEnd resumes a carried string mode (EPH-I1232 C2c)" {
+test "LineWalk.nextClosure resumes a carried string mode (EPH-I1232 C3)" {
     // The quote state carries across lines: a continuation line whose
     // first chars close the caller's open string yields no code until
     // the closing quote, then the real `;` terminates the statement.
     var depth: usize = 0;
     var mode: QuoteMode = .str;
-    try std.testing.expectEqual(@as(?usize, 4), scanLineForStatementEnd("xx\";", 0, &depth, &mode));
+    var walk = LineWalk.initLine("xx\";", 0);
+    try std.testing.expectEqual(@as(?usize, 4), walk.nextClosure(statementCloseAt, &depth, &mode));
     try std.testing.expectEqual(QuoteMode.none, mode);
+}
+
+test "LineWalk.forward skips comment lines and applies the origin start col (EPH-I1232 C3)" {
+    const lines = [_][]const u8{
+        "a = b;",
+        "// whole-line comment",
+        "c = d;",
+    };
+    var walk = LineWalk.forward(&lines, 1, 0, lines.len);
+    const first = walk.nextLine().?;
+    try std.testing.expectEqual(@as(usize, 2), first.idx);
+    try std.testing.expectEqualStrings("c = d;", first.text);
+    try std.testing.expect(walk.nextLine() == null);
+    // The origin start col applies on the origin line only.
+    const lines2 = [_][]const u8{ "xx; yy;", "z;" };
+    var walk2 = LineWalk.forward(&lines2, 0, 4, lines2.len);
+    const s0 = walk2.nextLine().?;
+    try std.testing.expectEqual(@as(usize, 4), s0.start);
+    const s1 = walk2.nextLine().?;
+    try std.testing.expectEqual(@as(usize, 0), s1.start);
+}
+
+test "LineWalk.backward yields below the origin down to the stop, comment-stripped (EPH-I1232 C3)" {
+    const lines = [_][]const u8{
+        "a;",
+        "// comment",
+        "b; // tail",
+    };
+    var walk = LineWalk.backward(&lines, 3, 0);
+    const s0 = walk.nextCodeLineBack().?;
+    try std.testing.expectEqual(@as(usize, 2), s0.idx);
+    try std.testing.expectEqualStrings("b;", s0.text);
+    const s1 = walk.nextCodeLineBack().?;
+    try std.testing.expectEqual(@as(usize, 0), s1.idx);
+    try std.testing.expect(walk.nextCodeLineBack() == null);
+}
+
+test "LineWalk.nextChar carries the quote mode across lines (EPH-I1232 C3)" {
+    const lines = [_][]const u8{
+        "x = \"open",
+        "close\";",
+    };
+    var mode: QuoteMode = .none;
+    var depth: usize = 0;
+    var walk = LineWalk.forward(&lines, 0, 0, lines.len);
+    var found: ?usize = null;
+    while (walk.nextChar(&mode)) |col| : (walk.advanceChar()) {
+        const c = walk.text[col];
+        foldBracketDepth(&depth, c);
+        if (c == ';' and depth == 0) {
+            found = col;
+            break;
+        }
+    }
+    try std.testing.expectEqual(@as(?usize, 6), found);
+    try std.testing.expectEqual(@as(usize, 1), walk.cur_idx);
 }
 
 test "ForLoopTracker.checkLoopEnd ignores braces in a multiline opener tail (EPH-I0751)" {

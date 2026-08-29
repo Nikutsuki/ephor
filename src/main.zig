@@ -4433,12 +4433,35 @@ fn foldBracketDepth(depth: *usize, c: u8) void {
     if (c == ')' or c == ']' or c == '}') depth.* -|= 1;
 }
 
+/// One code-position char from a carried scan (EPH-I1232 C2c, REL-GATE-2,
+/// REL-AB-5): the index at or after i.* with the caller-carried quote mode
+/// stepped, or null when the scan ends at the line end, a `\\` multiline
+/// opener, or a `//` comment opener (EPH-I0751). The pointer head shared
+/// by scanLineForStatementEnd and scanLineForParenClose: the callers own
+/// the quote mode and the bracket depth, so the state survives across
+/// lines. The caller's loop carries `: (i += 1)`, stepping past each
+/// yielded char.
+fn carriedScanStep(t: []const u8, i: *usize, mode: *QuoteMode) ?usize {
+    while (i.* < t.len) : (i.* += 1) {
+        const c = t[i.*];
+        if (scanQuoteStep(mode, c)) |skip| {
+            i.* += skip;
+            continue;
+        }
+        if (types.isMultilineOpenerAt(t, i.*)) return null;
+        if (isLineCommentOpenerAt(t, i.*)) return null;
+        return i.*;
+    }
+    return null;
+}
+
 /// Scan one trimmed line for the statement-terminating `;`, starting at
 /// column `start`. Returns the column just past a depth-0 `;`, or null when
 /// the statement continues past this line. Bracket depth and quote mode
-/// carry across lines through the pointers. A `\\` multiline opener cuts
-/// the scan: its tail is string data, so the statement continues on a later
-/// line (EPH-I0751).
+/// carry across lines through the pointers; the walk head is
+/// carriedScanStep (EPH-I1232 C2c). A `\\` multiline opener cuts the scan:
+/// its tail is string data, so the statement continues on a later line
+/// (EPH-I0751).
 fn scanLineForStatementEnd(
     t: []const u8,
     start: usize,
@@ -4446,15 +4469,8 @@ fn scanLineForStatementEnd(
     mode: *QuoteMode,
 ) ?usize {
     var i: usize = start;
-    while (i < t.len) : (i += 1) {
+    while (carriedScanStep(t, &i, mode)) |_| : (i += 1) {
         const c = t[i];
-        if (scanQuoteStep(mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
-        if (mode.* != .none) continue;
-        if (types.isMultilineOpenerAt(t, i)) break;
-        if (isLineCommentOpenerAt(t, i)) break;
         foldBracketDepth(depth, c);
         if (c == ';' and depth.* == 0) return i + 1;
     }
@@ -4501,9 +4517,9 @@ fn bracketGroupClosed(depth: *usize, c: u8) bool {
 /// Scan one trimmed line for the closing bracket that brings `depth` to
 /// zero, starting at column `start`. Returns the column just past it, or
 /// null when the expression continues past this line. Bracket depth and
-/// quote mode carry across lines through the pointers. A `\\` multiline
-/// opener cuts the scan: its tail is string data, so the group closes on a
-/// later line (EPH-I0751).
+/// quote mode carry across lines through the pointers; the walk head is
+/// carriedScanStep (EPH-I1232 C2c). A `\\` multiline opener cuts the scan:
+/// its tail is string data, so the group closes on a later line (EPH-I0751).
 fn scanLineForParenClose(
     t: []const u8,
     start: usize,
@@ -4511,16 +4527,8 @@ fn scanLineForParenClose(
     mode: *QuoteMode,
 ) ?usize {
     var i: usize = start;
-    while (i < t.len) : (i += 1) {
-        const c = t[i];
-        if (scanQuoteStep(mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
-        if (mode.* != .none) continue;
-        if (types.isMultilineOpenerAt(t, i)) break;
-        if (isLineCommentOpenerAt(t, i)) break;
-        if (bracketGroupClosed(depth, c)) return i + 1;
+    while (carriedScanStep(t, &i, mode)) |_| : (i += 1) {
+        if (bracketGroupClosed(depth, t[i])) return i + 1;
     }
     return null;
 }
@@ -9285,15 +9293,13 @@ fn captureCloseLine(
 /// carried in `depth`. True when the group closes on the line: a `}` at
 /// depth 1. Quote data never reaches the brace counter — a brace inside a
 /// string or char literal would corrupt the depth walk — and a `\\`
-/// opener's tail is string data, so it ends the scan. The flat form keeps
-/// ZA302 nesting at 3 here (EPH-I0792).
+/// opener's tail is string data, so it ends the scan. The quote mode is
+/// per-line through QuoteWalk; only the depth carries across lines
+/// (EPH-I1232 C2c). The flat form keeps ZA302 nesting at 3 here (EPH-I0792).
 fn lineClosesBraceGroup(code: []const u8, start: usize, depth: *usize) bool {
-    var mode: QuoteMode = .none;
-    var i: usize = start;
-    while (i < code.len) : (i += 1) {
+    var walk = QuoteWalk.initAt(code, start);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = code[i];
-        i += scanQuoteStep(&mode, c) orelse 0;
-        if (mode != .none) continue;
         if (types.isMultilineOpenerAt(code, i)) return false;
         if (c == '{') depth.* += 1;
         if (c != '}' or depth.* == 0) continue;
@@ -34181,20 +34187,19 @@ fn hasNullCheckExit(line: []const u8, lookup: NullGuardLookup, eq_pos: usize) bo
 /// owns an earlier group and its tail is not the guard's (EPH-I0892).
 /// A continued condition (`if (x == null || q) return;`) keeps its exit.
 fn guardLineHasSameLineExit(line: []const u8, pred_col: usize) bool {
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < line.len) : (i += 1) {
+    var walk = QuoteWalk.init(line);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = line[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
         if (c != '(') continue;
         const close = parenCloseAt(line, i) orelse return false;
         if (i <= pred_col and pred_col < close) {
             return hasSameLineGuardExit(line[close + 1 ..]);
         }
-        i = close;
+        // Resume past the paren group: its content is not the guard's
+        // tail. The continue expression advances one more, so the next
+        // scan starts at close + 1 (the pre-migration `i = close` plus
+        // the loop's own increment).
+        walk.index = close;
     }
     return false;
 }
@@ -34468,15 +34473,10 @@ fn trackBraceChar(depth: *i32, c: u8) bool {
 fn hasSameLineGuardExit(tail: []const u8) bool {
     const stmt = guardExitScanStmt(tail) orelse return false;
     var depth: i32 = 0;
-    var mode: QuoteMode = .none;
     var start: usize = 0;
-    var i: usize = 0;
-    while (i < stmt.len) : (i += 1) {
+    var walk = QuoteWalk.init(stmt);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = stmt[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
         if (trackBraceChar(&depth, c)) continue;
         if (c == ';' and depth == 0) {
             if (sameLinePieceExit(stmt, start, i)) return true;
@@ -34532,21 +34532,11 @@ fn sameLinePieceExit(stmt: []const u8, start: usize, end: usize) bool {
 /// and char literals are data, not structure (EPH-I0867).
 fn leadingBracedEnd(stmt: []const u8) ?usize {
     var depth: i32 = 0;
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < stmt.len) : (i += 1) {
+    var walk = QuoteWalk.init(stmt);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = stmt[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
-        if (c == '{') {
-            depth += 1;
-            continue;
-        }
-        if (c != '}') continue;
-        depth -= 1;
-        if (depth == 0) return i + 1;
+        if (!trackBraceChar(&depth, c)) continue;
+        if (c == '}' and depth == 0) return i + 1;
     }
     return null;
 }
@@ -34580,21 +34570,11 @@ fn nestedBothArmsExit(stmt: []const u8) bool {
 /// depth; null otherwise (EPH-I0861).
 fn bracedArmExitEnd(arm: []const u8) ?usize {
     var depth: i32 = 0;
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < arm.len) : (i += 1) {
+    var walk = QuoteWalk.init(arm);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = arm[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
-        if (c == '{') {
-            depth += 1;
-            continue;
-        }
-        if (c != '}') continue;
-        depth -= 1;
-        if (depth != 0) continue;
+        if (!trackBraceChar(&depth, c)) continue;
+        if (c != '}' or depth != 0) continue;
         if (armBodyHasDirectExit(arm[1..i])) return i + 1;
         return null;
     }
@@ -34609,14 +34589,9 @@ fn bracedArmExitEnd(arm: []const u8) ?usize {
 /// (EPH-I0861).
 fn unbracedArmExitEnd(arm: []const u8) ?usize {
     var depth: i32 = 0;
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < arm.len) : (i += 1) {
+    var walk = QuoteWalk.init(arm);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = arm[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
         if (trackBraceChar(&depth, c)) continue;
         if (c == ';' and depth == 0) return semicolonArmExitEnd(arm, i);
         if (c == 'e' and depth == 0 and wordIsElseAt(arm, i)) return elseKeywordArmExitEnd(arm, i);
@@ -34685,23 +34660,11 @@ fn isExitStatementStart(t: []const u8) bool {
 /// body's own depth (the depth-1 split, EPH-I0861).
 fn armBodyHasDirectExit(body: []const u8) bool {
     var depth: i32 = 0;
-    var mode: QuoteMode = .none;
     var start: usize = 0;
-    var i: usize = 0;
-    while (i < body.len) : (i += 1) {
+    var walk = QuoteWalk.init(body);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = body[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
-        if (c == '{') {
-            depth += 1;
-            continue;
-        }
-        if (c == '}') {
-            depth -= 1;
-            continue;
-        }
+        if (trackBraceChar(&depth, c)) continue;
         if (c == ';' and depth == 0) {
             if (isUnconditionalExitLine(body[start .. i + 1])) return true;
             start = i + 1;
@@ -73268,6 +73231,51 @@ test "scanLineForParenClose stops at a multiline opener (EPH-I0751)" {
     depth = 1;
     mode = .none;
     try std.testing.expectEqual(@as(?usize, 5), scanLineForParenClose("a, b);", 0, &depth, &mode));
+}
+
+test "carriedScanStep yields code chars and cuts at openers (EPH-I1232 C2c)" {
+    // Code chars yield in order; string content is skipped, and the quote
+    // state survives between steps through the caller's mode.
+    var mode: QuoteMode = .none;
+    var i: usize = 0;
+    const s = "x = \"a b\";";
+    try std.testing.expectEqual(@as(?usize, 0), carriedScanStep(s, &i, &mode));
+    i += 1;
+    try std.testing.expectEqual(@as(?usize, 1), carriedScanStep(s, &i, &mode));
+    i += 1;
+    try std.testing.expectEqual(@as(?usize, 2), carriedScanStep(s, &i, &mode));
+    i += 1;
+    try std.testing.expectEqual(@as(?usize, 3), carriedScanStep(s, &i, &mode));
+    i += 1;
+    // The quote at 4 opens a string: the next code char is the `;` at 9.
+    try std.testing.expectEqual(@as(?usize, 9), carriedScanStep(s, &i, &mode));
+    i += 1;
+    try std.testing.expect(carriedScanStep(s, &i, &mode) == null);
+    // A `//` comment opener cuts the scan: the first slash yields, the
+    // tail returns null.
+    i = 0;
+    mode = .none;
+    try std.testing.expectEqual(@as(?usize, 0), carriedScanStep("x // c", &i, &mode));
+    i = 2;
+    mode = .none;
+    try std.testing.expect(carriedScanStep("x // c", &i, &mode) == null);
+    // A `\\` multiline opener cuts the scan the same way.
+    i = 0;
+    mode = .none;
+    try std.testing.expectEqual(@as(?usize, 0), carriedScanStep("x \\\\ tail", &i, &mode));
+    i = 2;
+    mode = .none;
+    try std.testing.expect(carriedScanStep("x \\\\ tail", &i, &mode) == null);
+}
+
+test "scanLineForStatementEnd resumes a carried string mode (EPH-I1232 C2c)" {
+    // The quote state carries across lines: a continuation line whose
+    // first chars close the caller's open string yields no code until
+    // the closing quote, then the real `;` terminates the statement.
+    var depth: usize = 0;
+    var mode: QuoteMode = .str;
+    try std.testing.expectEqual(@as(?usize, 4), scanLineForStatementEnd("xx\";", 0, &depth, &mode));
+    try std.testing.expectEqual(QuoteMode.none, mode);
 }
 
 test "ForLoopTracker.checkLoopEnd ignores braces in a multiline opener tail (EPH-I0751)" {

@@ -15227,17 +15227,31 @@ fn applyBraceChar(scan: *TransferBraceScan, code: []const u8, pos: usize) bool {
 /// zig fmt tolerates the form after a multi-line condition, so fmt-clean
 /// files can carry it).
 fn isControlBrace(code: []const u8, pos: usize) bool {
-    if (pos == 0) return false;
-    var i = pos;
-    while (i > 0 and (code[i - 1] == ' ' or code[i - 1] == '\t')) i -= 1;
+    const i = braceTokenEnd(code, pos);
     if (i == 0) return false;
     const c = code[i - 1];
     if (c == ')' or c == '|' or c == '>') return true;
     if (c == ':' or c == '.') return false;
-    if (!isIdent(c)) return false;
-    var start = i - 1;
+    return isControlKeywordWord(code, i);
+}
+
+/// Index just past the last non-space byte before `pos`, or 0 when the
+/// line has no earlier byte: the token the `{` at `pos` follows.
+fn braceTokenEnd(code: []const u8, pos: usize) usize {
+    if (pos == 0) return 0;
+    var i = pos;
+    while (i > 0 and (code[i - 1] == ' ' or code[i - 1] == '\t')) i -= 1;
+    return i;
+}
+
+/// True when the identifier ending at `end` (code[end - 1] is an ident
+/// byte) spells a control keyword. Shared by isControlBrace and
+/// isScopeBrace (EPH-I0832).
+fn isControlKeywordWord(code: []const u8, end: usize) bool {
+    if (!isIdent(code[end - 1])) return false;
+    var start = end - 1;
     while (start > 0 and isIdent(code[start - 1])) start -= 1;
-    const word = code[start..i];
+    const word = code[start..end];
     for (control_brace_keywords) |kw| {
         if (mem.eql(u8, word, kw)) return true;
     }
@@ -15530,25 +15544,17 @@ const MatchedCleanup = struct {
 /// True when the `{` at `pos` opens a BLOCK SCOPE for the span walk: a
 /// control brace (isControlBrace's semantics), a labeled block
 /// (`blk: {`), or a guard-keyword block. Value literals (`Type{`, `.{`)
-/// never open scopes. Dedicated to scopeEndOf — isControlBrace stays
-/// shared with the transfer gate (EPH-I0832).
+/// never open scopes. Dedicated to scopeEndOf — the brace classification
+/// stays shared with the transfer gate through braceTokenEnd and
+/// isControlKeywordWord (EPH-I0832).
 fn isScopeBrace(code: []const u8, pos: usize) bool {
-    if (pos == 0) return false;
-    var i = pos;
-    while (i > 0 and (code[i - 1] == ' ' or code[i - 1] == '\t')) i -= 1;
+    const i = braceTokenEnd(code, pos);
     if (i == 0) return false;
     const c = code[i - 1];
     if (c == ')' or c == '|' or c == '>') return true;
     if (c == ':') return true;
     if (c == '.') return false;
-    if (!isIdent(c)) return false;
-    var start = i - 1;
-    while (start > 0 and isIdent(code[start - 1])) start -= 1;
-    const word = code[start..i];
-    for (control_brace_keywords) |kw| {
-        if (mem.eql(u8, word, kw)) return true;
-    }
-    return false;
+    return isControlKeywordWord(code, i);
 }
 
 /// Line where the scope containing `line` closes, or 0 when it runs to
@@ -17056,14 +17062,9 @@ const ImportGraph = struct {
         depth: usize,
     ) !void {
         if (depth == 0) return;
-        var dir = Fs.cwd(self.diag.io).openDir(
-            search_dir,
-            // RED4-7 (EPH-I0210): no-follow like the main walk's descent.
-            .{ .iterate = true, .follow_symlinks = false },
-        ) catch return;
-        defer dir.close(self.diag.io);
-        var iter = dir.iterate();
-        while (try iter.next(self.diag.io)) |entry| {
+        var walk = self.openWalkDir(search_dir) orelse return;
+        defer walk.dir.close(self.diag.io);
+        while (try walk.iter.next(self.diag.io)) |entry| {
             self.handleModuleDirEntry(search_dir, mod_name, depth, entry);
         }
     }
@@ -17151,6 +17152,25 @@ const ImportGraph = struct {
         } else |_| {}
     }
 
+    /// A no-follow directory open plus its iterator (openWalkDir): the
+    /// walk helpers share this pair. The no-follow open fails a symlink
+    /// swap after the containment gate (RED4-7, EPH-I0210).
+    const WalkDir = struct {
+        dir: std.Io.Dir,
+        iter: std.Io.Dir.Iterator,
+    };
+
+    /// Open `dir_path` with the walk's no-follow options and return the
+    /// dir plus its iterator; null when the open fails (the walkers
+    /// treat a missing or swapped dir as a skip).
+    fn openWalkDir(self: *ImportGraph, dir_path: []const u8) ?WalkDir {
+        const dir = Fs.cwd(self.diag.io).openDir(
+            dir_path,
+            .{ .iterate = true, .follow_symlinks = false },
+        ) catch return null;
+        return .{ .dir = dir, .iter = dir.iterate() };
+    }
+
     fn scanForNestedBuildZig(self: *ImportGraph, dir_path: []const u8, depth: u16) !void {
         // Bound the recursion (RED1-8): a generated deep tree would
         // overflow the stack. 64 doubles scanRecursive's 32 so discovery
@@ -17158,14 +17178,9 @@ const ImportGraph = struct {
         // truncation note here: the main walk's 32 cap fires first on
         // every tree this cap could truncate (EPH-I0667, F-5).
         if (depth > 64) return;
-        // RED4-7 (EPH-I0210): no-follow like the main walk's descent.
-        var dir = Fs.cwd(self.diag.io).openDir(
-            dir_path,
-            .{ .iterate = true, .follow_symlinks = false },
-        ) catch return;
-        defer dir.close(self.diag.io);
-        var iter = dir.iterate();
-        while (try iter.next(self.diag.io)) |entry| {
+        var walk = self.openWalkDir(dir_path) orelse return;
+        defer walk.dir.close(self.diag.io);
+        while (try walk.iter.next(self.diag.io)) |entry| {
             if (entry.kind != .directory) continue;
             if (isSkippableDir(entry.name)) continue;
             const subdir = std.fmt.allocPrint(
@@ -17242,14 +17257,9 @@ const ImportGraph = struct {
         // can still cover it — pre-memo coverage semantics preserved.
         if (depth > 64) return;
         if (try self.memoInsertMarkedDir(dir_path)) return;
-        // RED4-7 (EPH-I0210): no-follow like the main walk's descent.
-        var dir = Fs.cwd(self.diag.io).openDir(
-            dir_path,
-            .{ .iterate = true, .follow_symlinks = false },
-        ) catch return;
-        defer dir.close(self.diag.io);
-        var iter = dir.iterate();
-        while (try iter.next(self.diag.io)) |entry| {
+        var walk = self.openWalkDir(dir_path) orelse return;
+        defer walk.dir.close(self.diag.io);
+        while (try walk.iter.next(self.diag.io)) |entry| {
             if (entry.kind == .file and mem.endsWith(u8, entry.name, ".zig"))
                 self.markSingleZigFile(dir_path, entry.name);
             if (entry.kind != .directory or isSkippableDir(entry.name))
@@ -19643,10 +19653,13 @@ fn isControlFlowKeyword(fname: []const u8) bool {
     return false;
 }
 
-/// Walk backward from `pos` for the nearest unmatched '(' and judge its
-/// call name through isNonAllocFnCallAt. The caller must blank string
-/// literals and strip comments first (findSpawnResolution does).
-fn isInsideFunctionCallArg(t: []const u8, pos: usize) bool {
+/// Position of the unmatched '(' that encloses `pos` on the line, or
+/// null when `pos` sits at paren depth 0: walk backward, `)` increments
+/// depth, and the first `(` reached at depth 0 is the group open.
+/// String and comment bytes are not tracked (contrived inputs only,
+/// same as findMatchingBracket). Shared by the call-arg transfer check
+/// and the guard-expression judge.
+fn unmatchedGroupOpenBefore(t: []const u8, pos: usize) ?usize {
     var depth: usize = 0;
     var i = pos;
     while (i > 0) {
@@ -19656,13 +19669,18 @@ fn isInsideFunctionCallArg(t: []const u8, pos: usize) bool {
             continue;
         }
         if (t[i] != '(') continue;
-        if (depth > 0) {
-            depth -= 1;
-            continue;
-        }
-        return isNonAllocFnCallAt(t, i);
+        if (depth == 0) return i;
+        depth -= 1;
     }
-    return false;
+    return null;
+}
+
+/// Walk backward from `pos` for the nearest unmatched '(' and judge its
+/// call name through isNonAllocFnCallAt. The caller must blank string
+/// literals and strip comments first (findSpawnResolution does).
+fn isInsideFunctionCallArg(t: []const u8, pos: usize) bool {
+    const open = unmatchedGroupOpenBefore(t, pos) orelse return false;
+    return isNonAllocFnCallAt(t, open);
 }
 
 /// Detect function-argument ownership transfer (ZC104): the name appears
@@ -20244,16 +20262,30 @@ fn isInsideWhileCondition(t: []const u8, pos: usize) bool {
     return depth > 0;
 }
 
-/// Extract variable name from "var x" or "const x" declaration (for ZA204)
-fn extractVarDeclName(t: []const u8) ?[]const u8 {
+/// The declared name of a line that starts with "var NAME" or
+/// "const NAME", plus the index just past the name. Null when the line
+/// starts with neither keyword. Shared by extractVarDeclName and
+/// extractStructVarName.
+const DeclaredName = struct {
+    name: []const u8,
+    end: usize,
+};
+
+fn declaredNameAtLineStart(t: []const u8) ?DeclaredName {
     const is_var = mem.startsWith(u8, t, "var ");
     const is_const = mem.startsWith(u8, t, "const ");
     if (!is_var and !is_const) return null;
     const start: usize = if (is_var) 4 else 6;
     var end = start;
     while (end < t.len and isIdent(t[end])) end += 1;
-    if (end > start) return t[start..end];
+    if (end > start) return .{ .name = t[start..end], .end = end };
     return null;
+}
+
+/// Extract variable name from "var x" or "const x" declaration (for ZA204)
+fn extractVarDeclName(t: []const u8) ?[]const u8 {
+    const decl = declaredNameAtLineStart(t) orelse return null;
+    return decl.name;
 }
 
 /// Address-of fill forms for one occurrence at `i`: &var, &(var)
@@ -20636,17 +20668,10 @@ fn isStructLiteralStart(t: []const u8, i: usize) bool {
 
 /// Extract struct variable name from "var NAME = Type{" or "var NAME = .{"
 fn extractStructVarName(t: []const u8) ?[]const u8 {
-    const is_var = mem.startsWith(u8, t, "var ");
-    const is_const = mem.startsWith(u8, t, "const ");
-    if (!is_var and !is_const) return null;
+    const decl = declaredNameAtLineStart(t) orelse return null;
+    const name = decl.name;
 
-    const start: usize = if (is_var) 4 else 6;
-    var end = start;
-    while (end < t.len and isIdent(t[end])) end += 1;
-    if (end <= start) return null;
-
-    const name = t[start..end];
-    var i = skipBlanks(t, end);
+    var i = skipBlanks(t, decl.end);
     if (i >= t.len or t[i] != '=') return null;
     i = skipBlanks(t, i + 1);
 
@@ -22545,34 +22570,31 @@ const CallSite = struct {
     open_paren: usize,
 };
 
-/// Index just past the closing quote of the string literal starting at
-/// `start` (code[start] == '"'). Unterminated literal scans to end.
-fn skipPastString(code: []const u8, start: usize) usize {
+/// Index just past the closing quote of the literal starting at `start`
+/// (code[start] == quote). Unterminated literal scans to end.
+fn skipPastQuoted(code: []const u8, start: usize, quote: u8) usize {
     var i = start + 1;
     while (i < code.len) {
         if (code[i] == '\\') {
             i += 2;
             continue;
         }
-        if (code[i] == '"') return i + 1;
+        if (code[i] == quote) return i + 1;
         i += 1;
     }
     return code.len;
 }
 
+/// Index just past the closing quote of the string literal starting at
+/// `start` (code[start] == '"'). Unterminated literal scans to end.
+fn skipPastString(code: []const u8, start: usize) usize {
+    return skipPastQuoted(code, start, '"');
+}
+
 /// Index just past the closing quote of the char literal starting at
 /// `start` (code[start] == '\''). Unterminated literal scans to end.
 fn skipPastChar(code: []const u8, start: usize) usize {
-    var i = start + 1;
-    while (i < code.len) {
-        if (code[i] == '\\') {
-            i += 2;
-            continue;
-        }
-        if (code[i] == '\'') return i + 1;
-        i += 1;
-    }
-    return code.len;
+    return skipPastQuoted(code, start, '\'');
 }
 
 /// Skip a string or char literal starting at `i.*`, advancing `i` past
@@ -22671,12 +22693,11 @@ fn callSiteName(code: []const u8, site: CallSite) []const u8 {
     return lastSegment(code[site.start..site.name_end]);
 }
 
-/// True when `seg` contains the snapshot-testing verb `snap` as a whole
-/// word (split on case transitions and underscores): `snap(@src(), ...)`,
-/// `snap_fn`, `takeSnap`. Substring matching would pull in data-shaped
-/// names like `initWithSnaplen` (RhyOS pcap) and `snapshot_max_for_table_
-/// input` (tigerbeetle compaction), inventing assertions where none exist.
-fn isSnapshotVerb(seg: []const u8) bool {
+/// True when any whole word of `seg` satisfies `word_p`: the walker
+/// splits `seg` on case transitions and underscores, calls `word_p` on
+/// each word, and calls it once more on the trailing run. Shared by
+/// isSnapshotVerb, hasAssertionWord, and isVerificationVerb.
+fn hasWholeWord(seg: []const u8, comptime word_p: fn ([]const u8) bool) bool {
     var start: usize = 0;
     var i: usize = 0;
     while (i < seg.len) {
@@ -22685,7 +22706,7 @@ fn isSnapshotVerb(seg: []const u8) bool {
             i += 1;
             continue;
         }
-        if (std.ascii.eqlIgnoreCase(seg[start..i], "snap")) return true;
+        if (word_p(seg[start..i])) return true;
         // An uppercase letter opens the next word; an underline is consumed.
         if (seg[i] == '_') {
             start = i + 1;
@@ -22695,7 +22716,27 @@ fn isSnapshotVerb(seg: []const u8) bool {
             i += 1;
         }
     }
-    return std.ascii.eqlIgnoreCase(seg[start..], "snap");
+    return word_p(seg[start..]);
+}
+
+/// True when `w` is the snapshot verb `snap` (case-insensitive).
+fn isSnapWord(w: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(w, "snap");
+}
+
+/// True when `w` is one of the verification verbs `verify` or `validate`
+/// (case-insensitive).
+fn isVerifyValidateWord(w: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(w, "verify") or std.ascii.eqlIgnoreCase(w, "validate");
+}
+
+/// True when `seg` contains the snapshot-testing verb `snap` as a whole
+/// word (split on case transitions and underscores): `snap(@src(), ...)`,
+/// `snap_fn`, `takeSnap`. Substring matching would pull in data-shaped
+/// names like `initWithSnaplen` (RhyOS pcap) and `snapshot_max_for_table_
+/// input` (tigerbeetle compaction), inventing assertions where none exist.
+fn isSnapshotVerb(seg: []const u8) bool {
+    return hasWholeWord(seg, isSnapWord);
 }
 
 /// True when `w` is the assertion word `expect` or `assert`
@@ -22722,24 +22763,7 @@ fn isExpectAssertWord(w: []const u8) bool {
 /// is a false-positive ZT102 note — the safe direction. One genuine
 /// project instance is the signal to extend the matcher.
 fn hasAssertionWord(seg: []const u8) bool {
-    var start: usize = 0;
-    var i: usize = 0;
-    while (i < seg.len) {
-        const word_end = seg[i] == '_' or std.ascii.isUpper(seg[i]);
-        if (!word_end) {
-            i += 1;
-            continue;
-        }
-        if (isExpectAssertWord(seg[start..i])) return true;
-        if (seg[i] == '_') {
-            start = i + 1;
-            i = start;
-        } else {
-            start = i;
-            i += 1;
-        }
-    }
-    return isExpectAssertWord(seg[start..]);
+    return hasWholeWord(seg, isExpectAssertWord);
 }
 
 /// True when `seg` contains the verification verbs `verify` or `validate`
@@ -22748,27 +22772,7 @@ fn hasAssertionWord(seg: []const u8) bool {
 /// `pubkeyValidate`. Whole-word matching keeps noun shapes out
 /// (`verified_count`, `Verifier`).
 fn isVerificationVerb(seg: []const u8) bool {
-    var start: usize = 0;
-    var i: usize = 0;
-    while (i < seg.len) {
-        const word_end = seg[i] == '_' or std.ascii.isUpper(seg[i]);
-        if (!word_end) {
-            i += 1;
-            continue;
-        }
-        const w = seg[start..i];
-        if (std.ascii.eqlIgnoreCase(w, "verify") or std.ascii.eqlIgnoreCase(w, "validate"))
-            return true;
-        if (seg[i] == '_') {
-            start = i + 1;
-            i = start;
-        } else {
-            start = i;
-            i += 1;
-        }
-    }
-    const w = seg[start..];
-    return std.ascii.eqlIgnoreCase(w, "verify") or std.ascii.eqlIgnoreCase(w, "validate");
+    return hasWholeWord(seg, isVerifyValidateWord);
 }
 
 /// True when the call at `code[start]` follows an identifier-bounded `try`
@@ -24897,6 +24901,17 @@ fn pathIsStrictlyInside(dir: []const u8, root: []const u8) bool {
     return dir[root.len] == '/';
 }
 
+/// The comment-stripped code prefix of `line`, or null when the trimmed
+/// line is a comment or multiline-string line — those never reach the
+/// line scans. Comment text is prose, never evidence: the scans run on
+/// the prefix findCommentStart cuts at the comment start.
+fn lineCodePrefix(line: []const u8) ?[]const u8 {
+    const t = mem.trim(u8, line, " \t\r");
+    if (isCommentOrMultilineString(t)) return null;
+    const code_end = findCommentStart(line) orelse line.len;
+    return line[0..code_end];
+}
+
 /// Process one source line for the ZT105 pass: track test-block membership
 /// (same ordering as scanTestLine — comment and multiline-string lines
 /// never reach the tracker), collect pub fn candidates, and tokenize the
@@ -24908,9 +24923,7 @@ fn scanUntestedFnLine(
     line_num: usize,
 ) !void {
     const t = mem.trim(u8, line, " \t\r");
-    if (isCommentOrMultilineString(t)) return;
-    const code_end = findCommentStart(line) orelse line.len;
-    const code = line[0..code_end];
+    const code = lineCodePrefix(line) orelse return;
     // The previous significant line's tail, captured before this line's
     // own tail replaces it: the line's tokenization classifies its
     // leading dots against the PREVIOUS line's ending token (EPH-I0913).
@@ -25494,6 +25507,15 @@ const ConcLineCtx = struct {
     defer_attr_depth: usize,
 };
 
+/// True when `seg` equals one of `names`. Shared by the ZC101 method
+/// family lists (isAcquireMethod, isReleaseMethod).
+fn isSegOneOf(seg: []const u8, names: []const []const u8) bool {
+    for (names) |n| {
+        if (mem.eql(u8, seg, n)) return true;
+    }
+    return false;
+}
+
 /// ZC101 acquire family: std mutex/rwlock/semaphore method names across
 /// Zig 0.15 (`std.Thread.Mutex`/`RwLock`) and 0.16 (`std.Io.Mutex`/`RwLock`,
 /// verified against std 0.16.0: lock/lockUncancelable/tryLock/tryLockShared/
@@ -25505,10 +25527,7 @@ fn isAcquireMethod(seg: []const u8) bool {
         "lockSharedUncancelable", "tryLock",          "tryLockShared",
         "wait",                   "waitUncancelable",
     };
-    for (methods) |m| {
-        if (mem.eql(u8, seg, m)) return true;
-    }
-    return false;
+    return isSegOneOf(seg, &methods);
 }
 
 /// Field type texts that mark a struct as lock-bearing for the ZC101
@@ -25548,10 +25567,7 @@ fn isReleaseMethod(seg: []const u8) bool {
         "unlock",                   "unlockUncancelable", "unlockShared",
         "unlockSharedUncancelable", "post",
     };
-    for (methods) |m| {
-        if (mem.eql(u8, seg, m)) return true;
-    }
-    return false;
+    return isSegOneOf(seg, &methods);
 }
 
 /// Free-function file-lock release names (ZC101, EPH-I0903): a helper
@@ -26437,9 +26453,7 @@ fn scanConcurrencyLine(
     line_num: usize,
 ) !void {
     const t = mem.trim(u8, line, " \t\r");
-    if (isCommentOrMultilineString(t)) return;
-    const code_end = findCommentStart(line) orelse line.len;
-    const code = line[0..code_end];
+    const code = lineCodePrefix(line) orelse return;
     const blanked = blankLiteralContents(code, &state.blank_buf);
     const was_in_fn = state.in_fn;
     if (!state.in_fn) {
@@ -29336,22 +29350,51 @@ fn analyzeFileComplexity(
     }
 }
 
-/// Run the complexity analyzers (ZA301-ZA306) over every file in the
-/// graph and return the merged issue list. The list carries heap-owned
-/// messages, so the OOM path frees the partial list with errdefer
-/// (EPH-I0459, band B09 F10).
-fn analyzeComplexity(
+/// One per-file analyzer body: append the findings for `a` to `issues`.
+const PerFileAnalyzer = fn (
+    Allocator,
+    *std.ArrayListUnmanaged(Issue),
+    FileAnalysis,
+    Thresholds,
+) anyerror!void;
+
+/// Drive one per-file analyzer over every file in the graph: build the
+/// merged issue list and run `per_file` once per file. The list carries
+/// heap-owned messages, so the OOM path frees the partial list with
+/// errdefer (EPH-I0459, band B09 F10).
+fn analyzeAllFiles(
     allocator: Allocator,
     graph: *ImportGraph,
     th: Thresholds,
+    comptime per_file: PerFileAnalyzer,
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     errdefer deinitIssues(&issues, allocator);
     var iter = graph.files.iterator();
     while (iter.next()) |entry| {
-        try analyzeFileComplexity(allocator, .{ .issues = &issues }, entry.value_ptr.*, th);
+        try per_file(allocator, &issues, entry.value_ptr.*, th);
     }
     return issues;
+}
+
+/// Run the complexity analyzers (ZA301-ZA306) over every file in the
+/// graph and return the merged issue list (analyzeAllFiles with the
+/// per-file complexity body).
+fn analyzeComplexity(
+    allocator: Allocator,
+    graph: *ImportGraph,
+    th: Thresholds,
+) !std.ArrayListUnmanaged(Issue) {
+    return analyzeAllFiles(allocator, graph, th, complexityPerFile);
+}
+
+fn complexityPerFile(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    a: FileAnalysis,
+    th: Thresholds,
+) !void {
+    try analyzeFileComplexity(allocator, .{ .issues = issues }, a, th);
 }
 
 /// Optional per-file observation channels for the AST tier driver: the
@@ -29455,6 +29498,21 @@ fn isContinuationByte(b: u8) bool {
     return b >= 0x80 and b <= 0xBF;
 }
 
+/// Advance `i` over a tab or CR at `line[i.*]`, returning the column
+/// after it (tabs expand to 4-space boundaries); null when the byte is
+/// neither — the caller counts it as a codepoint.
+fn advanceTabOrCr(line: []const u8, col: usize, i: *usize) ?usize {
+    if (line[i.*] == '\t') {
+        i.* += 1;
+        return ((col / 4) + 1) * 4;
+    }
+    if (line[i.*] == '\r') {
+        i.* += 1;
+        return col;
+    }
+    return null;
+}
+
 /// Calculate visible line length (tabs expand to 4-space boundaries). Each
 /// codepoint counts one column: a 40-char CJK comment is 40 columns,
 /// not 123 bytes (EPH-I0248). No East-Asian width table — every codepoint
@@ -29463,14 +29521,8 @@ fn calculateVisibleLength(line: []const u8) usize {
     var visible_len: usize = 0;
     var i: usize = 0;
     while (i < line.len) {
-        const c = line[i];
-        if (c == '\t') {
-            visible_len = ((visible_len / 4) + 1) * 4;
-            i += 1;
-            continue;
-        }
-        if (c == '\r') {
-            i += 1;
+        if (advanceTabOrCr(line, visible_len, &i)) |next| {
+            visible_len = next;
             continue;
         }
         visible_len += 1;
@@ -29526,16 +29578,11 @@ fn stringContentStats(line: []const u8) StringContentStats {
     var stats = StringContentStats{};
     var i: usize = 0;
     while (i < line.len) {
+        if (advanceTabOrCr(line, stats.code, &i)) |next| {
+            stats.code = next;
+            continue;
+        }
         const c = line[i];
-        if (c == '\t') {
-            stats.code = ((stats.code / 4) + 1) * 4;
-            i += 1;
-            continue;
-        }
-        if (c == '\r') {
-            i += 1;
-            continue;
-        }
         // Char literals are code, not string data — skip their span so a
         // '"' inside one ('"') is not mistaken for a string opener.
         if (c == '\'') {
@@ -29687,21 +29734,23 @@ fn analyzeStyleFile(
 }
 
 /// Run the style analyzers (ZA701/ZA702) over every file in the graph and
-/// return the merged issue list. The list carries heap-owned messages, so
-/// the OOM path frees the partial list with errdefer (EPH-I0459,
-/// band B09 F10).
+/// return the merged issue list (analyzeAllFiles with the per-file style
+/// body).
 fn analyzeStyle(
     allocator: Allocator,
     graph: *ImportGraph,
     th: Thresholds,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .empty;
-    errdefer deinitIssues(&issues, allocator);
-    var iter = graph.files.iterator();
-    while (iter.next()) |entry| {
-        try analyzeStyleFile(&issues, allocator, entry.value_ptr.*, th);
-    }
-    return issues;
+    return analyzeAllFiles(allocator, graph, th, stylePerFile);
+}
+
+fn stylePerFile(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    a: FileAnalysis,
+    th: Thresholds,
+) !void {
+    try analyzeStyleFile(issues, allocator, a, th);
 }
 
 // ============================================================================
@@ -30009,7 +30058,7 @@ fn checkConstDeclName(
         try reportConstTypeNaming(ctx, name, name_col);
         return;
     }
-    try checkConstFnAliasNaming(ctx, name, name_col);
+    try checkCamelFnName(ctx, name, name_col);
 }
 
 /// The checked declaration's own RHS segment (checkConstDeclName): from
@@ -30060,10 +30109,10 @@ fn reportConstTypeNaming(ctx: NamingLineCtx, name: []const u8, name_col: usize) 
     });
 }
 
-/// Check a closure-wrapping function alias name (checkConstDeclName):
-/// camelCase conforms, anything else reports the function-name
-/// convention.
-fn checkConstFnAliasNaming(ctx: NamingLineCtx, name: []const u8, name_col: usize) !void {
+/// Check a camelCase fn name: camelCase conforms, anything else reports
+/// the function-name convention. Shared by checkConstDeclName's
+/// closure-alias arm and checkOneFnName's plain-fn arm.
+fn checkCamelFnName(ctx: NamingLineCtx, name: []const u8, name_col: usize) !void {
     if (isCamelCase(name)) return;
     try reportNaming(ctx, .{
         .col = name_col,
@@ -30208,7 +30257,7 @@ fn checkOneFnName(ctx: NamingLineCtx, t: []const u8, facts: FnNameFacts) !void {
     if (fnReturnsType(t, facts.name_end)) {
         try checkTypeReturningFnName(ctx, facts.name, facts.name_col);
     } else {
-        try checkPlainFnName(ctx, facts.name, facts.name_col);
+        try checkCamelFnName(ctx, facts.name, facts.name_col);
     }
 }
 
@@ -30223,20 +30272,6 @@ fn checkTypeReturningFnName(ctx: NamingLineCtx, name: []const u8, name_col: usiz
         .kind = "type-returning fn",
         .name = name,
         .expected = "TitleCase",
-    });
-}
-
-/// Check a plain fn name (checkOneFnName): camelCase conforms, anything
-/// else reports the function convention.
-fn checkPlainFnName(ctx: NamingLineCtx, name: []const u8, name_col: usize) !void {
-    if (isCamelCase(name)) return;
-    try reportNamingIssue(ctx.issues, ctx.allocator, .{
-        .path = ctx.path,
-        .line = ctx.line_num,
-        .col = name_col,
-        .kind = "function",
-        .name = name,
-        .expected = "camelCase",
     });
 }
 
@@ -30399,18 +30434,12 @@ fn matchesErrorSetOpen(t: []const u8, i: usize) ?usize {
 /// `\\` multiline tails, and line comments is data, not syntax, so it
 /// cannot open one.
 fn lineOpensErrorBlock(t: []const u8) bool {
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < t.len) : (i += 1) {
-        const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
+    var walk = QuoteWalk.init(t);
+    while (walk.next()) |i| : (walk.advance()) {
         // A `\\` opener's tail is string data (EPH-I0751): no error-set
         // open can follow it on this line.
         if (types.isMultilineOpenerAt(t, i)) return false;
-        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') return false;
+        if (t[i] == '/' and i + 1 < t.len and t[i + 1] == '/') return false;
         if (matchesErrorSetOpen(t, i) != null) return true;
     }
     return false;
@@ -39225,27 +39254,6 @@ fn hasLowerBoundGuardForVar(t: []const u8, var_name: []const u8, limit: usize) b
     return false;
 }
 
-/// Position of the paren group open that encloses `pos` on the line, or
-/// null when `pos` sits at paren depth 0. The walk counts `)` as opens
-/// going backwards; the first `(` reached at depth 0 is the group open.
-/// String and comment bytes are not tracked (contrived inputs only,
-/// same as findMatchingBracket).
-fn enclosingParenGroupStart(t: []const u8, pos: usize) ?usize {
-    var depth: usize = 0;
-    var i = pos;
-    while (i > 0) {
-        i -= 1;
-        if (t[i] == ')') {
-            depth += 1;
-            continue;
-        }
-        if (t[i] != '(') continue;
-        if (depth == 0) return i;
-        depth -= 1;
-    }
-    return null;
-}
-
 /// True when the boolean expression enclosing the comparison at
 /// `op_pos` proves no bound for `var_name`: the expression has a
 /// top-level `or` and the or-root min-combine returns null. `y > 0 or
@@ -39257,7 +39265,7 @@ fn enclosingParenGroupStart(t: []const u8, pos: usize) ?usize {
 /// the literal-bound judge cannot prove var bounds (band-B12 F17,
 /// EPH-I0506, EPH-I0942).
 fn comparisonOrRootNulls(t: []const u8, var_name: []const u8, op_pos: usize) bool {
-    const group_start = enclosingParenGroupStart(t, op_pos);
+    const group_start = unmatchedGroupOpenBefore(t, op_pos);
     const start = if (group_start) |gs| gs + 1 else 0;
     const end = if (group_start) |gs| (matchingCloseParenOnLine(t, gs) orelse t.len) else t.len;
     if (topLevelKeywordPos(t, "or", start, end) == null) return false;
@@ -39921,16 +39929,10 @@ fn maskOrRaw(t: []const u8, buf: []u8) []const u8 {
 /// individually (EPH-I0944).
 fn hasMidLineMultilineOpener(t: []const u8) bool {
     if (mem.startsWith(u8, t, "\\\\")) return false;
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < t.len) : (i += 1) {
-        const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
+    var walk = QuoteWalk.init(t);
+    while (walk.next()) |i| : (walk.advance()) {
         if (types.isMultilineOpenerAt(t, i)) return true;
-        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') return false;
+        if (t[i] == '/' and i + 1 < t.len and t[i + 1] == '/') return false;
     }
     return false;
 }
@@ -108307,6 +108309,10 @@ test "analyzeFileComplexity skips cimport files (EPH-I0454)" {
     try graph.reachable.put(try allocator.dupe(u8, "gtk_bindings.zig"), {});
 
     const th = Thresholds{ .max_function_lines = 5 };
+    // The run reaches analyzeFileComplexity through analyzeAllFiles'
+    // comptime analyzer parameter — invisible to ZT101's call graph; the
+    // value reference documents the covered fn (EPH-I0029 workaround).
+    _ = analyzeFileComplexity;
     var issues = try analyzeComplexity(allocator, &graph, th);
     defer deinitIssues(&issues, allocator);
 
@@ -108380,6 +108386,10 @@ test "analyzeFileComplexity runs on a string-only marker file (EPH-I0758)" {
     try graph.reachable.put(try allocator.dupe(u8, "stringy.zig"), {});
 
     const th = Thresholds{ .max_function_lines = 5 };
+    // The run reaches analyzeFileComplexity through analyzeAllFiles'
+    // comptime analyzer parameter — invisible to ZT101's call graph; the
+    // value reference documents the covered fn (EPH-I0029 workaround).
+    _ = analyzeFileComplexity;
     var issues = try analyzeComplexity(allocator, &graph, th);
     defer deinitIssues(&issues, allocator);
 

@@ -23197,6 +23197,14 @@ const LineForms = struct {
     blanked: []const u8,
 };
 
+/// One pending delegation edge (EPH-I1235): the caller fn passed `arg` by
+/// value to `target`. The fold admits it only when `target` is a
+/// file-local fn whose signature declares a fn-typed parameter.
+const DelegationEdge = struct {
+    target: []const u8,
+    arg: []const u8,
+};
+
 /// File-local call facts for ZT101: every fn's direct callees, plus the fn
 /// names excluded from candidacy. Keys and callee names borrow the file
 /// content, which outlives the maps. The graph includes excluded fns as
@@ -23204,11 +23212,15 @@ const LineForms = struct {
 /// pipeline entry delegating to X) is not lying; the call edge is a fact.
 /// `asserting` holds every fn whose own body contains an assertion call —
 /// the ZT102 helper-mediation witness set: a test delegating to one of
-/// these verifies through it, so the block is never smoke.
+/// these verifies through it, so the block is never smoke. `defs` and
+/// `delegated` back the EPH-I1235 delegation edges: def lines keyed by
+/// name, and the pending (target, arg) edges folded after the pass.
 const FnCallFacts = struct {
     callees: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
     excluded: std.StringHashMapUnmanaged(void) = .empty,
     asserting: std.StringHashMapUnmanaged(void) = .empty,
+    defs: std.StringHashMapUnmanaged([]const u8) = .empty,
+    delegated: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(DelegationEdge)) = .empty,
 
     fn deinit(self: *FnCallFacts, allocator: Allocator) void {
         var it = self.callees.valueIterator();
@@ -23216,6 +23228,10 @@ const FnCallFacts = struct {
         self.callees.deinit(allocator);
         self.excluded.deinit(allocator);
         self.asserting.deinit(allocator);
+        self.defs.deinit(allocator);
+        var dit = self.delegated.valueIterator();
+        while (dit.next()) |list| list.deinit(allocator);
+        self.delegated.deinit(allocator);
     }
 
     /// Guarantee a callees entry for `name` (even when it calls nothing)
@@ -23225,12 +23241,14 @@ const FnCallFacts = struct {
         if (!gop.found_existing) gop.value_ptr.* = .empty;
     }
 
-    /// Record one line's direct call targets under fn `name`. A fn whose
-    /// body contains an assertion call joins the `asserting` witness set
-    /// (ZT102 helper-mediation, the EPH-I0048-tightened witness
-    /// predicate — word-boundary verbs minus the enum token-matcher
-    /// shape); nested-fn assertions roll up into the outer fn, the same
-    /// FP-safe precedent as the call edges.
+    /// Record one line's direct call targets under fn `name`, plus the
+    /// fn-valued arguments of each call site as pending delegation edges
+    /// (EPH-I1235) — admitted later, once every def line is recorded. A
+    /// fn whose body contains an assertion call joins the `asserting`
+    /// witness set (ZT102 helper-mediation, the EPH-I0048-tightened
+    /// witness predicate — word-boundary verbs minus the enum
+    /// token-matcher shape); nested-fn assertions roll up into the outer
+    /// fn, the same FP-safe precedent as the call edges.
     fn recordCallees(
         self: *FnCallFacts,
         allocator: Allocator,
@@ -23252,10 +23270,32 @@ const FnCallFacts = struct {
             if (isFnDeclSite(code, site.start) and
                 mem.eql(u8, callSiteName(code, site), name)) continue;
             if (isAssertionWitnessCall(code, site)) try self.asserting.put(allocator, name, {});
+            try self.recordDelegatedArgs(allocator, name, code, site);
             const seg = callSiteName(code, site);
             if (containsName(list.items, seg)) continue;
             try list.append(allocator, seg);
         }
+    }
+
+    /// Record one call site's fn-valued argument edges for `caller` into
+    /// the pending set (EPH-I1235). A `@`-builtin target (`@typeName`,
+    /// `@hasDecl`) is a query, not delegation — its bare-identifier
+    /// arguments are data, never invoked — and records nothing. The
+    /// admission gate (does the target declare a fn-typed parameter)
+    /// runs in the fold: the target's def line may not be recorded yet.
+    fn recordDelegatedArgs(
+        self: *FnCallFacts,
+        allocator: Allocator,
+        caller: []const u8,
+        code: []const u8,
+        site: CallSite,
+    ) !void {
+        if (site.start > 0 and code[site.start - 1] == '@') return;
+        const target = callSiteName(code, site);
+        const args = callArgs(code, site.open_paren) orelse return;
+        const gop = try self.delegated.getOrPut(allocator, caller);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try collectDelegatedArgs(allocator, gop.value_ptr, target, args);
     }
 
     /// Notice a fn def outside any body and open its span when the body
@@ -23276,6 +23316,9 @@ const FnCallFacts = struct {
             span.pending = def.name;
             if (def.excluded) try self.excluded.put(allocator, def.name, {});
             try self.ensureFn(allocator, def.name);
+            // Keep the comment-stripped def line: the delegation-edge
+            // fold reads the target's signature from it (EPH-I1235).
+            try self.defs.put(allocator, def.name, mem.trim(u8, forms.code, " \t\r"));
             span.sig_parens = 0;
         }
         if (!findBodyOpen(forms.blanked, &span.sig_parens)) {
@@ -23308,6 +23351,129 @@ const FnCallFacts = struct {
         }
     }
 };
+
+/// Step one argument-list byte: update paren/brace depth and report a
+/// top-level comma (the argument boundary). The per-char checks are
+/// independent, not an else-if chain — the flat shape keeps the
+/// complexity budget (EPH-I1235).
+fn delegationArgBoundary(c: u8, depth: *usize, braces: *usize) bool {
+    if (c == ',' and depth.* == 0 and braces.* == 0) return true;
+    if (c == '(') depth.* += 1;
+    if (c == ')') {
+        if (depth.* > 0) depth.* -= 1;
+    }
+    if (c == '{') braces.* += 1;
+    if (c == '}') {
+        if (braces.* > 0) braces.* -= 1;
+    }
+    return false;
+}
+
+/// Append one pending delegation edge when the argument is exactly one
+/// fn name (EPH-I1235) — the whole-identifier shape — else drop it.
+/// Dedupe runs at the fold.
+fn appendDelegatedArg(
+    allocator: Allocator,
+    list: *std.ArrayListUnmanaged(DelegationEdge),
+    target: []const u8,
+    arg: []const u8,
+) !void {
+    const name = delegationArgName(arg) orelse return;
+    try list.append(allocator, .{ .target = target, .arg = name });
+}
+
+/// Append the whole-identifier fn-value arguments of one argument-list
+/// region as pending delegation edges for `target` (EPH-I1235). A
+/// multi-line argument tail is invisible (the conservative direction —
+/// a missed edge never invents a warning).
+fn collectDelegatedArgs(
+    allocator: Allocator,
+    list: *std.ArrayListUnmanaged(DelegationEdge),
+    target: []const u8,
+    args: []const u8,
+) !void {
+    var depth: usize = 0;
+    var braces: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < args.len) {
+        if (skipLiteral(args, &i)) continue;
+        if (types.isMultilineOpenerAt(args, i)) return;
+        if (args[i] == '@' and i + 1 < args.len and args[i + 1] == '"') {
+            i = skipQuotedIdent(args, i + 2);
+            continue;
+        }
+        if (delegationArgBoundary(args[i], &depth, &braces)) {
+            try appendDelegatedArg(allocator, list, target, args[start..i]);
+            start = i + 1;
+        }
+        i += 1;
+    }
+    try appendDelegatedArg(allocator, list, target, args[start..]);
+}
+
+/// The fn name an argument contributes as a delegation edge, else null
+/// (EPH-I1235): exactly one bare identifier (no dots — a dotted value is
+/// a field or namespace member, never an unambiguous file-local fn) or
+/// one well-formed `@"..."` quoted identifier (the spelling the
+/// declaration side records, EPH-I0908). Anything else — variables,
+/// types, `&`-prefixed, literals, call expressions — is not delegation
+/// evidence.
+fn delegationArgName(arg: []const u8) ?[]const u8 {
+    const a = mem.trim(u8, arg, " \t\r");
+    if (a.len == 0) return null;
+    if (a[0] != '@') {
+        for (a) |c| {
+            if (!types.isIdent(c)) return null;
+        }
+        return a;
+    }
+    if (a.len < 3 or a[1] != '"') return null;
+    const after = skipQuotedIdent(a, 2);
+    if (a[after - 1] != '"') return null;
+    return a[2 .. after - 1];
+}
+
+/// True when a def line declares a fn-typed parameter (EPH-I1235): the
+/// signature carries a second space-bounded `fn` token (the first is the
+/// def's own keyword), e.g. `comptime verdict: fn ([]const u8, usize)
+/// bool` or `*const fn () void`. Only such a callee can dispatch a
+/// fn-valued argument, so delegation edges admit only at these sites —
+/// a bare data parameter (a format string, an enum value) can never
+/// silence a genuinely untested fn through a name coincidence. A `?fn(`
+/// form without surrounding spaces is the accepted boundary.
+fn signatureHasFnParam(def: []const u8) bool {
+    var seen_keyword = false;
+    var tokens = mem.tokenizeAny(u8, def, " \t\r");
+    while (tokens.next()) |tok| {
+        if (!mem.eql(u8, tok, "fn")) continue;
+        if (!seen_keyword) {
+            seen_keyword = true;
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+/// Fold the pending delegation edges into the callee lists (EPH-I1235,
+/// REL-GATE-2, REL-AB-5): an edge admits only when its call target is a
+/// file-local fn whose signature declares a fn-typed parameter — the
+/// same-file evidence the argument really is a fn value the callee can
+/// dispatch. Cross-file targets (std.Thread.spawn) and bare data
+/// parameters admit nothing, so the widening is real delegation only.
+/// Runs once, after the pass, when every def line is recorded.
+fn foldDelegationEdges(allocator: Allocator, facts: *FnCallFacts) !void {
+    var it = facts.delegated.iterator();
+    while (it.next()) |entry| {
+        const list = facts.callees.getPtr(entry.key_ptr.*) orelse continue;
+        for (entry.value_ptr.items) |edge| {
+            const def = facts.defs.get(edge.target) orelse continue;
+            if (!signatureHasFnParam(def)) continue;
+            if (!containsName(list.items, edge.arg)) try list.append(allocator, edge.arg);
+        }
+    }
+}
 
 /// State for tracking which fn body a line belongs to (ZT101 call graph).
 /// `sig_parens` is the paren depth while awaiting a pending def's body
@@ -23400,6 +23566,7 @@ fn collectFnCallFacts(allocator: Allocator, content: []const u8) !FnCallFacts {
         };
         try facts.trackLine(allocator, &span, forms);
     }
+    try foldDelegationEdges(allocator, &facts);
     return facts;
 }
 
@@ -109460,6 +109627,40 @@ test "ZT101: helper-mediated calls satisfy the candidate" {
     );
 }
 
+test "ZT101: comptime fn-value delegation reaches the candidate (EPH-I1235)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The C1a pipeline shape: the test calls a pipeline fn whose body
+    // passes parseHeader by value into a comptime-dispatched helper.
+    // Pre-fix the call graph saw only runVisits -> visit (a parameter
+    // name — dead) and reported a lie; the delegation edge makes the
+    // coverage real.
+    const content =
+        \\fn parseHeader(raw: []const u8) !void {
+        \\    _ = raw;
+        \\}
+        \\fn runVisits(comptime visit: fn ([]const u8) !void) !void {
+        \\    try visit("x");
+        \\}
+        \\fn headerPipeline() !void {
+        \\    try runVisits(parseHeader);
+        \\}
+        \\test "parseHeader rejects empty" {
+        \\    try headerPipeline();
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt101_delegate.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "zt101_delegate.zig", RULE_TEST_LIE),
+    );
+}
+
 test "ZT101: lowercase prose words are not candidates" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -110341,6 +110542,58 @@ test "ZT105: pub fn called from a test in another file is silent" {
             .content =
             \\test "x" {
             \\    shared_api();
+            \\    const n: u32 = 0;
+            \\    try std.testing.expect(n == 0);
+            \\}
+            ,
+        },
+    };
+    var run = try runTestQualityCheckFiles(&diag, allocator, &files);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUntestedFnNotes(run.issues.items, "shared_api"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUntestedFnNotes(run.issues.items, "orphan_api"),
+    );
+}
+
+test "ZT105: comptime fn-value delegation reaches a cross-file pub fn (EPH-I1235)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The C1a chain shape, cross-file: the test calls pipeline, whose
+    // body passes lastHop by value into a comptime-dispatched helper,
+    // and only lastHop's body calls the pub fn. Pre-fix the chain broke
+    // at the comptime hop and the note fired; the delegation edge
+    // completes it. orphan_api is the control — the flag path ran.
+    const files = [_]TestQualityFile{
+        .{
+            .path = "zt1235_api.zig",
+            .content =
+            \\pub fn shared_api() void {}
+            \\pub fn orphan_api() void {}
+            ,
+        },
+        .{
+            .path = "zt1235_user.zig",
+            .content =
+            \\fn lastHop() void {
+            \\    shared_api();
+            \\}
+            \\fn dispatcher(comptime visit: fn () void) void {
+            \\    visit();
+            \\}
+            \\fn pipeline() void {
+            \\    dispatcher(lastHop);
+            \\}
+            \\test "x" {
+            \\    pipeline();
             \\    const n: u32 = 0;
             \\    try std.testing.expect(n == 0);
             \\}

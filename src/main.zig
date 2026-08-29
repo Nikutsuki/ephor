@@ -5085,13 +5085,43 @@ fn recordGenEffect(ctx: *const DefAssignCtx, occ: GenOccurrence, gen_sets: *GenS
     gen_sets.first_effect[bid] = minAssignEffect(gen_sets.first_effect[bid], occ.effect);
 }
 
+/// Column of the bracketed occurrence of var_name whose bracket span
+/// contains the fill-call open paren at `col`, or null. In
+/// `hash_buf[0..formatHashHex(&hash_buf, x)]` the fill-call sits inside
+/// the slice bounds, and Zig evaluates the bound or index expression
+/// before the bracketed read — the fill completes first (EPH-I1230;
+/// serves REL-ZERO-1, the RT-1 zero-warning sweep, and REL-AB-5, the
+/// corpus A/B byte-identity).
+/// Callers move the fill's effect point to the bracketed occurrence,
+/// which covers the read at its exact column: a same-line read BEFORE
+/// the bracketed occurrence still observes the pre-fill value and keeps
+/// firing. A fill-call outside every bracket span of the var keeps its
+/// close-paren effect (EPH-I0102).
+fn bracketedSpanContainingFill(
+    t: []const u8,
+    var_name: []const u8,
+    col: usize,
+) ?usize {
+    var iter = VarOccurrenceIter{ .t = t, .name = var_name };
+    while (iter.next()) |pos| {
+        const open = pos + var_name.len;
+        if (open >= t.len or t[open] != '[') continue;
+        const close = skipBracketed(t, open) orelse continue;
+        if (col > open and col < close) return pos;
+    }
+    return null;
+}
+
 /// Record every fill occurrence of var_name on one body line. Each
 /// occurrence gens the block that owns its column: a same-line if/else
 /// can hold one fill per arm, and the first occurrence's block must not
 /// claim them all (EPH-I0111). Direct assignments take effect at their
 /// own `;` — a same-block read before that point is not covered
 /// (EPH-I0080). Fill-CALLS (fill(&x), foo(&x), @memset/@memcpy dests)
-/// take effect at the call's closing `)` (EPH-I0102).
+/// take effect at the call's closing `)` (EPH-I0102), except a call
+/// inside the var's own bracket span, which completes before the
+/// bracketed read and takes effect at the bracketed occurrence
+/// (EPH-I1230).
 fn recordLineFills(
     ctx: *const DefAssignCtx,
     idx: usize,
@@ -5125,10 +5155,14 @@ fn recordLineFills(
     while (nextFillCallOccurrence(t, var_name, &occ_s)) |open_col| {
         if (occInContinuation(cont_region, open_col)) continue;
         any = true;
+        const effect = if (bracketedSpanContainingFill(t, var_name, open_col)) |bpos|
+            AssignEffect{ .line = idx, .col = bpos }
+        else
+            fillCallEffectPos(ctx.lines, idx, open_col);
         recordGenEffect(ctx, .{
             .idx = idx,
             .col = open_col,
-            .effect = fillCallEffectPos(ctx.lines, idx, open_col),
+            .effect = effect,
         }, gen_sets);
     }
     // A line with a non-assignment `x[...]` slice occurrence keeps the
@@ -80389,6 +80423,75 @@ test "ZA607: element address pass in call arg stays silent (EPH-I0773)" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_i0773_addrpass.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: fill-call inside the slice bounds covers the same-line slice read (EPH-I1230)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // `hash_buf[0..formatHashHex(&hash_buf, ...)]`: Zig evaluates the
+    // range's end expression — the fill call — before it takes the slice,
+    // so the fill completes before the read. The fill-call's effect point
+    // moves to the bracketed occurrence (EPH-I1230). Pre-fix the effect
+    // sat at the call's closing `)`, after the slice start, and the read
+    // fired ZA607 (verified: the b141 scratch file warned).
+    const content =
+        \\fn formatHashHex(out: *[64]u8, hash: [32]u8) usize {
+        \\    out[0..32].* = hash;
+        \\    return 64;
+        \\}
+        \\fn printFailure(hash: [32]u8) void {
+        \\    var hash_buf: [64]u8 = undefined;
+        \\    const text = hash_buf[0..formatHashHex(&hash_buf, hash)];
+        \\    emit(text);
+        \\}
+        \\fn emit(text: []const u8) void {
+        \\    _ = text;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1230_slicebound.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1230_slicebound.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: read before the bracketed span still fires (EPH-I1230 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The bracketed effect point covers only reads at or after the
+    // bracketed occurrence: `use(buf[0])` before the slice on the same
+    // line still reads undefined memory, so the control must keep firing.
+    // A whole-line coverage effect (col 0) would silence it — this pin
+    // holds the tight-effect design of the EPH-I1230 arm.
+    const content =
+        \\fn formatLen(out: *[16]u8) usize {
+        \\    out[0] = 1;
+        \\    return 4;
+        \\}
+        \\fn earlyRead() u8 {
+        \\    var buf: [16]u8 = undefined;
+        \\    use(buf[0]); const h = buf[0..formatLen(&buf)];
+        \\    return h[0];
+        \\}
+        \\fn use(v: u8) void {
+        \\    _ = v;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1230_control.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1230_control.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

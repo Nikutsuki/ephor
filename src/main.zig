@@ -1158,6 +1158,14 @@ const QuoteWalk = struct {
         return .{ .line = line };
     }
 
+    /// Start the walk at `start` instead of 0: the pre-migration
+    /// `i = start` sites (EPH-I1232 C2b, REL-GATE-2, REL-AB-5). The quote mode
+    /// still begins in code position at `start`, matching each migrated
+    /// site's pre-migration semantics.
+    fn initAt(line: []const u8, start: usize) QuoteWalk {
+        return .{ .line = line, .index = start };
+    }
+
     /// Index of the next code-position char, or null at the line end.
     fn next(self: *QuoteWalk) ?usize {
         while (self.index < self.line.len) : (self.index += 1) {
@@ -6959,26 +6967,15 @@ fn loopBodyFillsVar(
 }
 
 /// Brace depth at position `pos` of `t` given the depth before the line:
-/// the depth of the innermost block containing the position. Mirrors
-/// computeBraceDepth's quote, multiline, and comment handling (EPH-I0107,
-/// EPH-I0751, EPH-I0081), so the same lines score the same depth here and
-/// in the block walkers.
+/// the depth of the innermost block containing the position. The prefix
+/// form of computeBraceDepth — t[0..pos] runs the same quote, multiline,
+/// and comment walk (EPH-I0107, EPH-I0751, EPH-I0081), so the same lines
+/// score the same depth here and in the block walkers. The boundary cases
+/// are no-ops either way: a `//` or `\\` opener straddling pos ends a scan
+/// whose loop ends at pos anyway, and neither byte changes the depth
+/// (EPH-I1232 C2b). Pos must stay within t.
 fn braceDepthAt(t: []const u8, pos: usize, initial: usize) usize {
-    var depth = initial;
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < pos) : (i += 1) {
-        const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
-        if (types.isMultilineOpenerAt(t, i)) break;
-        if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
-        if (c == '{') depth += 1;
-        if (c == '}' and depth > 0) depth -= 1;
-    }
-    return depth;
+    return computeBraceDepth(t[0..pos], initial);
 }
 
 /// True when the line assigns var_name at the target depth: the top level
@@ -7715,25 +7712,19 @@ const OnelineIfBody = struct {
 /// Column of the `}` matching the `{` at open, scanning quote-aware:
 /// string and char content carries no braces. Null when a `\\` multiline
 /// opener cuts the scan — its tail is string data, so the group closes
-/// on a later line (EPH-I0751).
+/// on a later line (EPH-I0751). The quote mode starts in code position at
+/// open + 1, like the pre-migration `i = open + 1` walk (EPH-I1232 C2b).
 fn matchingCloseBraceCol(t: []const u8, open: usize) ?usize {
     var depth: usize = 1;
-    var mode: QuoteMode = .none;
-    var i: usize = open + 1;
-    while (i < t.len) : (i += 1) {
+    var walk = QuoteWalk.initAt(t, open + 1);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
         if (types.isMultilineOpenerAt(t, i)) return null;
-        if (c == '{') {
-            depth += 1;
-            continue;
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) return i;
         }
-        if (c != '}') continue;
-        depth -= 1;
-        if (depth == 0) return i;
+        if (c == '{') depth += 1;
     }
     return null;
 }
@@ -8337,33 +8328,8 @@ fn oneLineElseArmTailExits(t: []const u8) bool {
     const else_abs = t.len - rest.len;
     const open_rel = mem.indexOf(u8, rest["else".len..], "{") orelse return false;
     const open = else_abs + "else".len + open_rel;
-    const close = onelineArmClose(t, open) orelse return false;
+    const close = matchingCloseBraceCol(t, open) orelse return false;
     return lastStatementExits(t[open + 1 .. close]);
-}
-
-/// Column of the `}` matching the brace at `open` on the same line, or
-/// null when the brace does not close on the line. String and char
-/// content carries no braces; a `\\` opener's tail is string data.
-fn onelineArmClose(t: []const u8, open: usize) ?usize {
-    var depth: usize = 1;
-    var mode: QuoteMode = .none;
-    var i: usize = open + 1;
-    while (i < t.len) : (i += 1) {
-        const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
-        if (types.isMultilineOpenerAt(t, i)) return null;
-        if (c == '{') {
-            depth += 1;
-            continue;
-        }
-        if (c != '}') continue;
-        depth -= 1;
-        if (depth == 0) return i;
-    }
-    return null;
 }
 
 /// Scan state for the last-statement walk: the current statement's start,
@@ -11841,17 +11807,14 @@ fn parenGroupEnd(
 
 /// computeBraceDepth from a start column: the loop header's `{` sits after
 /// the clause on the same line, so the scan must not count the clause's
-/// own brackets. A `\\` opener's tail is string data (EPH-I0751).
+/// own brackets. The quote mode starts in code position at `start`, like
+/// the pre-migration `i = start` walk (EPH-I1232 C2b). A `\\` opener's tail
+/// is string data (EPH-I0751).
 fn braceDepthFrom(t: []const u8, start: usize, initial: usize) usize {
     var depth = initial;
-    var mode: QuoteMode = .none;
-    var i: usize = start;
-    while (i < t.len) : (i += 1) {
+    var walk = QuoteWalk.initAt(t, start);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
         if (types.isMultilineOpenerAt(t, i)) break;
         if (c == '{') depth += 1;
         if (c == '}' and depth > 0) depth -= 1;
@@ -34237,17 +34200,14 @@ fn guardLineHasSameLineExit(line: []const u8, pred_col: usize) bool {
 }
 
 /// Position of the `)` that closes the `(` at `open` (quote-aware from
-/// the open position), or null when the group is unterminated.
+/// the open position), or null when the group is unterminated. The quote
+/// mode starts in code position at open + 1, like the pre-migration
+/// `i = open + 1` walk (EPH-I1232 C2b).
 fn parenCloseAt(t: []const u8, open: usize) ?usize {
     var depth: usize = 1;
-    var mode: QuoteMode = .none;
-    var i = open + 1;
-    while (i < t.len) : (i += 1) {
+    var walk = QuoteWalk.initAt(t, open + 1);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
         if (c == '(') {
             depth += 1;
             continue;
@@ -34385,18 +34345,15 @@ fn operandFormStart(t: []const u8, end: usize) ?usize {
 /// group is unterminated before the line start. Quote-aware: parens
 /// inside string and char literals are data, not structure (EPH-I0906).
 /// The forward walk keeps a bounded open-paren stack; deeper nesting
-/// overflows to null (fail-safe: the operand is not bindable).
+/// overflows to null (fail-safe: the operand is not bindable). The
+/// t[0..close] slice is the pre-migration `i < close` bound; the stack
+/// keeps absolute offsets, so the slice changes nothing (EPH-I1232 C2b).
 fn parenOpenBackAt(t: []const u8, close: usize) ?usize {
     var stack = [_]usize{0} ** 64;
     var len: usize = 0;
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < close) : (i += 1) {
+    var walk = QuoteWalk.init(t[0..close]);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
         if (c == '(') {
             if (len >= stack.len) return null;
             stack[len] = i;
@@ -73429,6 +73386,11 @@ test "braceDepthAt ignores braces in comments (EPH-I0081)" {
     // the assign on `x = 1; // {` sits at depth 0.
     try std.testing.expectEqual(@as(usize, 0), braceDepthAt("x = 1; // {", 11, 0));
     try std.testing.expectEqual(@as(usize, 1), braceDepthAt("if (c) { // }", 9, 0));
+    // Boundary pins for the computeBraceDepth prefix form (EPH-I1232 C2b):
+    // an opener straddling pos is a no-op either way — the scan would end
+    // at pos regardless, and neither byte changes the depth.
+    try std.testing.expectEqual(@as(usize, 0), braceDepthAt("x = 1; // {", 8, 0));
+    try std.testing.expectEqual(@as(usize, 0), braceDepthAt("a \\\\ }", 3, 0));
 }
 
 test "isIndirectlyInitialized ignores string braces in for-loop depth (EPH-I0081)" {

@@ -235,45 +235,39 @@ pub fn sanitizeTerminal(
     allocator: Allocator,
     input: []const u8,
 ) error{OutOfMemory}!Sanitized {
-    var out_len: usize = 0;
-    var dirty = false;
-    var i: usize = 0;
-    while (i < input.len) {
-        const skip = hostileSeqLen(input[i..]);
-        if (skip == 0) {
-            i += 1;
-        } else {
-            dirty = true;
-            i += skip;
-        }
-        out_len += 1;
-    }
-    if (!dirty) return .{ .slice = input, .owned = false };
-    const buf = try allocator.alloc(u8, out_len);
-    errdefer allocator.free(buf);
-    i = 0;
-    var o: usize = 0;
-    while (i < input.len) {
-        const skip = hostileSeqLen(input[i..]);
-        if (skip == 0) {
-            buf[o] = input[i];
-            i += 1;
-        } else {
-            buf[o] = '?';
-            i += skip;
-        }
-        o += 1;
-    }
-    return .{ .slice = buf, .owned = true };
+    return twoPassSanitize(allocator, input, terminalUnit, writePlaceholderOrCopy);
 }
 
-/// One classified input unit for JSON escaping: how many input bytes it
-/// spans, how many output bytes it emits, and which escaped form to
-/// write. The classifier owns both counts so the two passes cannot drift.
-const JsonEscape = struct {
+/// Classify the unit at `s[0]` for sanitizeTerminal: every unit emits
+/// one output byte, and a hostile sequence consumes its full UTF-8 run.
+fn terminalUnit(s: []const u8) SanitizeUnit {
+    const skip = hostileSeqLen(s);
+    if (skip == 0) return .{ .consumed = 1, .emitted = 1 };
+    return .{ .consumed = skip, .emitted = 1, .dirty = true };
+}
+
+/// Writer shared by sanitizeTerminal and sanitizeSnippet: a changed unit
+/// becomes one '?' per emitted byte; a clean unit copies its bytes raw.
+fn writePlaceholderOrCopy(dst: []u8, src: []const u8, unit: SanitizeUnit) usize {
+    if (unit.dirty) {
+        @memset(dst[0..unit.emitted], '?');
+    } else {
+        @memcpy(dst[0..unit.emitted], src[0..unit.emitted]);
+    }
+    return unit.emitted;
+}
+
+/// One classified input unit for the two-pass sanitizers: the input
+/// bytes the unit spans, the output bytes it emits, the escaped form to
+/// write (JSON only), and whether the unit changes under sanitization.
+/// The classifier owns both counts so the two passes cannot drift. The
+/// terminal, markdown, and snippet units use only the first three
+/// fields; the JSON units use the rest.
+const SanitizeUnit = struct {
     consumed: usize,
     emitted: usize,
-    kind: Kind,
+    dirty: bool = false,
+    kind: Kind = .clean,
     named_char: u8 = 0,
     codepoint: u21 = 0,
 
@@ -283,6 +277,39 @@ const JsonEscape = struct {
         unicode, // \uXXXX (BMP) or the \uDXXX\uDXXX surrogate pair
     };
 };
+
+/// Shared two-pass body: classify every input unit to size the output,
+/// borrow the input when nothing changed, then classify again to write.
+/// Each sanitizer supplies only its classifier and writer; the loop, the
+/// borrow-or-allocate decision, and the allocation discipline live here
+/// once (EPH-I1232: four sibling copies collapsed).
+fn twoPassSanitize(
+    allocator: Allocator,
+    input: []const u8,
+    classify: *const fn ([]const u8) SanitizeUnit,
+    write: *const fn ([]u8, []const u8, SanitizeUnit) usize,
+) error{OutOfMemory}!Sanitized {
+    var out_len: usize = 0;
+    var dirty = false;
+    var i: usize = 0;
+    while (i < input.len) {
+        const unit = classify(input[i..]);
+        dirty = dirty or unit.dirty;
+        out_len += unit.emitted;
+        i += unit.consumed;
+    }
+    if (!dirty) return .{ .slice = input, .owned = false };
+    const buf = try allocator.alloc(u8, out_len);
+    errdefer allocator.free(buf);
+    i = 0;
+    var o: usize = 0;
+    while (i < input.len) {
+        const unit = classify(input[i..]);
+        o += write(buf[o..], input[i..], unit);
+        i += unit.consumed;
+    }
+    return .{ .slice = buf, .owned = true };
+}
 
 /// The escape letter for bytes with a two-character JSON escape.
 fn jsonNamedEscape(b: u8) ?u8 {
@@ -299,13 +326,13 @@ fn jsonNamedEscape(b: u8) ?u8 {
 }
 
 /// Classify the unit at `s[0]` for JSON escaping.
-fn classifyJsonUnit(s: []const u8) JsonEscape {
+fn classifyJsonUnit(s: []const u8) SanitizeUnit {
     const b = s[0];
     if (jsonNamedEscape(b)) |c| {
-        return .{ .consumed = 1, .emitted = 2, .kind = .named, .named_char = c };
+        return .{ .consumed = 1, .emitted = 2, .kind = .named, .named_char = c, .dirty = true };
     }
     if (b < 0x20 or b == 0x7F) {
-        return .{ .consumed = 1, .emitted = 6, .kind = .unicode, .codepoint = b };
+        return .{ .consumed = 1, .emitted = 6, .kind = .unicode, .codepoint = b, .dirty = true };
     }
     if (b < 0x80) return .{ .consumed = 1, .emitted = 1, .kind = .clean };
     // Hostile format characters escape as their codepoint: \uXXXX inside
@@ -317,16 +344,27 @@ fn classifyJsonUnit(s: []const u8) JsonEscape {
             .emitted = jsonEscapeBytes(hostile.cp),
             .kind = .unicode,
             .codepoint = hostile.cp,
+            .dirty = true,
         };
     }
     // Other multi-byte bytes: well-formed sequences pass through whole;
     // invalid bytes become U+FFFD so the document stays strict UTF-8
     // (RFC 8259 section 8.1, EPH-I0580).
-    const expect = utf8ExpectLen(b) orelse
-        return .{ .consumed = 1, .emitted = 6, .kind = .unicode, .codepoint = 0xFFFD };
-    if (!utf8Valid(s, expect))
-        return .{ .consumed = 1, .emitted = 6, .kind = .unicode, .codepoint = 0xFFFD };
+    const expect = utf8ExpectLen(b) orelse return invalidJsonUnit();
+    if (!utf8Valid(s, expect)) return invalidJsonUnit();
     return .{ .consumed = expect, .emitted = expect, .kind = .clean };
+}
+
+/// One invalid-byte unit: a single input byte becomes the six-byte
+/// \uFFFD escape.
+fn invalidJsonUnit() SanitizeUnit {
+    return .{
+        .consumed = 1,
+        .emitted = 6,
+        .kind = .unicode,
+        .codepoint = 0xFFFD,
+        .dirty = true,
+    };
 }
 
 /// Output bytes of a codepoint's JSON escape: 6 for the BMP \uXXXX form,
@@ -375,7 +413,7 @@ fn utf8Valid(s: []const u8, expect: usize) bool {
 
 /// Write one escaped unit into `dst`, returning the bytes written. The
 /// caller sized `dst` for exactly this unit.
-fn writeJsonUnit(dst: []u8, unit: JsonEscape, src: []const u8) usize {
+fn writeJsonUnit(dst: []u8, src: []const u8, unit: SanitizeUnit) usize {
     switch (unit.kind) {
         .clean => {
             @memcpy(dst[0..unit.consumed], src[0..unit.consumed]);
@@ -429,26 +467,7 @@ pub fn escapeJson(
     allocator: Allocator,
     input: []const u8,
 ) error{OutOfMemory}!Sanitized {
-    var out_len: usize = 0;
-    var dirty = false;
-    var i: usize = 0;
-    while (i < input.len) {
-        const unit = classifyJsonUnit(input[i..]);
-        if (unit.kind != .clean) dirty = true;
-        out_len += unit.emitted;
-        i += unit.consumed;
-    }
-    if (!dirty) return .{ .slice = input, .owned = false };
-    const buf = try allocator.alloc(u8, out_len);
-    errdefer allocator.free(buf);
-    i = 0;
-    var o: usize = 0;
-    while (i < input.len) {
-        const unit = classifyJsonUnit(input[i..]);
-        o += writeJsonUnit(buf[o..], unit, input[i..]);
-        i += unit.consumed;
-    }
-    return .{ .slice = buf, .owned = true };
+    return twoPassSanitize(allocator, input, classifyJsonUnit, writeJsonUnit);
 }
 
 /// ASCII punctuation with markdown meaning. Export fields backslash-escape
@@ -470,47 +489,36 @@ pub fn sanitizeMarkdown(
     allocator: Allocator,
     input: []const u8,
 ) error{OutOfMemory}!Sanitized {
-    var out_len: usize = 0;
-    var dirty = false;
-    var i: usize = 0;
-    while (i < input.len) {
-        const skip = hostileSeqLen(input[i..]);
-        if (skip != 0) {
-            dirty = true;
-            out_len += 1;
-            i += skip;
-        } else if (isMarkdownMeta(input[i])) {
-            dirty = true;
-            out_len += 2;
-            i += 1;
-        } else {
-            out_len += 1;
-            i += 1;
-        }
+    return twoPassSanitize(allocator, input, markdownUnit, writeMarkdownUnit);
+}
+
+/// Classify the unit at `s[0]` for sanitizeMarkdown: a hostile sequence
+/// collapses to one placeholder, a metacharacter escapes to two output
+/// bytes, and a clean byte copies raw.
+fn markdownUnit(s: []const u8) SanitizeUnit {
+    const skip = hostileSeqLen(s);
+    if (skip != 0) return .{ .consumed = skip, .emitted = 1, .dirty = true };
+    if (isMarkdownMeta(s[0])) return .{ .consumed = 1, .emitted = 2, .dirty = true };
+    return .{ .consumed = 1, .emitted = 1 };
+}
+
+/// Writer for sanitizeMarkdown: a metacharacter unit escapes with a
+/// backslash, every other changed unit (hostile) collapses to '?', and a
+/// clean unit copies raw. The metacharacter test reads `src[0]`: hostile
+/// bytes never sit in the markdown set, so the test discriminates
+/// exactly.
+fn writeMarkdownUnit(dst: []u8, src: []const u8, unit: SanitizeUnit) usize {
+    if (!unit.dirty) {
+        @memcpy(dst[0..unit.emitted], src[0..unit.emitted]);
+        return unit.emitted;
     }
-    if (!dirty) return .{ .slice = input, .owned = false };
-    const buf = try allocator.alloc(u8, out_len);
-    errdefer allocator.free(buf);
-    i = 0;
-    var o: usize = 0;
-    while (i < input.len) {
-        const skip = hostileSeqLen(input[i..]);
-        if (skip != 0) {
-            buf[o] = '?';
-            o += 1;
-            i += skip;
-        } else if (isMarkdownMeta(input[i])) {
-            buf[o] = '\\';
-            buf[o + 1] = input[i];
-            o += 2;
-            i += 1;
-        } else {
-            buf[o] = input[i];
-            o += 1;
-            i += 1;
-        }
+    if (isMarkdownMeta(src[0])) {
+        dst[0] = '\\';
+        dst[1] = src[0];
+        return unit.emitted;
     }
-    return .{ .slice = buf, .owned = true };
+    dst[0] = '?';
+    return unit.emitted;
 }
 
 /// Length of the backtick run at `s[0]` (s[0] == '`').
@@ -528,63 +536,18 @@ pub fn sanitizeSnippet(
     allocator: Allocator,
     input: []const u8,
 ) error{OutOfMemory}!Sanitized {
-    var out_len: usize = 0;
-    var dirty = false;
-    var i: usize = 0;
-    while (i < input.len) {
-        const unit = snippetUnit(input[i..]);
-        dirty = dirty or unit.dirty;
-        out_len += unit.emitted;
-        i += unit.consumed;
-    }
-    if (!dirty) return .{ .slice = input, .owned = false };
-    const buf = try allocator.alloc(u8, out_len);
-    errdefer allocator.free(buf);
-    i = 0;
-    var o: usize = 0;
-    while (i < input.len) {
-        const skip = hostileSeqLen(input[i..]);
-        if (skip != 0) {
-            buf[o] = '?';
-            o += 1;
-            i += skip;
-            continue;
-        }
-        if (input[i] == '`') {
-            const run = backtickRun(input[i..]);
-            if (run >= 3) {
-                @memset(buf[o .. o + run], '?');
-            } else {
-                @memcpy(buf[o .. o + run], input[i .. i + run]);
-            }
-            o += run;
-            i += run;
-            continue;
-        }
-        buf[o] = input[i];
-        o += 1;
-        i += 1;
-    }
-    return .{ .slice = buf, .owned = true };
+    return twoPassSanitize(allocator, input, snippetUnit, writePlaceholderOrCopy);
 }
 
-/// One classified input unit for sanitizeSnippet pass one: input bytes
-/// consumed, output bytes emitted, and whether the unit changes under
-/// sanitization. Hostile sequences collapse to one placeholder; backtick
-/// runs keep their length either way.
-const SnippetUnit = struct {
-    consumed: usize,
-    emitted: usize,
-    dirty: bool,
-};
-
-/// Classify the unit at `s[0]` for sanitizeSnippet.
-fn snippetUnit(s: []const u8) SnippetUnit {
+/// Classify the unit at `s[0]` for sanitizeSnippet: hostile sequences
+/// collapse to one placeholder; backtick runs keep their length either
+/// way, marked dirty from three backticks up.
+fn snippetUnit(s: []const u8) SanitizeUnit {
     const skip = hostileSeqLen(s);
     if (skip != 0) {
         return .{ .consumed = skip, .emitted = 1, .dirty = true };
     }
-    if (s[0] != '`') return .{ .consumed = 1, .emitted = 1, .dirty = false };
+    if (s[0] != '`') return .{ .consumed = 1, .emitted = 1 };
     const run = backtickRun(s);
     return .{ .consumed = run, .emitted = run, .dirty = run >= 3 };
 }

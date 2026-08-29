@@ -236,23 +236,11 @@ fn bodyInside(tree: *const Ast, sb: NodeIndex, body_first: u32, body_last: u32) 
     return body_first >= tree.firstToken(sb) and body_last <= tree.lastToken(sb);
 }
 
+/// The container-declaration tag set lives in the walker module, shared
+/// with isBoundaryTag there (the B75/B76 split mirrored the list across
+/// the two files; it lives there once, EPH-I1232).
 fn isContainerDeclTag(tag: Ast.Node.Tag) bool {
-    return switch (tag) {
-        .container_decl,
-        .container_decl_trailing,
-        .container_decl_two,
-        .container_decl_two_trailing,
-        .container_decl_arg,
-        .container_decl_arg_trailing,
-        .tagged_union,
-        .tagged_union_trailing,
-        .tagged_union_two,
-        .tagged_union_two_trailing,
-        .tagged_union_enum_tag,
-        .tagged_union_enum_tag_trailing,
-        => true,
-        else => false,
-    };
+    return walk.isContainerDeclTag(tag);
 }
 
 /// Index every `const Name = struct/union/enum {...};` in the file,

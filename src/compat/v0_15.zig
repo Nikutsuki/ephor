@@ -12,6 +12,7 @@
 //   - zig-cache renamed to .zig-cache
 
 const std = @import("std");
+const mem = std.mem;
 // Shared quote machine for the code-position mask (EPH-I0880). types.zig
 // imports only std, so this import edge stays cycle-free.
 const types = @import("../types.zig");
@@ -459,34 +460,84 @@ pub const stdlib_container_init_patterns: []const []const u8 = &.{
     "Io.Reader",
 };
 
+/// Managed-container exclusions: init-table entries that copy safely or
+/// own no heap backing (node-based lists keep their nodes user-owned;
+/// the inline-storage containers copy by value). The idx field is the
+/// entry's position in stdlib_container_init_patterns, and the comptime
+/// block below asserts each pair stays in sync, so a reordered or
+/// renamed init table fails the build instead of silently changing the
+/// managed set (EPH-I1232).
+const managed_exclusions = [_]struct { idx: usize, name: []const u8 }{
+    .{ .idx = 7, .name = "SinglyLinkedList" },
+    .{ .idx = 8, .name = "DoublyLinkedList" },
+    .{ .idx = 17, .name = "StaticStringMap(" },
+    .{ .idx = 18, .name = "EnumArray(" },
+    .{ .idx = 19, .name = "EnumMap(" },
+    .{ .idx = 20, .name = "EnumSet(" },
+    .{ .idx = 21, .name = "BufSet.init(" },
+    .{ .idx = 22, .name = "BufMap.init(" },
+    .{ .idx = 23, .name = "std.fs.File" },
+    .{ .idx = 24, .name = "fs.File" },
+    .{ .idx = 25, .name = "Io.Reader" },
+};
+
+/// Non-generic managed names appended after the filtered init entries.
+const managed_extras = [_][]const u8{ "BufMap", "BufSet" };
+
 /// Managed-container type families: structs that own a heap backing store
 /// (ptr + capacity + allocator fields), so a BY-VALUE copy aliases the same
 /// backing allocation — returning one from a fn creates a second owner with
 /// no language-level transfer (double-free on deinit, dangle after a callee
-/// defer). Deliberately EXCLUDES the inline-storage entries of
-/// stdlib_container_init_patterns (EnumArray/EnumMap/EnumSet/StaticStringMap
-/// copy safely) and node-based linked lists (nodes stay user-owned).
-/// Patterns carry the trailing `(` of a generic instantiation except the
-/// non-generic BufMap/BufSet. Used by ZA110 return-type classification.
-pub const managed_container_type_patterns: []const []const u8 = &.{
-    "ArrayList(",
-    "ArrayListUnmanaged(",
-    "ArrayListAligned(",
-    "MultiArrayList(",
-    "SegmentedList(",
-    "PriorityQueue(",
-    "PriorityDequeue(",
-    "StringHashMap(",
-    "StringHashMapUnmanaged(",
-    "AutoHashMap(",
-    "AutoHashMapUnmanaged(",
-    "AutoArrayHashMap(",
-    "AutoArrayHashMapUnmanaged(",
-    "StringArrayHashMap(",
-    "StringArrayHashMapUnmanaged(",
-    "BufMap",
-    "BufSet",
-};
+/// defer). Derived from stdlib_container_init_patterns minus the
+/// managed_exclusions plus managed_extras: the inline-storage entries
+/// (EnumArray/EnumMap/EnumSet/StaticStringMap copy safely) and node-based
+/// linked lists drop out, and the BufMap/BufSet names join without the
+/// `.init(` of the generic form. Patterns carry the trailing `(` of a
+/// generic instantiation except the non-generic BufMap/BufSet. Used by
+/// ZA110 return-type classification.
+pub const managed_container_type_patterns: []const []const u8 = managed_patterns_list[0..];
+
+/// Result length of the managed table: init entries minus the excluded
+/// ones plus the extras.
+const managed_pattern_count =
+    stdlib_container_init_patterns.len - managed_exclusions.len + managed_extras.len;
+
+/// The managed families built once at comptime: init entries minus the
+/// exclusions plus the extras, in init order. The array form (not a blk
+/// slice) keeps the result immutable comptime data.
+fn buildManagedPatterns() [managed_pattern_count][]const u8 {
+    var list: [managed_pattern_count][]const u8 = undefined;
+    var n: usize = 0;
+    for (stdlib_container_init_patterns) |p| {
+        if (isManagedExcluded(p)) continue;
+        list[n] = p;
+        n += 1;
+    }
+    for (managed_extras) |e| {
+        list[n] = e;
+        n += 1;
+    }
+    return list;
+}
+
+/// The immutable comptime array backing managed_container_type_patterns.
+const managed_patterns_list = buildManagedPatterns();
+
+/// True when init-table entry `p` stays out of the managed families.
+fn isManagedExcluded(p: []const u8) bool {
+    for (managed_exclusions) |x| {
+        if (mem.eql(u8, p, x.name)) return true;
+    }
+    return false;
+}
+
+comptime {
+    for (managed_exclusions) |x| {
+        if (!mem.eql(u8, stdlib_container_init_patterns[x.idx], x.name)) {
+            @compileError("managed_exclusions drift at: " ++ x.name);
+        }
+    }
+}
 
 // ============================================================================
 // Helper functions

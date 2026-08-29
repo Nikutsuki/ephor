@@ -486,12 +486,11 @@ const binary_like_tags = blk: {
     break :blk set;
 };
 
-/// Tags whose subtrees must not be entered during a fn-body walk.
-fn isBoundaryTag(tag: Ast.Node.Tag) bool {
+/// Container-declaration tags: the boundary set's container half, shared
+/// with the type index in ast_tier_za111.zig. The B75/B76 split mirrored
+/// this list across the two files; it lives here once (EPH-I1232).
+pub fn isContainerDeclTag(tag: Ast.Node.Tag) bool {
     return switch (tag) {
-        .root,
-        .test_decl,
-        .error_set_decl,
         .container_decl,
         .container_decl_trailing,
         .container_decl_two,
@@ -504,6 +503,23 @@ fn isBoundaryTag(tag: Ast.Node.Tag) bool {
         .tagged_union_two_trailing,
         .tagged_union_enum_tag,
         .tagged_union_enum_tag_trailing,
+        => true,
+        else => false,
+    };
+}
+
+/// Tags whose subtrees must not be entered during a fn-body walk.
+fn isBoundaryTag(tag: Ast.Node.Tag) bool {
+    if (isContainerDeclTag(tag)) return true;
+    return isNonContainerBoundaryTag(tag);
+}
+
+/// The non-container boundary tags: declaration roots and the asm family.
+fn isNonContainerBoundaryTag(tag: Ast.Node.Tag) bool {
+    return switch (tag) {
+        .root,
+        .test_decl,
+        .error_set_decl,
         .global_var_decl,
         .fn_decl,
         .fn_proto,
@@ -523,3 +539,12 @@ fn isBoundaryTag(tag: Ast.Node.Tag) bool {
 }
 
 // ============================================================================
+// Walker tests
+// ============================================================================
+
+test "container-decl tag set matches the boundary walk (EPH-I1232)" {
+    try std.testing.expect(isContainerDeclTag(.container_decl));
+    try std.testing.expect(isContainerDeclTag(.tagged_union_enum_tag_trailing));
+    try std.testing.expect(!isContainerDeclTag(.fn_decl));
+    try std.testing.expect(!isContainerDeclTag(.root));
+}

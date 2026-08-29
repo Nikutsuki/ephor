@@ -439,10 +439,9 @@ fn isRightRecursiveKeyword(word: []const u8) bool {
         "try",    "comptime", "nosuspend", "resume", "break",
         "return", "if",       "while",     "for",
     };
-    for (keywords) |kw| {
-        if (mem.eql(u8, word, kw)) return true;
-    }
-    return false;
+    return for (keywords) |kw| {
+        if (mem.eql(u8, word, kw)) break true;
+    } else false;
 }
 
 /// Run every AST-tier rule over one file. Files with parse errors, deep
@@ -1194,17 +1193,18 @@ test "exceedsNestingBudget: two-char = tokens keep the run, bare = resets (EPH-I
 }
 
 /// Valid Zig with `n` nested grouped expressions: `const x = (((1)));`.
-/// The shape stays parseable at any depth, so only the budget decides
-/// skip vs parse.
+/// One exactly-sized allocation (head + 2n + 2) filled in place — the
+/// `**` repeat needs a comptime factor (EPH-I1232). The caller frees.
 fn buildNestedParens(a: Allocator, n: usize) ![]u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(a);
-    try buf.appendSlice(a, "const x = ");
-    try buf.appendNTimes(a, '(', n);
-    try buf.append(a, '1');
-    try buf.appendNTimes(a, ')', n);
-    try buf.append(a, ';');
-    return buf.toOwnedSlice(a);
+    const head = "const x = ";
+    const buf = try a.alloc(u8, head.len + 2 * n + 2);
+    errdefer a.free(buf);
+    @memcpy(buf[0..head.len], head);
+    @memset(buf[head.len .. head.len + n], '(');
+    buf[head.len + n] = '1';
+    @memset(buf[head.len + n + 1 .. head.len + 2 * n + 1], ')');
+    buf[head.len + 2 * n + 1] = ';';
+    return buf;
 }
 
 /// Parts of a synthetic operator-run file: `head` + `op`×n + `tail`.

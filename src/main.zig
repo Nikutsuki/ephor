@@ -1429,6 +1429,38 @@ fn findTagInCodeScan(
     return null;
 }
 
+/// The import tag the bare-import scanners search for (EPH-I1232 C6,
+/// REL-GATE-2, REL-AB-5): findImportPath and extractBareImports match
+/// this exact opener, masked to code positions by findTagInCodeScan
+/// (EPH-I0227).
+const import_tag = "@import(\"";
+
+/// The quoted import path after the next `@import("` tag at/after `from`
+/// on `line`, or null when no code-position tag remains. `from` advances
+/// past the tag (its closing quote, or its start on an unclosed quote),
+/// so the caller's loop never re-matches. An unclosed quote ends the
+/// scan under both advance shapes: a later tag's own quote would have
+/// closed this path first. Caller-held line state (EPH-I0306): the
+/// classifier and comment start walk the line once across all queries
+/// (EPH-I1232 C6, REL-GATE-2, REL-AB-5).
+fn nextImportPathOnLine(
+    line: []const u8,
+    cls: *LineClassifier,
+    comment_start: ?usize,
+    from: *usize,
+) ?[]const u8 {
+    const idx = findTagInCodeScan(import_tag, from.*, cls, comment_start) orelse return null;
+    const path_start = idx + import_tag.len;
+    var path_end = path_start;
+    while (path_end < line.len and line[path_end] != '"') path_end += 1;
+    if (path_end == path_start) {
+        from.* = idx + 1;
+        return null;
+    }
+    from.* = path_end + 1;
+    return line[path_start..path_end];
+}
+
 /// True when `code[i..]` starts the whole-word keyword `else` (bounded by
 /// non-identifier chars on both sides). Callers handle quote/comment state.
 fn isElseWordAt(code: []const u8, i: usize) bool {
@@ -3218,8 +3250,7 @@ fn hasRealKeyword(t: []const u8, kw: []const u8) bool {
         const pos = s + rel;
         s = pos + kw.len;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
-        if (cls.isInsideString(pos)) continue;
-        if (comment_start != null and pos >= comment_start.?) continue;
+        if (isDataPos(&cls, comment_start, pos)) continue;
         return true;
     }
     return false;
@@ -3768,6 +3799,43 @@ const VarOccurrenceIter = struct {
             if (pos > 0 and
                 (isIdent(self.t[pos - 1]) or hasLeftDot(self.t, pos)))
                 continue;
+            return pos;
+        }
+        return null;
+    }
+};
+
+/// Var-name occurrences on one line that sit outside string and comment
+/// data (the classify+query head hasDirectFill and isPartialFill share;
+/// EPH-I1232 C6, REL-GATE-2, REL-AB-5). Unlike VarOccurrenceIter,
+/// left-boundary filtering belongs to the caller: hasDirectFill credits
+/// the `&Struct.var` field form (isAmpFillOccurrence), isPartialFill
+/// rejects field positions with its own hasLeftDot check. The iterator
+/// owns its classifier, so each iteration walks the line once
+/// (EPH-I0153); callers apply their right-side checks at the yielded
+/// position.
+const VarCodeOccurrenceIter = struct {
+    t: []const u8,
+    name: []const u8,
+    from: usize = 0,
+    cls: LineClassifier,
+    comment_start: ?usize,
+
+    fn init(t: []const u8, name: []const u8) VarCodeOccurrenceIter {
+        return .{
+            .t = t,
+            .name = name,
+            .cls = LineClassifier.init(t),
+            .comment_start = findCommentStart(t),
+        };
+    }
+
+    fn next(self: *VarCodeOccurrenceIter) ?usize {
+        while (self.from + self.name.len <= self.t.len) {
+            const pos = self.from;
+            self.from += 1;
+            if (!mem.eql(u8, self.t[pos .. pos + self.name.len], self.name)) continue;
+            if (!isVarOccurrenceInCode(pos, &self.cls, self.comment_start)) continue;
             return pos;
         }
         return null;
@@ -14338,8 +14406,7 @@ fn hasRealWordKeyword(code: []const u8, kw: []const u8) bool {
         s = pos + kw.len;
         if (pos > 0 and isIdent(code[pos - 1])) continue;
         if (s < code.len and isIdent(code[s])) continue;
-        if (cls.isInsideString(pos)) continue;
-        if (comment_start != null and pos >= comment_start.?) continue;
+        if (isDataPos(&cls, comment_start, pos)) continue;
         return true;
     }
     return false;
@@ -16368,7 +16435,6 @@ const ImportGraph = struct {
     /// shapes are missed by design and stay pinned as accepted until a
     /// future scan covers them deliberately.
     fn findImportPath(content: []const u8, start: usize) ?[]const u8 {
-        const import_tag = "@import(\"";
         const line_start = if (mem.lastIndexOfScalar(u8, content[0..start], '\n')) |nl|
             nl + 1
         else
@@ -16380,12 +16446,8 @@ const ImportGraph = struct {
         // (EPH-I0306), instead of a fresh full-line rescan per occurrence.
         var cls = LineClassifier.init(line);
         const comment_start = findCommentStart(line);
-        while (findTagInCodeScan(import_tag, from, &cls, comment_start)) |idx| {
-            const path_start = idx + import_tag.len;
-            var path_end = path_start;
-            while (path_end < line.len and line[path_end] != '"') path_end += 1;
-            if (path_end > path_start) return line[path_start..path_end];
-            from = idx + 1;
+        while (nextImportPathOnLine(line, &cls, comment_start, &from)) |path| {
+            return path;
         }
         return null;
     }
@@ -16540,7 +16602,6 @@ const ImportGraph = struct {
         file_path: []const u8,
         analysis: *FileAnalysis,
     ) !void {
-        const import_tag = "@import(\"";
         var lines = mem.splitScalar(u8, content, '\n');
         while (lines.next()) |line| {
             var from: usize = 0;
@@ -16548,13 +16609,8 @@ const ImportGraph = struct {
             // queries (EPH-I0306).
             var cls = LineClassifier.init(line);
             const comment_start = findCommentStart(line);
-            while (findTagInCodeScan(import_tag, from, &cls, comment_start)) |idx| {
-                const path_start = idx + import_tag.len;
-                var path_end = path_start;
-                while (path_end < line.len and line[path_end] != '"') path_end += 1;
-                if (path_end > path_start)
-                    try self.tryAddBareImport(file_path, analysis, line[path_start..path_end]);
-                from = path_end + 1;
+            while (nextImportPathOnLine(line, &cls, comment_start, &from)) |path| {
+                try self.tryAddBareImport(file_path, analysis, path);
             }
         }
     }
@@ -20214,6 +20270,15 @@ fn isSelfMatch(t: []const u8, i: usize) bool {
     return i == 0 or (!isIdent(t[i - 1]) and !hasLeftDot(t, i));
 }
 
+/// True when the byte at `pos` is data, not code: inside a string literal
+/// (the carried classifier's incremental query) or at/after the line's
+/// comment start. The classifier query must ascend (types.zig assert).
+/// The cls_query family's shared query (EPH-I1232 C6, REL-GATE-2,
+/// REL-AB-5).
+fn isDataPos(cls: *LineClassifier, comment_start: ?usize, pos: usize) bool {
+    return cls.isInsideString(pos) or (comment_start != null and pos >= comment_start.?);
+}
+
 /// True when `i` is a code-position occurrence of var_name: not inside
 /// a string literal, not after a mid-line `//` (EPH-I0104, EPH-I0153).
 /// The identifier boundary check stays with the caller (it owns the
@@ -20223,8 +20288,7 @@ fn isVarOccurrenceInCode(
     cls: *LineClassifier,
     comment_start: ?usize,
 ) bool {
-    if (cls.isInsideString(i)) return false;
-    return comment_start == null or i < comment_start.?;
+    return !isDataPos(cls, comment_start, i);
 }
 
 /// Self-fill forms for one occurrence at `i`: var_name[...] in a write
@@ -20247,19 +20311,10 @@ fn isSelfFillOccurrence(t: []const u8, var_name: []const u8, i: usize) bool {
 /// firstVarReadPos).
 fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
     if (isCommentOrMultilineString(t)) return false;
-    // One classifier walk plus one comment-start walk per call (EPH-I0153):
-    // the comment start is string-aware, so a `//` inside a string literal
-    // (http:// URLs) never fakes a comment (EPH-I0412).
-    var cls = LineClassifier.init(t);
-    const comment_start = findCommentStart(t);
-    // Check all occurrences of var_name (handles Struct.var_name patterns)
-    var i: usize = 0;
-    while (i + var_name.len <= t.len) : (i += 1) {
-        if (!mem.eql(u8, t[i .. i + var_name.len], var_name)) continue;
-        // Check it is a word boundary (not middle of identifier)
+    var iter = VarCodeOccurrenceIter.init(t, var_name);
+    while (iter.next()) |i| {
         const end_i = i + var_name.len;
         if (end_i < t.len and isIdent(t[end_i])) continue;
-        if (!isVarOccurrenceInCode(i, &cls, comment_start)) continue;
         // Pattern 1: &var_name or &Struct.var_name, with any spacing
         // around the dot (EPH-I0796). A grouping paren on the bare name
         // (`use(&(x))`, EPH-I0822) takes the same bridge as the chain
@@ -20374,15 +20429,10 @@ const FillState = enum { none, partial };
 /// (conservative fire direction); the shape is vanishingly rare.
 fn isPartialFill(t: []const u8, var_name: []const u8) bool {
     if (isCommentOrMultilineString(t)) return false;
-    var cls = LineClassifier.init(t);
-    const comment_start = findCommentStart(t);
-    var i: usize = 0;
-    while (i + var_name.len <= t.len) : (i += 1) {
-        if (!mem.eql(u8, t[i .. i + var_name.len], var_name)) continue;
+    var iter = VarCodeOccurrenceIter.init(t, var_name);
+    while (iter.next()) |i| {
         const end_i = i + var_name.len;
         if (end_i < t.len and isIdent(t[end_i])) continue;
-        if (cls.isInsideString(i)) continue;
-        if (comment_start != null and i >= comment_start.?) continue;
         if (i > 0 and (isIdent(t[i - 1]) or hasLeftDot(t, i))) continue;
         if (end_i >= t.len or t[end_i] != '[') continue;
         if (classifyBracketUse(t, end_i) != .fill) continue;
@@ -21454,8 +21504,7 @@ fn findCatchPayloadStart(t: []const u8) ?usize {
     var from: usize = 0;
     while (mem.indexOfPos(u8, t, from, "catch |")) |pos| {
         from = pos + 1;
-        if (cls.isInsideString(pos)) continue;
-        if (comment_start != null and pos >= comment_start.?) continue;
+        if (isDataPos(&cls, comment_start, pos)) continue;
         return pos;
     }
     return null;
@@ -28122,8 +28171,7 @@ fn realTokenPosFrom(t: []const u8, needle: []const u8, from: usize) ?usize {
         s = pos + needle.len;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
         if (pos + needle.len < t.len and isIdent(t[pos + needle.len])) continue;
-        if (cls.isInsideString(pos)) continue;
-        if (comment_start != null and pos >= comment_start.?) continue;
+        if (isDataPos(&cls, comment_start, pos)) continue;
         return pos;
     }
     return null;
@@ -35712,8 +35760,7 @@ fn findDecrementOpAt(t: []const u8, from: usize) ?usize {
         if (j >= t.len) continue;
         const rhs = t[j];
         if (!isIdent(rhs) and rhs != '(' and rhs != '@' and rhs != '-') continue;
-        if (cls.isInsideString(pos)) continue;
-        if (comment_start != null and pos >= comment_start.?) continue;
+        if (isDataPos(&cls, comment_start, pos)) continue;
         return pos;
     }
     return null;
@@ -37587,6 +37634,18 @@ const ElseOpenKind = enum { plain, chain };
 /// the same brace-predecessor rule (EPH-I0965). A ternary `else`
 /// (`x = if (a) 1 else 2`) never follows a brace and never qualifies.
 fn elseKeywordPos(t: []const u8) ?usize {
+    // The unbounded form of elseKeywordBeforePos: an arm cannot open
+    // past the line end, so the limit is the line length.
+    return elseKeywordBeforePos(t, t.len);
+}
+
+/// Position of the last `else` keyword that opens an else arm at or
+/// before `limit`, or null. The bounded form of elseKeywordPos (which
+/// delegates here with the line length): the same-line guard judge uses
+/// it to tell a then-arm candidate (before any else) from an else-arm
+/// candidate (EPH-I1001). Positions ascend, so the scan stops at the
+/// first keyword past `limit`.
+fn elseKeywordBeforePos(t: []const u8, limit: usize) ?usize {
     // One classifier walk plus one comment-start walk (EPH-I0153). The
     // classifier's queries must ascend (types.zig assert), so the scan
     // runs FORWARD and the last qualifying else wins. Pre-fix the scan
@@ -37600,37 +37659,11 @@ fn elseKeywordPos(t: []const u8) ?usize {
     var last: ?usize = null;
     while (mem.indexOf(u8, t[from..], "else")) |rel| {
         const pos = from + rel;
-        from = pos + 4;
-        if (pos > 0 and isIdent(t[pos - 1])) continue;
-        if (pos + 4 < t.len and isIdent(t[pos + 4])) continue;
-        if (cls.isInsideString(pos)) continue;
-        if (comment_start != null and pos >= comment_start.?) continue;
-        var k = pos;
-        while (k > 0 and (t[k - 1] == ' ' or t[k - 1] == '\t')) k -= 1;
-        if (k == 0 or t[k - 1] != '}') continue;
-        last = pos;
-    }
-    return last;
-}
-
-/// Position of the last `else` keyword that opens an else arm at or
-/// before `limit`, or null. The bounded twin of elseKeywordPos: the
-/// same-line guard judge uses it to tell a then-arm candidate (before
-/// any else) from an else-arm candidate (EPH-I1001). Positions ascend,
-/// so the scan stops at the first keyword past `limit`.
-fn elseKeywordBeforePos(t: []const u8, limit: usize) ?usize {
-    var cls = LineClassifier.init(t);
-    const comment_start = findCommentStart(t);
-    var from: usize = 0;
-    var last: ?usize = null;
-    while (mem.indexOf(u8, t[from..], "else")) |rel| {
-        const pos = from + rel;
         if (pos >= limit) break;
         from = pos + 4;
         if (pos > 0 and isIdent(t[pos - 1])) continue;
         if (pos + 4 < t.len and isIdent(t[pos + 4])) continue;
-        if (cls.isInsideString(pos)) continue;
-        if (comment_start != null and pos >= comment_start.?) continue;
+        if (isDataPos(&cls, comment_start, pos)) continue;
         var k = pos;
         while (k > 0 and (t[k - 1] == ' ' or t[k - 1] == '\t')) k -= 1;
         if (k == 0 or t[k - 1] != '}') continue;

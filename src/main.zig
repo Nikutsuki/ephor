@@ -40122,6 +40122,35 @@ fn analyzeIntCastGuards(
     return (GraphScan{ .allocator = allocator, .graph = graph }).run(visitIntCastFile);
 }
 
+/// Standard owned-message runtime report (reportFmtFailure,
+/// reportFmtTermFailure, reportSignalDeath, reportRunFailure,
+/// reportNoBuildZig): the message is allocator-owned, transfers to the
+/// issue on a successful append, and frees when the append OOMs (B13-18).
+const OwnedRuntimeReport = struct {
+    file: []const u8,
+    rule: []const u8,
+    help: []const u8,
+};
+
+fn emitOwnedRuntimeReport(
+    allocator: Allocator,
+    issues: *std.ArrayListUnmanaged(Issue),
+    msg: []const u8,
+    spec: OwnedRuntimeReport,
+) !void {
+    errdefer allocator.free(msg);
+    try issues.append(allocator, .{
+        .file = spec.file,
+        .line = 1,
+        .col = 1,
+        .severity = .err,
+        .rule = spec.rule,
+        .message = msg,
+        .help = spec.help,
+        .message_owned = true,
+    });
+}
+
 /// ZR104 for a zig fmt spawn failure (EPH-I0232): an empty list would
 /// read as ran-clean, so the failure becomes a finding. ZR104, not
 /// ZA601: a missing zig is a command failure, not a format finding.
@@ -40146,22 +40175,16 @@ fn reportFmtFailure(
             "cannot run zig fmt: {s}",
             .{@errorName(err)},
         );
-    errdefer allocator.free(msg);
     // The action must match the cause: StreamTooLong proves zig ran, so
     // the missing-zig help would mislead (batch 24 review F3).
     const help = if (err == error.StreamTooLong)
         "rerun on a smaller path set or report the case"
     else
         "check that zig is installed and on PATH";
-    try issues.append(allocator, .{
+    try emitOwnedRuntimeReport(allocator, issues, msg, .{
         .file = path,
-        .line = 1,
-        .col = 1,
-        .severity = .err,
         .rule = RULE_RUNTIME_TEST_FAILURE,
-        .message = msg,
         .help = help,
-        .message_owned = true,
     });
 }
 
@@ -40237,16 +40260,10 @@ fn reportFmtTermFailure(
     result: std.process.RunResult,
 ) !void {
     const msg = try fmtTermMessage(allocator, result.term, result.stderr);
-    errdefer allocator.free(msg);
-    try issues.append(allocator, .{
+    try emitOwnedRuntimeReport(allocator, issues, msg, .{
         .file = path,
-        .line = 1,
-        .col = 1,
-        .severity = .err,
         .rule = RULE_RUNTIME_TEST_FAILURE,
-        .message = msg,
         .help = "run zig fmt directly to see the full error",
-        .message_owned = true,
     });
 }
 
@@ -40637,16 +40654,10 @@ fn reportSignalDeath(
         "command terminated by signal {d}",
         .{sig_num},
     );
-    errdefer allocator.free(msg);
-    try issues.append(allocator, .{
+    try emitOwnedRuntimeReport(allocator, issues, msg, .{
         .file = "runtime",
-        .line = 1,
-        .col = 1,
-        .severity = .err,
         .rule = RULE_RUNTIME_SIGNAL_DEATH,
-        .message = msg,
         .help = "check the command for crashes",
-        .message_owned = true,
     });
 }
 
@@ -40672,16 +40683,10 @@ fn reportRunFailure(
             "cannot run {s}: {s}",
             .{ cmd_str, @errorName(err) },
         );
-    errdefer allocator.free(msg);
-    try issues.append(allocator, .{
+    try emitOwnedRuntimeReport(allocator, issues, msg, .{
         .file = "runtime",
-        .line = 1,
-        .col = 1,
-        .severity = .err,
         .rule = RULE_RUNTIME_TEST_FAILURE,
-        .message = msg,
         .help = "check the command and the project build",
-        .message_owned = true,
     });
 }
 
@@ -40853,16 +40858,10 @@ fn reportNoBuildZig(
         "no build.zig found at {s}: the default runtime command requires the target project's build.zig",
         .{safe_path.slice},
     );
-    errdefer allocator.free(msg);
-    try issues.append(allocator, .{
+    try emitOwnedRuntimeReport(allocator, issues, msg, .{
         .file = "runtime",
-        .line = 1,
-        .col = 1,
-        .severity = .err,
         .rule = RULE_RUNTIME_TEST_FAILURE,
-        .message = msg,
         .help = "run ephor runtime from a Zig project root or pass --command",
-        .message_owned = true,
     });
 }
 
@@ -41011,6 +41010,21 @@ fn runtimeLocationAllowed(ctx: RuntimeEmitCtx, loc: FileLocation) bool {
     return resolvesInRoot(ctx.io, loc.file, root);
 }
 
+/// The standard runtime finding shape (col 1, severity err, the spec's
+/// rule/message/help) anchored at file:line (emitAnchoredRuntimeIssue,
+/// emitRuntimeIssue).
+fn runtimeIssueAt(spec: RuntimeIssueSpec, file: []const u8, line: usize) Issue {
+    return .{
+        .file = file,
+        .line = line,
+        .col = 1,
+        .severity = .err,
+        .rule = spec.rule,
+        .message = spec.message,
+        .help = spec.help,
+    };
+}
+
 /// Append a runtime finding with a location that already passed the
 /// containment gate. The file dupe is the EPH-I0196 ownership pattern:
 /// child output frees before the findings print (EPH-I0202).
@@ -41020,41 +41034,19 @@ fn emitAnchoredRuntimeIssue(
     file: []const u8,
     line: usize,
 ) !void {
-    const issue = Issue{
-        .file = file,
-        .line = line,
-        .col = 1,
-        .severity = .err,
-        .rule = spec.rule,
-        .message = spec.message,
-        .help = spec.help,
-    };
+    const issue = runtimeIssueAt(spec, file, line);
     if (!try runtimeFindingKept(ctx, issue)) return;
     const owned_file = try ctx.allocator.dupe(u8, file);
     errdefer ctx.allocator.free(owned_file);
-    try ctx.issues.append(ctx.allocator, .{
-        .file = owned_file,
-        .file_owned = true,
-        .line = line,
-        .col = 1,
-        .severity = .err,
-        .rule = spec.rule,
-        .message = spec.message,
-        .help = spec.help,
-    });
+    var owned_issue = issue;
+    owned_issue.file = owned_file;
+    owned_issue.file_owned = true;
+    try ctx.issues.append(ctx.allocator, owned_issue);
 }
 
 /// Emit a simple runtime issue (file=runtime, line=1)
 fn emitRuntimeIssue(ctx: RuntimeEmitCtx, spec: RuntimeIssueSpec) !void {
-    try tryAppendRuntimeIssue(ctx, .{
-        .file = "runtime",
-        .line = 1,
-        .col = 1,
-        .severity = .err,
-        .rule = spec.rule,
-        .message = spec.message,
-        .help = spec.help,
-    });
+    try tryAppendRuntimeIssue(ctx, runtimeIssueAt(spec, "runtime", 1));
 }
 
 /// Emit a runtime issue with a file location extracted from the line. A
@@ -41103,30 +41095,35 @@ fn leakFindingMessage(
     return .{ .msg = msg, .owned = true, .located = true };
 }
 
-/// Handle memory leak detection with next-line stack trace
-fn handleMemoryLeak(
+/// Shared handler context for the line-consuming GPA handlers
+/// (handleMemoryLeak, handleRunnerBlock): the emit context, the output
+/// line iterator, the verbose flag, and the current line.
+const GpaLineCtx = struct {
     ctx: RuntimeEmitCtx,
     line_iter: *mem.SplitIterator(u8, .scalar),
     verbose: bool,
     t: []const u8,
-) !void {
-    if (verbose) try printVerboseRuntimeLine(ctx, "GPA", t);
-    const loc = if (line_iter.next()) |next_line|
+};
+
+/// Handle memory leak detection with next-line stack trace
+fn handleMemoryLeak(h: GpaLineCtx) !void {
+    if (h.verbose) try printVerboseRuntimeLine(h.ctx, "GPA", h.t);
+    const loc = if (h.line_iter.next()) |next_line|
         extractFileLocation(mem.trim(u8, next_line, " \t\r"))
     else
         FileLocation{ .file = "unknown", .line = 0 };
-    const message = try leakFindingMessage(ctx, loc, verbose);
-    errdefer if (message.owned) ctx.allocator.free(message.msg);
+    const message = try leakFindingMessage(h.ctx, loc, h.verbose);
+    errdefer if (message.owned) h.ctx.allocator.free(message.msg);
     // The structured fields carry the located frame too (EPH-I0736):
     // the GCC-style prefix points at the alloc site, so editors can
     // jump to the most common runtime finding. The dupe is the
     // EPH-I0196 ownership pattern — child output frees before the
     // findings print (EPH-I0202).
     const owned_file: ?[]u8 = if (message.located)
-        try ctx.allocator.dupe(u8, loc.file)
+        try h.ctx.allocator.dupe(u8, loc.file)
     else
         null;
-    errdefer if (owned_file) |f| ctx.allocator.free(f);
+    errdefer if (owned_file) |f| h.ctx.allocator.free(f);
     const issue = Issue{
         .file = owned_file orelse "runtime",
         .file_owned = message.located,
@@ -41138,12 +41135,12 @@ fn handleMemoryLeak(
         .help = "allocation not freed - check for missing defer or error path",
         .message_owned = message.owned,
     };
-    if (!try runtimeFindingKept(ctx, issue)) {
-        if (owned_file) |f| ctx.allocator.free(f);
-        if (message.owned) ctx.allocator.free(message.msg);
+    if (!try runtimeFindingKept(h.ctx, issue)) {
+        if (owned_file) |f| h.ctx.allocator.free(f);
+        if (message.owned) h.ctx.allocator.free(message.msg);
         return;
     }
-    try ctx.issues.append(ctx.allocator, issue);
+    try h.ctx.issues.append(h.ctx.allocator, issue);
 }
 
 /// Parse GPA memory diagnostics from stderr. The ctx carries the
@@ -41225,9 +41222,19 @@ fn classifyGPALine(
 ) !void {
     const leak_pats = [_][]const u8{ "memory leak", "Memory leak", "leaked:" };
     if (matchesAnyPattern(t, &leak_pats))
-        return handleMemoryLeak(ctx, line_iter, verbose, t);
+        return handleMemoryLeak(.{
+            .ctx = ctx,
+            .line_iter = line_iter,
+            .verbose = verbose,
+            .t = t,
+        });
     if (isRunnerBlockHeader(t))
-        return handleRunnerBlock(ctx, line_iter, verbose, t);
+        return handleRunnerBlock(.{
+            .ctx = ctx,
+            .line_iter = line_iter,
+            .verbose = verbose,
+            .t = t,
+        });
     return classifyGPATable(ctx, verbose, t);
 }
 
@@ -41421,21 +41428,16 @@ fn emitRunnerBlockFinding(
 /// trace, classify the crash shape, and emit one located finding. An
 /// unrecognized block replays header and lines through the plain table so
 /// pre-0.16 outputs keep the pre-fix behavior.
-fn handleRunnerBlock(
-    ctx: RuntimeEmitCtx,
-    line_iter: *mem.SplitIterator(u8, .scalar),
-    verbose: bool,
-    t: []const u8,
-) !void {
-    if (verbose) try printVerboseRuntimeLine(ctx, "GPA", t);
+fn handleRunnerBlock(h: GpaLineCtx) !void {
+    if (h.verbose) try printVerboseRuntimeLine(h.ctx, "GPA", h.t);
     var buf: [max_runner_block_lines][]const u8 = undefined;
-    const n = collectRunnerBlock(line_iter, &buf);
+    const n = collectRunnerBlock(h.line_iter, &buf);
     const lines = buf[0..n];
     var scan: RunnerBlockScan = .{};
     for (lines) |line| scanRunnerBlockLine(&scan, line);
-    if (try emitRunnerBlockFinding(ctx, &scan, t)) return;
-    try classifyGPATable(ctx, verbose, t);
-    for (lines) |line| try classifyGPATable(ctx, verbose, line);
+    if (try emitRunnerBlockFinding(h.ctx, &scan, h.t)) return;
+    try classifyGPATable(h.ctx, h.verbose, h.t);
+    for (lines) |line| try classifyGPATable(h.ctx, h.verbose, line);
 }
 
 /// The `" panic:"` form is a substring of `"panic:"`, so one match covers
@@ -42403,18 +42405,31 @@ fn stashBadGateValue(diag: *DiagCtx, value: []const u8) void {
     diag.last_bad_gate_value_len = n;
 }
 
+/// Sanitize the offending CI-gate value for the invalid-value report, or
+/// print the fallback (the value could not be sanitized) and return null
+/// (reportBadFailOn, reportBadStrictValue).
+fn safeBadGateValue(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    safe_path: []const u8,
+    comptime fallback_fmt: []const u8,
+) ?types.Sanitized {
+    return types.sanitizeTerminal(allocator, badGateValueSlice(diag)) catch {
+        cliDiag(diag, fallback_fmt, .{safe_path});
+        return null;
+    };
+}
+
 /// The InvalidFailOnValue diagnostic. The offending value is config file
 /// content, so it crosses the terminal sanitizer like the path does
 /// (EPH-I0147).
 fn reportBadFailOn(diag: *DiagCtx, allocator: Allocator, safe_path: []const u8) void {
-    var safe = types.sanitizeTerminal(allocator, badGateValueSlice(diag)) catch {
-        cliDiag(
-            diag,
-            "error: {s}: invalid fail_on value (expected: error, warning, note, never)\n",
-            .{safe_path},
-        );
-        return;
-    };
+    var safe = safeBadGateValue(
+        diag,
+        allocator,
+        safe_path,
+        "error: {s}: invalid fail_on value (expected: error, warning, note, never)\n",
+    ) orelse return;
     defer safe.deinit(allocator);
     cliDiag(
         diag,
@@ -42427,14 +42442,12 @@ fn reportBadFailOn(diag: *DiagCtx, allocator: Allocator, safe_path: []const u8) 
 /// value is config file content, so it crosses the terminal sanitizer
 /// like the fail_on value does (EPH-I0147).
 fn reportBadStrictValue(diag: *DiagCtx, allocator: Allocator, safe_path: []const u8) void {
-    var safe = types.sanitizeTerminal(allocator, badGateValueSlice(diag)) catch {
-        cliDiag(
-            diag,
-            "error: {s}: invalid strict value (expected: true or false)\n",
-            .{safe_path},
-        );
-        return;
-    };
+    var safe = safeBadGateValue(
+        diag,
+        allocator,
+        safe_path,
+        "error: {s}: invalid strict value (expected: true or false)\n",
+    ) orelse return;
     defer safe.deinit(allocator);
     cliDiag(
         diag,
@@ -42984,18 +42997,10 @@ fn passTargetEntryGate(io: std.Io, scan_root: []const u8, candidate: []const u8)
 /// Index just past the closing quote of the JSON string whose opening quote
 /// is at start. A `\` escapes the next byte (RED1-9: `\"` must not end the
 /// span). Returns content.len for an unterminated string (RED1-1: callers
-/// must never receive an index past the buffer end).
+/// must never receive an index past the buffer end). The walk is
+/// parseJsonString's; skip callers keep only the end.
 fn skipJsonStringSpan(content: []const u8, start: usize) usize {
-    var i = start + 1;
-    while (i < content.len) {
-        if (content[i] == '\\') {
-            i = @min(i + 2, content.len);
-            continue;
-        }
-        if (content[i] == '"') return i + 1;
-        i += 1;
-    }
-    return content.len;
+    return parseJsonString(content, start).end;
 }
 
 /// Parse JSON string value starting at opening quote. The value is the raw
@@ -43344,22 +43349,52 @@ fn findConfigObjectEnd(content: []const u8, brace_start: usize) ?usize {
     return null;
 }
 
+/// One `"key": value` pair head: the key string and the separator stop
+/// index (parseThresholdPair, parseCoveragePair, parseConfigJsonSource
+/// share the head; the missing-separator handling stays per-caller).
+const JsonPairKey = struct {
+    val: []const u8,
+    sep_stop: usize,
+};
+
+fn findJsonPairKey(content: []const u8, quote: usize) JsonPairKey {
+    const key_result = parseJsonString(content, quote);
+    return .{ .val = key_result.val, .sep_stop = findKeySeparator(content, key_result.end) };
+}
+
+/// One full `"key": value` pair head (parseThresholdPair,
+/// parseCoveragePair): the key value plus the disposition — the value's
+/// first byte, or the pair's end when the separator is missing. The
+/// caller returns the end: a missing separator ends the pair after the
+/// stray value so the remaining pairs stay aligned (EPH-I0514).
+const JsonPairHead = union(enum) {
+    value_start: usize,
+    skip_end: usize,
+};
+
+fn jsonPairHead(content: []const u8, quote: usize) struct { val: []const u8, head: JsonPairHead } {
+    const key = findJsonPairKey(content, quote);
+    if (key.sep_stop >= content.len or content[key.sep_stop] != ':')
+        return .{
+            .val = key.val,
+            .head = .{ .skip_end = skipSeparatorlessPairValue(content, key.sep_stop) },
+        };
+    var i = key.sep_stop + 1;
+    while (i < content.len and (content[i] == ' ' or content[i] == '\t')) i += 1;
+    return .{ .val = key.val, .head = .{ .value_start = i } };
+}
+
 /// Parse threshold key-value pair
 fn parseThresholdPair(ctx: ConfigParseCtx, start: usize) usize {
     const content = ctx.content;
     var i = start;
     if (i >= content.len) return i;
     if (content[i] != '"') return i + 1;
-    const key_result = parseJsonString(content, i);
-    const sep_stop = findKeySeparator(content, key_result.end);
-    if (sep_stop >= content.len or content[sep_stop] != ':') {
-        // Missing separator: end the pair after the stray value so the
-        // remaining pairs stay aligned (EPH-I0514). A `:` inside a later
-        // string must not bind this key.
-        return skipSeparatorlessPairValue(content, sep_stop);
+    const pair = jsonPairHead(content, i);
+    switch (pair.head) {
+        .skip_end => |end| return end,
+        .value_start => |v| i = v,
     }
-    i = sep_stop + 1;
-    while (i < content.len and (content[i] == ' ' or content[i] == '\t')) i += 1;
     const num_start = i;
     while (i < content.len and content[i] >= '0' and content[i] <= '9') i += 1;
     const raw = std.fmt.parseInt(usize, content[num_start..i], 10) catch {
@@ -43367,28 +43402,28 @@ fn parseThresholdPair(ctx: ConfigParseCtx, start: usize) usize {
         // empty run) is skipped with a warning — the pre-fix code skipped
         // it silently, so a mistyped huge threshold reverted to the default
         // without a signal, inconsistent with the clampThreshold policy.
-        warnBadThresholdValue(ctx, key_result.val, content[num_start..i]);
+        warnBadThresholdValue(ctx, pair.val, content[num_start..i]);
         return i;
     };
-    const cap = thresholdCapFor(key_result.val) orelse return i;
+    const cap = thresholdCapFor(pair.val) orelse return i;
     // A CLI-locked field discards this value; clamping it would warn falsely.
-    if (thresholdCliLocked(ctx.cfg.threshold_cli_mask, key_result.val)) return i;
+    if (thresholdCliLocked(ctx.cfg.threshold_cli_mask, pair.val)) return i;
     // EPH-I1135: the CLI channel rejects zero as a hard usage error
     // (EPH-I0522), so the config channel must reject it too — a zero
     // threshold flags every function and the two channels cannot
     // disagree on the same typo class. Warn and keep the default, the
     // B13-11 shape for an unparseable value.
     if (raw == 0) {
-        warnBadThresholdValue(ctx, key_result.val, content[num_start..i]);
+        warnBadThresholdValue(ctx, pair.val, content[num_start..i]);
         return i;
     }
     const num = clampThreshold(
         ctx.diag,
         ctx.source.path,
-        .{ .key = key_result.val, .cap = cap },
+        .{ .key = pair.val, .cap = cap },
         raw,
     );
-    setThresholdValue(&ctx.cfg.thresholds, ctx.cfg.threshold_cli_mask, key_result.val, num);
+    setThresholdValue(&ctx.cfg.thresholds, ctx.cfg.threshold_cli_mask, pair.val, num);
     return i;
 }
 
@@ -43565,6 +43600,30 @@ fn applyConfigPathDir(ctx: ConfigParseCtx, value: []const u8) !void {
     try setOwnedPath(allocator, ctx.cfg, stripDotSlashPrefix(value));
 }
 
+/// One sanitized (config_path, value) pair for the bad-config warning
+/// formatters (formatPathDirRejected, formatBadErrorNaming): both slices
+/// are config content and cross the terminal sanitizer (EPH-I0147).
+const SafeConfigPair = struct {
+    path: types.Sanitized,
+    value: types.Sanitized,
+
+    fn deinit(self: *SafeConfigPair, allocator: Allocator) void {
+        self.path.deinit(allocator);
+        self.value.deinit(allocator);
+    }
+};
+
+fn sanitizeConfigPair(
+    out: *types.OutBuf,
+    config_path: []const u8,
+    value: []const u8,
+) !SafeConfigPair {
+    var safe_path = try types.sanitizeTerminal(out.allocator, config_path);
+    errdefer safe_path.deinit(out.allocator);
+    const safe_value = try types.sanitizeTerminal(out.allocator, value);
+    return .{ .path = safe_path, .value = safe_value };
+}
+
 /// Render the path_dir rejection warning into `out`. The value is
 /// undecoded config file content and the path comes from the scanned
 /// tree, so both cross the terminal sanitizer (EPH-I0147).
@@ -43574,14 +43633,12 @@ fn formatPathDirRejected(
     value: []const u8,
     reason: []const u8,
 ) !void {
-    var safe_path = try types.sanitizeTerminal(out.allocator, config_path);
-    defer safe_path.deinit(out.allocator);
-    var safe_value = try types.sanitizeTerminal(out.allocator, value);
-    defer safe_value.deinit(out.allocator);
+    var safe = try sanitizeConfigPair(out, config_path, value);
+    defer safe.deinit(out.allocator);
     try out.buf.print(
         out.allocator,
         "warning: ignoring path_dir '{s}' in {s}: {s}. Fix the value or remove the key.\n",
-        .{ safe_value.slice, safe_path.slice, reason },
+        .{ safe.value.slice, safe.path.slice, reason },
     );
 }
 
@@ -43643,22 +43700,20 @@ fn handleConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !usize {
 /// Render the unknown-error_naming warning into `out` (B13-10,
 /// EPH-I0147). The value is undecoded config content, so it crosses the
 /// terminal sanitizer like the fail_on value does. Mirrors
-/// formatBadThresholdValue's shape: tests call the formatter directly to
-/// pin the rendered bytes.
+/// formatBadThresholdValue's message shape: tests call the formatter
+/// directly to pin the rendered bytes.
 fn formatBadErrorNaming(
     out: *types.OutBuf,
     config_path: []const u8,
     value: []const u8,
 ) !void {
-    var safe_path = try types.sanitizeTerminal(out.allocator, config_path);
-    defer safe_path.deinit(out.allocator);
-    var safe_value = try types.sanitizeTerminal(out.allocator, value);
-    defer safe_value.deinit(out.allocator);
+    var safe = try sanitizeConfigPair(out, config_path, value);
+    defer safe.deinit(out.allocator);
     try out.buf.print(
         out.allocator,
         "warning: {s}: unknown error_naming '{s}' " ++
             "(expected: TitleCase, PascalCase, snake_case) — using TitleCase\n",
-        .{ safe_path.slice, safe_value.slice },
+        .{ safe.path.slice, safe.value.slice },
     );
 }
 
@@ -43725,14 +43780,12 @@ fn parseCoveragePair(ctx: ConfigParseCtx, start: usize) !usize {
     const content = ctx.content;
     var i = start;
     if (i >= content.len or content[i] != '"') return i + 1;
-    const key_result = parseJsonString(content, i);
-    const sep_stop = findKeySeparator(content, key_result.end);
-    if (sep_stop >= content.len or content[sep_stop] != ':') {
-        return skipSeparatorlessPairValue(content, sep_stop);
+    const pair = jsonPairHead(content, i);
+    switch (pair.head) {
+        .skip_end => |end| return end,
+        .value_start => |v| i = v,
     }
-    i = sep_stop + 1;
-    while (i < content.len and (content[i] == ' ' or content[i] == '\t')) i += 1;
-    const key_val = key_result.val;
+    const key_val = pair.val;
     if (mem.eql(u8, key_val, "unreached_pub_fn_ratio_max"))
         return parseCoverageRatio(ctx, key_val, i);
     if (mem.eql(u8, key_val, "min_tests"))
@@ -44042,18 +44095,17 @@ fn parseConfigJsonSource(ctx: ConfigParseCtx) !void {
             i += 1;
             continue;
         }
-        const key_result = parseJsonString(content, i);
-        const sep_stop = findKeySeparator(content, key_result.end);
-        if (sep_stop < content.len and content[sep_stop] == ':') {
-            i = skipWhitespace(content, sep_stop + 1);
-            i = try handleConfigKey(ctx, i, key_result.val);
+        const pair = findJsonPairKey(content, i);
+        if (pair.sep_stop < content.len and content[pair.sep_stop] == ':') {
+            i = skipWhitespace(content, pair.sep_stop + 1);
+            i = try handleConfigKey(ctx, i, pair.val);
             continue;
         }
         // Missing separator: the pair is malformed. Skip the stray value
         // so the following pairs stay aligned (EPH-I0514): the pre-fix
         // scan bound the key to the first colon anywhere, which a later
         // string's `:` satisfied, shifting every pair after it.
-        i = skipSeparatorlessPairValue(content, sep_stop);
+        i = skipSeparatorlessPairValue(content, pair.sep_stop);
     }
 }
 
@@ -44829,6 +44881,19 @@ fn parseFingerprintHint(allocator: Allocator, output: []const u8) ?[]u8 {
     return allocator.dupe(u8, output[start..end]) catch null;
 }
 
+/// Read the project's build.zig.zon (byte-capped), or null when it is
+/// unreadable (patchZonFingerprint, projectHasEphorDependency). Both
+/// probes are best-effort on the operator's own tree, so every failure
+/// reads as "no zon here".
+fn readBuildZigZon(io: std.Io, allocator: Allocator, project_dir: std.Io.Dir) ?[]u8 {
+    return project_dir.readFileAlloc(
+        io,
+        "build.zig.zon",
+        allocator,
+        .limited(64 * 1024),
+    ) catch null;
+}
+
 /// Patch `.fingerprint = 0x0` to the hinted value in build.zig.zon
 /// (EPH-I0718). The marker is masked to code positions like every
 /// install/upgrade zon splice: a mention inside a comment or a string
@@ -44840,12 +44905,7 @@ fn patchZonFingerprint(
     project_dir: std.Io.Dir,
     hint: []const u8,
 ) bool {
-    const content = project_dir.readFileAlloc(
-        io,
-        "build.zig.zon",
-        allocator,
-        .limited(64 * 1024),
-    ) catch return false;
+    const content = readBuildZigZon(io, allocator, project_dir) orelse return false;
     defer allocator.free(content);
     const marker = ".fingerprint = 0x0";
     const pos = indexOfCode(content, 0, marker) orelse return false;
@@ -44958,6 +45018,18 @@ fn buildZigIsSymlink(io: std.Io, dir: std.Io.Dir) bool {
     return stat.kind == .sym_link;
 }
 
+/// Print the upgrade-side symlink refusal and return the upgrade error.
+/// The pre-flight (EPH-I1112) and the integration backstop (EPH-I0670)
+/// in upgradeWithVerification share the report.
+fn refuseBuildZigSymlink(diag: *DiagCtx) error{UpgradeFailed} {
+    cliDiag(
+        diag,
+        "error: build.zig is a symlink. Replace it with a regular file and re-run the upgrade.\n",
+        .{},
+    );
+    return error.UpgradeFailed;
+}
+
 /// Patch build.zig to add ephor step. Returns line number
 /// where inserted, or null if already exists.
 /// EPH-I0721: the append terminates the block with a newline.
@@ -45049,12 +45121,7 @@ fn patchBuildZig(diag: *DiagCtx, allocator: Allocator, project_dir: std.Io.Dir) 
 /// or a quoted mention and let the upgrade proceed into zig fetch,
 /// re-adding a dependency the user had disabled.
 fn projectHasEphorDependency(io: std.Io, allocator: Allocator, project_dir: std.Io.Dir) bool {
-    const content = project_dir.readFileAlloc(
-        io,
-        "build.zig.zon",
-        allocator,
-        .limited(64 * 1024),
-    ) catch return false;
+    const content = readBuildZigZon(io, allocator, project_dir) orelse return false;
     defer allocator.free(content);
     return indexOfCode(content, 0, ".ephor =") != null;
 }
@@ -45340,14 +45407,8 @@ const UpgradeRun = struct {
         // a refusal after the fetch left the zon and ephor.json rewritten
         // while the integration refused. The integration step keeps its
         // own check as the backstop (EPH-I0670).
-        if (buildZigIsSymlink(self.diag.io, self.project_dir)) {
-            cliDiag(
-                self.diag,
-                "error: build.zig is a symlink. Replace it with a regular file and re-run the upgrade.\n",
-                .{},
-            );
-            return error.UpgradeFailed;
-        }
+        if (buildZigIsSymlink(self.diag.io, self.project_dir))
+            return refuseBuildZigSymlink(self.diag);
 
         std.debug.print("Upgrading ephor to v{s}...\n", .{ver});
 
@@ -45376,12 +45437,7 @@ const UpgradeRun = struct {
         // Only the symlink refusal errors here (EPH-I0670); every
         // other miss is best-effort by the function's guarantee.
         updateBuildZigIntegration(self.diag, self.allocator) catch {
-            cliDiag(
-                self.diag,
-                "error: build.zig is a symlink. Replace it with a regular file and re-run the upgrade.\n",
-                .{},
-            );
-            return error.UpgradeFailed;
+            return refuseBuildZigSymlink(self.diag);
         };
 
         std.debug.print(
@@ -46655,6 +46711,16 @@ fn scanBuildZigEntries(
     try extractBuildZigEntriesFromPath(ctx);
 }
 
+/// Conventional multi-entry directories probed under the scan target
+/// (scanMultiEntryDirs) and the invocation cwd (scanCwdMultiEntryDirs).
+const multi_entry_dirs = [_][]const u8{
+    "examples",  "example", "samples", "experiments",
+    "tools",     "test",    "tests",   "fuzz",
+    "benchmark", "benches", "scripts", "lib",
+    "clients",   "drivers", "apps",    "cmd",
+    "bin",       "ci",      "user",
+};
+
 /// Scan the conventional multi-entry directories under cfg.path for entry
 /// files. A target-tree dir walk, so the candidates are containment-gated
 /// (EPH-I0195).
@@ -46664,22 +46730,10 @@ fn scanMultiEntryDirs(
     cfg: *Config,
     added: *std.StringHashMap(void),
 ) !void {
-    const multi_entry_dirs = [_][]const u8{
-        "examples",  "example", "samples", "experiments",
-        "tools",     "test",    "tests",   "fuzz",
-        "benchmark", "benches", "scripts", "lib",
-        "clients",   "drivers", "apps",    "cmd",
-        "bin",       "ci",      "user",
-    };
-    const scan_ctx = EntryScanCtx{
-        .diag = diag,
-        .allocator = allocator,
-        .cfg = cfg,
-        .added = added,
-        .check_access = true,
-        // EPH-I0195: dir walk over the scanned tree — containment-gate.
-        .gate_containment = true,
-    };
+    var scan_ctx = entryScanCtx(diag, allocator, cfg, added);
+    scan_ctx.check_access = true;
+    // EPH-I0195: dir walk over the scanned tree — containment-gate.
+    scan_ctx.gate_containment = true;
     for (multi_entry_dirs) |dir| {
         const dir_path = try buildPathWithPrefix(allocator, cfg.path, dir);
         defer allocator.free(dir_path);
@@ -46742,10 +46796,7 @@ fn detectCliEntriesTarget(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !v
     cfg.entries = .empty;
     // Whatever survives in `kept` was re-appended. The buffer and its
     // remaining strings die here, on success and on error.
-    defer {
-        for (kept.items) |e| allocator.free(e);
-        kept.deinit(allocator);
-    }
+    defer freeKeptEntries(&kept, allocator);
     try loadConfigFromTargetPath(diag, allocator, cfg, cfg.path);
     const from_tree = cfg.entries.items.len == 0;
     if (from_tree) try scanTargetTreeEntries(diag, allocator, cfg);
@@ -46755,15 +46806,7 @@ fn detectCliEntriesTarget(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !v
     // themselves. Capacity first: one fallible call, so the move loop
     // cannot fail with ownership half-moved.
     try cfg.entries.ensureUnusedCapacity(allocator, kept.items.len);
-    var remaining: usize = 0;
-    for (kept.items) |e| {
-        if (containsEntry(cfg.entries.items, e)) {
-            kept.items[remaining] = e;
-            remaining += 1;
-            continue;
-        }
-        cfg.entries.appendAssumeCapacity(e);
-    }
+    const remaining = reappendKeptEntries(cfg, &kept);
     // Moved entries sit past the new length, so the deferred cleanup
     // frees only the duplicates.
     kept.shrinkRetainingCapacity(remaining);
@@ -46870,10 +46913,7 @@ fn detectFileTargetEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !
     cfg.entries = .empty;
     // Whatever survives in `kept` was re-discovered by the load. The
     // buffer and its remaining strings die here, on success and on error.
-    defer {
-        for (kept.items) |e| allocator.free(e);
-        kept.deinit(allocator);
-    }
+    defer freeKeptEntries(&kept, allocator);
     if (std.fs.path.dirname(cfg.path)) |parent| {
         // A parent dir that IS the cwd carries the config parseArgs
         // already loaded: re-parsing it only duplicates the kept entries
@@ -46897,9 +46937,10 @@ fn detectFileTargetEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !
 }
 
 /// Compact `kept` to the entries the load did not re-discover and append
-/// them to cfg.entries, returning the kept count (detectFileTargetEntries).
-/// The caller reserved capacity first, so the append is infallible: the
-/// move cannot fail with ownership half-moved.
+/// them to cfg.entries, returning the kept count
+/// (detectCliEntriesTarget, detectFileTargetEntries). The caller reserved
+/// capacity first, so the append is infallible: the move cannot fail with
+/// ownership half-moved.
 fn reappendKeptEntries(
     cfg: *Config,
     kept: *std.ArrayListUnmanaged([]const u8),
@@ -46914,6 +46955,14 @@ fn reappendKeptEntries(
         cfg.entries.appendAssumeCapacity(e);
     }
     return remaining;
+}
+
+/// Free the surviving kept entries and the list buffer (the defer arm in
+/// detectCliEntriesTarget and detectFileTargetEntries): the moved-out
+/// strings that survive the re-append die here, on success and on error.
+fn freeKeptEntries(kept: *std.ArrayListUnmanaged([]const u8), allocator: Allocator) void {
+    for (kept.items) |e| allocator.free(e);
+    kept.deinit(allocator);
 }
 
 /// Extract entry points from build.zig by parsing common patterns.
@@ -47165,6 +47214,18 @@ const EntryScanCtx = struct {
     check_access: bool = false,
     gate_containment: bool = false,
 };
+
+/// EntryScanCtx with the four shared fields set (scanMultiEntryDirs,
+/// scanCwdMultiEntryDirs); the per-scan flags and path plumbing stay
+/// per-caller.
+fn entryScanCtx(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    cfg: *Config,
+    added: *std.StringHashMap(void),
+) EntryScanCtx {
+    return .{ .diag = diag, .allocator = allocator, .cfg = cfg, .added = added };
+}
 
 /// Add entry with prefix if the file exists. Target-tree scans
 /// (gate_containment) containment-check the candidate first: build.zig
@@ -47492,20 +47553,7 @@ fn scanCwdMultiEntryDirs(
     cfg: *Config,
     added: *std.StringHashMap(void),
 ) !void {
-    // Based on patterns found in community projects
-    const multi_entry_dirs = [_][]const u8{
-        "examples",  "example", "samples", "experiments",
-        "tools",     "test",    "tests",   "fuzz",
-        "benchmark", "benches", "scripts", "lib",
-        "clients",   "drivers", "apps",    "cmd",
-        "bin",       "ci",      "user",
-    };
-    const scan_ctx = EntryScanCtx{
-        .diag = diag,
-        .allocator = allocator,
-        .cfg = cfg,
-        .added = added,
-    };
+    const scan_ctx = entryScanCtx(diag, allocator, cfg, added);
     for (multi_entry_dirs) |dir| {
         try scanDirForEntries(scan_ctx, dir);
     }
@@ -55502,7 +55550,12 @@ test "handleMemoryLeak builds an owned message from the next line" {
     defer deinitIssues(&issues, allocator);
     var iter = mem.splitScalar(u8, "/src/x.zig:42:5: 0xabc in foo", '\n');
     const ctx = RuntimeEmitCtx{ .issues = &issues, .allocator = allocator };
-    try handleMemoryLeak(ctx, &iter, false, "0x1 leaked:");
+    try handleMemoryLeak(.{
+        .ctx = ctx,
+        .line_iter = &iter,
+        .verbose = false,
+        .t = "0x1 leaked:",
+    });
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_MEMORY_LEAK, issues.items[0].rule);
     try std.testing.expectEqualStrings("memory leak at /src/x.zig:42", issues.items[0].message);
@@ -55520,7 +55573,12 @@ test "handleMemoryLeak falls back to a static message without a location" {
     defer deinitIssues(&issues, allocator);
     var iter = mem.splitScalar(u8, "", '\n');
     const ctx = RuntimeEmitCtx{ .issues = &issues, .allocator = allocator };
-    try handleMemoryLeak(ctx, &iter, false, "0x1 leaked:");
+    try handleMemoryLeak(.{
+        .ctx = ctx,
+        .line_iter = &iter,
+        .verbose = false,
+        .t = "0x1 leaked:",
+    });
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings("memory leak detected at runtime", issues.items[0].message);
     try std.testing.expect(!issues.items[0].message_owned);
@@ -55548,7 +55606,12 @@ test "handleMemoryLeak keeps the runtime anchor for a forged location (EPH-I0736
         .root_real = root_real,
         .root_attempted = true,
     };
-    try handleMemoryLeak(ctx, &iter, false, "0x1 leaked:");
+    try handleMemoryLeak(.{
+        .ctx = ctx,
+        .line_iter = &iter,
+        .verbose = false,
+        .t = "0x1 leaked:",
+    });
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings("memory leak detected at runtime", issues.items[0].message);
     try std.testing.expectEqualStrings("runtime", issues.items[0].file);
@@ -55937,7 +56000,12 @@ test "null containment root fails the located-finding gate closed (EPH-I1140)" {
             .root_attempted = true,
         };
         var iter = mem.splitScalar(u8, "/forged/x.zig:7:5: 0xabc in foo", '\n');
-        try handleMemoryLeak(ctx, &iter, false, "0x1 leaked:");
+        try handleMemoryLeak(.{
+            .ctx = ctx,
+            .line_iter = &iter,
+            .verbose = false,
+            .t = "0x1 leaked:",
+        });
         try std.testing.expectEqual(@as(usize, 1), issues.items.len);
         try std.testing.expectEqualStrings(
             "memory leak detected at runtime",
@@ -56033,6 +56101,25 @@ test "reportSignalDeath names the signal number in an owned message" {
     try std.testing.expectEqualStrings("command terminated by signal 15", issues.items[0].message);
     try std.testing.expect(issues.items[0].message_owned);
     try std.testing.expectEqualStrings("check the command for crashes", issues.items[0].help.?);
+}
+
+test "emitOwnedRuntimeReport frees the message when the append fails (C9a)" {
+    // The helper owns the message until the append transfers it to the
+    // issue: an append OOM must free it (the B13-18 shape). The
+    // FailingAllocator parent catches the leak at deinit if it survives.
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    const msg = try allocator.dupe(u8, "command terminated");
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        emitOwnedRuntimeReport(failing.allocator(), &issues, msg, .{
+            .file = "runtime",
+            .rule = RULE_RUNTIME_SIGNAL_DEATH,
+            .help = "check the command for crashes",
+        }),
+    );
 }
 
 test "reportRunFailure distinguishes spawn failure from output overflow" {
@@ -72176,18 +72263,43 @@ test "ephor:ignore with trailing whitespace and no rule suppresses all rules" {
 
 /// Nasty-case fixtures for the IgnoreCache differential test. Every fixture
 /// is probed exhaustively: lines 0..EOF+2 crossed with the rule table.
+/// Each element is a named const: the per-element name line breaks the
+/// repeated comma-separator skeleton out of the ZA504 clone stream (the
+/// multiline-string bodies never join it).
 const ignore_cache_fixtures = [_][]const u8{
-    // same-line directive suppresses only that line/rule
+    ignore_cache_same_line,
+    ignore_cache_legacy_disable,
+    ignore_cache_scope_fn,
+    ignore_cache_unclosed_scope,
+    ignore_cache_comment_last,
+    ignore_cache_file_level_top,
+    ignore_cache_bare_file_level,
+    ignore_cache_file_level_mid,
+    ignore_cache_doc_comment,
+    ignore_cache_string_mention,
+    ignore_cache_crlf,
+    ignore_cache_multi_rule,
+    ignore_cache_multiline_body,
+    ignore_cache_active_scope,
+    ignore_cache_balanced_braces,
+    ignore_cache_brace_string,
+    ignore_cache_bare_trailing,
+};
+
+// same-line directive suppresses only that line/rule
+const ignore_cache_same_line =
     \\const x = foo() catch {}; // ephor:ignore ZA201
     \\const y = foo() catch {};
-    ,
-    // legacy same-line disable + disable-next-line variant (rule list only)
+;
+// legacy same-line disable + disable-next-line variant (rule list only)
+const ignore_cache_legacy_disable =
     \\const a = foo() catch {}; // ephor:disable ZA202
     \\// ephor:disable-next-line ZA203
     \\const b = val orelse unreachable;
     \\const c = val orelse unreachable;
-    ,
-    // scope directive over a fn with nested braces
+;
+// scope directive over a fn with nested braces
+const ignore_cache_scope_fn =
     \\const before = foo() catch {};
     \\// ephor:ignore ZA201
     \\fn outer() void {
@@ -72197,82 +72309,95 @@ const ignore_cache_fixtures = [_][]const u8{
     \\    bar() catch {};
     \\}
     \\const after = baz() catch {};
-    ,
-    // unclosed scope at EOF
+;
+// unclosed scope at EOF
+const ignore_cache_unclosed_scope =
     \\// ephor:ignore ZA201
     \\fn unterminated() void {
     \\    foo() catch {};
-    ,
-    // comment-only directive as the last line (no following line)
+;
+// comment-only directive as the last line (no following line)
+const ignore_cache_comment_last =
     \\const a = foo() catch {};
     \\// ephor:ignore ZA201
-    ,
-    // file-level with rule at top of file
+;
+// file-level with rule at top of file
+const ignore_cache_file_level_top =
     \\// ephor:ignore-file ZA201
     \\const a = foo() catch {};
     \\fn f() void {
     \\    bar() catch {};
     \\}
-    ,
-    // bare file-level in a trailing comment
+;
+// bare file-level in a trailing comment
+const ignore_cache_bare_file_level =
     \\const marker = 1; // ephor:ignore-file
     \\const a = foo() catch {};
-    ,
-    // file-level mid-file also suppresses lines before the directive
+;
+// file-level mid-file also suppresses lines before the directive
+const ignore_cache_file_level_mid =
     \\const a = foo() catch {};
     \\// ephor:ignore-file ZC101
     \\const b = bar() catch {};
-    ,
-    // doc-comment and prose-comment non-directives
+;
+// doc-comment and prose-comment non-directives
+const ignore_cache_doc_comment =
     \\/// ephor:ignore ZA201
     \\// NOTE: ephor:ignore ZA202
     \\const x = foo() catch {};
-    ,
-    // string-literal and code-mention non-directives
+;
+// string-literal and code-mention non-directives
+const ignore_cache_string_mention =
     \\const s = "// ephor:ignore ZA201";
     \\const t = "ephor:ignore-file";
     \\const has = mem.indexOf(u8, line, "ephor:ignore") != null;
     \\const a = foo() catch {};
-    ,
-    // CRLF line endings (explicit escapes; raw literals cannot hold \r)
-    "// ephor:ignore ZA201\r\nfn f() void {\r\n    foo() catch {};\r\n}\r\nconst z = bar() catch {};\r\n",
-    // multi-rule list with trailing prose; rule id buried in prose is inert
+;
+// CRLF line endings (explicit escapes; raw literals cannot hold \r)
+const ignore_cache_crlf =
+    "// ephor:ignore ZA201\r\nfn f() void {\r\n    foo() catch {};\r\n}\r\nconst z = bar() catch {};\r\n";
+// multi-rule list with trailing prose; rule id buried in prose is inert
+const ignore_cache_multi_rule =
     \\// ephor:ignore ZA201 ZA305 because pre-checked
     \\const x = foo() catch {};
     \\// ephor:ignore because ZA202 is noisy
     \\const y = foo() catch {};
-    ,
-    // multiline-string body is string data, not directives
+;
+// multiline-string body is string data, not directives
+const ignore_cache_multiline_body =
     \\const fixture =
     \\    \\// ephor:ignore-file
     \\    \\// ephor:ignore ZA201
     \\;
     \\const x = foo() catch {};
-    ,
-    // directive inside an active scope still self-suppresses for its rule
+;
+// directive inside an active scope still self-suppresses for its rule
+const ignore_cache_active_scope =
     \\// ephor:ignore ZA201
     \\fn f() void {
     \\    // ephor:ignore ZA202
     \\    foo() catch {};
     \\}
     \\bar() catch {};
-    ,
-    // balanced braces on the scope-open line: scope never activates
+;
+// balanced braces on the scope-open line: scope never activates
+const ignore_cache_balanced_braces =
     \\// ephor:ignore ZA201
     \\const x = blk: { break :blk foo() catch {}; };
     \\bar() catch {};
-    ,
-    // brace inside a string on the would-be open line opens no scope: the
-    // directive suppresses only the next line
+;
+// brace inside a string on the would-be open line opens no scope: the
+// directive suppresses only the next line
+const ignore_cache_brace_string =
     \\// ephor:ignore ZA201
     \\const s = "{";
     \\foo() catch {};
     \\}
     \\bar() catch {};
-    ,
-    // bare directive with trailing whitespace suppresses all rules
-    "const x = foo() catch {}; // ephor:ignore \nconst y = foo() catch {};\n",
-};
+;
+// bare directive with trailing whitespace suppresses all rules
+const ignore_cache_bare_trailing =
+    "const x = foo() catch {}; // ephor:ignore \nconst y = foo() catch {};\n";
 
 test "IgnoreCache matches isInlineDisabled on every (line, rule) pair" {
     const allocator = std.testing.allocator;

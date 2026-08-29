@@ -1478,15 +1478,23 @@ const BodyStart = enum { none, brace, label_block, statement };
 /// EPH-I0095): end-of-line (Allman — the pending_brace path), `{` (braced
 /// body), `ident: {` (labeled block — braced path), or any other code (a
 /// same-line statement body).
+/// Index just past a `|payload|` capture's closing `|` and any following
+/// whitespace, or null when the capture never closes (peekBodyStart,
+/// peekElseBody share the strict skip; the tolerant no-op form for loop
+/// headers is skipPayloadCapture).
+fn payloadCaptureEnd(code: []const u8, j: usize) ?usize {
+    const close = mem.indexOfScalarPos(u8, code, j + 1, '|') orelse return null;
+    var k = close + 1;
+    while (k < code.len and (code[k] == ' ' or code[k] == '\t')) k += 1;
+    return k;
+}
+
 fn peekBodyStart(code: []const u8, i: usize) BodyStart {
     var j = i + 1;
     while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
     if (j >= code.len) return .none;
     if (code[j] == '|') {
-        const close = mem.indexOfScalarPos(u8, code, j + 1, '|') orelse
-            return .statement;
-        j = close + 1;
-        while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
+        j = payloadCaptureEnd(code, j) orelse return .statement;
         if (j >= code.len) return .none;
     }
     if (code[j] == '{') return .brace;
@@ -1532,10 +1540,7 @@ fn peekElseBody(code: []const u8, i: usize) BodyStart {
     if (j >= code.len) return .none;
     var payload_skipped = false;
     if (code[j] == '|') {
-        const close = mem.indexOfScalarPos(u8, code, j + 1, '|') orelse
-            return .statement;
-        j = close + 1;
-        while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
+        j = payloadCaptureEnd(code, j) orelse return .statement;
         if (j >= code.len) return .none;
         payload_skipped = true;
     }
@@ -1923,9 +1928,25 @@ const CFGBuildCtx = struct {
         line_scan.else_open_pending = false;
         line_scan.out.saw_control_open = true;
         line_scan.last_control_open = i;
+        try self.pushControlOpen(i);
+    }
+
+    /// Push a control brace and emit the open event (openControlBrace,
+    /// tryVirtualBodyOpen share the pair; the line_scan updates around
+    /// each emission stay per-caller).
+    fn pushControlOpen(self: *CFGBuildCtx, i: usize) !void {
         try self.brace_stack.append(self.allocator, .control);
         try self.event_scratch.append(self.allocator, .{
             .kind = .open_control,
+            .col = i,
+        });
+    }
+
+    /// Emit a close-control event at column i (classifyCloseBrace's
+    /// three emission points share the append).
+    fn emitCloseControl(self: *CFGBuildCtx, i: usize) !void {
+        try self.event_scratch.append(self.allocator, .{
+            .kind = .close_control,
             .col = i,
         });
     }
@@ -1942,18 +1963,12 @@ const CFGBuildCtx = struct {
         // An entry still waiting for its `{` (brace-less body) is closed by
         // the next close event, matching pre-guard pop-on-`}` semantics.
         if (line_scan.dispatch_pop and self.topIsPending()) {
-            try self.event_scratch.append(self.allocator, .{
-                .kind = .close_control,
-                .col = i,
-            });
+            try self.emitCloseControl(i);
             return;
         }
         const items = self.brace_stack.items;
         if (items.len == 0) {
-            try self.event_scratch.append(self.allocator, .{
-                .kind = .close_control,
-                .col = i,
-            });
+            try self.emitCloseControl(i);
             return;
         }
         const kind = items[items.len - 1];
@@ -1966,10 +1981,7 @@ const CFGBuildCtx = struct {
             // on the same line must not clobber an earlier one.
             if (jump != .none) line_scan.out.body_jump = jump;
         }
-        try self.event_scratch.append(self.allocator, .{
-            .kind = .close_control,
-            .col = i,
-        });
+        try self.emitCloseControl(i);
     }
 
     /// True when the scan's latest event closed a control block (braced or
@@ -2017,11 +2029,7 @@ const CFGBuildCtx = struct {
         // A pending opener (condition ended on this line) is claimed by the
         // virtual body, not by a later `{`.
         _ = self.clearTopPending();
-        try self.brace_stack.append(self.allocator, .control);
-        try self.event_scratch.append(self.allocator, .{
-            .kind = .open_control,
-            .col = i,
-        });
+        try self.pushControlOpen(i);
     }
 
     /// Close a virtual else body: no brace was pushed, so the close event
@@ -3218,9 +3226,8 @@ fn hasRealFreePattern(t: []const u8) bool {
     for (compat.getCleanupPatterns()) |pat| {
         // Only check .free( and .destroy( — not .deinit( (bulk cleanup, not per-alloc)
         if (mem.eql(u8, pat, ".deinit(")) continue;
-        if (mem.indexOf(u8, t, pat)) |pos| {
-            if (!isPatternInString(t, pos)) return true;
-        }
+        const pos = mem.indexOf(u8, t, pat) orelse continue;
+        if (!isPatternInString(t, pos)) return true;
     }
     return false;
 }
@@ -3228,9 +3235,8 @@ fn hasRealFreePattern(t: []const u8) bool {
 /// Check if line has any cleanup pattern (.free, .destroy, .deinit) NOT inside a string
 fn hasRealCleanupPattern(t: []const u8) bool {
     for (compat.getCleanupPatterns()) |pat| {
-        if (mem.indexOf(u8, t, pat)) |pos| {
-            if (!isPatternInString(t, pos)) return true;
-        }
+        const pos = mem.indexOf(u8, t, pat) orelse continue;
+        if (!isPatternInString(t, pos)) return true;
     }
     return false;
 }
@@ -3681,17 +3687,28 @@ fn isAssignmentOp(text: []const u8) bool {
     return text.len == 1 or (text[1] != '=' and text[1] != '>');
 }
 
+/// Fold one `[`/`]` byte into a bracket depth; true when the byte closed
+/// a bracket group (hasAssignmentAfterBracket, skipBracketed share the
+/// fold; the depth-0 tails stay per-caller). The decrement saturates: a
+/// stray closer never underflows the depth.
+fn bracketCloseAt(depth: *usize, c: u8) bool {
+    if (c == '[') {
+        depth.* += 1;
+        return false;
+    }
+    if (c == ']') {
+        if (depth.* > 0) depth.* -= 1;
+        return true;
+    }
+    return false;
+}
+
 /// Find closing bracket and check if `=` follows. Returns true if assignment.
 fn hasAssignmentAfterBracket(text: []const u8) ?bool {
     var depth: usize = 0;
     for (text, 0..) |c, i| {
-        if (c == '[') {
-            depth += 1;
-            continue;
-        }
-        if (c != ']') continue;
-        if (depth > 0) depth -= 1;
-        if (depth != 0) continue;
+        const closed = bracketCloseAt(&depth, c);
+        if (!closed or depth != 0) continue;
         const after = mem.trimStart(u8, text[i + 1 ..], " \t");
         if (isAssignmentOp(after)) return true;
         // Continue through chained field.index access
@@ -3708,13 +3725,8 @@ fn hasAssignmentAfterBracket(text: []const u8) ?bool {
 fn skipBracketed(text: []const u8, start: usize) ?usize {
     var depth: usize = 0;
     for (text[start..], 0..) |c, i| {
-        if (c == '[') {
-            depth += 1;
-            continue;
-        }
-        if (c != ']') continue;
-        if (depth > 0) depth -= 1;
-        if (depth == 0) return start + i + 1;
+        const closed = bracketCloseAt(&depth, c);
+        if (closed and depth == 0) return start + i + 1;
     }
     return null;
 }
@@ -4352,6 +4364,32 @@ fn identBefore(code: []const u8, pos: usize) []const u8 {
 /// generated lines.
 const max_paren_stack = 64;
 
+/// Literal-masked paren walk over code[0..end]: the stack records each
+/// opener's index while the depth counts open groups; null on stack
+/// overflow (parenHeaderKeyword, unmatchedOpenParenBefore share the
+/// walk; the depth-0 fallback and the stack read stay per-caller).
+fn parenStackScan(
+    cls: *LineClassifier,
+    code: []const u8,
+    end: usize,
+    stack: *[max_paren_stack]usize,
+) ?usize {
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i < end and i < code.len) : (i += 1) {
+        if (cls.isInsideLiteral(i)) continue;
+        const c = code[i];
+        if (c == '(') {
+            if (depth >= max_paren_stack) return null;
+            stack[depth] = i;
+            depth += 1;
+        } else if (c == ')') {
+            depth -|= 1;
+        }
+    }
+    return depth;
+}
+
 /// Identifier of the keyword whose parenthesized header closes at
 /// `close_idx` on this line, or null: a depth-counted scan finds the
 /// matching `(`, and the identifier before it names the header. A
@@ -4363,19 +4401,7 @@ const max_paren_stack = 64;
 fn parenHeaderKeyword(code: []const u8, close_idx: usize) ?[]const u8 {
     var cls = LineClassifier.init(code);
     var stack: [max_paren_stack]usize = [_]usize{0} ** max_paren_stack;
-    var depth: usize = 0;
-    var i: usize = 0;
-    while (i < close_idx and i < code.len) : (i += 1) {
-        if (cls.isInsideLiteral(i)) continue;
-        const c = code[i];
-        if (c == '(') {
-            if (depth >= max_paren_stack) return null;
-            stack[depth] = i;
-            depth += 1;
-        } else if (c == ')') {
-            depth -|= 1;
-        }
-    }
+    const depth = parenStackScan(&cls, code, close_idx, &stack) orelse return null;
     if (depth == 0) return null;
     return identBefore(code, stack[depth - 1]);
 }
@@ -4683,7 +4709,10 @@ fn isLineCommentOpenerAt(t: []const u8, i: usize) bool {
     return t[i + 1] == '/';
 }
 
-/// Advance a carried bracket depth across one char.
+/// Advance a carried bracket depth across one char (the type walks in
+/// topLevelBangIndex/topLevelFnTypeStart and the statement scans share
+/// it): openers increment, closers decrement (saturating), everything
+/// else is neutral.
 fn foldBracketDepth(depth: *usize, c: u8) void {
     if (c == '(' or c == '[' or c == '{') {
         depth.* += 1;
@@ -4817,19 +4846,7 @@ fn unmatchedOpenParenBefore(t: []const u8, pos: usize) ?usize {
     const comment_start = findCommentStart(t) orelse t.len;
     const scan_end = @min(pos, comment_start);
     var stack: [max_paren_stack]usize = [_]usize{0} ** max_paren_stack;
-    var depth: usize = 0;
-    var i: usize = 0;
-    while (i < scan_end and i < t.len) : (i += 1) {
-        if (cls.isInsideLiteral(i)) continue;
-        const c = t[i];
-        if (c == '(') {
-            if (depth >= max_paren_stack) return null;
-            stack[depth] = i;
-            depth += 1;
-        } else if (c == ')') {
-            depth -|= 1;
-        }
-    }
+    const depth = parenStackScan(&cls, t, scan_end, &stack) orelse return null;
     if (depth == 0) return null;
     return stack[depth - 1];
 }
@@ -5447,14 +5464,20 @@ fn lineFillsVar(t: []const u8, var_name: []const u8) bool {
         hasAddressOfVar(t, var_name);
 }
 
-/// Check if a line takes the address of a variable (&var_name)
-/// This indicates out-parameter usage where the variable may be assigned
-fn hasAddressOfVar(t: []const u8, var_name: []const u8) bool {
-    // One classifier walk per line (EPH-I0153): candidates ascend.
-    var cls = LineClassifier.init(t);
-    var search_start: usize = 0;
+/// Position of the next `&var_name` occurrence at or after `start` with a
+/// word boundary after the name and outside strings/comments, or null
+/// (hasAddressOfVar, firstUntrackableAddressOfCol share the candidate
+/// walk; the classifier stays caller-owned so one init covers the
+/// whole-line scan).
+fn nextAmpVarOccurrence(
+    cls: *LineClassifier,
+    t: []const u8,
+    var_name: []const u8,
+    start: usize,
+) ?usize {
+    var search_start = start;
     while (search_start + 1 + var_name.len <= t.len) {
-        const amp_pos = mem.indexOf(u8, t[search_start..], "&") orelse return false;
+        const amp_pos = mem.indexOf(u8, t[search_start..], "&") orelse return null;
         const pos = search_start + amp_pos;
         search_start = pos + 1;
 
@@ -5470,9 +5493,17 @@ fn hasAddressOfVar(t: []const u8, var_name: []const u8) bool {
         if (cls.isInsideString(pos)) continue;
         if (findCommentStart(t[0..pos]) != null) continue;
 
-        return true;
+        return pos;
     }
-    return false;
+    return null;
+}
+
+/// Check if a line takes the address of a variable (&var_name)
+/// This indicates out-parameter usage where the variable may be assigned
+fn hasAddressOfVar(t: []const u8, var_name: []const u8) bool {
+    // One classifier walk per line (EPH-I0153): candidates ascend.
+    var cls = LineClassifier.init(t);
+    return nextAmpVarOccurrence(&cls, t, var_name, 0) != null;
 }
 
 /// Column of the first untrackable `&var_name` occurrence in `t`, or
@@ -5482,24 +5513,8 @@ fn hasAddressOfVar(t: []const u8, var_name: []const u8) bool {
 fn firstUntrackableAddressOfCol(t: []const u8, var_name: []const u8) ?usize {
     // One classifier walk per line (EPH-I0153): candidates ascend.
     var cls = LineClassifier.init(t);
-    var search_start: usize = 0;
-    while (search_start + 1 + var_name.len <= t.len) {
-        const amp_rel = mem.indexOf(u8, t[search_start..], "&") orelse return null;
-        const pos = search_start + amp_rel;
-        search_start = pos + 1;
-
-        // Must be immediately followed by var_name (no space)
-        if (pos + 1 + var_name.len > t.len) continue;
-        if (!mem.eql(u8, t[pos + 1 .. pos + 1 + var_name.len], var_name)) continue;
-
-        // Check word boundary after var_name
-        const end = pos + 1 + var_name.len;
-        if (end < t.len and isIdent(t[end])) continue;
-
-        // Make sure it is not inside a string or comment
-        if (cls.isInsideString(pos)) continue;
-        if (findCommentStart(t[0..pos]) != null) continue;
-
+    var next = nextAmpVarOccurrence(&cls, t, var_name, 0);
+    while (next) |pos| : (next = nextAmpVarOccurrence(&cls, t, var_name, pos + 1)) {
         if (!isInsideCallArg(t, pos)) return pos;
     }
     return null;
@@ -5981,8 +5996,8 @@ fn payloadBindingCol(t: []const u8, var_name: []const u8) ?usize {
         const end = pos + 1 + var_name.len;
         if (end >= t.len) continue;
         if (t[end] != '|' and t[end] != ',') continue;
-        if (cls.isInsideString(pos)) continue;
-        if (findCommentStart(t[0..pos]) != null) continue;
+        // String/comment positions never bind.
+        if (cls.isInsideString(pos) or findCommentStart(t[0..pos]) != null) continue;
         return pos;
     }
     return null;
@@ -7931,22 +7946,31 @@ fn onelineIfBodyRegion(t: []const u8) ?OnelineIfBody {
     return .{ .open = o, .close = close };
 }
 
+/// Position of the `)` that closes the paren group opened at `open` on
+/// one line, or null when the parens never balance (conditionCloseParen,
+/// extractFnReturnType, scanFnSignatureRet share the walk). `depth`
+/// carries the open-group count past the scan: a multi-line caller
+/// continues its count from it.
+fn matchingParenCol(t: []const u8, open: usize, depth: *usize) ?usize {
+    for (t[open..], 0..) |c, ci| {
+        if (c == '(') {
+            depth.* += 1;
+            continue;
+        }
+        if (c != ')') continue;
+        depth.* -= 1;
+        if (depth.* == 0) return open + ci;
+    }
+    return null;
+}
+
 /// Column of the condition's close paren on an if-opener line: the `)`
 /// matching the first `(` after the `if` keyword (mirrors
 /// extractIfCondition's paren scan).
 fn conditionCloseParen(t: []const u8) ?usize {
     const open = mem.indexOfScalar(u8, t, '(') orelse return null;
     var depth: usize = 0;
-    for (t[open..], 0..) |c, ci| {
-        if (c == '(') {
-            depth += 1;
-            continue;
-        }
-        if (c != ')') continue;
-        depth -= 1;
-        if (depth == 0) return open + ci;
-    }
-    return null;
+    return matchingParenCol(t, open, &depth);
 }
 
 /// Find the line index of the nearest enclosing if-statement by walking
@@ -10737,6 +10761,23 @@ const SameBlockFreeResult = struct {
     freed_line: usize = 0,
 };
 
+/// Build a same-block free verdict (checkSameBlockFree,
+/// checkAliasBlockFree share the literal; the rebound field stays
+/// per-caller — the alias walk never observes a root rebind).
+fn sameBlockFreeResult(
+    freed: bool,
+    intervening_return: bool,
+    rebound: bool,
+    freed_line: usize,
+) SameBlockFreeResult {
+    return .{
+        .freed = freed,
+        .intervening_return = intervening_return,
+        .rebound = rebound,
+        .freed_line = freed_line,
+    };
+}
+
 fn checkSameBlockFree(
     scan: *const VarFreeCtx,
     block_start: usize,
@@ -10762,12 +10803,7 @@ fn checkSameBlockFree(
         }
         if (freed and isExitStatementLine(ct)) ret = true;
     }
-    return .{
-        .freed = freed,
-        .intervening_return = ret,
-        .rebound = rebound,
-        .freed_line = freed_line,
-    };
+    return sameBlockFreeResult(freed, ret, rebound, freed_line);
 }
 
 /// Same-block free probe for one alias (EPH-I0835): the alias's target is
@@ -10802,12 +10838,7 @@ fn checkAliasBlockFree(
         }
         if (freed and isExitStatementLine(ct)) ret = true;
     }
-    return .{
-        .freed = freed,
-        .intervening_return = ret,
-        .rebound = false,
-        .freed_line = freed_line,
-    };
+    return sameBlockFreeResult(freed, ret, false, freed_line);
 }
 
 /// True when the line past the alloc line rebinds the root (EPH-I0835):
@@ -11399,16 +11430,32 @@ const DeferPairCtx = struct {
     aliases: *const std.StringHashMapUnmanaged([]const u8),
 };
 
-/// Collect frees of var_name registered through `defer` statements (single-line
-/// `defer free(x);` and frees inside `defer { ... }` blocks). errdefer frees
-/// are deliberately excluded: the pair errdefer-free + defer-free of the same
-/// variable is the canonical error/success cleanup split. defer ALSO runs on
-/// error exits, so the pair CAN double-free on the error path — an accepted FN
-/// here. The errdefer + direct-free pairing has its own detector
-/// (detectErrdeferDirectFree, EPH-I0006).
-fn collectDeferFrees(
+/// Which registered-free pass the shared collector runs: defer-registered
+/// or errdefer-registered (detectDeferDoubleFree,
+/// detectErrdeferDirectFree share the walk; the two modes differ only in
+/// the accept filter and the conditional mark).
+const CollectMode = enum { defer_frees, errdefer_frees };
+
+/// Collect frees of var_name registered through `defer` statements
+/// (single-line `defer free(x);` and frees inside `defer { ... }`
+/// blocks), or through single-line `errdefer free(x);` statements
+/// (EPH-I0006) per the mode. Defer mode deliberately excludes errdefer
+/// frees: the pair errdefer-free + defer-free of the same variable is
+/// the canonical error/success cleanup split. defer ALSO runs on error
+/// exits, so the pair CAN double-free on the error path — an accepted
+/// FN here (the errdefer + direct-free pairing has its own detector,
+/// detectErrdeferDirectFree). Errdefer mode excludes frees inside
+/// `errdefer { ... }` blocks (the collection walk matches only the
+/// single-line prefix: the block IS the deferred expression, it runs at
+/// scope exit on error and disarms nothing, so a block-body free is a
+/// real pairing candidate the single-line walk never sees — accepted
+/// FN) and conditional errdefer frees (`errdefer if (flag) free(x);`:
+/// the guard flag couples the free to an ownership handoff the line
+/// model cannot track — accepted FN).
+fn collectRegisteredFrees(
     allocator: Allocator,
     ctx: *const DeferPairCtx,
+    comptime mode: CollectMode,
 ) !std.ArrayListUnmanaged(DeferFree) {
     var frees: std.ArrayListUnmanaged(DeferFree) = .empty;
     // Join buffer for zig-fmt wrapped frees: the freed var of a wrapped
@@ -11417,17 +11464,23 @@ fn collectDeferFrees(
     for (ctx.lines, 0..) |line, idx| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
-        if (ctx.in_errdefer[idx] or mem.startsWith(u8, t, "errdefer ")) continue;
-        if (!ctx.in_defer[idx] and !mem.startsWith(u8, t, "defer ")) continue;
-        // A defer inside a capture's scope frees the capture at scope exit,
-        // not the tracked binding (EPH-I0748, EPH-I0780).
+        if (!registeredFreeLineAccepted(mode, ctx, t, idx)) continue;
+        // A defer inside a capture's scope frees the capture at scope
+        // exit, not the tracked binding (EPH-I0748, EPH-I0780).
         if (ctx.capture_shadowed[idx]) continue;
         if (!lineHasTrackedFree(ctx, t, idx, &join_buf)) continue;
-        // Conditional defer (`defer if (c) free(x);`): may or may not run,
-        // so a pairing is reported at warning severity. The block form
-        // (`defer { if (c) { free(x); } }`) puts the guard on a line above
-        // the free — the walk in deferFreeIsConditional finds it (EPH-I0006).
-        const is_conditional = deferFreeIsConditional(ctx.lines, ctx.in_defer, idx, t);
+        // Conditional defer (`defer if (c) free(x);`): may or may not
+        // run, so a pairing is reported at warning severity. The block
+        // form (`defer { if (c) { free(x); } }`) puts the guard on a
+        // line above the free — the walk in deferFreeIsConditional
+        // finds it (EPH-I0006). Errdefer entries mark true
+        // unconditionally: every errdefer free is path-conditional by
+        // nature, the errdefer pairing grades each pair warning, and no
+        // consumer reads the field for errdefer entries.
+        const is_conditional = if (mode == .defer_frees)
+            deferFreeIsConditional(ctx.lines, ctx.in_defer, idx, t)
+        else
+            true;
         try frees.append(allocator, .{
             .line = ctx.func_line + idx,
             .indent = countIndent(line),
@@ -11435,6 +11488,74 @@ fn collectDeferFrees(
         });
     }
     return frees;
+}
+
+/// The accept filter for collectRegisteredFrees: a defer-mode line must
+/// sit in defer scope (single-line prefix or block) and never in
+/// errdefer scope; an errdefer-mode line must be a single-line errdefer
+/// free without a block opener or a guard if.
+fn registeredFreeLineAccepted(
+    comptime mode: CollectMode,
+    ctx: *const DeferPairCtx,
+    t: []const u8,
+    idx: usize,
+) bool {
+    if (mode == .defer_frees) {
+        if (ctx.in_errdefer[idx] or mem.startsWith(u8, t, "errdefer ")) return false;
+        return ctx.in_defer[idx] or mem.startsWith(u8, t, "defer ");
+    }
+    // Single-line form only: `errdefer {` opens a block (excluded), and
+    // block-body lines never carry the prefix.
+    if (!mem.startsWith(u8, t, "errdefer ")) return false;
+    if (mem.startsWith(u8, t, "errdefer {")) return false;
+    return !hasGuardIfToken(t);
+}
+
+test "collectRegisteredFrees: mode dispatch pins the defer/errdefer filters (EPH-I1232 C9b)" {
+    const a = std.testing.allocator;
+    const lines = [_][]const u8{
+        "    defer allocator.free(buf);",
+        "    errdefer allocator.free(buf);",
+        "    defer {",
+        "        allocator.free(buf);",
+        "    }",
+        "    errdefer {",
+        "        allocator.free(buf);",
+        "    }",
+        "    errdefer if (c) allocator.free(buf);",
+    };
+    const in_defer = [_]bool{ false, false, true, true, true, false, false, false, false };
+    const in_errdefer = [_]bool{ false, false, false, false, false, true, true, false, false };
+    const capture_shadowed = [_]bool{false} ** 9;
+    var aliases = std.StringHashMapUnmanaged([]const u8){};
+    defer aliases.deinit(a);
+    const ctx: DeferPairCtx = .{
+        .lines = &lines,
+        .func_line = 0,
+        .file_path = "pair.zig",
+        .var_name = "buf",
+        .in_defer = &in_defer,
+        .in_errdefer = &in_errdefer,
+        .capture_shadowed = &capture_shadowed,
+        .aliases = &aliases,
+    };
+
+    // Defer mode: the single-line defer free and the block-body free;
+    // the errdefer lines never join.
+    var defers = try collectRegisteredFrees(a, &ctx, .defer_frees);
+    defer defers.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), defers.items.len);
+    try std.testing.expectEqual(@as(usize, 0), defers.items[0].line);
+    try std.testing.expect(!defers.items[0].is_conditional);
+    try std.testing.expectEqual(@as(usize, 3), defers.items[1].line);
+
+    // Errdefer mode: only the single-line unguarded errdefer free; the
+    // block opener and the guarded form stay out, and the mark is true.
+    var errdefers = try collectRegisteredFrees(a, &ctx, .errdefer_frees);
+    defer errdefers.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), errdefers.items.len);
+    try std.testing.expectEqual(@as(usize, 1), errdefers.items[0].line);
+    try std.testing.expect(errdefers.items[0].is_conditional);
 }
 
 /// True when a code-position `if`/`if(` guard token opens on the line:
@@ -11600,14 +11721,15 @@ fn detectDeferDoubleFree(
     ctx: *const DeferPairCtx,
     issues: *std.ArrayListUnmanaged(Issue),
 ) !void {
-    var defer_frees = try collectDeferFrees(allocator, ctx);
+    var defer_frees = try collectRegisteredFrees(allocator, ctx, .defer_frees);
     defer defer_frees.deinit(allocator);
     if (defer_frees.items.len == 0) return;
 
     var sites = try collectDirectFreeSites(allocator, ctx, defer_frees.items);
     defer sites.deinit(allocator);
+    var sink = freeIssueSink(allocator, ctx, issues);
     for (sites.items) |site| {
-        try pairDirectFreeWithDefers(allocator, ctx, site, issues);
+        try pairDirectFreeWithDefers(ctx, site, &sink);
     }
 }
 
@@ -11670,54 +11792,16 @@ fn detectErrdeferDirectFree(
     ctx: *const DeferPairCtx,
     issues: *std.ArrayListUnmanaged(Issue),
 ) !void {
-    var errdefer_frees = try collectErrdeferFrees(allocator, ctx);
+    var errdefer_frees = try collectRegisteredFrees(allocator, ctx, .errdefer_frees);
     defer errdefer_frees.deinit(allocator);
     if (errdefer_frees.items.len == 0) return;
 
     var sites = try collectDirectFreeSites(allocator, ctx, errdefer_frees.items);
     defer sites.deinit(allocator);
+    var sink = freeIssueSink(allocator, ctx, issues);
     for (sites.items) |site| {
-        try pairDirectFreeWithErrdefers(allocator, ctx, site, issues);
+        try pairDirectFreeWithErrdefers(ctx, site, &sink);
     }
-}
-
-/// Collect frees registered through single-line `errdefer free(x);`
-/// statements — the issue's named class (EPH-I0006). Frees inside
-/// `errdefer { ... }` blocks are excluded because the collection walk
-/// matches only the single-line prefix: the block IS the deferred
-/// expression (it runs at scope exit on error and disarms nothing), so a
-/// block-body free is a real pairing candidate the single-line walk never
-/// sees — accepted FN. A CONDITIONAL errdefer free (`errdefer if (flag)
-/// free(x);`) is excluded too: the guard flag couples the free to an
-/// ownership handoff the line model cannot track. Accepted FN: a guarded
-/// errdefer whose guard stays true past a direct free still double-frees.
-fn collectErrdeferFrees(
-    allocator: Allocator,
-    ctx: *const DeferPairCtx,
-) !std.ArrayListUnmanaged(DeferFree) {
-    var frees: std.ArrayListUnmanaged(DeferFree) = .empty;
-    var join_buf: [max_join_bytes]u8 = undefined;
-    for (ctx.lines, 0..) |line, idx| {
-        const t = mem.trim(u8, line, " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        // Single-line form only: `errdefer {` opens a block (excluded), and
-        // block-body lines never carry the prefix.
-        if (!mem.startsWith(u8, t, "errdefer ")) continue;
-        if (mem.startsWith(u8, t, "errdefer {")) continue;
-        if (hasGuardIfToken(t)) continue;
-        if (ctx.capture_shadowed[idx]) continue;
-        if (!lineHasTrackedFree(ctx, t, idx, &join_buf)) continue;
-        try frees.append(allocator, .{
-            .line = ctx.func_line + idx,
-            .indent = countIndent(line),
-            // Informational only: the errdefer pairing grades every pair
-            // warning unconditionally (each errdefer free is path-
-            // conditional by nature), so no consumer reads this field for
-            // errdefer entries.
-            .is_conditional = true,
-        });
-    }
-    return frees;
 }
 
 /// Build the FreeIssueSink for one pairing pass (EPH-I1232): the two
@@ -11741,12 +11825,10 @@ fn freeIssueSink(
 /// two. A fallible statement must follow the pair — without one the
 /// errdefer never fires after the free, the canonical success-path split.
 fn pairDirectFreeWithErrdefers(
-    allocator: Allocator,
     ctx: *const DeferPairCtx,
     site: DirectFreeSite,
-    issues: *std.ArrayListUnmanaged(Issue),
+    sink: *const FreeIssueSink,
 ) !void {
-    const sink = freeIssueSink(allocator, ctx, issues);
     for (site.frees) |ef| {
         const first = @min(ef.line, site.free_line);
         if (hasReassignmentAfter(ctx.lines, ctx.func_line, first, ctx.var_name)) continue;
@@ -11759,7 +11841,7 @@ fn pairDirectFreeWithErrdefers(
         };
         if (hasElseBranchBetween(ctx.lines, ctx.func_line, span)) continue;
         if (hasSwitchArmBetween(ctx.lines, ctx.func_line, span)) continue;
-        try appendDoubleFreeIssue(&sink, .{
+        try appendDoubleFreeIssue(sink, .{
             .t = site.t,
             .line = site.free_line,
             .freed_line = ef.line,
@@ -11822,12 +11904,10 @@ const DirectFreeSite = struct {
 
 /// Pair one direct free with every defer-registered free of the same var.
 fn pairDirectFreeWithDefers(
-    allocator: Allocator,
     ctx: *const DeferPairCtx,
     site: DirectFreeSite,
-    issues: *std.ArrayListUnmanaged(Issue),
+    sink: *const FreeIssueSink,
 ) !void {
-    const sink = freeIssueSink(allocator, ctx, issues);
     for (site.frees) |df| {
         const first = @min(df.line, site.free_line);
         // Reassignment after the first free: safe only when the direct free
@@ -11845,7 +11925,7 @@ fn pairDirectFreeWithDefers(
             continue;
         if (hasSwitchArmBetween(ctx.lines, ctx.func_line, span)) continue;
         const severity: Severity = if (df.is_conditional) .warning else .err;
-        try appendDoubleFreeIssue(&sink, .{
+        try appendDoubleFreeIssue(sink, .{
             .t = site.t,
             .line = site.free_line,
             .freed_line = df.line,
@@ -13507,15 +13587,7 @@ fn returnTupleTransfersHere(
     for (idx..limit) |i| {
         const t = mem.trim(u8, lines[i], " \t\r");
         if (scan.remaining > 0) {
-            scan.remaining -= 1;
-            if (findTagInCode(t, "};", 0) != null) scan.remaining = 0;
-            const hit = isReturnTupleElement(t, name, .{
-                .from = 0,
-                .to = t.len,
-                .base_depth = scan.paren_depth,
-            });
-            scan.paren_depth = parenDepthAt(t, 0, t.len, scan.paren_depth);
-            if (hit) return true;
+            if (advanceReturnTupleScan(t, name, &scan)) return true;
             continue;
         }
         // Opener detection: `return .{` (anon tuple) or `return Type{`
@@ -14320,30 +14392,53 @@ fn exitFreeSpanHasExitKeyword(
         if (first or b.end_line > max_line) max_line = b.end_line;
         first = false;
     }
-    if (!first and spanHasExitKeyword(ctx.lines, ctx.func_line, min_line, max_line)) return true;
+    if (!first and
+        scanRangeHasExitKeyword(ctx.lines, ctx.func_line, min_line, max_line)) return true;
     const hb = ctx.cfg.blocks.items[header_bid];
     if (hb.start_line == 0 or hb.end_line < hb.start_line) return false;
     return conditionSpanHasExitKeyword(ctx.lines, ctx.func_line, hb.start_line, hb.end_line);
 }
 
-/// True when a masked line in `min_line..max_line` (inclusive) carries
+/// True when a masked line in `start_line..end_line` (inclusive) carries
 /// an exit keyword (EPH-I0116). Lines shorter than the mask buffer are
-/// blanked code; longer lines fall back raw (documented bound).
-fn spanHasExitKeyword(
+/// blanked code; longer lines fall back raw (documented bound). The two
+/// exit-keyword range probes (spanHasExitKeyword's former walk,
+/// conditionSpanHasExitKeyword's second walk) share the scan.
+fn scanRangeHasExitKeyword(
     lines: []const []const u8,
     func_line: usize,
-    min_line: usize,
-    max_line: usize,
+    start_line: usize,
+    end_line: usize,
 ) bool {
     var blank_buf: [16 * 1024]u8 = undefined;
-    var line_num = min_line;
-    while (line_num <= max_line) : (line_num += 1) {
+    var line_num = start_line;
+    while (line_num <= end_line) : (line_num += 1) {
         if (line_num < func_line) continue;
         const idx = line_num - func_line;
         if (idx >= lines.len) break;
         if (maskedLineHasExitKeyword(lines[idx], &blank_buf)) return true;
     }
     return false;
+}
+
+/// First line in the range carrying a word-bounded while/for keyword, or
+/// the range's last line when none appears (conditionSpanHasExitKeyword
+/// narrows its exit scan to the loop header's condition).
+fn firstWhileForLine(
+    lines: []const []const u8,
+    func_line: usize,
+    range: LineRange,
+) usize {
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var line_num = range.from_line;
+    while (line_num <= range.to_line) : (line_num += 1) {
+        if (line_num < func_line) continue;
+        const idx = line_num - func_line;
+        if (idx >= lines.len) break;
+        const code = maskedCodeLine(lines[idx], &blank_buf);
+        if (hasRealKeyword(code, "while") or hasRealKeyword(code, "for")) return line_num;
+    }
+    return range.to_line;
 }
 
 /// True when a masked line in the header's CONDITION range carries an
@@ -14356,27 +14451,11 @@ fn conditionSpanHasExitKeyword(
     start_line: usize,
     end_line: usize,
 ) bool {
-    var cond_start = end_line;
-    var blank_buf: [16 * 1024]u8 = undefined;
-    var line_num = start_line;
-    while (line_num <= end_line) : (line_num += 1) {
-        if (line_num < func_line) continue;
-        const idx = line_num - func_line;
-        if (idx >= lines.len) break;
-        const code = maskedCodeLine(lines[idx], &blank_buf);
-        if (hasRealKeyword(code, "while") or hasRealKeyword(code, "for")) {
-            cond_start = line_num;
-            break;
-        }
-    }
-    line_num = cond_start;
-    while (line_num <= end_line) : (line_num += 1) {
-        if (line_num < func_line) continue;
-        const idx = line_num - func_line;
-        if (idx >= lines.len) break;
-        if (maskedLineHasExitKeyword(lines[idx], &blank_buf)) return true;
-    }
-    return false;
+    const cond_start = firstWhileForLine(lines, func_line, .{
+        .from_line = start_line,
+        .to_line = end_line,
+    });
+    return scanRangeHasExitKeyword(lines, func_line, cond_start, end_line);
 }
 
 /// True when the masked code of one line carries a word-bounded
@@ -14496,21 +14575,31 @@ fn isExitBlock(cfg: *ControlFlowGraph, bid: usize) bool {
     return false;
 }
 
-/// Check defer coverage for a single allocation using CFG dataflow
-/// Build a partial-coverage issue for an alloc that has defer on some but not all paths
-fn buildPartialCoverageIssue(file_path: []const u8, alloc: CFGAlloc) Issue {
+/// The shared head of the defer-coverage issues (buildPartialCoverageIssue,
+/// buildMissingDeferIssue): anchor, severity, and the create-vs-alloc rule
+/// select. The message and help stay per-builder.
+fn deferCoverageIssueHead(file_path: []const u8, alloc: CFGAlloc) Issue {
     return Issue{
         .file = file_path,
         .line = alloc.line,
         .col = alloc.col,
         .severity = .warning,
         .rule = if (alloc.is_create) RULE_CREATE_NO_DEFER else RULE_ALLOC_NO_DEFER,
-        .message = if (alloc.is_create)
-            "defer destroy() not on all code paths"
-        else
-            "defer free() not on all code paths",
-        .help = "move defer to outer scope or add defer on all branches",
+        .message = "",
+        .help = null,
     };
+}
+
+/// Check defer coverage for a single allocation using CFG dataflow
+/// Build a partial-coverage issue for an alloc that has defer on some but not all paths
+fn buildPartialCoverageIssue(file_path: []const u8, alloc: CFGAlloc) Issue {
+    var issue = deferCoverageIssueHead(file_path, alloc);
+    issue.message = if (alloc.is_create)
+        "defer destroy() not on all code paths"
+    else
+        "defer free() not on all code paths";
+    issue.help = "move defer to outer scope or add defer on all branches";
+    return issue;
 }
 
 /// Build a missing-defer issue for an alloc with no defer anywhere in the
@@ -14518,18 +14607,13 @@ fn buildPartialCoverageIssue(file_path: []const u8, alloc: CFGAlloc) Issue {
 /// coverage that does not exist. A direct free on some branch does not
 /// change the verdict — the rule reports the missing defer.
 fn buildMissingDeferIssue(file_path: []const u8, alloc: CFGAlloc) Issue {
-    return Issue{
-        .file = file_path,
-        .line = alloc.line,
-        .col = alloc.col,
-        .severity = .warning,
-        .rule = if (alloc.is_create) RULE_CREATE_NO_DEFER else RULE_ALLOC_NO_DEFER,
-        .message = if (alloc.is_create)
-            "missing defer destroy(): no defer frees this allocation"
-        else
-            "missing defer free(): no defer frees this allocation",
-        .help = "add a defer right after the allocation so it runs on every exit path",
-    };
+    var issue = deferCoverageIssueHead(file_path, alloc);
+    issue.message = if (alloc.is_create)
+        "missing defer destroy(): no defer frees this allocation"
+    else
+        "missing defer free(): no defer frees this allocation";
+    issue.help = "add a defer right after the allocation so it runs on every exit path";
+    return issue;
 }
 
 fn checkDeferCoverageForAlloc(
@@ -18178,23 +18262,13 @@ fn classifyReturnType(ret: []const u8) ReturnKind {
     return .value;
 }
 
-/// Advance `depth` for one byte of a type walk: openers increment, closers
-/// decrement (saturating), everything else is neutral.
-fn typeDepthStep(c: u8, depth: *usize) void {
-    if (c == '(' or c == '[' or c == '{') {
-        depth.* += 1;
-        return;
-    }
-    if (c == ')' or c == ']' or c == '}') depth.* -|= 1;
-}
-
 /// Index of the first `!` at paren/bracket/brace depth 0 in `t`, or null.
 /// A bang nested inside another type never registers as the outer
 /// error-union operator (EPH-I1066).
 fn topLevelBangIndex(t: []const u8) ?usize {
     var depth: usize = 0;
     for (t, 0..) |c, i| {
-        typeDepthStep(c, &depth);
+        foldBracketDepth(&depth, c);
         if (c == '!' and depth == 0) return i;
     }
     return null;
@@ -18207,7 +18281,7 @@ fn topLevelFnTypeStart(t: []const u8) ?usize {
     var depth: usize = 0;
     var i: usize = 0;
     while (i + 2 <= t.len) : (i += 1) {
-        typeDepthStep(t[i], &depth);
+        foldBracketDepth(&depth, t[i]);
         if (depth != 0 or t[i] != 'f' or !mem.startsWith(u8, t[i..], "fn")) continue;
         if (i > 0 and isIdent(t[i - 1])) continue;
         const after = i + 2;
@@ -18335,20 +18409,7 @@ fn extractFnReturnType(t: []const u8) ?[]const u8 {
     const open_paren = findTagInCode(t, "(", fn_pos) orelse return null;
     // Walk to find the matching closing paren (handle nested parens)
     var depth: usize = 0;
-    var close_paren: ?usize = null;
-    for (t[open_paren..], 0..) |c, offset| {
-        if (c == '(') {
-            depth += 1;
-            continue;
-        }
-        if (c != ')') continue;
-        depth -= 1;
-        if (depth == 0) {
-            close_paren = open_paren + offset;
-            break;
-        }
-    }
-    const cp = close_paren orelse return null;
+    const cp = matchingParenCol(t, open_paren, &depth) orelse return null;
     // Text between close paren and the body brace is the return type.
     // Error-set literal braces (`error{OutOfMemory}`) are balanced, not a
     // boundary: a first-`{` end would resolve a `error{...}!T {` joined
@@ -18613,22 +18674,6 @@ const FnSigScan = struct {
     close_idx: usize,
 };
 
-/// Walk one continuation line for the paren that closes the signature's
-/// parameter list (depth carries across lines). Returns its offset or
-/// null when the line does not close it.
-fn closerInLine(masked: []const u8, depth: *usize) ?usize {
-    for (masked, 0..) |c, offset| {
-        if (c == '(') {
-            depth.* += 1;
-            continue;
-        }
-        if (c != ')') continue;
-        depth.* -= 1;
-        if (depth.* == 0) return offset;
-    }
-    return null;
-}
-
 /// Return-type text for an Allman-style closer line (`)` alone): the
 /// first following line up to its `{`. Hand-formatted code only; zig fmt
 /// always emits `) T {` on one line (EPH-I0388).
@@ -18671,17 +18716,9 @@ fn scanFnSignatureRet(
     const fn_pos = realTokenPos(t, "fn") orelse return null;
     const open_paren = findTagInCode(t, "(", fn_pos) orelse return null;
     var depth: usize = 0;
-    for (t[open_paren..], 0..) |c, offset| {
-        if (c == '(') {
-            depth += 1;
-            continue;
-        }
-        if (c != ')') continue;
-        depth -= 1;
-        if (depth == 0) {
-            const ret = returnTypeAfter(t[open_paren + offset + 1 ..]) orelse return null;
-            return .{ .ret = ret, .close_idx = idx };
-        }
+    if (matchingParenCol(t, open_paren, &depth)) |cp| {
+        const ret = returnTypeAfter(t[cp + 1 ..]) orelse return null;
+        return .{ .ret = ret, .close_idx = idx };
     }
     // Multi-line: the closer sits on a continuation line.
     return scanContinuationRet(lines, idx, &depth);
@@ -18705,7 +18742,10 @@ fn scanContinuationRet(
         const raw = lines[li];
         const code_end = findCommentStart(raw) orelse raw.len;
         const masked = blankLiteralContents(raw[0..code_end], &blank_buf);
-        if (closerInLine(masked, depth)) |offset| {
+        // matchingParenCol walks one line for the closer; depth carries
+        // across continuation lines (the line's own offset IS the column,
+        // so a zero open base returns it directly).
+        if (matchingParenCol(masked, 0, depth)) |offset| {
             // The closer line may carry the return type (`) !void {`) or
             // stand alone (Allman style: the type is on a later line).
             const rest = mem.trimStart(u8, raw[offset + 1 ..], " \t\r");
@@ -19243,32 +19283,38 @@ const ReturnTupleScan = struct {
     paren_depth: usize = 0,
 };
 
+/// Advance the armed multi-line return-tuple scan across one line and
+/// report the element-hit verdict (returnTupleTransfersHere,
+/// checkReturnTupleLine share the armed branch; the unarmed opener
+/// probes stay per-caller). Both closer probes are code-position-masked:
+/// a `};` inside a string or comment is data and must not disarm the
+/// scan early (EPH-I0900).
+fn advanceReturnTupleScan(t: []const u8, name: []const u8, scan: *ReturnTupleScan) bool {
+    scan.remaining -= 1;
+    if (findTagInCode(t, "};", 0) != null) scan.remaining = 0;
+    const hit = isReturnTupleElement(t, name, .{
+        .from = 0,
+        .to = t.len,
+        .base_depth = scan.paren_depth,
+    });
+    scan.paren_depth = parenDepthAt(t, 0, t.len, scan.paren_depth);
+    return hit;
+}
+
 /// Track a multi-line `return .{ ... };` tuple across lines (bounded). While
 /// armed (`scan.remaining > 0`) each line is checked for the alloc name as a
 /// tuple element at the carried paren depth until the `};` closer; otherwise
 /// an unclosed `return .{` opener arms the scan (the opener line itself may
-/// carry the first element). Both closer probes are code-position-masked: a
-/// `};` inside a string or comment is data and must not disarm the scan
-/// early or hide a real opener (EPH-I0900). All per-line checks run on the
-/// caller's masked code (comments stripped, literal contents blanked), so
-/// comment text mentioning the alloc name, and unbalanced parens inside
-/// comments or char literals, cannot skew the element match or the carried
-/// paren depth (EPH-I0369 mechanism; residual (3) of EPH-I0063 re-verified
-/// dead at batch 14 — probe `.tmp/probe-b14/i0063_res3.zig` and corpus scan:
-/// 40 comment lines with trailing identifiers inside 1192 multi-line return
-/// regions, 2 with unbalanced parens; none affect the verdict).
+/// carry the first element). All per-line checks run on the caller's masked
+/// code (comments stripped, literal contents blanked), so comment text
+/// mentioning the alloc name, and unbalanced parens inside comments or char
+/// literals, cannot skew the element match or the carried paren depth
+/// (EPH-I0369 mechanism; residual (3) of EPH-I0063 re-verified dead at batch
+/// 14 — probe `.tmp/probe-b14/i0063_res3.zig` and corpus scan: 40 comment
+/// lines with trailing identifiers inside 1192 multi-line return regions, 2
+/// with unbalanced parens; none affect the verdict).
 fn checkReturnTupleLine(t: []const u8, name: []const u8, scan: *ReturnTupleScan) bool {
-    if (scan.remaining > 0) {
-        scan.remaining -= 1;
-        if (findTagInCode(t, "};", 0) != null) scan.remaining = 0;
-        const hit = isReturnTupleElement(t, name, .{
-            .from = 0,
-            .to = t.len,
-            .base_depth = scan.paren_depth,
-        });
-        scan.paren_depth = parenDepthAt(t, 0, t.len, scan.paren_depth);
-        return hit;
-    }
+    if (scan.remaining > 0) return advanceReturnTupleScan(t, name, scan);
     const expr = afterReturnKeyword(t) orelse return false;
     if (!mem.startsWith(u8, expr, ".{")) return false;
     // Closed on this line — isReturnTransfer's single-line job.

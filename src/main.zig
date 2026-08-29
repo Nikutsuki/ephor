@@ -49739,9 +49739,12 @@ const quality_todo_label = "TO" ++ "DO/FIX" ++ "ME";
 /// print constant zeros that read as a parse run (EPH-I0588). The Files
 /// line is the graph count, so a check summary includes the joined entry
 /// points while a stats run counts the scan path alone (EPH-I0541).
+/// Each block splits into the shared value head (printStatsCore) and a
+/// format-specific tail, so the shared value run lives in one copy
+/// (EPH-I1232 C7, REL-GATE-2, REL-AB-5).
 fn printStats(s: ProjectStats, format: OutputFormat) void {
     if (format == .json) {
-        std.debug.print(
+        printStatsCore(
             \\{{
             \\  "files": {d},
             \\  "total_lines": {d},
@@ -49751,24 +49754,17 @@ fn printStats(s: ProjectStats, format: OutputFormat) void {
             \\  "public_functions": {d},
             \\  "tests": {d},
             \\  "files_with_tests": {d},
-            \\  "not_implemented": {d},
-            \\  "todos": {d}
-            \\}}
-            \\
-        , .{
-            s.total_files,
-            s.total_lines,
-            s.code_lines,
-            s.comment_lines,
-            s.blank_lines,
-            s.pub_fn_count,
-            s.test_count,
-            s.files_with_tests,
-            s.not_implemented_count,
-            s.todo_count,
-        });
-    } else {
+        , s);
+        // The JSON tail opens with the line break the core template's
+        // last line would have carried: a multiline template contributes
+        // no trailing newline after its final line, and the pre-split
+        // block rendered that break.
         std.debug.print(
+            "\n  \"not_implemented\": {d},\n  \"todos\": {d}\n}}\n",
+            .{ s.not_implemented_count, s.todo_count },
+        );
+    } else {
+        printStatsCore(
             \\ephor stats
             \\
             \\Files:          {d}
@@ -49779,26 +49775,40 @@ fn printStats(s: ProjectStats, format: OutputFormat) void {
             \\
             \\Public funcs:   {d}
             \\Tests:          {d}
-            \\Files w/tests:  {d} ({d}%)
+            \\Files w/tests:  {d}
+        , s);
+        // The text tail opens mid-line (" ({d}%)"): the split point sits
+        // where the shared value run ends, and the rendered block stays
+        // byte-identical to the pre-split print.
+        std.debug.print(
+            \\ ({d}%)
             \\
             \\NotImplemented: {d}
             \\{s}:     {d}
             \\
         , .{
-            s.total_files,
-            s.total_lines,
-            s.code_lines,
-            s.comment_lines,
-            s.blank_lines,
-            s.pub_fn_count,
-            s.test_count,
-            s.files_with_tests,
             if (s.total_files > 0) s.files_with_tests * 100 / s.total_files else 0,
             s.not_implemented_count,
             quality_todo_label,
             s.todo_count,
         });
     }
+}
+
+/// The stats value head both stats blocks share (EPH-I1232 C7,
+/// REL-GATE-2, REL-AB-5): total_files through files_with_tests, in
+/// template order. One copy feeds the JSON and the text templates.
+fn printStatsCore(comptime fmt: []const u8, s: ProjectStats) void {
+    std.debug.print(fmt, .{
+        s.total_files,
+        s.total_lines,
+        s.code_lines,
+        s.comment_lines,
+        s.blank_lines,
+        s.pub_fn_count,
+        s.test_count,
+        s.files_with_tests,
+    });
 }
 
 /// Per-category summary buckets. One bucket per report category plus an
@@ -49848,14 +49858,16 @@ const summary_json_buf_bytes = 1536;
 /// they already read. The issues member gains an explicit "notes" count;
 /// "total" counts every printed finding (warnings plus errors plus notes),
 /// and "status" reflects that total, so a notes-only run never reports
-/// ok (EPH-I0535).
+/// ok (EPH-I0535). The head shares its value run with the text summary
+/// (formatSummaryCore, EPH-I1232 C7); the tail keeps the JSON-only
+/// todos/status/suppressed members.
 fn formatSummaryJson(
     buf: []u8,
     counts: IssueCounts,
     s: ProjectStats,
     suppression: SuppressionStats,
 ) ![]const u8 {
-    const head = try std.fmt.bufPrint(buf,
+    const head = try formatSummaryCore(
         \\{{
         \\  "summary": {{
         \\    "files": {d},
@@ -49879,40 +49891,30 @@ fn formatSummaryJson(
         \\    }},
         \\    "quality": {{
         \\      "not_implemented": {d},
-        \\      "todos": {d}
-        \\    }},
-        \\    "status": "{s}",
-    , .{
-        s.total_files,
-        s.code_lines,
-        s.ast_parsed,
-        s.ast_skipped,
-        counts.orphan,
-        counts.memory,
-        counts.err,
-        counts.unused,
-        counts.complexity,
-        counts.fmt,
-        counts.style,
-        counts.null_safety,
-        counts.panic,
-        counts.tests,
-        counts.concurrency,
-        counts.notes,
-        counts.total(),
-        s.not_implemented_count,
-        s.todo_count,
-        if (counts.total() == 0) "ok" else "issues_found",
-    });
+    , buf, counts, s);
     var mbuf: [256]u8 = undefined;
     // Overflow is impossible: 92 fixed bytes + 5 usize values (<=20 digits
     // each) = 192 bytes worst case.
     const member = try formatSuppressedJson(&mbuf, suppression);
-    const tail = try std.fmt.bufPrint(
-        buf[head.len..],
-        "    \"suppressed\": {s}\n  }}\n}}\n",
-        .{member},
-    );
+    // The tail opens with the break the head template's last line would
+    // have carried (the empty first \\ line supplies it), and keeps the
+    // original byte shape: the status and suppressed members share one
+    // rendered line (the original head template ended at the status
+    // placeholder, so no break followed it), and the empty last line
+    // keeps the trailing break.
+    const tail = try std.fmt.bufPrint(buf[head.len..],
+        \\
+        \\      "todos": {d}
+        \\    }},
+        \\    "status": "{s}",    "suppressed": {s}
+        \\  }}
+        \\}}
+        \\
+    , .{
+        s.todo_count,
+        if (counts.total() == 0) "ok" else "issues_found",
+        member,
+    });
     return buf[0 .. head.len + tail.len];
 }
 
@@ -49933,9 +49935,11 @@ fn printSummaryJson(counts: IssueCounts, s: ProjectStats, suppression: Suppressi
 /// Format the text summary with the STATUS line into `buf`. The AST-tier
 /// line (EPH-I0200) keeps parse coverage visible in every --summary run.
 /// The Notes line and the TOTAL (which includes notes) keep the summary
-/// consistent with the footer and the exit code (EPH-I0535).
+/// consistent with the footer and the exit code (EPH-I0535). The head
+/// shares its value run with the JSON summary (formatSummaryCore,
+/// EPH-I1232 C7); the tail keeps the text-only label/status shape.
 fn formatSummaryText(buf: []u8, counts: IssueCounts, s: ProjectStats) ![]const u8 {
-    return std.fmt.bufPrint(buf,
+    const head = try formatSummaryCore(
         \\
         \\ephor summary
         \\
@@ -49957,11 +49961,33 @@ fn formatSummaryText(buf: []u8, counts: IssueCounts, s: ProjectStats) ![]const u
         \\  Notes:      {d}
         \\  TOTAL:      {d}
         \\
-        \\Quality: NotImplemented={d} {s}={d}
-        \\
-        \\STATUS: {s}
-        \\
-    , .{
+        \\Quality: NotImplemented={d} 
+    , buf, counts, s);
+    // The tail opens mid-line: the split point sits where the shared
+    // value run ends, and the rendered block stays byte-identical to the
+    // pre-split print.
+    const tail = try std.fmt.bufPrint(
+        buf[head.len..],
+        "{s}={d}\n\nSTATUS: {s}\n",
+        .{
+            quality_todo_label,
+            s.todo_count,
+            if (counts.total() == 0) "OK" else "ISSUES FOUND",
+        },
+    );
+    return buf[0 .. head.len + tail.len];
+}
+
+/// The summary value run both summary templates open with (EPH-I1232 C7,
+/// REL-GATE-2, REL-AB-5): total_files through not_implemented, in
+/// template order. One copy feeds the JSON and the text summary heads.
+fn formatSummaryCore(
+    comptime fmt: []const u8,
+    buf: []u8,
+    counts: IssueCounts,
+    s: ProjectStats,
+) ![]const u8 {
+    return std.fmt.bufPrint(buf, fmt, .{
         s.total_files,
         s.code_lines,
         s.ast_parsed,
@@ -49980,9 +50006,6 @@ fn formatSummaryText(buf: []u8, counts: IssueCounts, s: ProjectStats) ![]const u
         counts.notes,
         counts.total(),
         s.not_implemented_count,
-        quality_todo_label,
-        s.todo_count,
-        if (counts.total() == 0) "OK" else "ISSUES FOUND",
     });
 }
 
@@ -50339,6 +50362,24 @@ fn printOrphansEntryList(allocator: Allocator, entries: []const []const u8) !voi
     }
 }
 
+/// Init, scan, and require files for one check-family command handler
+/// (EPH-I1232 C7, REL-GATE-2, REL-AB-5): the shared prologue seven
+/// handlers carried verbatim. Returns null when the scan resolved to
+/// zero Zig files: ctx.should_exit_error is set and the caller returns.
+/// The caller owns the returned graph and calls deinit.
+fn initScannedGraph(ctx: *RunCtx) !?ImportGraph {
+    var g = ImportGraph.init(ctx.alloc, ctx.diag);
+    errdefer g.deinit();
+    g.scan_root = ctx.base_path;
+    try scanPath(&g, ctx.cfg.path);
+    requireScannedFiles(ctx, &g);
+    if (ctx.should_exit_error) {
+        g.deinit();
+        return null;
+    }
+    return g;
+}
+
 /// `orphans` command: report files no entry point can reach.
 fn handleOrphans(ctx: *RunCtx) !void {
     if (ctx.cfg.entries.items.len == 0) {
@@ -50348,12 +50389,8 @@ fn handleOrphans(ctx: *RunCtx) !void {
     }
     if (ctx.cfg.verbose) try printOrphansEntryList(ctx.alloc, ctx.cfg.entries.items);
     try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
-    var g = ImportGraph.init(ctx.alloc, ctx.diag);
+    var g = (try initScannedGraph(ctx)) orelse return;
     defer g.deinit();
-    g.scan_root = ctx.base_path;
-    try scanPath(&g, ctx.cfg.path);
-    requireScannedFiles(ctx, &g);
-    if (ctx.should_exit_error) return;
     for (ctx.cfg.entries.items) |e| try g.markReachable(e);
     try g.markBuildPathReferences(ctx.cfg);
     var issues = try g.getOrphanIssues(ctx.alloc, ctx.cfg);
@@ -50368,12 +50405,8 @@ fn handleOrphans(ctx: *RunCtx) !void {
 /// `memory` command: CFG-based allocation checks plus the AST tier (ZA111).
 fn handleMemory(ctx: *RunCtx) !void {
     try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
-    var g = ImportGraph.init(ctx.alloc, ctx.diag);
+    var g = (try initScannedGraph(ctx)) orelse return;
     defer g.deinit();
-    g.scan_root = ctx.base_path;
-    try scanPath(&g, ctx.cfg.path);
-    requireScannedFiles(ctx, &g);
-    if (ctx.should_exit_error) return;
     var issues = try analyzeCFGMemory(ctx.alloc, &g);
     defer deinitIssues(&issues, ctx.alloc);
     // AST tier (ZA111) is a memory-family rule — include it here too.
@@ -50403,12 +50436,8 @@ fn handleMemory(ctx: *RunCtx) !void {
 /// `errors` command: error-handling findings plus discarded error unions.
 fn handleErrors(ctx: *RunCtx) !void {
     try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
-    var g = ImportGraph.init(ctx.alloc, ctx.diag);
+    var g = (try initScannedGraph(ctx)) orelse return;
     defer g.deinit();
-    g.scan_root = ctx.base_path;
-    try scanPath(&g, ctx.cfg.path);
-    requireScannedFiles(ctx, &g);
-    if (ctx.should_exit_error) return;
     var issues = try analyzeErrors(ctx.alloc, &g);
     defer deinitIssues(&issues, ctx.alloc);
     // ZA205: discarded error union results
@@ -50430,12 +50459,8 @@ fn handleErrors(ctx: *RunCtx) !void {
 /// `unused` command: dead-code findings.
 fn handleUnused(ctx: *RunCtx) !void {
     try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
-    var g = ImportGraph.init(ctx.alloc, ctx.diag);
+    var g = (try initScannedGraph(ctx)) orelse return;
     defer g.deinit();
-    g.scan_root = ctx.base_path;
-    try scanPath(&g, ctx.cfg.path);
-    requireScannedFiles(ctx, &g);
-    if (ctx.should_exit_error) return;
     var issues = try analyzeUnused(ctx.alloc, &g);
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "unused", ctx.reportOut(&g));
@@ -50446,12 +50471,8 @@ fn handleUnused(ctx: *RunCtx) !void {
 /// `complexity` command: function-size and branch-metric findings.
 fn handleComplexity(ctx: *RunCtx) !void {
     try loadKnownIssues(ctx.diag, ctx.alloc, ctx.cfg);
-    var g = ImportGraph.init(ctx.alloc, ctx.diag);
+    var g = (try initScannedGraph(ctx)) orelse return;
     defer g.deinit();
-    g.scan_root = ctx.base_path;
-    try scanPath(&g, ctx.cfg.path);
-    requireScannedFiles(ctx, &g);
-    if (ctx.should_exit_error) return;
     var issues = try analyzeComplexity(ctx.alloc, &g, ctx.cfg.thresholds);
     defer deinitIssues(&issues, ctx.alloc);
     const c = printIssues(issues.items, "complexity", ctx.reportOut(&g));
@@ -50471,12 +50492,8 @@ fn handleFmtCheck(ctx: *RunCtx) !void {
 
 /// `stats` command: project scan counters, no findings.
 fn handleStats(ctx: *RunCtx) !void {
-    var g = ImportGraph.init(ctx.alloc, ctx.diag);
+    var g = (try initScannedGraph(ctx)) orelse return;
     defer g.deinit();
-    g.scan_root = ctx.base_path;
-    try scanPath(&g, ctx.cfg.path);
-    requireScannedFiles(ctx, &g);
-    if (ctx.should_exit_error) return;
     printStats(g.getStats(), ctx.cfg.format);
 }
 
@@ -50485,12 +50502,8 @@ fn handleStats(ctx: *RunCtx) !void {
 /// (EPH-I1088). No diagnostics print between the listing and the footer
 /// line, so the JSON stream stays a single machine document.
 fn handleListTests(ctx: *RunCtx) !void {
-    var g = ImportGraph.init(ctx.alloc, ctx.diag);
+    var g = (try initScannedGraph(ctx)) orelse return;
     defer g.deinit();
-    g.scan_root = ctx.base_path;
-    try scanPath(&g, ctx.cfg.path);
-    requireScannedFiles(ctx, &g);
-    if (ctx.should_exit_error) return;
     var blocks = try collectTestBlocks(ctx.alloc, &g);
     defer blocks.deinit(ctx.alloc);
     printTestListing(ctx.alloc, blocks.items, ctx.cfg.format);
@@ -51849,6 +51862,55 @@ test "zero-zig-files scan is a usage error (EPH-I0726)" {
     try std.testing.expectEqual(@as(usize, 1), g2.files.count());
     requireScannedFiles(&ctx, &g2);
     try std.testing.expect(!ctx.should_exit_error);
+}
+
+test "initScannedGraph scans files and nulls on an empty scan (EPH-I1232 C7)" {
+    // The seven check-family handlers share one graph prologue. The
+    // helper must return the scanned graph for a Zig-bearing tree and
+    // null plus the usage-error flag for a Zig-less one — the same
+    // contract requireScannedFiles pins (EPH-I0726).
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "pub fn a() void {}\n" });
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    var cache = IgnoreCache.init(allocator);
+    defer cache.deinit();
+    var ctx = RunCtx{
+        .alloc = allocator,
+        .cfg = &cfg,
+        .diag = &diag,
+        .base_path = ".",
+        .ignore_cache = &cache,
+    };
+
+    // path_owned stays false: the test frees its own path dupes.
+    const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(dir_path);
+    cfg.path = dir_path;
+    var g = (try initScannedGraph(&ctx)) orelse return error.TestUnexpectedResult;
+    defer g.deinit();
+    try std.testing.expectEqual(@as(usize, 1), g.files.count());
+    try std.testing.expect(!ctx.should_exit_error);
+
+    // A Zig-less tree returns null and sets the usage-error flag.
+    var empty = std.testing.tmpDir(.{});
+    defer empty.cleanup();
+    const empty_path = try empty.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(empty_path);
+    cfg.path = empty_path;
+    ctx.should_exit_error = false;
+    const g2 = try initScannedGraph(&ctx);
+    try std.testing.expect(g2 == null);
+    try std.testing.expect(ctx.should_exit_error);
+    try std.testing.expect(
+        mem.indexOf(u8, capture.slice(), "error: no Zig files found at") != null,
+    );
 }
 
 test "stats file count is the graph count: joined out-of-root entries count once (EPH-I0541)" {
@@ -117605,29 +117667,13 @@ test "ZA210: off by default; explicit enable turns it on" {
 // ============================================================================
 
 /// Default-config builder for rule-gating tests (no allocations to free).
+/// Derives from the CLI default (EPH-I1232 C7, REL-GATE-2, REL-AB-5):
+/// the two literals were the same 21-line shape, and the test contract is
+/// "the CLI default config", so a future Config field lands in the test
+/// view without a second literal to forget. Tests that need an override
+/// mutate the returned copy explicitly.
 fn testConfig() Config {
-    return .{
-        .command = .check,
-        .path = "src",
-        .path_owned = false,
-        .entries = .empty,
-        .exclude = .empty,
-        .orphan_exclude = .empty,
-        .disabled_rules = .empty,
-        .enabled_rules = .empty,
-        .verbose = false,
-        .show_summary = false,
-        .format = .text,
-        .thresholds = .{},
-        .init_build = false,
-        .export_path = null,
-        .known_issues_path = null,
-        .known_issues = .empty,
-        .auto_approve = false,
-        .runtime_command = null,
-        .install_version = null,
-        .include_parent = false,
-    };
+    return cli_default_config;
 }
 
 /// Test helper: build a one-file graph and run analyzeIntCastGuards (ZA904).

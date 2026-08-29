@@ -509,7 +509,7 @@ ZA305 and ZA306 are off by default. To enable them, remove `"ZA305"` and `"ZA306
 | **ZA501** | warning | ON | Orphan file (not imported from entry points) |
 | **ZA502** | warning | ON | File reaches or exceeds the 10 MiB source read cap and is skipped from analysis (split the file into smaller units) |
 | **ZA503** | warning | ON | File does not parse (the AST tier's host-parser check rejected it): one finding per file, located at the first parse error, naming the error. The line tier still scans the file, but `zig build` cannot compile it (EPH-I0742) |
-| **ZA504** | warning | OFF | Duplicated block: a run of 6 or more normalized lines that repeats within one file or across files (copy-paste duplication, EPH-I1076). Off by default until the zero-line cleanup wave burns ephor's own duplicated blocks; flips ON at the same commit (EPH-I1232) |
+| **ZA504** | warning | ON | Duplicated block: a run of 6 or more normalized lines that repeats within one file or across files (copy-paste duplication, EPH-I1076) |
 
 **ZA504 and normalization:** the normalized form of a line strips `//`
 comments (quote-aware), trims surrounding whitespace, and drops blank

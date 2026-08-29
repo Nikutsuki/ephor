@@ -42328,10 +42328,6 @@ const Config = struct {
         if (mem.eql(u8, rule, RULE_FILE_TOO_LONG)) return true;
         if (mem.eql(u8, rule, RULE_CYCLOMATIC)) return true;
         if (mem.eql(u8, rule, RULE_COGNITIVE)) return true;
-        // ZA504 lands OFF until the zero-line cleanup wave burns ephor's
-        // own duplicated blocks (EPH-I1232); the flip commit removes this
-        // line and turns the README row ON.
-        if (mem.eql(u8, rule, RULE_DUPLICATED_BLOCK)) return true;
         for (off_by_default_prefixes) |prefix| {
             if (mem.startsWith(u8, rule, prefix)) return true;
         }

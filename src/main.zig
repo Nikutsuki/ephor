@@ -11286,12 +11286,7 @@ fn collectDeferFrees(
         // A defer inside a capture's scope frees the capture at scope exit,
         // not the tracked binding (EPH-I0748, EPH-I0780).
         if (ctx.capture_shadowed[idx]) continue;
-        if (!hasRealFreePattern(t)) continue;
-        if (!isDirectFreeOfVarOrAlias(
-            joinParenContinuation(ctx.lines, idx, &join_buf),
-            ctx.var_name,
-            ctx.aliases,
-        )) continue;
+        if (!lineHasTrackedFree(ctx, t, idx, &join_buf)) continue;
         // Conditional defer (`defer if (c) free(x);`): may or may not run,
         // so a pairing is reported at warning severity. The block form
         // (`defer { if (c) { free(x); } }`) puts the guard on a line above
@@ -11473,6 +11468,40 @@ fn detectDeferDoubleFree(
     defer defer_frees.deinit(allocator);
     if (defer_frees.items.len == 0) return;
 
+    var sites = try collectDirectFreeSites(allocator, ctx, defer_frees.items);
+    defer sites.deinit(allocator);
+    for (sites.items) |site| {
+        try pairDirectFreeWithDefers(allocator, ctx, site, issues);
+    }
+}
+
+/// True when this line is a direct free of the tracked var (EPH-I1232):
+/// the pattern gate plus the join-aware var check the three free scans
+/// share.
+fn lineHasTrackedFree(
+    ctx: *const DeferPairCtx,
+    t: []const u8,
+    idx: usize,
+    join_buf: *[max_join_bytes]u8,
+) bool {
+    if (!hasRealFreePattern(t)) return false;
+    return isDirectFreeOfVarOrAlias(
+        joinParenContinuation(ctx.lines, idx, join_buf),
+        ctx.var_name,
+        ctx.aliases,
+    );
+}
+
+/// Collect the direct-free sites of the tracked var (EPH-I1232): the
+/// skip chain and the free-pattern gate both pairing detectors share.
+/// Each site carries the registered frees it pairs against.
+fn collectDirectFreeSites(
+    allocator: Allocator,
+    ctx: *const DeferPairCtx,
+    frees: []const DeferFree,
+) !std.ArrayListUnmanaged(DirectFreeSite) {
+    var sites: std.ArrayListUnmanaged(DirectFreeSite) = .empty;
+    errdefer sites.deinit(allocator);
     // Join buffer for zig-fmt wrapped frees (EPH-I0351).
     var join_buf: [max_join_bytes]u8 = undefined;
     for (ctx.lines, 0..) |line, idx| {
@@ -11482,19 +11511,15 @@ fn detectDeferDoubleFree(
         // A direct free inside a capture's scope releases the capture, so it
         // must not pair with a defer-registered free (EPH-I0748, EPH-I0780).
         if (ctx.capture_shadowed[idx]) continue;
-        if (!hasRealFreePattern(t)) continue;
-        if (!isDirectFreeOfVarOrAlias(
-            joinParenContinuation(ctx.lines, idx, &join_buf),
-            ctx.var_name,
-            ctx.aliases,
-        )) continue;
-        try pairDirectFreeWithDefers(allocator, ctx, .{
-            .frees = defer_frees.items,
+        if (!lineHasTrackedFree(ctx, t, idx, &join_buf)) continue;
+        try sites.append(allocator, .{
+            .frees = frees,
             .free_line = ctx.func_line + idx,
             .free_indent = countIndent(line),
             .t = t,
-        }, issues);
+        });
     }
+    return sites;
 }
 
 /// Detect double-free between an errdefer-registered free and a direct
@@ -11513,24 +11538,10 @@ fn detectErrdeferDirectFree(
     defer errdefer_frees.deinit(allocator);
     if (errdefer_frees.items.len == 0) return;
 
-    var join_buf: [max_join_bytes]u8 = undefined;
-    for (ctx.lines, 0..) |line, idx| {
-        const t = mem.trim(u8, line, " \t\r");
-        if (isDoubleFreeSkipLine(t)) continue;
-        if (ctx.in_defer[idx] or ctx.in_errdefer[idx]) continue;
-        if (ctx.capture_shadowed[idx]) continue;
-        if (!hasRealFreePattern(t)) continue;
-        if (!isDirectFreeOfVarOrAlias(
-            joinParenContinuation(ctx.lines, idx, &join_buf),
-            ctx.var_name,
-            ctx.aliases,
-        )) continue;
-        try pairDirectFreeWithErrdefers(allocator, ctx, .{
-            .frees = errdefer_frees.items,
-            .free_line = ctx.func_line + idx,
-            .free_indent = countIndent(line),
-            .t = t,
-        }, issues);
+    var sites = try collectDirectFreeSites(allocator, ctx, errdefer_frees.items);
+    defer sites.deinit(allocator);
+    for (sites.items) |site| {
+        try pairDirectFreeWithErrdefers(allocator, ctx, site, issues);
     }
 }
 
@@ -11559,12 +11570,7 @@ fn collectErrdeferFrees(
         if (mem.startsWith(u8, t, "errdefer {")) continue;
         if (hasGuardIfToken(t)) continue;
         if (ctx.capture_shadowed[idx]) continue;
-        if (!hasRealFreePattern(t)) continue;
-        if (!isDirectFreeOfVarOrAlias(
-            joinParenContinuation(ctx.lines, idx, &join_buf),
-            ctx.var_name,
-            ctx.aliases,
-        )) continue;
+        if (!lineHasTrackedFree(ctx, t, idx, &join_buf)) continue;
         try frees.append(allocator, .{
             .line = ctx.func_line + idx,
             .indent = countIndent(line),
@@ -11578,6 +11584,21 @@ fn collectErrdeferFrees(
     return frees;
 }
 
+/// Build the FreeIssueSink for one pairing pass (EPH-I1232): the two
+/// pair emitters share the literal.
+fn freeIssueSink(
+    allocator: Allocator,
+    ctx: *const DeferPairCtx,
+    issues: *std.ArrayListUnmanaged(Issue),
+) FreeIssueSink {
+    return .{
+        .allocator = allocator,
+        .issues = issues,
+        .file_path = ctx.file_path,
+        .var_name = ctx.var_name,
+    };
+}
+
 /// Pair one direct free with every errdefer-registered free of the same
 /// var (EPH-I0006). The errdefer may register before or after the direct
 /// free: both orders double-free on an error exit past the later of the
@@ -11589,12 +11610,7 @@ fn pairDirectFreeWithErrdefers(
     site: DirectFreeSite,
     issues: *std.ArrayListUnmanaged(Issue),
 ) !void {
-    const sink: FreeIssueSink = .{
-        .allocator = allocator,
-        .issues = issues,
-        .file_path = ctx.file_path,
-        .var_name = ctx.var_name,
-    };
+    const sink = freeIssueSink(allocator, ctx, issues);
     for (site.frees) |ef| {
         const first = @min(ef.line, site.free_line);
         if (hasReassignmentAfter(ctx.lines, ctx.func_line, first, ctx.var_name)) continue;
@@ -11675,12 +11691,7 @@ fn pairDirectFreeWithDefers(
     site: DirectFreeSite,
     issues: *std.ArrayListUnmanaged(Issue),
 ) !void {
-    const sink: FreeIssueSink = .{
-        .allocator = allocator,
-        .issues = issues,
-        .file_path = ctx.file_path,
-        .var_name = ctx.var_name,
-    };
+    const sink = freeIssueSink(allocator, ctx, issues);
     for (site.frees) |df| {
         const first = @min(df.line, site.free_line);
         // Reassignment after the first free: safe only when the direct free
@@ -22329,6 +22340,47 @@ fn analyzeFileErrors(
     try reportEndOfFileIssues(&state, a.path, issues, allocator);
 }
 
+/// One issue list without the hash-map growth type (EPH-I1232): the short
+/// spelling keeps the graph-scan driver's fn-typed param on its def line,
+/// where the delegation-edge gate (EPH-I1235) reads it.
+const IssueList = std.ArrayListUnmanaged(Issue);
+
+/// One per-file visit during a graph scan (EPH-I1232): the allocator and
+/// the merged issue list. The driver builds one per entry and the visit
+/// fn appends its findings.
+const ScanCtx = struct {
+    allocator: Allocator,
+    issues: *IssueList,
+};
+
+/// Drive one per-file analyzer over every file in the graph and merge
+/// its findings (EPH-I1232, EPH-I0419): the iterator prologue that six
+/// graph analyzers once duplicated. `visit` runs per entry; the OOM
+/// path frees the partial list with errdefer. The fn-typed param sits
+/// on the def line, so passing a file-local visit fn records a
+/// delegation edge and ZT101/ZT105 reachability crosses the hop
+/// (EPH-I1235).
+const GraphScan = struct {
+    allocator: Allocator,
+    graph: *ImportGraph,
+
+    fn run(self: GraphScan, comptime visit: fn (ScanCtx, FileAnalysis) anyerror!void) !IssueList {
+        var issues: IssueList = .empty;
+        errdefer deinitIssues(&issues, self.allocator);
+        var iter = self.graph.files.iterator();
+        while (iter.next()) |entry| {
+            try visit(.{ .allocator = self.allocator, .issues = &issues }, entry.value_ptr.*);
+        }
+        return issues;
+    }
+};
+
+/// Per-file visit for analyzeErrors (EPH-I1232): forward to the file
+/// analyzer unchanged.
+fn visitErrorFile(c: ScanCtx, a: FileAnalysis) anyerror!void {
+    try analyzeFileErrors(c.allocator, c.issues, a);
+}
+
 /// Run the error-handling analyzers (ZA201-ZA210) over every file in the
 /// graph and return the merged issue list. WHY: this driver is the only
 /// top-level analyzer the band left undocumented; its list carries
@@ -22338,13 +22390,7 @@ fn analyzeErrors(
     allocator: Allocator,
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .empty;
-    errdefer deinitIssues(&issues, allocator);
-    var iter = graph.files.iterator();
-    while (iter.next()) |entry| {
-        try analyzeFileErrors(allocator, &issues, entry.value_ptr.*);
-    }
-    return issues;
+    return (GraphScan{ .allocator = allocator, .graph = graph }).run(visitErrorFile);
 }
 
 // ============================================================================
@@ -27114,24 +27160,24 @@ fn analyzeFileConcurrency(sink: *const ConcurrencyIssueSink, a: FileAnalysis) !v
     try analyzeFileSpawns(sink, a);
 }
 
+/// Per-file visit for analyzeConcurrency (EPH-I1232): build the sink and
+/// forward to the file analyzer unchanged.
+fn visitConcurrencyFile(c: ScanCtx, a: FileAnalysis) anyerror!void {
+    const sink: ConcurrencyIssueSink = .{
+        .issues = c.issues,
+        .allocator = c.allocator,
+        .path = a.path,
+    };
+    try analyzeFileConcurrency(&sink, a);
+}
+
 /// Drive the concurrency rules (EPH-I0448): ZC101/ZC102 lock pairing per
 /// fn, ZC103 conditional-tryLock fn-scope defers, ZC104 spawn handles.
 fn analyzeConcurrency(
     allocator: Allocator,
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .empty;
-    errdefer deinitIssues(&issues, allocator);
-    var iter = graph.files.iterator();
-    while (iter.next()) |entry| {
-        const sink: ConcurrencyIssueSink = .{
-            .issues = &issues,
-            .allocator = allocator,
-            .path = entry.value_ptr.path,
-        };
-        try analyzeFileConcurrency(&sink, entry.value_ptr.*);
-    }
-    return issues;
+    return (GraphScan{ .allocator = allocator, .graph = graph }).run(visitConcurrencyFile);
 }
 
 // ============================================================================
@@ -27445,40 +27491,39 @@ fn checkUnusedDecl(ctx: UnusedFileCtx, t: []const u8, line_num: usize) !void {
     });
 }
 
+/// Per-file visit for analyzeUnused (EPH-I1232): skip cimport files and
+/// run the unused-declaration checks unchanged.
+fn visitUnusedFile(c: ScanCtx, a: FileAnalysis) anyerror!void {
+    // Skip auto-generated C import/translation files (many false positives)
+    if (isCImportFile(a.path, a.content)) return;
+    var index = IdentUseIndex.init(c.allocator, a.content);
+    defer index.deinit();
+    try index.build();
+    const ctx: UnusedFileCtx = .{
+        .issues = c.issues,
+        .allocator = c.allocator,
+        .path = a.path,
+        .index = &index,
+    };
+    for (a.imports.items) |imp| {
+        try checkUnusedImport(ctx, imp);
+    }
+    var line_num: usize = 1;
+    var lines = mem.splitScalar(u8, a.content, '\n');
+    while (lines.next()) |line| {
+        defer line_num += 1;
+        const t = mem.trim(u8, line, " \t\r");
+        try checkUnusedDecl(ctx, t, line_num);
+    }
+}
+
 /// Drive the unused-declaration rules (EPH-I0448): ZA401 unused imports,
 /// ZA402 unused const declarations, ZA403 unused var declarations.
 fn analyzeUnused(
     allocator: Allocator,
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .empty;
-    errdefer deinitIssues(&issues, allocator);
-    var iter = graph.files.iterator();
-    while (iter.next()) |entry| {
-        const a = entry.value_ptr.*;
-        // Skip auto-generated C import/translation files (many false positives)
-        if (isCImportFile(a.path, a.content)) continue;
-        var index = IdentUseIndex.init(allocator, a.content);
-        defer index.deinit();
-        try index.build();
-        const ctx: UnusedFileCtx = .{
-            .issues = &issues,
-            .allocator = allocator,
-            .path = a.path,
-            .index = &index,
-        };
-        for (a.imports.items) |imp| {
-            try checkUnusedImport(ctx, imp);
-        }
-        var line_num: usize = 1;
-        var lines = mem.splitScalar(u8, a.content, '\n');
-        while (lines.next()) |line| {
-            defer line_num += 1;
-            const t = mem.trim(u8, line, " \t\r");
-            try checkUnusedDecl(ctx, t, line_num);
-        }
-    }
-    return issues;
+    return (GraphScan{ .allocator = allocator, .graph = graph }).run(visitUnusedFile);
 }
 
 // ============================================================================
@@ -31678,9 +31723,7 @@ fn collectManagedPath(
     kind: DeferArmKind,
     s: *DeferRegionScan,
 ) void {
-    var start = call;
-    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) start -= 1;
-    if (start == call) return;
+    const start = dottedIdentStart(t, call) orelse return;
     const path = t[start..call];
     if (path[0] == '.' or path[path.len - 1] == '.') return;
     if (mem.indexOf(u8, path, "..") != null) return;
@@ -32794,22 +32837,20 @@ fn checkIgnoredError(
     });
 }
 
+/// Per-file visit for analyzeIgnoredErrors (EPH-I1232): skip cimport
+/// files, then forward to the file analyzer unchanged.
+fn visitIgnoredErrorsFile(c: ScanCtx, a: FileAnalysis) anyerror!void {
+    if (mem.endsWith(u8, a.path, "cimport.zig")) return;
+    if (isCImportFile(a.path, a.content)) return;
+    try analyzeIgnoredErrorsInFile(c.allocator, c.issues, a.path, a.content);
+}
+
 /// ZA205: Detect ignored error union results (function returns error but result discarded)
 fn analyzeIgnoredErrors(
     allocator: Allocator,
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .empty;
-    errdefer deinitIssues(&issues, allocator);
-    var iter = graph.files.iterator();
-    while (iter.next()) |entry| {
-        const content = entry.value_ptr.content;
-        const file_path = entry.key_ptr.*;
-        if (mem.endsWith(u8, file_path, "cimport.zig")) continue;
-        if (isCImportFile(file_path, content)) continue;
-        try analyzeIgnoredErrorsInFile(allocator, &issues, file_path, content);
-    }
-    return issues;
+    return (GraphScan{ .allocator = allocator, .graph = graph }).run(visitIgnoredErrorsFile);
 }
 
 /// Analyze a single file for ignored errors (ZA205)
@@ -34791,17 +34832,25 @@ fn classifyNullCheck(t: []const u8, lines: []const []const u8, idx: usize) ?Null
     return null;
 }
 
+/// Start index of the identifier run (dots included) ending at `end`,
+/// or null when no identifier byte precedes `end` (EPH-I1232): the walk
+/// the extract helpers share.
+fn dottedIdentStart(t: []const u8, end: usize) ?usize {
+    var start = end;
+    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
+        start -= 1;
+    }
+    if (start < end) return start;
+    return null;
+}
+
 /// Extract variable name being unwrapped with .?
 fn extractUnwrappedVar(t: []const u8, dot_q_pos: usize) ?[]const u8 {
     if (dot_q_pos == 0) return null;
     // Look backwards for identifier
     const end = dot_q_pos;
-    var start = end;
-    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
-        start -= 1;
-    }
-    if (start < end) return t[start..end];
-    return null;
+    const start = dottedIdentStart(t, end) orelse return null;
+    return t[start..end];
 }
 
 /// Position of the `==` in a `var_name == null)` guard predicate on the
@@ -34879,12 +34928,8 @@ fn hasEarlyReturnNullGuard(
 fn extractDerefVar(t: []const u8, dot_star_pos: usize) ?[]const u8 {
     if (dot_star_pos == 0) return null;
     const end = dot_star_pos;
-    var start = end;
-    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
-        start -= 1;
-    }
-    if (start < end) return t[start..end];
-    return null;
+    const start = dottedIdentStart(t, end) orelse return null;
+    return t[start..end];
 }
 
 /// Phase 1: Identify guard patterns in each CFG block
@@ -35724,13 +35769,7 @@ fn checkDecrementOverflow(
     while (findDecrementOpAt(t, from)) |col| {
         from = col + 2;
         const var_name = extractDecrementVar(t, col) orelse continue;
-        const gctx: GuardLineCtx = .{
-            .t = t,
-            .lines = ctx.lines,
-            .idx = idx,
-            .entry_guards = ctx.entry_guards,
-            .local_guards = ctx.local_guards,
-        };
+        const gctx = guardLineCtx(ctx, t, idx);
         const amount = parseDecrementAmount(t, col);
         if (isDecrementGuarded(gctx, var_name, amount, col)) continue;
         try ctx.issues.append(ctx.allocator, .{
@@ -35748,6 +35787,18 @@ fn checkDecrementOverflow(
     if (any_fire) try ctx.reported.put(line_num, {});
 }
 
+/// Build the GuardLineCtx for one candidate line (EPH-I1232): the two
+/// ZA902/ZA903 guard checks share the literal.
+fn guardLineCtx(ctx: CFGPanicCtx, t: []const u8, idx: usize) GuardLineCtx {
+    return .{
+        .t = t,
+        .lines = ctx.lines,
+        .idx = idx,
+        .entry_guards = ctx.entry_guards,
+        .local_guards = ctx.local_guards,
+    };
+}
+
 /// ZA903: Check for unguarded array index subtraction
 fn checkArrayIndexOverflow(
     ctx: CFGPanicCtx,
@@ -35759,13 +35810,7 @@ fn checkArrayIndexOverflow(
     if (isInsideString(t, col)) return;
     // A bracket expression mentioned in a trailing comment is prose, not code.
     if (isInTrailingComment(t, col)) return;
-    const gctx: GuardLineCtx = .{
-        .t = t,
-        .lines = ctx.lines,
-        .idx = idx,
-        .entry_guards = ctx.entry_guards,
-        .local_guards = ctx.local_guards,
-    };
+    const gctx = guardLineCtx(ctx, t, idx);
     if (isArrayIndexGuarded(gctx)) return;
     try ctx.issues.append(ctx.allocator, .{
         .file = ctx.file_path,
@@ -35926,10 +35971,7 @@ fn extractGuardedVar(t: []const u8) ?[]const u8 {
 fn identStartBefore(t: []const u8, end: usize) ?usize {
     var e = end;
     while (e > 0 and t[e - 1] == ' ') e -= 1;
-    var start = e;
-    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) start -= 1;
-    if (start >= e) return null;
-    return start;
+    return dottedIdentStart(t, e);
 }
 
 /// "x.len > N" / "x.len >= N" length guard → "x.len".
@@ -35949,12 +35991,8 @@ fn extractLenGuard(t: []const u8) ?[]const u8 {
 fn extractDecrementVar(t: []const u8, decrement_pos: usize) ?[]const u8 {
     var end = decrement_pos;
     while (end > 0 and t[end - 1] == ' ') end -= 1;
-    var start = end;
-    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
-        start -= 1;
-    }
-    if (start < end) return t[start..end];
-    return null;
+    const start = dottedIdentStart(t, end) orelse return null;
+    return t[start..end];
 }
 
 /// Heuristic: a variable declared with a signed type is treated as safe to
@@ -37247,6 +37285,34 @@ fn indexSubOf(inside: []const u8) ?IdxSub {
     return .{ .idx_var = idx_var, .subtrahend = lit.value };
 }
 
+/// One subtraction-bearing bracket span (EPH-I1232): the bracket's
+/// open/close positions and its inside slice.
+const SubBracket = struct {
+    open: usize,
+    close: usize,
+    inside: []const u8,
+};
+
+/// The first subtraction-bearing bracket on the line, or null
+/// (EPH-I1232): the scan the bracket extract helpers share. A later
+/// subtraction-bearing bracket stays unexamined — the first-match
+/// consumers need only the first; everyLaterBracketWitnessed keeps its
+/// own all-brackets walk.
+fn findFirstSubBracket(t: []const u8) ?SubBracket {
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        if (t[i] != '[') continue;
+        const end = findMatchingBracket(t, i) orelse continue;
+        const inside = t[i + 1 .. end];
+        if (findIndexSubtraction(inside) == null) {
+            i = end;
+            continue;
+        }
+        return .{ .open = i, .close = end, .inside = inside };
+    }
+    return null;
+}
+
 /// The `x` and `N` of a `[0 .. x - N]` slice-end subtraction on `t`,
 /// or null when the line does not carry the form: a bracket whose
 /// range starts at literal 0, with a subtraction after the `..`
@@ -37258,18 +37324,8 @@ fn indexSubOf(inside: []const u8) ?IdxSub {
 /// verdict — a later range witness must not silence it (batch 24
 /// review F1).
 fn extractRangeEndSubtraction(t: []const u8) ?IdxSub {
-    var i: usize = 0;
-    while (i < t.len) : (i += 1) {
-        if (t[i] != '[') continue;
-        const end = findMatchingBracket(t, i) orelse continue;
-        const inside = t[i + 1 .. end];
-        if (findIndexSubtraction(inside) == null) {
-            i = end;
-            continue;
-        }
-        return rangeEndSubOf(inside);
-    }
-    return null;
+    const b = findFirstSubBracket(t) orelse return null;
+    return rangeEndSubOf(b.inside);
 }
 
 /// ZA903 witness for the `[0 .. x - N]` slice-end form: the end
@@ -37484,19 +37540,9 @@ fn lineReassignsIndexVar(t: []const u8, idx_var: []const u8) bool {
 /// unclassifiable first bracket (a call-result index, a stray
 /// structure) binds nothing: no witness source can prove it safe.
 fn firstBracketSubVar(t: []const u8) ?IdxSub {
-    var i: usize = 0;
-    while (i < t.len) : (i += 1) {
-        if (t[i] != '[') continue;
-        const end = findMatchingBracket(t, i) orelse continue;
-        const inside = t[i + 1 .. end];
-        if (findIndexSubtraction(inside) == null) {
-            i = end;
-            continue;
-        }
-        if (rangeEndSubOf(inside)) |rinfo| return rinfo;
-        if (indexSubOf(inside)) |iinfo| return iinfo;
-        return null;
-    }
+    const b = findFirstSubBracket(t) orelse return null;
+    if (rangeEndSubOf(b.inside)) |rinfo| return rinfo;
+    if (indexSubOf(b.inside)) |iinfo| return iinfo;
     return null;
 }
 
@@ -37842,7 +37888,6 @@ fn hasEnclosingGuardForVar(
     var_name: []const u8,
     amount: ?usize,
 ) bool {
-    const stop = current_idx -| enclosing_block_lookback;
     const gctx: GuardCrossingCtx = .{
         .lines = lines,
         .current_idx = current_idx,
@@ -37850,17 +37895,34 @@ fn hasEnclosingGuardForVar(
         .amount = amount,
     };
     var state = EnclosingWalkState{};
-    var i = current_idx;
-    while (i > stop) {
-        i -= 1;
-        const ctx = mem.trim(u8, lines[i], " \t\r");
-        switch (judgeEnclosingGuardWalkLine(gctx, i, ctx, &state)) {
-            .skip => continue,
-            .found => return true,
-            .boundary => return false,
+    return EnclosingWalk(GuardCrossingCtx).run(gctx, &state, judgeEnclosingGuardWalkLine);
+}
+
+/// Drive one enclosing backward walk (EPH-I1232): the shared loop the
+/// guard and bound twins duplicate. `judge` answers one line — `skip`
+/// resumes above, `found` answers true, `boundary` answers false. The
+/// walk ctx carries the lines and the anchor index.
+fn EnclosingWalk(comptime Ctx: type) type {
+    return struct {
+        fn run(
+            walk_ctx: Ctx,
+            state: *EnclosingWalkState,
+            comptime judge: fn (Ctx, usize, []const u8, *EnclosingWalkState) EnclosingWalkVerdict,
+        ) bool {
+            const stop = walk_ctx.current_idx -| enclosing_block_lookback;
+            var i = walk_ctx.current_idx;
+            while (i > stop) {
+                i -= 1;
+                const ctx = mem.trim(u8, walk_ctx.lines[i], " \t\r");
+                switch (judge(walk_ctx, i, ctx, state)) {
+                    .skip => continue,
+                    .found => return true,
+                    .boundary => return false,
+                }
+            }
+            return false;
         }
-    }
-    return false;
+    };
 }
 
 /// One line's answer to the enclosing-guard backward walk
@@ -37875,6 +37937,19 @@ const EnclosingWalkState = struct {
     brace_depth: i32 = 0,
     skip_antecedent: bool = false,
 };
+
+/// Fold one walk line's brace balance into the walk state and answer
+/// the line's else-open kind (EPH-I1232): the shared preamble of the
+/// guard and bound line judges. The kind computes before the opener
+/// check: on an else-open line the condition before the `else` keyword
+/// is the antecedent, negated for the arm below, so the opener check
+/// judges only the arm's own region after the `else` (EPH-I0965).
+fn foldWalkLine(ctx: []const u8, state: *EnclosingWalkState) ?ElseOpenKind {
+    const line_balance = countCurlyBalance(ctx);
+    const depth_before = state.brace_depth;
+    state.brace_depth = trackBraceDepthBackward(ctx, state.brace_depth);
+    return if (depth_before == 0 and line_balance >= 0) elseOpenKind(ctx) else null;
+}
 
 /// One walk line's else-open judgment inputs (hasEnclosingGuardForVar).
 const EnclosingElseOpenLine = struct {
@@ -37895,16 +37970,7 @@ fn judgeEnclosingGuardWalkLine(
     state: *EnclosingWalkState,
 ) EnclosingWalkVerdict {
     if (isCommentOrMultilineString(ctx)) return .skip;
-    const line_balance = countCurlyBalance(ctx);
-    const depth_before = state.brace_depth;
-    state.brace_depth = trackBraceDepthBackward(ctx, state.brace_depth);
-    // The else-open flag is computed before the opener check: on an
-    // else-open line the condition before the `else` keyword is the
-    // antecedent, negated for the arm below, so the opener check judges
-    // only the arm's own region after the `else`. A line like
-    // `} else { if (q) {` still credits the arm's own condition
-    // (EPH-I0965).
-    const kind = if (depth_before == 0 and line_balance >= 0) elseOpenKind(ctx) else null;
+    const kind = foldWalkLine(ctx, state);
     if (state.brace_depth < 0) {
         if (judgeGuardDepthNegativeCrossing(gctx, i, ctx, state.skip_antecedent)) return .found;
         state.skip_antecedent = false;
@@ -38258,6 +38324,17 @@ fn matchingCloseParenOnLine(t: []const u8, lparen: usize) ?usize {
     return null;
 }
 
+/// Spend one guard-expression budget unit (EPH-I1232): the shared
+/// exhaustion gate of the two recursive bound judges. True means spent —
+/// the caller answers null immediately.
+fn guardBudgetSpent(budget: *GuardDepthBudget) bool {
+    if (budget.remaining == 0) {
+        budget.exhausted = true;
+        return true;
+    }
+    return false;
+}
+
 /// The bound the boolean expression in t[start..end) proves for
 /// `var_name`, or null. The `or` is the expression root when present
 /// (`and` binds tighter: `a and b or c` is `(a and b) or c`), and a
@@ -38275,10 +38352,7 @@ fn guardExprBound(
     span: GuardSpan,
     budget: *GuardDepthBudget,
 ) ?usize {
-    if (budget.remaining == 0) {
-        budget.exhausted = true;
-        return null;
-    }
+    if (guardBudgetSpent(budget)) return null;
     budget.remaining -= 1;
     const start = span.start;
     const end = span.end;
@@ -38608,7 +38682,6 @@ fn hasEnclosingBoundForVar(
     var_name: []const u8,
     min_bound: usize,
 ) bool {
-    const stop = current_idx -| enclosing_block_lookback;
     const bctx: EnclosingBoundCtx = .{
         .lines = lines,
         .current_idx = current_idx,
@@ -38616,17 +38689,7 @@ fn hasEnclosingBoundForVar(
         .min_bound = min_bound,
     };
     var state = EnclosingWalkState{};
-    var i = current_idx;
-    while (i > stop) {
-        i -= 1;
-        const ctx = mem.trim(u8, lines[i], " \t\r");
-        switch (judgeEnclosingBoundWalkLine(bctx, i, ctx, &state)) {
-            .skip => continue,
-            .found => return true,
-            .boundary => return false,
-        }
-    }
-    return false;
+    return EnclosingWalk(EnclosingBoundCtx).run(bctx, &state, judgeEnclosingBoundWalkLine);
 }
 
 /// One walk line's else-open judgment inputs (hasEnclosingBoundForVar).
@@ -38649,16 +38712,7 @@ fn judgeEnclosingBoundWalkLine(
     state: *EnclosingWalkState,
 ) EnclosingWalkVerdict {
     if (isCommentOrMultilineString(ctx)) return .skip;
-    const line_balance = countCurlyBalance(ctx);
-    const depth_before = state.brace_depth;
-    state.brace_depth = trackBraceDepthBackward(ctx, state.brace_depth);
-    // The else-open flag is computed before the opener check: on an
-    // else-open line the condition before the `else` keyword is the
-    // antecedent, negated for the arm below, so the opener check judges
-    // only the arm's own region after the `else`. A line like
-    // `} else { if (q) {` still credits the arm's own condition
-    // (EPH-I0965).
-    const kind = if (depth_before == 0 and line_balance >= 0) elseOpenKind(ctx) else null;
+    const kind = foldWalkLine(ctx, state);
     if (state.brace_depth < 0) {
         if (judgeBoundDepthNegativeCrossing(bctx, i, ctx, state.skip_antecedent)) return .found;
         state.skip_antecedent = false;
@@ -38864,17 +38918,8 @@ fn isSafeZeroBasedRange(inside: []const u8) bool {
 /// Check for array index subtraction pattern [x - y]
 /// Returns position of subtraction if unsafe, null if safe or not found
 fn hasArrayIndexSubtraction(t: []const u8) ?usize {
-    var i: usize = 0;
-    while (i < t.len) : (i += 1) {
-        if (t[i] != '[') continue;
-        const end = findMatchingBracket(t, i) orelse continue;
-        const inside = t[i + 1 .. end];
-        if (findIndexSubtraction(inside)) |sub_pos| {
-            return i + 1 + sub_pos;
-        }
-        i = end;
-    }
-    return null;
+    const b = findFirstSubBracket(t) orelse return null;
+    return b.open + 1 + findIndexSubtraction(b.inside).?;
 }
 
 /// Extract array base variable from the index subtraction pattern
@@ -38890,12 +38935,8 @@ fn extractArrayBaseFromIndexArithmetic(t: []const u8) ?[]const u8 {
     // Extract identifier before [
     var end = bracket_pos;
     while (end > 0 and t[end - 1] == ' ') end -= 1;
-    var start = end;
-    while (start > 0 and (isIdent(t[start - 1]) or t[start - 1] == '.')) {
-        start -= 1;
-    }
-    if (start < end) return t[start..end];
-    return null;
+    const start = dottedIdentStart(t, end) orelse return null;
+    return t[start..end];
 }
 
 /// Position of the `if` keyword on `t` at a left word boundary, or null.
@@ -40056,32 +40097,31 @@ fn checkIntCastGuards(sink: CastSink, lines: []const []const u8, idx: usize) !vo
     for (cast_needles) |n| try checkCastNeedleOnLine(sink, lines, idx, n);
 }
 
+/// Per-file visit for analyzeIntCastGuards (EPH-I1232): split the lines
+/// and run the ZA904 checks unchanged.
+fn visitIntCastFile(c: ScanCtx, a: FileAnalysis) anyerror!void {
+    var lines_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines_list.deinit(c.allocator);
+    var split = mem.splitScalar(u8, a.content, '\n');
+    while (split.next()) |line| try lines_list.append(c.allocator, line);
+    const lines = lines_list.items;
+    const sink = CastSink{ .issues = c.issues, .allocator = c.allocator, .path = a.path };
+    for (lines, 0..) |line, idx| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        // ZA9xx family convention: assertion lines construct fixtures.
+        if (mem.indexOf(u8, t, "testing.expect") != null) continue;
+        try checkIntCastGuards(sink, lines, idx);
+    }
+}
+
 /// ZA904 (opt-in note): @intCast/@truncate without a textual bounds proof.
 /// Off by default via the ZA9 prefix in Config.off_by_default_prefixes.
 fn analyzeIntCastGuards(
     allocator: Allocator,
     graph: *ImportGraph,
 ) !std.ArrayListUnmanaged(Issue) {
-    var issues: std.ArrayListUnmanaged(Issue) = .empty;
-    errdefer deinitIssues(&issues, allocator);
-    var iter = graph.files.iterator();
-    while (iter.next()) |entry| {
-        const a = entry.value_ptr.*;
-        var lines_list: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer lines_list.deinit(allocator);
-        var split = mem.splitScalar(u8, a.content, '\n');
-        while (split.next()) |line| try lines_list.append(allocator, line);
-        const lines = lines_list.items;
-        const sink = CastSink{ .issues = &issues, .allocator = allocator, .path = a.path };
-        for (lines, 0..) |line, idx| {
-            const t = mem.trim(u8, line, " \t\r");
-            if (isCommentOrMultilineString(t)) continue;
-            // ZA9xx family convention: assertion lines construct fixtures.
-            if (mem.indexOf(u8, t, "testing.expect") != null) continue;
-            try checkIntCastGuards(sink, lines, idx);
-        }
-    }
-    return issues;
+    return (GraphScan{ .allocator = allocator, .graph = graph }).run(visitIntCastFile);
 }
 
 /// ZR104 for a zig fmt spawn failure (EPH-I0232): an empty list would
@@ -56960,6 +57000,38 @@ const CFGTestRun = struct {
     }
 };
 
+/// Short spelling of ImportGraph (EPH-I1232): keeps the test-run driver's
+/// fn-typed param on its def line, where the delegation-edge gate
+/// (EPH-I1235) reads it. The full name pushes the line past the limit.
+const Graph = ImportGraph;
+
+/// Test graph seed (EPH-I1232): the inputs the one-file test helpers
+/// share. `run` builds the one-file graph and runs one analyzer over it.
+/// The fn-typed param sits on the def line, so the analyzer passed by
+/// value records a delegation edge and ZT101/ZT105 reachability crosses
+/// the hop (EPH-I1235).
+const TestCtx = struct {
+    diag: *DiagCtx,
+    allocator: Allocator,
+    path: []const u8,
+    content: []const u8,
+
+    fn init(diag: *DiagCtx, allocator: Allocator, path: []const u8, content: []const u8) TestCtx {
+        return .{ .diag = diag, .allocator = allocator, .path = path, .content = content };
+    }
+
+    fn run(self: TestCtx, comptime visit: fn (Allocator, *Graph) anyerror!IssueList) !CFGTestRun {
+        var graph = ImportGraph.init(self.allocator, self.diag);
+        errdefer graph.deinit();
+        const analysis = try createTestFileAnalysis(self.allocator, self.path, self.content);
+        try graph.files.put(analysis.path, analysis);
+        try graph.reachable.put(try self.allocator.dupe(u8, self.path), {});
+        var issues = try visit(self.allocator, &graph);
+        errdefer deinitIssues(&issues, self.allocator);
+        return .{ .graph = graph, .issues = issues };
+    }
+};
+
 /// Test helper: build a one-file graph and run the full CFG memory pipeline.
 fn runCFGMemoryTest(
     diag: *DiagCtx,
@@ -56967,14 +57039,7 @@ fn runCFGMemoryTest(
     path: []const u8,
     content: []const u8,
 ) !CFGTestRun {
-    var graph = ImportGraph.init(allocator, diag);
-    errdefer graph.deinit();
-    const analysis = try createTestFileAnalysis(allocator, path, content);
-    try graph.files.put(analysis.path, analysis);
-    try graph.reachable.put(try allocator.dupe(u8, path), {});
-    var issues = try analyzeCFGMemory(allocator, &graph);
-    errdefer deinitIssues(&issues, allocator);
-    return .{ .graph = graph, .issues = issues };
+    return TestCtx.init(diag, allocator, path, content).run(analyzeCFGMemory);
 }
 
 /// One failing-allocator sweep iteration over the CFG memory pipeline:
@@ -71156,24 +71221,22 @@ test "ZA205 type-aware: multiple user types in same file resolved independently"
 // ============================================================================
 
 /// Count ZA205 findings the way the check command reports them: the
-/// analyzeErrors list plus the analyzeIgnoredErrors list on the same graph.
+/// analyzeErrors list plus the analyzeIgnoredErrors list. Each run
+/// builds its own one-file graph; both analyzers read the graph, so
+/// the merged count is identical to the shared-graph form.
 fn countCheckMergeZA205(
     diag: *DiagCtx,
     allocator: Allocator,
     path: []const u8,
     content: []const u8,
 ) !usize {
-    var graph = ImportGraph.init(allocator, diag);
-    defer graph.deinit();
-    const analysis = try createTestFileAnalysis(allocator, path, content);
-    try graph.files.put(analysis.path, analysis);
-    try graph.reachable.put(try allocator.dupe(u8, path), {});
-    var err_issues = try analyzeErrors(allocator, &graph);
-    defer deinitIssues(&err_issues, allocator);
-    var ignored = try analyzeIgnoredErrors(allocator, &graph);
-    defer deinitIssues(&ignored, allocator);
-    return countRuleIssues(err_issues.items, path, RULE_IGNORED_ERROR) +
-        countRuleIssues(ignored.items, path, RULE_IGNORED_ERROR);
+    const ctx = TestCtx.init(diag, allocator, path, content);
+    var err_run = try ctx.run(analyzeErrors);
+    defer err_run.deinit(allocator);
+    var ignored = try ctx.run(analyzeIgnoredErrors);
+    defer ignored.deinit(allocator);
+    return countRuleIssues(err_run.issues.items, path, RULE_IGNORED_ERROR) +
+        countRuleIssues(ignored.issues.items, path, RULE_IGNORED_ERROR);
 }
 
 /// Count ZA205 findings from the canonical analyzeIgnoredErrors alone.
@@ -71183,14 +71246,9 @@ fn countAnalyzerZA205(
     path: []const u8,
     content: []const u8,
 ) !usize {
-    var graph = ImportGraph.init(allocator, diag);
-    defer graph.deinit();
-    const analysis = try createTestFileAnalysis(allocator, path, content);
-    try graph.files.put(analysis.path, analysis);
-    try graph.reachable.put(try allocator.dupe(u8, path), {});
-    var issues = try analyzeIgnoredErrors(allocator, &graph);
-    defer deinitIssues(&issues, allocator);
-    return countRuleIssues(issues.items, path, RULE_IGNORED_ERROR);
+    var run_out = try TestCtx.init(diag, allocator, path, content).run(analyzeIgnoredErrors);
+    defer run_out.deinit(allocator);
+    return countRuleIssues(run_out.issues.items, path, RULE_IGNORED_ERROR);
 }
 
 test "ZA205: check merge reports one finding per zero-arg discard (EPH-I0408)" {
@@ -108087,14 +108145,14 @@ fn runTestQualityCheck(
     path: []const u8,
     content: []const u8,
 ) !CFGTestRun {
-    var graph = ImportGraph.init(allocator, diag);
-    errdefer graph.deinit();
-    const analysis = try createTestFileAnalysis(allocator, path, content);
-    try graph.files.put(analysis.path, analysis);
-    try graph.reachable.put(try allocator.dupe(u8, path), {});
-    var issues = try analyzeTests(allocator, &graph, null);
-    errdefer deinitIssues(&issues, allocator);
-    return .{ .graph = graph, .issues = issues };
+    return TestCtx.init(diag, allocator, path, content).run(visitTests);
+}
+
+/// Analyze the test-quality rules with a null coverage out-param
+/// (EPH-I1232): analyzeTests takes three params, so it cannot ride the
+/// two-param TestCtx.run shape directly.
+fn visitTests(allocator: Allocator, graph: *Graph) anyerror!IssueList {
+    return analyzeTests(allocator, graph, null);
 }
 
 /// Count issues by rule and severity (test assertion helper).
@@ -111814,14 +111872,7 @@ fn runConcurrencyCheck(
     path: []const u8,
     content: []const u8,
 ) !CFGTestRun {
-    var graph = ImportGraph.init(allocator, diag);
-    errdefer graph.deinit();
-    const analysis = try createTestFileAnalysis(allocator, path, content);
-    try graph.files.put(analysis.path, analysis);
-    try graph.reachable.put(try allocator.dupe(u8, path), {});
-    var issues = try analyzeConcurrency(allocator, &graph);
-    errdefer deinitIssues(&issues, allocator);
-    return .{ .graph = graph, .issues = issues };
+    return TestCtx.init(diag, allocator, path, content).run(analyzeConcurrency);
 }
 
 /// Assert the exact warning and note counts for one rule (EPH-I1232 C1a,
@@ -115339,14 +115390,7 @@ fn runErrorsCheck(
     path: []const u8,
     content: []const u8,
 ) !CFGTestRun {
-    var graph = ImportGraph.init(allocator, diag);
-    errdefer graph.deinit();
-    const analysis = try createTestFileAnalysis(allocator, path, content);
-    try graph.files.put(analysis.path, analysis);
-    try graph.reachable.put(try allocator.dupe(u8, path), {});
-    var issues = try analyzeErrors(allocator, &graph);
-    errdefer deinitIssues(&issues, allocator);
-    return .{ .graph = graph, .issues = issues };
+    return TestCtx.init(diag, allocator, path, content).run(analyzeErrors);
 }
 
 test "ZA110: plain ownership-transfer idiom is silent (established pattern)" {
@@ -117442,14 +117486,7 @@ fn runIntCastTest(
     path: []const u8,
     content: []const u8,
 ) !CFGTestRun {
-    var graph = ImportGraph.init(allocator, diag);
-    errdefer graph.deinit();
-    const analysis = try createTestFileAnalysis(allocator, path, content);
-    try graph.files.put(analysis.path, analysis);
-    try graph.reachable.put(try allocator.dupe(u8, path), {});
-    var issues = try analyzeIntCastGuards(allocator, &graph);
-    errdefer deinitIssues(&issues, allocator);
-    return .{ .graph = graph, .issues = issues };
+    return TestCtx.init(diag, allocator, path, content).run(analyzeIntCastGuards);
 }
 
 test "ZA904: off via ZA9 prefix" {

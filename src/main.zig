@@ -87462,54 +87462,56 @@ const MissingKeysCase = struct {
     expected: []const u8,
 };
 
+/// One migration pin: name, input, and expected byte-exact output. The
+/// builder keeps each fixture inline with its case. Without it, ZA504
+/// normalizes the repeated `.input =`/`.expected =` skeleton into one
+/// clone (multiline-string content never joins the clone stream), so
+/// every case reports as one duplicated block.
+fn migrateCase(
+    comptime name: []const u8,
+    comptime input: []const u8,
+    comptime expected: []const u8,
+) MigrateInsertCase {
+    return .{ .name = name, .input = input, .expected = expected };
+}
+
 /// Characterization pins: byte-exact migration output per case.
 const migrate_insert_cases = [_]MigrateInsertCase{
-    .{
-        .name = "only max_cyclomatic missing inserts only cyclo",
-        .input =
+    migrateCase("only max_cyclomatic missing inserts only cyclo",
         \\{
         \\  "thresholds": {
         \\    "max_cognitive": 12
         \\  }
         \\}
-        ,
-        .expected =
+    ,
         \\{
         \\  "thresholds": {
         \\    "max_cognitive": 12,
         \\    "max_cyclomatic": 10
         \\  }
         \\}
-        ,
-    },
-    .{
-        .name = "only max_cognitive missing inserts only cog, value 99 preserved",
-        .input =
+    ),
+    migrateCase("only max_cognitive missing inserts only cog, value 99 preserved",
         \\{
         \\  "thresholds": {
         \\    "max_cyclomatic": 99
         \\  }
         \\}
-        ,
-        .expected =
+    ,
         \\{
         \\  "thresholds": {
         \\    "max_cyclomatic": 99,
         \\    "max_cognitive": 15
         \\  }
         \\}
-        ,
-    },
-    .{
-        .name = "neither key present inserts both, cyclo then cog",
-        .input =
+    ),
+    migrateCase("neither key present inserts both, cyclo then cog",
         \\{
         \\  "thresholds": {
         \\    "max_function_lines": 50
         \\  }
         \\}
-        ,
-        .expected =
+    ,
         \\{
         \\  "thresholds": {
         \\    "max_function_lines": 50,
@@ -87517,18 +87519,14 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\    "max_cognitive": 15
         \\  }
         \\}
-        ,
-    },
-    .{
-        .name = "trailing comma in body gets no leading comma on insert",
-        .input =
+    ),
+    migrateCase("trailing comma in body gets no leading comma on insert",
         \\{
         \\  "thresholds": {
         \\    "max_function_lines": 50,
         \\  }
         \\}
-        ,
-        .expected =
+    ,
         \\{
         \\  "thresholds": {
         \\    "max_function_lines": 50,
@@ -87536,27 +87534,20 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\    "max_cognitive": 15
         \\  }
         \\}
-        ,
-    },
-    .{
-        .name = "empty thresholds object fills at derived indent",
-        .input =
+    ),
+    migrateCase("empty thresholds object fills at derived indent",
         \\{
         \\  "thresholds": {}
         \\}
-        ,
-        .expected =
+    ,
         \\{
         \\  "thresholds": {
         \\  "max_cyclomatic": 10,
         \\  "max_cognitive": 15
         \\}
         \\}
-        ,
-    },
-    .{
-        .name = "nested thresholds uses close_indent + 2 as entry indent",
-        .input =
+    ),
+    migrateCase("nested thresholds uses close_indent + 2 as entry indent",
         \\{
         \\    "outer": {
         \\        "thresholds": {
@@ -87564,11 +87555,10 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\        }
         \\    }
         \\}
-        ,
+    ,
         // Inserted entry lands at close_indent(8)+2=10 spaces, NOT aligned
         // with the sibling key at 12 — the algorithm derives indent from the
         // closing brace only. Valid JSON; cosmetic misalignment is the pin.
-        .expected =
         \\{
         \\    "outer": {
         \\        "thresholds": {
@@ -87577,11 +87567,8 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\        }
         \\    }
         \\}
-        ,
-    },
-    .{
-        .name = "disable array and content outside thresholds stay byte-identical",
-        .input =
+    ),
+    migrateCase("disable array and content outside thresholds stay byte-identical",
         \\{
         \\  "version": "0.13.0",
         \\  "disable": ["ZA305", "ZA306"],
@@ -87590,8 +87577,7 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\  },
         \\  "strict": true
         \\}
-        ,
-        .expected =
+    ,
         \\{
         \\  "version": "0.13.0",
         \\  "disable": ["ZA305", "ZA306"],
@@ -87601,15 +87587,13 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\  },
         \\  "strict": true
         \\}
-        ,
-    },
-    .{
+    ),
+    migrateCase(
         // EPH-I0511: a string VALUE mentioning "thresholds" must not
         // anchor the splice; the real key after it must. Pre-fix the
         // value's quote was the first raw match and the "x" object
         // received the migration (corruption).
-        .name = "value mention before the real key does not retarget the splice",
-        .input =
+        "value mention before the real key does not retarget the splice",
         \\{
         \\  "note": "thresholds",
         \\  "x": { },
@@ -87617,8 +87601,7 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\    "max_function_lines": 50
         \\  }
         \\}
-        ,
-        .expected =
+    ,
         \\{
         \\  "note": "thresholds",
         \\  "x": { },
@@ -87628,23 +87611,20 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\    "max_cognitive": 15
         \\  }
         \\}
-        ,
-    },
-    .{
+    ),
+    migrateCase(
         // EPH-I0511: a COMMENT mentioning "thresholds" with braces must
         // not anchor the splice. Pre-fix the comment's quote was the
         // first raw match and the comment's `{`/`}` pair became the
         // "object": the migration inserted keys into comment text.
-        .name = "comment mention does not anchor the splice",
-        .input =
+        "comment mention does not anchor the splice",
         \\{
         \\  // "thresholds" { } keys live here
         \\  "thresholds": {
         \\    "max_function_lines": 50
         \\  }
         \\}
-        ,
-        .expected =
+    ,
         \\{
         \\  // "thresholds" { } keys live here
         \\  "thresholds": {
@@ -87653,23 +87633,20 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\    "max_cognitive": 15
         \\  }
         \\}
-        ,
-    },
-    .{
+    ),
+    migrateCase(
         // EPH-I0065: the object-opener check skips whitespace and `//`
         // comments but still requires the first CODE char after the colon
         // to be `{`. A comment between the colon and the brace stays a
         // valid span, so the migration still runs.
-        .name = "comment between the colon and the brace still migrates (EPH-I0065)",
-        .input =
+        "comment between the colon and the brace still migrates (EPH-I0065)",
         \\{
         \\  "thresholds": // keys for the complexity gate
         \\  {
         \\    "max_function_lines": 50
         \\  }
         \\}
-        ,
-        .expected =
+    ,
         \\{
         \\  "thresholds": // keys for the complexity gate
         \\  {
@@ -87678,23 +87655,20 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\    "max_cognitive": 15
         \\  }
         \\}
-        ,
-    },
-    .{
+    ),
+    migrateCase(
         // EPH-I1171: findConfigKey accepts whitespace between the key and
         // its colon (findKeySeparator walks past spaces), so the
         // migration must too. The F3 walk started at a fixed offset past
         // the key, landed on the colon, and silently skipped this valid
         // hand-edited shape.
-        .name = "spaced colon between the key and its value still migrates (EPH-I1171)",
-        .input =
+        "spaced colon between the key and its value still migrates (EPH-I1171)",
         \\{
         \\  "thresholds" : {
         \\    "max_function_lines": 50
         \\  }
         \\}
-        ,
-        .expected =
+    ,
         \\{
         \\  "thresholds" : {
         \\    "max_function_lines": 50,
@@ -87702,8 +87676,7 @@ const migrate_insert_cases = [_]MigrateInsertCase{
         \\    "max_cognitive": 15
         \\  }
         \\}
-        ,
-    },
+    ),
 };
 
 const migrate_null_cases = [_]MigrateNullCase{
@@ -87765,47 +87738,47 @@ const migrate_null_cases = [_]MigrateNullCase{
     },
 };
 
+/// One buildMissingKeysJson pin. The builder mirrors migrateCase: the
+/// per-case name string keeps every row distinct in the ZA504 clone
+/// stream, where the repeated case skeleton would otherwise report as
+/// one duplicated block.
+fn missingKeysCase(
+    comptime name: []const u8,
+    mig: MissingThresholdKeys,
+    comptime expected: []const u8,
+) MissingKeysCase {
+    return .{ .name = name, .mig = mig, .expected = expected };
+}
+
 const missing_keys_cases = [_]MissingKeysCase{
-    .{
-        .name = "both missing with leading comma keeps entries order",
-        .mig = .{
-            .entry_indent = "    ",
-            .needs_comma = true,
-            .has_cyclo = false,
-            .has_cog = false,
-        },
-        .expected =
+    missingKeysCase("both missing with leading comma keeps entries order", .{
+        .entry_indent = "    ",
+        .needs_comma = true,
+        .has_cyclo = false,
+        .has_cog = false,
+    },
         \\,
         \\    "max_cyclomatic": 10,
         \\    "max_cognitive": 15
-        ,
+    ),
+    missingKeysCase("only cognitive missing without comma emits single entry", .{
+        .entry_indent = "    ",
+        .needs_comma = false,
+        .has_cyclo = true,
+        .has_cog = false,
     },
-    .{
-        .name = "only cognitive missing without comma emits single entry",
-        .mig = .{
-            .entry_indent = "    ",
-            .needs_comma = false,
-            .has_cyclo = true,
-            .has_cog = false,
-        },
-        .expected =
         \\
         \\    "max_cognitive": 15
-        ,
+    ),
+    missingKeysCase("only cyclomatic missing without comma uses given indent", .{
+        .entry_indent = "  ",
+        .needs_comma = false,
+        .has_cyclo = false,
+        .has_cog = true,
     },
-    .{
-        .name = "only cyclomatic missing without comma uses given indent",
-        .mig = .{
-            .entry_indent = "  ",
-            .needs_comma = false,
-            .has_cyclo = false,
-            .has_cog = true,
-        },
-        .expected =
         \\
         \\  "max_cyclomatic": 10
-        ,
-    },
+    ),
 };
 
 test "migrateThresholds inserts missing keys byte-exactly" {
@@ -87851,64 +87824,67 @@ const VersionRewriteCase = struct {
     expected: ?[]const u8,
 };
 
+/// One EPH-I0511 rewrite pin: name, input, and the expected output (null
+/// pins a no-op). The builder mirrors migrateCase: the repeated case
+/// skeleton stays out of the ZA504 clone stream.
+fn rewriteCase(
+    comptime name: []const u8,
+    comptime input: []const u8,
+    comptime expected: ?[]const u8,
+) VersionRewriteCase {
+    return .{ .name = name, .input = input, .expected = expected };
+}
+
 /// EPH-I0511 rewrite pins: the "version" anchor must sit in code in key
 /// position, and the splice must fail closed on any other shape. Pre-fix
 /// the raw substring matches hit comments, string values, and stray
 /// braces, splicing the version into the user's config at arbitrary
 /// quote pairs.
 const version_rewrite_cases = [_]VersionRewriteCase{
-    .{
-        .name = "comment version anchor stays inert; field inserted",
-        .input =
+    rewriteCase("comment version anchor stays inert; field inserted",
         \\// "version": "0.9.9" (schema note)
         \\{
         \\  "path_dir": "src"
         \\}
-        ,
-        .expected =
+    ,
         \\// "version": "0.9.9" (schema note)
         \\{
         \\  "version": "0.14.3",
         \\  "path_dir": "src"
         \\}
-        ,
-    },
-    .{
-        .name = "real key replaced byte-exactly",
-        .input = "{\"version\": \"0.9.9\", \"path_dir\": \"src\"}",
-        .expected = "{\"version\": \"0.14.3\", \"path_dir\": \"src\"}",
-    },
-    .{
-        .name = "leading comment brace does not receive the insertion",
-        .input =
+    ),
+    rewriteCase(
+        "real key replaced byte-exactly",
+        "{\"version\": \"0.9.9\", \"path_dir\": \"src\"}",
+        "{\"version\": \"0.14.3\", \"path_dir\": \"src\"}",
+    ),
+    rewriteCase("leading comment brace does not receive the insertion",
         \\// the { is a placeholder
         \\{
         \\  "path_dir": "src"
         \\}
-        ,
-        .expected =
+    ,
         \\// the { is a placeholder
         \\{
         \\  "version": "0.14.3",
         \\  "path_dir": "src"
         \\}
-        ,
-    },
-    .{
-        .name = "version VALUE does not anchor the replace",
-        .input = "{\"path_dir\": \"version\", \"disable\": [\"ZA305\"]}",
-        .expected = "{\n  \"version\": \"0.14.3\",\"path_dir\": \"version\", \"disable\": [\"ZA305\"]}",
-    },
-    .{
-        .name = "number value no-ops instead of splicing",
-        .input = "{\"version\": 5, \"path_dir\": \"src\"}",
-        .expected = null,
-    },
-    .{
-        .name = "missing colon no-ops the replace and inserts a field",
-        .input = "{\"version\" \"0.9.9\"}",
-        .expected = "{\n  \"version\": \"0.14.3\",\"version\" \"0.9.9\"}",
-    },
+    ),
+    rewriteCase(
+        "version VALUE does not anchor the replace",
+        "{\"path_dir\": \"version\", \"disable\": [\"ZA305\"]}",
+        "{\n  \"version\": \"0.14.3\",\"path_dir\": \"version\", \"disable\": [\"ZA305\"]}",
+    ),
+    rewriteCase(
+        "number value no-ops instead of splicing",
+        "{\"version\": 5, \"path_dir\": \"src\"}",
+        null,
+    ),
+    rewriteCase(
+        "missing colon no-ops the replace and inserts a field",
+        "{\"version\" \"0.9.9\"}",
+        "{\n  \"version\": \"0.14.3\",\"version\" \"0.9.9\"}",
+    ),
 };
 
 test "buildVersionUpdatedConfig ignores version anchors in comments and strings (EPH-I0511)" {
@@ -120597,6 +120573,28 @@ test "makeEntriesAbsolute OOM sweep keeps every slot owned 1:1 (EPH-I0195)" {
     }
 }
 
+/// One armed OOM-sweep probe: a FailingAllocator over the testing
+/// allocator plus the Config rooted at root_path, armed to fail on the
+/// fail_at-th allocation AFTER setOwnedPath (the arm must never eat the
+/// setup allocations). The diag counters reset so every iteration
+/// measures its own rejects and notes. Shared by the EPH-I0689 and
+/// EPH-I0763 sweep helpers; the repeated prologue was one ZA504 clone.
+const SweepProbe = struct {
+    failing: std.testing.FailingAllocator,
+    cfg: Config,
+};
+
+fn armSweepProbe(diag: *DiagCtx, root_path: []const u8, fail_at: usize) !SweepProbe {
+    const parent = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(parent, .{});
+    var cfg = testConfig();
+    try setOwnedPath(failing.allocator(), &cfg, root_path);
+    failing.fail_index = failing.allocations + fail_at;
+    diag.entries_reject_count = 0;
+    diag.entries_reject_note_count = 0;
+    return .{ .failing = failing, .cfg = cfg };
+}
+
 /// One EPH-I0689 sweep iteration: run loadConfigFromTargetPath under an
 /// allocator that fails on its fail_at-th allocation (fail_at == total
 /// induces none), then prove deinit releases every byte exactly once.
@@ -120606,22 +120604,16 @@ fn runConfigLoadSweepIteration(
     fail_at: usize,
     total: usize,
 ) !void {
-    const parent = std.testing.allocator;
-    var failing = std.testing.FailingAllocator.init(parent, .{});
-    var cfg = testConfig();
-    try setOwnedPath(failing.allocator(), &cfg, root_path);
-    failing.fail_index = failing.allocations + fail_at;
-    diag.entries_reject_count = 0;
-    diag.entries_reject_note_count = 0;
+    var probe = try armSweepProbe(diag, root_path, fail_at);
     if (fail_at == total) {
-        try runLoadSweepNoFailure(diag, &failing, &cfg, root_path);
+        try runLoadSweepNoFailure(diag, &probe.failing, &probe.cfg, root_path);
     } else {
-        try runLoadSweepInducedFailure(diag, &failing, &cfg, root_path);
+        try runLoadSweepInducedFailure(diag, &probe.failing, &probe.cfg, root_path);
     }
-    cfg.deinit(failing.allocator());
+    probe.cfg.deinit(probe.failing.allocator());
     // Byte balance is the leak proof. A double-free panics the parent
     // DebugAllocator before this line runs.
-    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try std.testing.expectEqual(probe.failing.allocated_bytes, probe.failing.freed_bytes);
 }
 
 /// The no-induced-failure arm of runConfigLoadSweepIteration: the load
@@ -120709,23 +120701,17 @@ test "loadConfigFromTargetPath OOM sweep frees saved_path exactly once (EPH-I068
 /// Pre-fix the fallback's dirname(target_path) read the freed bytes, so the
 /// parent config was missed and cfg.path stayed at the path_dir value.
 fn runParentFallbackSweepIteration(diag: *DiagCtx, root_path: []const u8, fail_at: usize) !void {
-    const parent = std.testing.allocator;
-    var failing = std.testing.FailingAllocator.init(parent, .{});
-    var cfg = testConfig();
-    try setOwnedPath(failing.allocator(), &cfg, root_path);
-    failing.fail_index = failing.allocations + fail_at;
-    diag.entries_reject_count = 0;
-    diag.entries_reject_note_count = 0;
-    if (loadConfigFromTargetPath(diag, failing.allocator(), &cfg, cfg.path)) {
-        try std.testing.expectEqualStrings(root_path, cfg.path);
-        try std.testing.expect(cfg.path_owned);
+    var probe = try armSweepProbe(diag, root_path, fail_at);
+    if (loadConfigFromTargetPath(diag, probe.failing.allocator(), &probe.cfg, probe.cfg.path)) {
+        try std.testing.expectEqualStrings(root_path, probe.cfg.path);
+        try std.testing.expect(probe.cfg.path_owned);
     } else |err| {
         try std.testing.expectEqual(error.OutOfMemory, err);
     }
-    cfg.deinit(failing.allocator());
+    probe.cfg.deinit(probe.failing.allocator());
     // Byte balance is the leak proof. A double-free panics the parent
     // DebugAllocator before this line runs.
-    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try std.testing.expectEqual(probe.failing.allocated_bytes, probe.failing.freed_bytes);
 }
 
 test "loadConfigFromTargetPath parent fallback never reads freed target_path (EPH-I0763)" {

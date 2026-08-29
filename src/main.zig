@@ -1139,23 +1139,56 @@ fn scanQuoteStep(mode: *QuoteMode, c: u8) ?usize {
     };
 }
 
+/// Iterate one line's code-position chars: quote content is skipped, and
+/// only code chars reach the caller (EPH-I1232 C2a, REL-GATE-2, REL-AB-5). The scan-loop
+/// prologue idiom — a local QuoteMode, an index from 0, and the same
+/// 8-line quote-aware walk head — repeated across the scanner fns; this
+/// iterator owns the uniform part, and each site keeps its own cut
+/// condition and body. `next` yields the index of the next code char in
+/// `line`, or null at the line end. The caller's loop carries
+/// `: (walk.advance())` as its continue expression, so a body that
+/// breaks leaves `index` naming the break char, and an exhausted walk
+/// leaves it at `line.len` — the pre-migration `i` semantics.
+const QuoteWalk = struct {
+    line: []const u8,
+    mode: QuoteMode = .none,
+    index: usize = 0,
+
+    fn init(line: []const u8) QuoteWalk {
+        return .{ .line = line };
+    }
+
+    /// Index of the next code-position char, or null at the line end.
+    fn next(self: *QuoteWalk) ?usize {
+        while (self.index < self.line.len) : (self.index += 1) {
+            const c = self.line[self.index];
+            if (scanQuoteStep(&self.mode, c)) |skip| {
+                self.index += skip;
+                continue;
+            }
+            return self.index;
+        }
+        return null;
+    }
+
+    /// Step past the char `next` most recently yielded.
+    fn advance(self: *QuoteWalk) void {
+        self.index += 1;
+    }
+};
+
 /// Return the line with any trailing `//` comment removed (quote-aware:
 /// `//` inside string/char literals is kept). A `\\` multiline opener in
 /// code position cuts the line at the opener: its tail is string data, so
 /// no comment or code can follow it (EPH-I0671).
 fn stripLineComment(t: []const u8) []const u8 {
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < t.len) : (i += 1) {
+    var walk = QuoteWalk.init(t);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
         if (types.isMultilineOpenerAt(t, i)) break;
         if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
     }
-    return mem.trimEnd(u8, t[0..i], " \t\r");
+    return mem.trimEnd(u8, t[0..walk.index], " \t\r");
 }
 
 /// Find the next `tag` occurrence in `line` at or after `from` whose first
@@ -1897,16 +1930,11 @@ const CFGBuildCtx = struct {
             .virtual_ok = virtualOkFor(pattern, cond_end),
             .suppress_pending = suppress_pending,
         };
-        var mode: QuoteMode = .none;
-        var i: usize = 0;
-        while (i < code.len) : (i += 1) {
+        var walk = QuoteWalk.init(code);
+        while (walk.next()) |i| : (walk.advance()) {
             const c = code[i];
-            if (scanQuoteStep(&mode, c)) |skip| {
-                i += skip;
-                continue;
-            }
             if (c == '/' and i + 1 < code.len and code[i + 1] == '/') break;
-            i += try self.scanCodeChar(i, &line_scan);
+            walk.index += try self.scanCodeChar(i, &line_scan);
         }
         try self.closeVirtualBody(code.len, &line_scan);
         try self.closeElseVirtual(code.len, &line_scan);
@@ -3952,15 +3980,9 @@ fn loopBodyStartCol(t: []const u8) ?usize {
 /// when the condition does not close on this line.
 fn loopCondCloseCol(t: []const u8) ?usize {
     var depth: usize = 0;
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < t.len) : (i += 1) {
+    var walk = QuoteWalk.init(t);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
-        if (mode != .none) continue;
         if (c == '(') depth += 1;
         if (c != ')') continue;
         if (depth == 0) continue;
@@ -4809,14 +4831,9 @@ fn hasOnelineLoopClose(t: []const u8) bool {
     var paren_depth: usize = 0;
     var bracket_depth: usize = 0;
     var brace_depth: usize = 0;
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < code.len) : (i += 1) {
+    var walk = QuoteWalk.init(code);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = code[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
         foldHeaderDepths(c, &paren_depth, &bracket_depth);
         if (paren_depth != 0 or bracket_depth != 0) continue;
         if (onelineBodyStep(&brace_depth, c)) |verdict| return verdict;
@@ -4853,14 +4870,9 @@ const ForLoopTracker = struct {
     /// EPH-I0751).
     fn codeBraceDelta(t: []const u8) i32 {
         var count: i32 = 0;
-        var mode: QuoteMode = .none;
-        var i: usize = 0;
-        while (i < t.len) : (i += 1) {
+        var walk = QuoteWalk.init(t);
+        while (walk.next()) |i| : (walk.advance()) {
             const c = t[i];
-            if (scanQuoteStep(&mode, c)) |skip| {
-                i += skip;
-                continue;
-            }
             if (types.isMultilineOpenerAt(t, i)) break;
             if (c == '{') count += 1;
             if (c == '}') count -= 1;
@@ -6630,14 +6642,9 @@ fn foldNonCloseLine(t: []const u8, depth: usize) usize {
 /// fails the walk closed.
 fn trailingClosePos(code: []const u8, depth: usize) ?usize {
     var d = depth;
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < code.len) : (i += 1) {
+    var walk = QuoteWalk.init(code);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = code[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
         if (c == '{') d += 1;
         if (c == '}') {
             d -= 1;
@@ -7079,14 +7086,9 @@ fn blockContainsAssignment(
 /// (EPH-I0081).
 fn computeBraceDepth(t: []const u8, initial: usize) usize {
     var depth = initial;
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < t.len) : (i += 1) {
+    var walk = QuoteWalk.init(t);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
         if (types.isMultilineOpenerAt(t, i)) break;
         if (c == '/' and i + 1 < t.len and t[i + 1] == '/') break;
         if (c == '{') depth += 1;
@@ -7584,14 +7586,9 @@ const BackwardBraceResult = struct {
 fn trackBackwardBraces(t: []const u8, initial_depth: usize) BackwardBraceResult {
     var unmatched_open: usize = 0;
     var unmatched_close: usize = 0;
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < t.len) : (i += 1) {
+    var walk = QuoteWalk.init(t);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
         if (types.isMultilineOpenerAt(t, i)) break;
         if (c == '{') unmatched_open += 1;
         if (c != '}') continue;
@@ -8127,14 +8124,9 @@ fn trackBracesWithZeroDetect(
         .found_open = initial_open,
         .touched_zero = false,
     };
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < t.len) : (i += 1) {
+    var walk = QuoteWalk.init(t);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
         if (types.isMultilineOpenerAt(t, i)) break;
         // A trailing comment's braces are data: they never open, close, or
         // touch zero (EPH-I0081).
@@ -8610,14 +8602,9 @@ fn isOrShortCircuitSafe(
 /// for callers holding a raw line (EPH-I0794).
 fn parenBalanceOutsideQuotes(t: []const u8) i32 {
     var balance: i32 = 0;
-    var mode: QuoteMode = .none;
-    var i: usize = 0;
-    while (i < t.len) : (i += 1) {
+    var walk = QuoteWalk.init(t);
+    while (walk.next()) |i| : (walk.advance()) {
         const c = t[i];
-        if (scanQuoteStep(&mode, c)) |skip| {
-            i += skip;
-            continue;
-        }
         if (c == '(') balance += 1;
         if (c == ')') balance -= 1;
     }
@@ -71827,6 +71814,31 @@ test "stripLineComment cuts a mid-line multiline opener tail (EPH-I0671)" {
     try std.testing.expectEqualStrings("", stripLineComment("\\\\ body // x"));
     // A comment before any opener still cuts at the comment.
     try std.testing.expectEqualStrings("x();", stripLineComment("x(); // c"));
+}
+
+test "QuoteWalk yields code chars and pins index at break or line end (EPH-I1232 C2a)" {
+    // String content is skipped: only the code chars reach the body.
+    var walk = QuoteWalk.init("a \"b\" c");
+    var seen: usize = 0;
+    while (walk.next()) |_| : (walk.advance()) {
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), seen);
+    // Exhaustion leaves index at line.len.
+    try std.testing.expectEqual(@as(usize, 7), walk.index);
+    // Break leaves index naming the break char (the comment opener).
+    var cut = QuoteWalk.init("x(); // c");
+    while (cut.next()) |i| : (cut.advance()) {
+        if (cut.line[i] == '/' and i + 1 < cut.line.len and cut.line[i + 1] == '/') break;
+    }
+    try std.testing.expectEqual(@as(usize, 5), cut.index);
+    // An escape inside a char literal skips the escaped closer.
+    var esc = QuoteWalk.init("'\\'' {");
+    var braces: usize = 0;
+    while (esc.next()) |i| : (esc.advance()) {
+        if (esc.line[i] == '{') braces += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), braces);
 }
 
 test "findCommentStart ignores comment text in a multiline opener tail (EPH-I0671)" {

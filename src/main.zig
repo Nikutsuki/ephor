@@ -24981,9 +24981,20 @@ const BlockClose = struct {
     opens_arm: bool,
 };
 
+/// One fn parameter's name and type text, owned by the record
+/// (EPH-I1228): the receiver-type binding for the ZC101 domain-method
+/// suppression. deinit frees both slices.
+const ConcParam = struct {
+    name: []const u8,
+    type_text: []const u8,
+};
+
 /// Per-fn lock facts accumulated while scanning (ZC101, ZC102, ZC103).
 const FnLockRecord = struct {
     acquires: std.ArrayListUnmanaged(LockAcquire) = .empty,
+    /// The fn's parameter bindings, captured from its signature when the
+    /// body opens (EPH-I1228). Empty when the signature never resolves.
+    params: std.ArrayListUnmanaged(ConcParam) = .empty,
     /// Acquires excluded from ZC101/ZC102 evaluation — defer-context
     /// (zls diagnostics cleanup blocks) or discarded-result (hold-till-
     /// close file locks). The exclusion is the whole story: no consumer
@@ -25001,6 +25012,11 @@ const FnLockRecord = struct {
 
     fn deinit(self: *FnLockRecord, allocator: Allocator) void {
         self.acquires.deinit(allocator);
+        for (self.params.items) |param| {
+            allocator.free(param.name);
+            allocator.free(param.type_text);
+        }
+        self.params.deinit(allocator);
         self.defer_releases.deinit(allocator);
         self.plain_releases.deinit(allocator);
         self.closes.deinit(allocator);
@@ -25013,10 +25029,31 @@ const FnLockRecord = struct {
 /// kind word; an overflow fails loud (pushDeferBrace).
 const max_defer_stack_depth = 64;
 
+/// Index of struct names declared in ONE file, each mapped to whether the
+/// struct body declares a tracked lock-primitive-typed field (EPH-I1228).
+/// Keys borrow the file content. The per-file bound follows the ZC104
+/// join-search precedent: a receiver whose struct lives in another file
+/// never resolves and keeps the current behavior (fire — the safe
+/// direction).
+const LockStructIndex = struct {
+    map: std.StringHashMapUnmanaged(bool) = .empty,
+
+    fn deinit(self: *LockStructIndex, allocator: Allocator) void {
+        self.map.deinit(allocator);
+    }
+};
+
 /// Mutable state for the per-file concurrency scan (ZC101).
 const ConcurrencyScanState = struct {
     allocator: Allocator,
     records: std.ArrayListUnmanaged(FnLockRecord) = .empty,
+    /// Accumulated signature lines of the pending fn def (EPH-I1228):
+    /// captured until the body brace opens, then parsed into the new
+    /// record's params. Slices borrow the file content.
+    pending_sig: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Per-file struct index the domain-method suppression consults
+    /// (EPH-I1228). Built once per file by analyzeFileConcurrency.
+    lock_structs: *const LockStructIndex = undefined,
     in_fn: bool = false,
     pending_fn: bool = false,
     /// Paren depth of a pending fn def's signature (EPH-I0447): a `{`
@@ -25047,6 +25084,7 @@ const ConcurrencyScanState = struct {
     fn deinit(self: *ConcurrencyScanState) void {
         for (self.records.items) |*rec| rec.deinit(self.allocator);
         self.records.deinit(self.allocator);
+        self.pending_sig.deinit(self.allocator);
     }
 
     /// The fn record currently being filled (always the last appended).
@@ -25090,6 +25128,27 @@ fn isAcquireMethod(seg: []const u8) bool {
     };
     for (methods) |m| {
         if (mem.eql(u8, seg, m)) return true;
+    }
+    return false;
+}
+
+/// Field type texts that mark a struct as lock-bearing for the ZC101
+/// domain-method check (EPH-I1228): the std lock primitives of 0.15
+/// (`std.Thread.*`) and 0.16 (`std.Io.*`, verified against std 0.16.0 —
+/// Io.zig carries Mutex/RwLock/Semaphore/Condition). The match is by
+/// TYPE text, never by field name. Aliased field types (`mu: Mutex`
+/// with `const Mutex = std.Thread.Mutex`) stay unrecognized — the
+/// struct then reads lock-less, the suppression-side conservative
+/// direction (see buildLockStructIndex).
+fn isLockPrimitiveFieldType(type_text: []const u8) bool {
+    const names = [_][]const u8{
+        "std.Thread.Mutex",     "std.Thread.Condvar",    "std.Thread.RwLock",
+        "std.Thread.Semaphore", "std.Thread.ResetEvent", "std.Thread.WaitGroup",
+        "std.Thread.Condition", "std.Io.Mutex",          "std.Io.RwLock",
+        "std.Io.Semaphore",     "std.Io.Condvar",        "std.Io.Condition",
+    };
+    for (names) |n| {
+        if (mem.indexOf(u8, type_text, n) != null) return true;
     }
     return false;
 }
@@ -25288,6 +25347,8 @@ fn popDeferBrace(state: *ConcurrencyScanState) void {
 /// The body brace is the first `{` OUTSIDE the signature's parens: a
 /// `.{}` default param value opens no record of its own, so a wrapped
 /// signature's real body is not lost to a phantom span (EPH-I0447).
+/// The pending signature lines accumulate so the opened record can bind
+/// its params for the EPH-I1228 domain-method suppression.
 fn updateConcurrencySpan(
     state: *ConcurrencyScanState,
     tc: []const u8,
@@ -25297,18 +25358,152 @@ fn updateConcurrencySpan(
         if (extractFnDef(tc) == null) return;
         state.pending_fn = true;
         state.sig_parens = 0;
+        state.pending_sig.clearRetainingCapacity();
     }
+    try state.pending_sig.append(state.allocator, tc);
     // Scan the literal-blanked line for the body open: paren depth is
     // carried across lines, so a `.{}` default on a wrapped param line
     // stays inside the signature.
     if (!findBodyOpen(blanked, &state.sig_parens)) {
-        if (mem.endsWith(u8, tc, ";")) state.pending_fn = false;
+        if (mem.endsWith(u8, tc, ";")) {
+            state.pending_fn = false;
+            state.pending_sig.clearRetainingCapacity();
+        }
         return;
     }
     state.pending_fn = false;
     state.in_fn = true;
     state.fn_depth = 0;
     try state.records.append(state.allocator, .{});
+    try captureConcParams(state.allocator, state.current(), state.pending_sig.items);
+    state.pending_sig.clearRetainingCapacity();
+}
+
+/// Bind every parameter of the accumulated fn signature (EPH-I1228):
+/// collect the param-list text from the first `(` to its match, split
+/// depth-1 commas into segments, and bind each segment's name and type
+/// (owned dupes — the list buffer dies with this fn). A signature that
+/// never yields a param list binds nothing — its acquires keep the
+/// current behavior (fire).
+fn captureConcParams(
+    allocator: Allocator,
+    rec: *FnLockRecord,
+    sig: []const []const u8,
+) !void {
+    const open = firstConcParen(sig) orelse return;
+    const list = try collectConcSigText(allocator, sig, open.line, open.col + 1);
+    defer allocator.free(list);
+    var from: usize = 0;
+    while (from < list.len) {
+        const end = nextConcSegEnd(list, from);
+        try bindConcParam(allocator, rec, list[from..end]);
+        from = end + 1;
+    }
+}
+
+/// Position of the fn param list: the first '(' across the signature
+/// lines (EPH-I1228). A quoted fn name carrying a paren would mis-bind
+/// — the degenerate miss resolves nothing and stays conservative.
+const ConcPos = struct { line: usize, col: usize };
+
+/// First '(' across the signature lines (EPH-I1228), or null.
+fn firstConcParen(sig: []const []const u8) ?ConcPos {
+    for (sig, 0..) |line, i| {
+        const col = mem.indexOfScalar(u8, line, '(') orelse continue;
+        return .{ .line = i, .col = col };
+    }
+    return null;
+}
+
+/// Collect the param-list text from (line, col) through its matching
+/// depth-1 ')' into a fresh buffer (EPH-I1228). The returned slice is
+/// caller-owned; group chars keep their depth for the segment walk.
+fn collectConcSigText(
+    allocator: Allocator,
+    sig: []const []const u8,
+    from_line: usize,
+    from_col: usize,
+) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var depth: usize = 1;
+    var li = from_line;
+    var ci = from_col;
+    while (li < sig.len) {
+        const line = sig[li];
+        while (ci < line.len) : (ci += 1) {
+            const c = line[ci];
+            if (isConcListEnd(c, depth)) return buf.toOwnedSlice(allocator);
+            stepConcDepth(&depth, concDepthDelta(c));
+            try buf.append(allocator, c);
+        }
+        li += 1;
+        ci = 0;
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+/// True when the char closes the param list at depth 1 (EPH-I1228).
+fn isConcListEnd(c: u8, depth: usize) bool {
+    return c == ')' and depth == 1;
+}
+
+/// Depth delta of one param-list char (EPH-I1228): openers deepen,
+/// closers shallow; other chars leave the depth unchanged.
+fn concDepthDelta(c: u8) i32 {
+    if (c == '(' or c == '{') return 1;
+    if (c == ')' or c == '}') return -1;
+    return 0;
+}
+
+/// Saturating group-depth step for the param-list walks (EPH-I1228):
+/// a closer at depth 0 (unbalanced text in broken source) never
+/// underflows — the miss stays conservative.
+fn stepConcDepth(depth: *usize, delta: i32) void {
+    if (delta > 0) {
+        depth.* += 1;
+        return;
+    }
+    if (delta < 0 and depth.* > 0) depth.* -= 1;
+}
+
+/// End offset of the segment starting at `from` in the flat param list
+/// (EPH-I1228): the next depth-0 comma, or the list end.
+fn nextConcSegEnd(list: []const u8, from: usize) usize {
+    var depth: usize = 0;
+    for (list[from..], from..) |c, i| {
+        stepConcDepth(&depth, concDepthDelta(c));
+        if (c == ',' and depth == 0) return i;
+    }
+    return list.len;
+}
+
+/// Bind one flat param segment (EPH-I1228): the identifier run before
+/// the first ':' is the name (prefix keywords like `noalias` sit before
+/// the run and never confuse it), and the trimmed text after the colon
+/// is the type. `anytype` segments have no colon and bind nothing. The
+/// name and type are duped into the record (the segment borrows the
+/// transient list buffer).
+fn bindConcParam(
+    allocator: Allocator,
+    rec: *FnLockRecord,
+    text: []const u8,
+) !void {
+    const colon = mem.indexOfScalar(u8, text, ':') orelse return;
+    var i = colon;
+    while (i > 0 and (text[i - 1] == ' ' or text[i - 1] == '\t')) i -= 1;
+    const name_end = i;
+    while (i > 0 and isIdent(text[i - 1])) i -= 1;
+    if (i == name_end) return;
+    const name = try allocator.dupe(u8, text[i..name_end]);
+    errdefer allocator.free(name);
+    const type_text = mem.trim(u8, text[colon + 1 ..], " \t");
+    const type_dupe = try allocator.dupe(u8, type_text);
+    errdefer allocator.free(type_dupe);
+    try rec.params.append(allocator, .{
+        .name = name,
+        .type_text = type_dupe,
+    });
 }
 
 /// Lock-family classification of one call's final segment (ZC101).
@@ -25339,10 +25534,63 @@ fn recordLockCall(
 ) !void {
     const rec = state.current();
     switch (kind) {
-        .acquire => try recordAcquireLock(rec, lc, call, state.allocator),
+        .acquire => {
+            if (isDomainLockCall(state, call.receiver)) return;
+            try recordAcquireLock(rec, lc, call, state.allocator);
+        },
         .release => try recordReleaseLock(rec, lc, call, state.allocator),
         .other => {},
     }
+}
+
+/// The identifier core of a param type text (EPH-I1228): strip leading
+/// pointer and optional tokens, then require the whole remainder to be
+/// one plain identifier. A dotted std type (`std.Thread.Mutex`), a
+/// generic (`ArrayList(u8)`), or a compound type resolves to null — the
+/// acquire keeps firing (the safe direction).
+fn typeIdentCore(type_text: []const u8) ?[]const u8 {
+    var t = mem.trim(u8, type_text, " \t");
+    while (true) {
+        const next = stripConcTypeToken(t);
+        if (next.ptr == t.ptr and next.len == t.len) break;
+        t = next;
+    }
+    if (t.len == 0 or !isIdent(t[0])) return null;
+    var end: usize = 1;
+    while (end < t.len and isIdent(t[end])) end += 1;
+    if (end != t.len) return null;
+    return t[0..end];
+}
+
+/// One leading pointer/optional token stripped from a param type text
+/// (EPH-I1228): returns the remainder, or the input unchanged when no
+/// token matches.
+fn stripConcTypeToken(t: []const u8) []const u8 {
+    if (mem.startsWith(u8, t, "*const ")) return mem.trim(u8, t[7..], " \t");
+    if (t.len > 0 and t[0] == '*') return mem.trim(u8, t[1..], " \t");
+    if (t.len > 0 and t[0] == '?') return mem.trim(u8, t[1..], " \t");
+    return t;
+}
+
+/// True when a lock-family acquire on a bare receiver is a domain
+/// method call (EPH-I1228): the receiver binds to a fn parameter whose
+/// type is a struct declared in THIS file with no tracked
+/// lock-primitive field. Chain receivers (`self.mu.lock`), local
+/// variables, std-typed params, and cross-file structs never resolve —
+/// they keep the current behavior (fire).
+fn isDomainLockCall(state: *const ConcurrencyScanState, receiver: []const u8) bool {
+    if (mem.indexOfScalar(u8, receiver, '.') != null) return false;
+    // The open fn record is always the last appended (same invariant as
+    // ConcurrencyScanState.current); the const path avoids the mutable
+    // accessor here.
+    const rec = &state.records.items[state.records.items.len - 1];
+    for (rec.params.items) |param| {
+        if (!mem.eql(u8, param.name, receiver)) continue;
+        const core = typeIdentCore(param.type_text) orelse return false;
+        const has_lock = state.lock_structs.map.get(core) orelse return false;
+        return !has_lock;
+    }
+    return false;
 }
 
 /// Record one lock-family acquire (recordLockCall): the ZC101 lock record
@@ -25492,6 +25740,185 @@ fn scanConcurrencyCalls(state: *ConcurrencyScanState, lc: ConcLineCtx) !void {
             .receiver = receiver,
             .depth = braceDelta(state.fn_depth, lc.blanked[0..site.start]),
         });
+    }
+}
+
+/// Struct name of a `Name = struct` declaration (EPH-I1228): the
+/// identifier token immediately before `= struct` in the blanked line,
+/// sliced from the original code (blanked bytes live in a reused
+/// buffer). A word boundary after `struct` rejects `= structName`.
+fn findStructDeclName(code: []const u8, blanked: []const u8) ?[]const u8 {
+    const eq = mem.indexOf(u8, blanked, "= struct") orelse return null;
+    if (eq + 8 < blanked.len and isIdent(blanked[eq + 8])) return null;
+    var i = eq;
+    while (i > 0 and (code[i - 1] == ' ' or code[i - 1] == '\t')) i -= 1;
+    const end = i;
+    while (i > 0 and isIdent(code[i - 1])) i -= 1;
+    if (i == end) return null;
+    return code[i..end];
+}
+
+/// Position of the `{` that opens a struct body, at/after `from` on the
+/// same line (EPH-I1228). A `;` first marks a bodiless forward decl.
+fn structBodyOpenPos(blanked: []const u8, from: usize) ?usize {
+    for (blanked[from..], from..) |c, i| {
+        if (c == '{') return i;
+        if (c == ';') return null;
+    }
+    return null;
+}
+
+/// The first word (identifier run) of the trimmed line at/after `from`,
+/// or null when none exists (EPH-I1228 field-line keyword test).
+fn firstConcWord(t: []const u8, from: usize) ?[]const u8 {
+    var start = from;
+    while (start < t.len and (t[start] == ' ' or t[start] == '\t')) start += 1;
+    if (start >= t.len or !isIdent(t[start])) return null;
+    var end = start + 1;
+    while (end < t.len and isIdent(t[end])) end += 1;
+    return t[start..end];
+}
+
+/// True when the word starts a struct-body declaration, never a field
+/// (EPH-I1228): `fn`, `const`, `var`, and the test/namespace forms.
+fn isConcDeclKeyword(word: []const u8) bool {
+    const keywords = [_][]const u8{
+        "fn",          "const",  "var",    "comptime", "test", "usingnamespace",
+        "threadlocal", "export", "extern",
+    };
+    for (keywords) |kw| {
+        if (mem.eql(u8, word, kw)) return true;
+    }
+    return false;
+}
+
+/// True when the trimmed depth-1 text declares a tracked
+/// lock-primitive field (EPH-I1228): an identifier-led decl (decl
+/// keywords excluded, after an optional `pub`) whose text after its
+/// first ':' carries a tracked lock-primitive type name.
+fn isLockPrimitiveFieldLine(t: []const u8) bool {
+    if (t.len == 0 or !isIdent(t[0])) return false;
+    const first = firstConcWord(t, 0) orelse return false;
+    const word = if (mem.eql(u8, first, "pub"))
+        firstConcWord(t, first.len) orelse return false
+    else
+        first;
+    if (isConcDeclKeyword(word)) return false;
+    const colon = mem.indexOfScalar(u8, t, ':') orelse return false;
+    return isLockPrimitiveFieldType(mem.trim(u8, t[colon + 1 ..], " \t"));
+}
+
+/// One open struct-declaration walk (EPH-I1228): `depth` counts the
+/// body's braces (0 while the opener is awaited), `lock_field` records
+/// a tracked lock-primitive field at depth 1, and `name` borrows the
+/// file content.
+const LockStructWalk = struct {
+    in_struct: bool = false,
+    depth: usize = 0,
+    lock_field: bool = false,
+    name: ?[]const u8 = null,
+};
+
+/// Build the per-file struct index (EPH-I1228): every `Name = struct`
+/// declaration's depth-1 fields, each checked for a tracked
+/// lock-primitive type. The walk is line-based with brace counting on
+/// the literal-blanked text, so string and comment braces are data.
+/// One field per line contributes (a line holding several fields is a
+/// disclosed miss — only the first is checked, the suppression-side
+/// conservative direction), and a struct body whose opener sits on a
+/// later line waits for it (the Allman shape).
+fn buildLockStructIndex(
+    allocator: Allocator,
+    index: *LockStructIndex,
+    lines: []const []const u8,
+) !void {
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var walk = LockStructWalk{};
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const code_end = findCommentStart(line) orelse line.len;
+        const code = line[0..code_end];
+        const trimmed = mem.trim(u8, blankLiteralContents(code, &blank_buf), " \t\r");
+        try scanLockStructLine(allocator, index, &walk, .{ .code = code, .trimmed = trimmed });
+    }
+}
+
+/// One comment-stripped struct-scan line (EPH-I1228): the raw code and
+/// its literal-blanked trimmed form (the blanked bytes live in a reused
+/// buffer — callers never store them).
+const ConcLineForms = struct {
+    code: []const u8,
+    trimmed: []const u8,
+};
+
+/// Advance the struct walk by one blanked line (EPH-I1228): capture a
+/// new declaration, or scan the open body at its current depth.
+fn scanLockStructLine(
+    allocator: Allocator,
+    index: *LockStructIndex,
+    walk: *LockStructWalk,
+    forms: ConcLineForms,
+) !void {
+    if (!walk.in_struct) {
+        if (findStructDeclName(forms.code, forms.trimmed)) |nm| {
+            walk.in_struct = true;
+            walk.depth = 0;
+            walk.lock_field = false;
+            walk.name = nm;
+            // Fall through: consume a same-line body opener now. An
+            // early return leaves depth 0, and the NEXT line's first
+            // `{` — the `.{}` default of the struct's own mutex field —
+            // is misread as the body opener and its `}` closes the walk
+            // with lock_field=false (EPH-I1228 zc101_guard gate fail).
+        } else {
+            return;
+        }
+    }
+    if (walk.depth == 0) {
+        try scanLockStructOpenLine(allocator, index, walk, forms.trimmed);
+        return;
+    }
+    if (walk.depth == 1 and isLockPrimitiveFieldLine(forms.trimmed)) walk.lock_field = true;
+    updateLockStructBraceDepth(walk, forms.trimmed);
+    if (!walk.in_struct) try index.map.put(allocator, walk.name.?, walk.lock_field);
+}
+
+/// Depth-0 line of an open struct walk (EPH-I1228): find the body
+/// opener (same line or a later one) or end a bodiless forward decl.
+fn scanLockStructOpenLine(
+    allocator: Allocator,
+    index: *LockStructIndex,
+    walk: *LockStructWalk,
+    trimmed: []const u8,
+) !void {
+    const open = structBodyOpenPos(trimmed, 0) orelse {
+        if (mem.indexOfScalar(u8, trimmed, ';') != null) {
+            try index.map.put(allocator, walk.name.?, false);
+            walk.in_struct = false;
+        }
+        return;
+    };
+    walk.depth = 1;
+    if (isLockPrimitiveFieldLine(mem.trim(u8, trimmed[open + 1 ..], " \t"))) {
+        walk.lock_field = true;
+    }
+    updateLockStructBraceDepth(walk, trimmed[open + 1 ..]);
+    if (!walk.in_struct) try index.map.put(allocator, walk.name.?, walk.lock_field);
+}
+
+/// Count one line's braces into the struct-body depth (EPH-I1228): a
+/// `{` deepens, a `}` shallows, and reaching zero closes the body.
+fn updateLockStructBraceDepth(walk: *LockStructWalk, text: []const u8) void {
+    for (text) |c| {
+        if (c == '{') {
+            walk.depth += 1;
+            continue;
+        }
+        if (c == '}' and walk.depth > 0) {
+            walk.depth -= 1;
+            if (walk.depth == 0) walk.in_struct = false;
+        }
     }
 }
 
@@ -26437,9 +26864,18 @@ fn analyzeFileSpawns(sink: *const ConcurrencyIssueSink, a: FileAnalysis) !void {
 fn analyzeFileConcurrency(sink: *const ConcurrencyIssueSink, a: FileAnalysis) !void {
     var state = ConcurrencyScanState{ .allocator = sink.allocator };
     defer state.deinit();
-    var lines = mem.splitScalar(u8, a.content, '\n');
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines.deinit(sink.allocator);
+    var split = mem.splitScalar(u8, a.content, '\n');
+    while (split.next()) |line| try lines.append(sink.allocator, line);
+    // The per-file struct index for the EPH-I1228 domain-method
+    // suppression: struct name -> has a tracked lock-primitive field.
+    var lock_structs = LockStructIndex{};
+    try buildLockStructIndex(sink.allocator, &lock_structs, lines.items);
+    defer lock_structs.deinit(sink.allocator);
+    state.lock_structs = &lock_structs;
     var line_num: usize = 0;
-    while (lines.next()) |line| {
+    for (lines.items) |line| {
         line_num += 1;
         try scanConcurrencyLine(&state, line, line_num);
     }
@@ -112447,9 +112883,219 @@ test "ZC101: unspaced discard is not an acquire (EPH-I0446)" {
     try expectZC101Counts(run.issues.items, 0, 0);
 }
 
+// ZC101 domain-method suppression (EPH-I1228): a lock-family call on a
+// bare receiver binds to a fn parameter; when that parameter's type is
+// a struct declared in the same file with NO tracked lock-primitive
+// field, the call is a domain method (`Vault.lock()` auto-lock) and
+// never fires. Chain receivers, std-typed params, and unresolved names
+// keep firing — the safe direction, pinned by the sibling tests below.
+test "ZC101: domain lock method on a lock-less struct is silent (EPH-I1228)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The RhyOS credential_manager shape: checkAutoLock calls the
+    // domain lock() on a struct holding only data fields. Pre-fix this
+    // fired the lock-without-defer-unlock warning (the name match).
+    const content =
+        \\pub const Vault = struct {
+        \\    is_unlocked: bool = false,
+        \\    auto_lock_minutes: u32 = 5,
+        \\    last_activity: u64 = 0,
+        \\
+        \\    pub fn checkAutoLock(self: *Vault, now: u64) void {
+        \\        const ok = now > 0;
+        \\        _ = ok;
+        \\        if (now -| self.last_activity >= self.auto_lock_minutes * 60) {
+        \\            self.lock();
+        \\        }
+        \\    }
+        \\
+        \\    pub fn lock(self: *Vault) void {
+        \\        self.is_unlocked = false;
+        \\    }
+        \\};
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_domain.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: condvar hand-off re-acquire on a custom mutex is silent (EPH-I1228)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The RhyOS sched/sync.zig shape: CondVar.wait releases the mutex
+    // to block, re-acquires it, and hands it back to the caller by
+    // contract. The kernel Mutex is not a tracked std primitive, so the
+    // bare receiver resolves lock-less and the re-acquire stays silent.
+    // Disclosed precision bound: a real leak on a custom lock struct
+    // param is also silent — tracked-std coverage only (EPH-I1228).
+    const content =
+        \\pub const Mutex = struct {
+        \\    locked: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+        \\    owner: usize = 0,
+        \\
+        \\    pub fn unlockLocked(self: *Mutex) void {
+        \\        self.locked.store(0, .release);
+        \\        self.owner = 0;
+        \\    }
+        \\};
+        \\
+        \\pub const CondVar = struct {
+        \\    waiters: usize = 0,
+        \\
+        \\    pub fn wait(self: *CondVar, mutex: *Mutex) void {
+        \\        mutex.unlockLocked();
+        \\        self.waiters += 1;
+        \\        mutex.lock();
+        \\    }
+        \\};
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_condvar.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: std-mutex parameter lock without release still fires (EPH-I1228)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The most common real shape: a std.Thread.Mutex parameter. Its
+    // dotted type never resolves through the per-file struct index, so
+    // the warning must survive the suppression (positive control).
+    const content =
+        \\fn doWork(mu: *std.Thread.Mutex) void {
+        \\    mu.lock();
+        \\    const x = 1;
+        \\    _ = x;
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_stdmutex.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: bare self lock on a struct with a Mutex field still fires (EPH-I1228)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The done-when positive control: the receiver struct CONTAINS a
+    // tracked lock primitive, so the name match must stay live even
+    // though the receiver is bare (a domain lock on a lock-bearing
+    // struct is indistinguishable from the lock itself by text alone).
+    const content =
+        \\const Guard = struct {
+        \\    mu: std.Thread.Mutex = .{},
+        \\
+        \\    pub fn begin(self: *Guard) void {
+        \\        self.lock();
+        \\        const x = 1;
+        \\        _ = x;
+        \\    }
+        \\
+        \\    pub fn lock(self: *Guard) void {}
+        \\};
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_guard.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: field-chain mutex acquire still fires (EPH-I1228)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Chain receivers are exempt from the domain-method check: the
+    // ghostty Termio and sig Db corpus shapes stay live (a field-bound
+    // lock is the real acquire idiom, never a domain method).
+    const content =
+        \\const Pool = struct {
+        \\    mu: std.Thread.Mutex = .{},
+        \\
+        \\    pub fn run(self: *Pool) void {
+        \\        self.mu.lock();
+        \\        const x = 1;
+        \\        _ = x;
+        \\    }
+        \\};
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_chain.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: local mutex variable still fires (EPH-I1228)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A local variable binds to no fn parameter, so the suppression
+    // never applies — the classic local-mutex leak stays a warning.
+    const content =
+        \\fn f() void {
+        \\    var mu = std.Thread.Mutex{};
+        \\    mu.lock();
+        \\    const x = 1;
+        \\    _ = x;
+        \\}
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_local.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: domain lock under a wrapped signature is silent (EPH-I1228)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The signature lines accumulate across the wrap, so the param
+    // binding survives a multi-line fn header (the parameter name sits
+    // at its line's start — the appendConcParam run-at-line-start arm).
+    const content =
+        \\const Vault = struct {
+        \\    is_unlocked: bool = false,
+        \\
+        \\    pub fn checkAutoLock(
+        \\        self: *Vault,
+        \\        now: u64,
+        \\    ) void {
+        \\        if (now > 0) {
+        \\            self.lock();
+        \\        }
+        \\        const x = 1;
+        \\        _ = x;
+        \\    }
+        \\
+        \\    pub fn lock(self: *Vault) void {}
+        \\};
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_domain_wrap.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
 // ============================================================================
 // Concurrency Analysis Tests (ZC102 double lock)
-// ============================================================================
 
 /// Assert the exact ZC102 warning/note counts (both — a silent analyzer
 /// passes a warnings==0 check vacuously, so every silent test has a

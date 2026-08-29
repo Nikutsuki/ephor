@@ -521,7 +521,14 @@ error: no build.zig found in current directory
                     break
                 }
                 if ($null -eq $response) { return $false }
-                $response.EnsureSuccessStatusCode()
+                # EPH-I1231: the same emission class as the tags fetch
+                # (EPH-I1219): on .NET 5+ EnsureSuccessStatusCode
+                # returns the message, and a bare call emits it into the
+                # function output. The caller's -not test reads the
+                # two-element output as success, so the byte cap's
+                # fail-closed return read as a clean download. Discard
+                # the return explicitly.
+                $null = $response.EnsureSuccessStatusCode()
                 $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
                 $bytes = New-Object byte[] 8192
                 $fileStream = [System.IO.File]::Create($OutPath)
@@ -1087,8 +1094,13 @@ error: could not repair the fingerprint in build.zig.zon
 }
 
 # Report the install code only when this file runs as a script. The
-# $MyInvocation.PSCommandPath property is populated only when the caller is
-# a script (about_Automatic_Variables), so under irm | iex it stays empty
-# and the user's shell stays open. The code is the script block's only
-# output.
-if ($MyInvocation.PSCommandPath) { exit $installExitCode }
+# $MyInvocation.PSCommandPath property is populated only when the caller
+# is a script (about_Automatic_Variables), so under irm | iex it stays
+# empty and the user's shell stays open. The code is the script block's
+# only output.
+# EPH-I1231 (B136a pin): on pwsh 7.6.5 $MyInvocation.PSCommandPath is
+# empty even in a -File run, so the guard never fired and a failing
+# install always exited 0 for script callers. $PSCommandPath is
+# populated in -File runs and empty under iex (probed 2026-08-28), so
+# the pair covers both channels without opening the iex exit hazard.
+if ($MyInvocation.PSCommandPath -or $PSCommandPath) { exit $installExitCode }

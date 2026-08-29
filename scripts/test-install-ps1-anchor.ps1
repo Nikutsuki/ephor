@@ -23,6 +23,17 @@
 # the variant, -eq would match it and mis-anchor the block, and the
 # marker-position check below fails.
 #
+# EPH-I1231 (B136a): two more subprocess runs activate the release
+# signature check with EPHOR_RELEASE_PUBKEY (EPHOR_TEST_MODE-gated) and
+# a fake minisign on PATH. Test-EphorReleaseSignature's active branch is
+# the only Get-BoundedFile caller, and with the archive and signature
+# URLs pointed at a local HTTP listener the bounded download takes its
+# HTTP arm twice per run. On .NET 5+ a bare EnsureSuccessStatusCode()
+# emits the response into the function output, which makes the byte
+# cap's fail-closed return read as success (details in the pin block).
+# The over-cap run discriminates the defect on a .NET 5+ pwsh (7.6.5
+# here).
+#
 # Run:
 #   pwsh -NoProfile -File scripts/test-install-ps1-anchor.ps1
 #   PS1_ANCHOR_KEEP=1 ...        (keep the scratch tree)
@@ -120,10 +131,10 @@ $archivePath = Join-Path $testRoot "archive.tar.gz"
 Set-Content -Path $archivePath -Value 'dummy archive' -Encoding ASCII
 $archiveUrl = "file://" + $archivePath
 
-# Bind one local HTTP port and serve the tags JSON once. Both
-# Invoke-RestMethod and HttpClient reject file:// URLs on this pwsh, so
-# local HTTP is the hermetic tags channel.
-function startTagsListener {
+# Bind one local HTTP port. Both Invoke-RestMethod and HttpClient reject
+# file:// URLs on this pwsh, so local HTTP is the hermetic network
+# channel for the tags API and the pubkey-channel downloads.
+function startLocalListener {
     for ($attempt = 0; $attempt -lt 5; $attempt++) {
         $probe = [System.Net.Sockets.TcpListener]::new(
             [System.Net.IPAddress]::Loopback, 0)
@@ -143,7 +154,7 @@ function startTagsListener {
 }
 
 $tagsJson = '[{"name":"v0.99.2"},{"name":"v0.99.1"}]'
-$bound = startTagsListener
+$bound = startLocalListener
 $listener = $bound[0]
 $tagsPort = $bound[1]
 
@@ -261,6 +272,187 @@ check "string-literal mention unchanged" { $mentionCount -eq 1 }
 check "comment mention unchanged" { $commentCount -eq 1 }
 check "case-variant control line survives" { $controlCount -eq 1 }
 check "case-variant control line sits below the block" { $controlIdx -gt $markerIdx }
+
+# --- EPH-I1231 (B136a): the Get-BoundedFile HTTP-arm emission pin --------
+# The pubkey channel activates Test-EphorReleaseSignature's active branch
+# (the only Get-BoundedFile caller): EPHOR_RELEASE_PUBKEY supplies the
+# key and a fake minisign verifies everything. Two subprocess runs point
+# the archive and signature URLs at a local HTTP listener, so the
+# bounded download takes its HTTP arm twice per run.
+#
+# On .NET 5+ a bare EnsureSuccessStatusCode() emits the response into
+# the function output (probed on this pwsh: the call returns the message
+# and the statement emits it). The caller's -not test reads a two-element
+# array as success, so the leak is invisible on a clean download. The
+# over-cap return path changes the shape: the emission lands first and
+# return $false follows, so the output is @(response, $false) — the
+# caller still reads success, and the 1 MiB byte cap fails open (a
+# truncated signature verifies and the install exits 0). The over-cap
+# run pins exit 1 plus the named download failure, which discriminates
+# the defect on a .NET 5+ pwsh (7.6.5 here).
+$fakeMinisign = Join-Path $binDir "minisign"
+Set-Content -Path $fakeMinisign -Encoding ASCII -Value @(
+    '#!/bin/sh'
+    '# fake minisign for the pubkey-channel pin: every signature verifies'
+    'exit 0'
+)
+$null = & chmod +x $fakeMinisign
+if ($LASTEXITCODE -ne 0) { throw "chmod failed for the fake minisign" }
+
+# Any non-empty key reaches the active branch: the fake minisign never
+# reads it, so the pin needs no real keypair.
+$testPubkey = "untrusted comment: ephor B136a pubkey-channel pin (fake)"
+
+# Run the installer subprocess with the pubkey channel active and serve
+# its three fetches (tags, archive, signature) from a fresh local HTTP
+# listener. $SigBodyLength controls the signature body size: a normal
+# size pins the success path, one byte over the 1 MiB cap pins the
+# fail-closed cap. Returns the exit code, the output logs, and the
+# served-request flags in a hashtable.
+function runPubkeyInstall {
+    param(
+        [string]$Tag,
+        [string]$WorkDir,
+        [long]$SigBodyLength
+    )
+    $bound = startLocalListener
+    $listener = $bound[0]
+    $port = $bound[1]
+    $tagsBody = [System.Text.Encoding]::UTF8.GetBytes($tagsJson)
+    $archiveBody = [System.Text.Encoding]::UTF8.GetBytes("B136a pubkey-channel archive body")
+    $sigBody = [System.Text.Encoding]::UTF8.GetBytes(("s" * $SigBodyLength))
+    $outLog = Join-Path $testRoot "$Tag-out.log"
+    $errLog = Join-Path $testRoot "$Tag-err.log"
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $pwshPath
+    $psi.ArgumentList.Add("-NoProfile")
+    $psi.ArgumentList.Add("-NonInteractive")
+    $psi.ArgumentList.Add("-File")
+    $psi.ArgumentList.Add($installPs1)
+    $psi.WorkingDirectory = $WorkDir
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.Environment["PATH"] = $binDir + [System.IO.Path]::PathSeparator + $env:PATH
+    $psi.Environment["EPHOR_TEST_MODE"] = "1"
+    $psi.Environment["EPHOR_TAGS_API"] = "http://127.0.0.1:$port/tags.json"
+    $psi.Environment["EPHOR_ARCHIVE_URL"] = "http://127.0.0.1:$port/archive.tar.gz"
+    $psi.Environment["EPHOR_SIG_URL"] = "http://127.0.0.1:$port/sig.minisig"
+    $psi.Environment["EPHOR_RELEASE_PUBKEY"] = $testPubkey
+    $child = [System.Diagnostics.Process]::new()
+    $child.StartInfo = $psi
+    # The suite's main thread serves the three fetches in arrival order
+    # while the child runs; path routing keeps the bodies straight. The
+    # loop ends when all three are served or the child exits.
+    $child.Start() | Out-Null
+    $servedTags = $false
+    $servedArchive = $false
+    $servedSig = $false
+    $requestsServed = 0
+    while (-not $child.HasExited -and $requestsServed -lt 3) {
+        $ctxTask = $listener.GetContextAsync()
+        if (-not $ctxTask.Wait(500)) { continue }
+        $ctx = $ctxTask.Result
+        $path = $ctx.Request.Url.AbsolutePath
+        if ($path -eq "/tags.json") {
+            $body = $tagsBody
+            $servedTags = $true
+        } elseif ($path -eq "/archive.tar.gz") {
+            $body = $archiveBody
+            $servedArchive = $true
+        } elseif ($path -eq "/sig.minisig") {
+            $body = $sigBody
+            $servedSig = $true
+        } else {
+            $ctx.Response.StatusCode = 404
+            $ctx.Response.ContentLength64 = 0
+            $ctx.Response.OutputStream.Close()
+            continue
+        }
+        $ctx.Response.StatusCode = 200
+        $ctx.Response.ContentType = "application/octet-stream"
+        $ctx.Response.ContentLength64 = $body.Length
+        $ctx.Response.OutputStream.Write($body, 0, $body.Length)
+        $ctx.Response.OutputStream.Close()
+        $requestsServed += 1
+    }
+    if (-not $child.WaitForExit(90000)) {
+        $child.Kill($true)
+        throw "pubkey-channel install subprocess timed out"
+    }
+    $rc = $child.ExitCode
+    [System.IO.File]::WriteAllText($outLog, $child.StandardOutput.ReadToEnd())
+    [System.IO.File]::WriteAllText($errLog, $child.StandardError.ReadToEnd())
+    try { $listener.Stop() } catch { }
+    return @{
+        rc = $rc
+        out = [System.IO.File]::ReadAllText($outLog)
+        err = [System.IO.File]::ReadAllText($errLog)
+        servedTags = $servedTags
+        servedArchive = $servedArchive
+        servedSig = $servedSig
+    }
+}
+
+$D2 = Join-Path $testRoot "t48b"
+New-Item -ItemType Directory -Path $D2 | Out-Null
+Set-Content -Path (Join-Path $D2 "build.zig") -Encoding UTF8 -Value @(
+    'const std = @import("std");'
+    'pub fn build(b: *std.Build) !void {'
+    '    const exe = b.addExecutable(.{'
+    '        .name = "demo",'
+    '        .root_module = b.createModule(.{}),'
+    '    });'
+    '    b.installArtifact(exe);'
+    '}'
+)
+$D3 = Join-Path $testRoot "t48c"
+New-Item -ItemType Directory -Path $D3 | Out-Null
+Set-Content -Path (Join-Path $D3 "build.zig") -Encoding UTF8 -Value @(
+    'const std = @import("std");'
+    'pub fn build(b: *std.Build) !void {'
+    '    const exe = b.addExecutable(.{'
+    '        .name = "demo",'
+    '        .root_module = b.createModule(.{}),'
+    '    });'
+    '    b.installArtifact(exe);'
+    '}'
+)
+
+# 282 is the measured minisig size (installer comment, verified
+# 2026-08-27): the success run serves a realistic signature body.
+$pubRun = runPubkeyInstall -Tag "pubkey" -WorkDir $D2 -SigBodyLength 282
+# One byte over the 1 MiB signature cap ($SigCap = 1048576 in the
+# installer): the download must fail closed.
+$ovRun = runPubkeyInstall -Tag "overcap" -WorkDir $D3 -SigBodyLength 1048577
+
+# The success pin: a green install downloads the tarball and the
+# signature through the bounded HTTP arm, verifies, and exits 0 with an
+# empty stderr (no trio: the key is set).
+check "pubkey run exits 0" { $pubRun.rc -eq 0 }
+check "pubkey run reports verified signature" {
+    $pubRun.out -match 'Release signature verified\.'
+}
+check "pubkey run serves all three fetches" {
+    $pubRun.servedTags -and $pubRun.servedArchive -and $pubRun.servedSig
+}
+check "pubkey run stderr is empty" { $pubRun.err -eq "" }
+
+# The emission pin: a signature one byte over the 1 MiB cap must fail
+# the download closed. The emission defect turns the cap's return $false
+# into @(response, $false), which the caller's -not reads as success, so
+# the unfixed installer verifies a truncated signature and exits 0. The
+# fixed installer names the failure and exits 1.
+check "over-cap sig run exits 1" { $ovRun.rc -eq 1 }
+check "over-cap sig run names the download failure" {
+    $ovRun.err -match 'error: could not download the release signature\.'
+}
+check "over-cap sig run warns about the cap" {
+    $ovRun.err -match 'warning: the download exceeds the 1048576 byte cap\.'
+}
+check "over-cap sig run serves all three fetches" {
+    $ovRun.servedTags -and $ovRun.servedArchive -and $ovRun.servedSig
+}
 
 if (-not $keep) { Remove-Item -Recurse -Force $testRoot }
 

@@ -99,9 +99,11 @@ fi
 # The installer surface changes often (tag clamp, 1 MiB body cap, fallback
 # pairing), and the harness drives the real shipped functions with a fake
 # curl and file:// fixtures in seconds. A regression must not land
-# gate-green. The install.ps1 bounded-read arm (EPH-I0207) has no ps1
-# coverage: the 1e anchor leg pins one anchor scenario, so the
-# bounded-read port stays manual — the recorded limitation.
+# gate-green. The install.ps1 bounded-read HTTP arm (EPH-I0207) gained ps1
+# coverage in B136a (EPH-I1231): the 1e anchor leg's pubkey-channel runs
+# drive Get-BoundedFile through a local HTTP listener twice (a clean
+# download and an over-cap fail-closed one). The non-http (file://) arm
+# stays manual — the recorded limitation.
 ITR_EXIT=0
 sh "$SCRIPT_DIR/test-install-tag-resolution.sh" > "$GATE_DIR/install-tag.log" 2>&1 || ITR_EXIT=$?
 # The tally line is the harness's own verdict ("N tests, M failed"). Its

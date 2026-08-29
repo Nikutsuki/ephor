@@ -389,6 +389,152 @@ pub fn getQualifiedAllocFnPatterns() []const []const u8 {
     return currentTables().qualified_alloc_fn_patterns;
 }
 
+// ============================================================================
+// First-argument allocator patterns (EPH-I1232 C8)
+// Serves REL-ZERO-1 (closing EPH-I1232), REL-GATE-2 (the dogfood ratchet
+// must hold at 0), and REL-AB-5 (the corpus A/B must stay byte-identical).
+// Derived from the per-version alloc_method_patterns registries, not
+// hand-maintained: the deleted main.zig hand table (the old KEEP IN
+// SYNC mirror) is reproduced here as a compile-checked derivation.
+// ============================================================================
+
+/// Method-style allocating forms whose allocator is the FIRST call
+/// argument, not the receiver (std.fmt.allocPrint(allocator, ...),
+/// list.toOwnedSlice(allocator)). The list is the version-agnostic
+/// union of both supported versions' alloc_method_patterns minus the
+/// forms whose allocator sits elsewhere:
+///   - the std.mem.Allocator receiver methods: .alloc(, .alignedAlloc(,
+///     .allocSentinel(, .realloc(, .create(, .allocWithOptions(
+///   - .replaceOwned( — a comptime type is the first argument, the
+///     allocator second (main.zig keeps its own type-first table)
+///   - .realPathFileAlloc( — the allocator is the third argument
+///     (EPH-I1113, main.zig's third-arg table)
+/// The exclusion list is the scope guard: a registry member outside it
+/// must be pinned, so a registry change can never widen the derived
+/// list silently — the build fails until the pin or the exclusions
+/// change. .dupe(/.dupeZ( are safe members: for real
+/// allocator-receiver calls (allocator.dupe(u8, str)) the extraction
+/// reads the type param u8, which matches no no-free name and
+/// suppresses nothing.
+const first_arg_excluded_patterns: []const []const u8 = &.{
+    ".alloc(",
+    ".alignedAlloc(",
+    ".allocSentinel(",
+    ".realloc(",
+    ".create(",
+    ".allocWithOptions(",
+    ".replaceOwned(",
+    ".realPathFileAlloc(",
+};
+
+/// The deleted main.zig hand table's literals, in the deleted table's
+/// order: the derivation's order spec and the byte-verification
+/// reference. A pin entry leaves the derived list only when BOTH
+/// version registries drop the form; the containment proofs below turn
+/// every such change into a compile error until the pin or the
+/// exclusions change consciously.
+const first_arg_order_pin: []const []const u8 = &.{
+    ".allocPrint(",
+    ".allocPrintSentinel(",
+    ".toOwnedSlice(",
+    ".toOwnedSliceSentinel(",
+    ".cloneWithAllocator(",
+    ".readFileAlloc(",
+    ".readFileAllocOptions(",
+    ".readAlloc(",
+    ".allocRemaining(",
+    ".allocRemainingAlignedSentinel(",
+    ".selfExePathAlloc(",
+    ".selfExeDirPathAlloc(",
+    ".realpathAlloc(",
+    ".concatWithSentinel(",
+    ".dupe(",
+    ".dupeZ(",
+};
+
+/// True when `needle` sits in `patterns`.
+fn registryContains(patterns: []const []const u8, needle: []const u8) bool {
+    for (patterns) |pat| {
+        if (std.mem.eql(u8, pat, needle)) return true;
+    }
+    return false;
+}
+
+/// True when `needle` is a first-arg exclusion.
+fn excludedFromFirstArg(needle: []const u8) bool {
+    for (first_arg_excluded_patterns) |pat| {
+        if (std.mem.eql(u8, pat, needle)) return true;
+    }
+    return false;
+}
+
+/// The derived list: every pin entry a version registry still carries,
+/// in pin order. The by-value struct copy clears the comptime-var
+/// provenance (the BuiltVersionsString pattern above): a
+/// container-scope const must not slice a comptime var's storage
+/// directly.
+const FirstArgDerived = struct {
+    entries: [first_arg_order_pin.len][]const u8,
+    len: usize,
+};
+
+const first_arg_derived = blk: {
+    var entries: [first_arg_order_pin.len][]const u8 = undefined;
+    var len: usize = 0;
+    for (first_arg_order_pin) |candidate| {
+        if (registryContains(v0_15.alloc_method_patterns, candidate) or
+            registryContains(v0_16.alloc_method_patterns, candidate))
+        {
+            entries[len] = candidate;
+            len += 1;
+        }
+    }
+    break :blk FirstArgDerived{ .entries = entries, .len = len };
+};
+
+/// First-argument allocator patterns, derived from the registries
+/// (EPH-I1232 C8, REL-GATE-2, REL-AB-5). The sole consumer is
+/// matchAllocArgPattern in main.zig (findAllocCall reads
+/// getAllocMethodPatterns directly, so a form matters here only while
+/// a version registry carries it).
+pub const first_arg_alloc_patterns: []const []const u8 =
+    first_arg_derived.entries[0..first_arg_derived.len];
+
+comptime {
+    @setEvalBranchQuota(100_000);
+    const both_registries = [_][]const []const u8{
+        v0_15.alloc_method_patterns,
+        v0_16.alloc_method_patterns,
+    };
+    // Byte-verification (EPH-I1232 C8): the derivation reproduces the
+    // deleted hand table exactly — the same literals, the same order.
+    if (first_arg_alloc_patterns.len != first_arg_order_pin.len) {
+        @compileError(
+            "first-arg derivation dropped a pin entry: a pinned pattern left " ++
+                "both version registries",
+        );
+    }
+    for (first_arg_alloc_patterns, first_arg_order_pin) |derived, pinned| {
+        if (!std.mem.eql(u8, derived, pinned)) {
+            @compileError("first-arg derivation diverged from the order pin");
+        }
+    }
+    // Scope guard: every registry member outside the exclusion list
+    // must be pinned. A new registry member without a conscious pin or
+    // exclusion update is a compile error, never a silent widening.
+    for (both_registries) |table| {
+        for (table) |pat| {
+            if (excludedFromFirstArg(pat)) continue;
+            if (registryContains(first_arg_order_pin, pat)) continue;
+            @compileError(std.fmt.comptimePrint(
+                "alloc_method_patterns entry '{s}' is missing from the first-arg pin " ++
+                    "(pin or exclusion update required)",
+                .{pat},
+            ));
+        }
+    }
+}
+
 /// Cleanup/deallocation patterns (.free, .destroy, .deinit)
 pub fn getCleanupPatterns() []const []const u8 {
     return currentTables().cleanup_patterns;
@@ -524,6 +670,21 @@ test "getAllocMethodPatterns includes dupe" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "first-arg derivation serves the deleted hand-table contract (EPH-I1232 C8)" {
+    // The comptime proofs byte-verify the derivation against the pin;
+    // this test pins the public shape at runtime: 16 forms, the
+    // representative members present, the excluded forms absent.
+    const patterns = first_arg_alloc_patterns;
+    try std.testing.expectEqual(@as(usize, 16), patterns.len);
+    try std.testing.expect(registryContains(patterns, ".allocPrint("));
+    try std.testing.expect(registryContains(patterns, ".dupe("));
+    try std.testing.expect(registryContains(patterns, ".allocRemainingAlignedSentinel("));
+    try std.testing.expect(registryContains(patterns, ".selfExePathAlloc("));
+    try std.testing.expect(!registryContains(patterns, ".alloc("));
+    try std.testing.expect(!registryContains(patterns, ".replaceOwned("));
+    try std.testing.expect(!registryContains(patterns, ".realPathFileAlloc("));
 }
 
 test "getCleanupPatterns returns non-empty list" {

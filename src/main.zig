@@ -19322,60 +19322,19 @@ fn extractAllocatorName(t: []const u8) ?[]const u8 {
     return extractAllocIdent(t, start, end);
 }
 
-/// Patterns where allocator is the first function argument (not the receiver).
-/// Used to extract the allocator name for no-free suppression on stdlib functions
-/// like `std.fmt.allocPrint(allocator, ...)` or `list.toOwnedSlice(allocator)`.
-/// `.dupe(`/`.dupeZ(` are safe here: for real allocator-receiver calls
-/// (`allocator.dupe(u8, str)`) extraction returns the type param `u8`, which
-/// matches neither no-free names nor arena names, so nothing is suppressed.
-/// Only custom-receiver calls with a non-type allocator first arg
-/// (`tuple_info.types.dupe(arena, ip)`) gain suppression.
-/// KEEP IN SYNC with compat's per-version alloc_method_patterns
-/// (v0_15.zig / v0_16.zig): this list is the version-agnostic superset
-/// of the method-style first-arg forms, and its SOLE consumer is
-/// matchAllocArgPattern (the extractor for allocator names). findAllocCall
-/// does NOT read this list — it reads compat.getAllocMethodPatterns() and
-/// compat.getQualifiedAllocFnPatterns(), so a pattern must first exist in
-/// those tables before any entry here matters. The same mandate binds
-/// third_arg_alloc_patterns (EPH-I1113): the .realPathFileAlloc entry
-/// there matters only because the 0.16 table carries it. The 0.15-only
-/// path ops stay
-/// (fs.zig:521/656/683), and the 0.15.1+/0.16 reader allocs
-/// (.readAlloc/.allocRemaining — allocator is the first arg after the
-/// receiver in both: Io/Reader.zig:682/288 and :739/292) joined.
-/// .allocRemainingAlignedSentinel is 0.16-only (Io/Reader.zig:299): the
-/// v0_15 tables deliberately omit it, so this entry only matches 0.16
-/// code (the I1114 grounding fix, EPH-I1114).
-/// The removed readToEndAlloc/readAllAlloc/stringifyAlloc/allocPrintZ forms
-/// left with B71: they match no released stdlib (gone in both 0.15.1 and
-/// 0.16), so the compat tables never match them and matchAllocArgPattern
-/// never reaches these entries.
-const first_arg_alloc_patterns = [_][]const u8{
-    ".allocPrint(",
-    ".allocPrintSentinel(",
-    ".toOwnedSlice(",
-    ".toOwnedSliceSentinel(",
-    ".cloneWithAllocator(",
-    ".readFileAlloc(",
-    ".readFileAllocOptions(",
-    ".readAlloc(",
-    ".allocRemaining(",
-    ".allocRemainingAlignedSentinel(",
-    ".selfExePathAlloc(",
-    ".selfExeDirPathAlloc(",
-    ".realpathAlloc(",
-    ".concatWithSentinel(",
-    ".dupe(",
-    ".dupeZ(",
-};
-
+/// First-argument allocator patterns live in compat.zig:
+/// compat.first_arg_alloc_patterns is the compile-checked derivation
+/// from the per-version alloc_method_patterns registries (EPH-I1232
+/// C8, REL-GATE-2, REL-AB-5) — see the derivation doc comment there.
+/// The two tables below stay here: they hold the forms whose allocator
+/// is NOT the plain first call argument.
 /// Patterns whose FIRST argument is a comptime type parameter, with the
 /// allocator as the SECOND argument: `std.mem.replaceOwned(u8, arena, ...)`.
 /// Verified against the 0.15.2 and 0.16.0 stdlib signatures:
 ///   replaceOwned(comptime T: type, allocator: Allocator, ...)
 /// `std.mem.concatWithSentinel` is NOT here — its signature is
 /// (allocator, comptime T, ...), allocator-first, so it stays in
-/// first_arg_alloc_patterns.
+/// compat.first_arg_alloc_patterns.
 const type_first_arg_alloc_patterns = [_][]const u8{
     ".replaceOwned(",
 };
@@ -19474,7 +19433,7 @@ fn matchAllocArgPattern(t: []const u8) ?AllocArgMatch {
     for (compat.getQualifiedAllocFnPatterns()) |pat| {
         if (mem.indexOf(u8, t, pat)) |pos| return .{ .start = pos + pat.len, .kind = .first_arg };
     }
-    for (first_arg_alloc_patterns) |pat| {
+    for (compat.first_arg_alloc_patterns) |pat| {
         if (mem.indexOf(u8, t, pat)) |pos| return .{ .start = pos + pat.len, .kind = .first_arg };
     }
     for (type_first_arg_alloc_patterns) |pat| {

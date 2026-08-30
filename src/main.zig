@@ -15766,15 +15766,14 @@ const gap_msg_create_err_ret: ErrdeferGapMsg = .{
     .help = "add errdefer destroy immediately after create",
 };
 
-/// Issue text for one ZA103 gap: the pair names the allocation verb the
-/// record carries (band-B03 F10, EPH-I0373) and the trigger kind that
-/// leaked the alloc — a later `try` or an error return (EPH-I0983).
-fn errdeferGapText(is_create: bool, is_try_trigger: bool) ErrdeferGapMsg {
-    return if (is_create)
-        (if (is_try_trigger) gap_msg_create_try else gap_msg_create_err_ret)
-    else
-        (if (is_try_trigger) gap_msg_alloc_try else gap_msg_alloc_err_ret);
-}
+/// Two-axis gap message table (ZA506 D5): row 0 = allocation verb
+/// `alloc` (is_create false), row 1 = `create`; col 0 = error-return
+/// trigger (try_gap false), col 1 = try trigger. Indexed by
+/// @intFromBool, so the selection carries no branch.
+const gap_msgs = [2][2]ErrdeferGapMsg{
+    .{ gap_msg_alloc_err_ret, gap_msg_alloc_try },
+    .{ gap_msg_create_err_ret, gap_msg_create_try },
+};
 
 fn checkErrdeferGaps(
     allocator: Allocator,
@@ -15792,9 +15791,13 @@ fn checkErrdeferGaps(
         const try_gap = hasErrdeferGap(alloc, matched, ctx.try_lines);
         const error_return_gap = !try_gap and hasErrorReturnGap(alloc, matched, ctx);
         if (!try_gap and !error_return_gap) continue;
-        // The try-trigger class keeps the classic wording; an error-return
-        // trigger names its own kind (EPH-I0983).
-        const text = errdeferGapText(alloc.is_create, try_gap);
+        // The message pair names the allocation verb the record carries
+        // (band-B03 F10, EPH-I0373) and the trigger kind that leaked the
+        // alloc — the try-trigger class keeps the classic wording, an
+        // error-return trigger names its own kind (EPH-I0983). The
+        // two-axis table replaces the two-flag errdeferGapText selector,
+        // so no bool parameter survives (ZA506 D5, EPH-I1081).
+        const text = gap_msgs[@intFromBool(alloc.is_create)][@intFromBool(try_gap)];
         try issues.append(allocator, .{
             .file = ctx.file_path,
             .line = alloc.line,
@@ -16022,16 +16025,16 @@ fn scanErrdeferLines(
 /// line sit between them at the alloc's indent or deeper (findMatchingErrdefer,
 /// isGapTrigger). The CFG contributes nothing to the verdict — the function
 /// name keeps the historical analyzeCFG* prefix (EPH-I0682,
-/// design-cfg-soundness F15).
+/// design-cfg-soundness F15). The caller gates on the fn's error-return
+/// shape: a fn that never returns an error has no error path for a gap to
+/// leak through, so the gate stays outside the analysis (ZA506 D5).
 fn analyzeCFGErrdeferCoverage(
     allocator: Allocator,
     body: FuncBodyCtx,
-    fn_returns_error: bool,
     file_no_free_fields: ?*const std.StringHashMapUnmanaged(void),
 ) !std.ArrayListUnmanaged(Issue) {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     errdefer deinitIssues(&issues, allocator);
-    if (!fn_returns_error) return issues;
 
     // No-free suppression is per call site (collectTryAllocFromLine /
     // isNoFreeAllocLine), never a function-level bail: a no-free pattern
@@ -32295,10 +32298,20 @@ fn runBodyCtx(run: CFGRunCtx) FuncBodyCtx {
     };
 }
 
+/// True when the fn receives a no-free allocator via call-site
+/// propagation: the call-site no-free set names the fn, so its allocs
+/// leak nothing and the leak-coverage guards skip it. Both the ZA101 r2
+/// guard in runCFGMemoryAnalyses and the ZA103 tail read it, so the
+/// derivation lives here instead of as a threaded flag (ZA506 D5).
+fn isNoFreeRecipient(run: CFGRunCtx) bool {
+    const fns = run.func.no_free_param_fns orelse return false;
+    return fns.contains(run.func.name);
+}
+
 /// The memory-family tail: ZA103 errdefer coverage and the must-return-ref
 /// check. The line cap bounds the tail's ZA103 walk too (EPH-I1006); ZA110
 /// stays uncapped — checkMustReturnRef is a single linear pass.
-fn runDeferredTailAnalyses(run: CFGRunCtx, is_no_free_recipient: bool) !void {
+fn runDeferredTailAnalyses(run: CFGRunCtx) !void {
     const a = run.file.allocator;
     const out = run.file.issues;
     const body = runBodyCtx(run);
@@ -32331,13 +32344,12 @@ fn runDeferredTailAnalyses(run: CFGRunCtx, is_no_free_recipient: bool) !void {
         });
         return;
     }
-    var r3 = if (run.func.in_test or is_no_free_recipient)
+    var r3 = if (run.func.in_test or isNoFreeRecipient(run) or !run.func.fn_returns_error)
         std.ArrayListUnmanaged(Issue).empty
     else
         try analyzeCFGErrdeferCoverage(
             a,
             body,
-            run.func.fn_returns_error,
             run.func.no_free_fields,
         );
     defer r3.deinit(a);
@@ -32358,11 +32370,6 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
     const a = run.file.allocator;
     const out = run.file.issues;
     const body = runBodyCtx(run);
-    // Check if this function receives a no-free allocator via call-site propagation
-    const is_no_free_recipient = if (run.func.no_free_param_fns) |fns|
-        fns.contains(run.func.name)
-    else
-        false;
     const over_line_cap = run.func.lines.len > max_mem_family_lines;
     if (over_line_cap)
         try appendMemFamilyCapNote(.{
@@ -32390,7 +32397,7 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
     // ZA101's leak class cannot fire in a noreturn fn: every exit
     // terminates the program, so a missing defer leaks nothing the OS
     // does not reclaim (EPH-I0073). ZA105/ZA106 in r1 stay live.
-    var r2 = if (over_line_cap or is_no_free_recipient or run.func.fn_is_noreturn)
+    var r2 = if (over_line_cap or isNoFreeRecipient(run) or run.func.fn_is_noreturn)
         std.ArrayListUnmanaged(Issue).empty
     else
         try analyzeCFGDeferCoverage(.{
@@ -32410,7 +32417,7 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
     errdefer if (r2_owns_payloads) deinitIssuePayloads(r2.items, a);
     try out.appendSlice(a, r2.items);
     r2_owns_payloads = false;
-    try runDeferredTailAnalyses(run, is_no_free_recipient);
+    try runDeferredTailAnalyses(run);
 }
 
 // ============================================================================
@@ -35979,7 +35986,22 @@ fn hasBothBranches(cfg: *ControlFlowGraph, pred: usize) bool {
     return has_true and has_false;
 }
 
-const PredInfo = struct { block: usize, via_true_branch: bool };
+/// One predecessor edge into a merge block: the pred, the branch kind
+/// this edge takes, and whether the pred carries both branch kinds. The
+/// true-edge guards of a both-kind pred do not hold on the false path,
+/// so that edge cannot vote in the meet (EPH-I0486).
+const PredInfo = struct {
+    block: usize,
+    via_true_branch: bool,
+    has_both: bool,
+
+    /// The edge votes in the meet: a false-branch edge always votes, and
+    /// a true-branch edge votes only when the pred has no false edge —
+    /// its guards then hold on every path to the merge (EPH-I0486).
+    fn votesInMeet(self: PredInfo) bool {
+        return !self.has_both or self.via_true_branch;
+    }
+};
 
 /// The two per-block guard layers the meet and the consumer use: the
 /// entry-guard sets (var -> line from which the guard holds at block
@@ -36011,13 +36033,13 @@ fn predGuardLine(ctx: GuardIntersectCtx, pred: usize, var_name: []const u8) ?usi
     return @max(entry_line.?, local_line.?);
 }
 
-/// Intersect first predecessor's guards into the intersection set
+/// Intersect first predecessor's guards into the intersection set. A
+/// pred whose edge does not vote in the meet contributes nothing.
 fn initIntersectionFromPred(
     ctx: GuardIntersectCtx,
     pred_info: PredInfo,
-    pred_has_both: bool,
 ) !void {
-    if (pred_has_both and !pred_info.via_true_branch) return;
+    if (!pred_info.votesInMeet()) return;
     var iter = ctx.layers.entry[pred_info.block].iterator();
     while (iter.next()) |entry| {
         try ctx.intersection.put(ctx.allocator, entry.key_ptr.*, entry.value_ptr.*);
@@ -36033,18 +36055,19 @@ fn initIntersectionFromPred(
     }
 }
 
-/// Remove guards from intersection not in a subsequent predecessor
+/// Remove guards from intersection not in a subsequent predecessor. A
+/// pred whose edge does not vote in the meet holds no guard line to
+/// merge, so every intersection key it lacks leaves the set.
 fn narrowIntersection(
     ctx: GuardIntersectCtx,
     pred_info: PredInfo,
-    pred_has_both: bool,
 ) !void {
     var to_remove = std.ArrayListUnmanaged([]const u8).empty;
     defer to_remove.deinit(ctx.allocator);
     var iter = ctx.intersection.iterator();
     while (iter.next()) |entry| {
         var pred_line: ?usize = null;
-        if (!(pred_has_both and !pred_info.via_true_branch)) {
+        if (pred_info.votesInMeet()) {
             pred_line = predGuardLine(ctx, pred_info.block, entry.key_ptr.*);
         }
         if (pred_line == null) {
@@ -36073,6 +36096,7 @@ fn collectPredecessors(
         try preds.append(allocator, .{
             .block = edge.from,
             .via_true_branch = edge.kind == .branch_true,
+            .has_both = hasBothBranches(cfg, edge.from),
         });
     }
     return preds;
@@ -36081,7 +36105,6 @@ fn collectPredecessors(
 /// Compute guard intersection from all predecessors of a block
 fn computePredIntersection(
     allocator: Allocator,
-    cfg: *ControlFlowGraph,
     layers: GuardLayers,
     preds: []const PredInfo,
 ) !std.StringHashMapUnmanaged(usize) {
@@ -36092,11 +36115,10 @@ fn computePredIntersection(
         .layers = layers,
     };
     for (preds, 0..) |pi, i| {
-        const both = hasBothBranches(cfg, pi.block);
         if (i == 0) {
-            try initIntersectionFromPred(ix, pi, both);
+            try initIntersectionFromPred(ix, pi);
         } else {
-            try narrowIntersection(ix, pi, both);
+            try narrowIntersection(ix, pi);
         }
     }
     return intersection;
@@ -36147,7 +36169,6 @@ fn propagateGuardsThroughCFG(
 
             var intersection = try computePredIntersection(
                 allocator,
-                cfg,
                 layers,
                 preds.items,
             );
@@ -38851,10 +38872,11 @@ fn foldWalkLine(ctx: []const u8, state: *EnclosingWalkState) ?ElseOpenKind {
 /// Judge one trimmed line of the enclosing walk (EPH-I1232): the
 /// shared skeleton the guard and bound twins duplicated. Fold the
 /// line's brace balance into the walk depth, judge a depth-negative
-/// crossing through `judges.crossing`, then judge the line's else-open
-/// kind through `judges.else_open` — the else-open line builds through
-/// `judges.make_line` because the two walks carry different ctx types
-/// (EPH-I0963, EPH-I0965, EPH-I0995).
+/// crossing through `judges.crossing` (the crossing judges read the
+/// antecedent-skip flag from the walk state), then judge the line's
+/// else-open kind through `judges.else_open` — the else-open line
+/// builds through `judges.make_line` because the two walks carry
+/// different ctx types (EPH-I0963, EPH-I0965, EPH-I0995).
 fn judgeEnclosingWalkLine(
     inputs: anytype,
     state: *EnclosingWalkState,
@@ -38867,7 +38889,7 @@ fn judgeEnclosingWalkLine(
     const kind = foldWalkLine(ctx, state);
     const line = judges.make_line(walk_ctx, i, ctx, kind);
     if (state.brace_depth < 0) {
-        if (judges.crossing(walk_ctx, i, ctx, state.skip_antecedent)) return .found;
+        if (judges.crossing(walk_ctx, i, ctx, state)) return .found;
         state.skip_antecedent = false;
         state.brace_depth = 0;
     }
@@ -38964,13 +38986,13 @@ fn judgeGuardDepthNegativeCrossing(
     ctx: GuardCrossingCtx,
     i: usize,
     line: []const u8,
-    skip_antecedent: bool,
+    state: *const EnclosingWalkState,
 ) bool {
-    if (!skip_antecedent and
+    if (!state.skip_antecedent and
         hasConditionalGuardForVar(elseArmRegion(line), ctx.var_name) and
         guardRegionCovers(ctx.lines, i, ctx.var_name, ctx.amount)) return true;
     const stop = ctx.current_idx -| enclosing_block_lookback;
-    if (!skip_antecedent and i > stop and closesGroupOpenedAbove(line) and
+    if (!state.skip_antecedent and i > stop and closesGroupOpenedAbove(line) and
         openerLineGuardsVar(ctx.lines, i - 1, ctx.var_name, ctx.amount)) return true;
     return line.len > 0 and line[0] == '{' and
         allmanHeaderGuardHasVar(.{
@@ -39684,11 +39706,11 @@ fn judgeBoundDepthNegativeCrossing(
     bctx: EnclosingBoundCtx,
     i: usize,
     ctx: []const u8,
-    skip_antecedent: bool,
+    state: *const EnclosingWalkState,
 ) bool {
-    if (!skip_antecedent and openerCoversBound(bctx, i)) return true;
+    if (!state.skip_antecedent and openerCoversBound(bctx, i)) return true;
     const stop = bctx.current_idx -| enclosing_block_lookback;
-    if (!skip_antecedent and i > stop and closesGroupOpenedAbove(ctx) and
+    if (!state.skip_antecedent and i > stop and closesGroupOpenedAbove(ctx) and
         openerCoversBound(bctx, i - 1)) return true;
     return ctx.len > 0 and ctx[0] == '{' and
         allmanHeaderGuardHasBound(bctx, stop, i);
@@ -71340,6 +71362,29 @@ test "analyzeCFGErrdeferCoverage no false positive for proper errdefer (ZA103)" 
     for (issues.items) |issue| {
         try std.testing.expect(!mem.eql(u8, issue.rule, RULE_ALLOC_NO_ERRDEFER));
     }
+}
+
+test "errdefer gap message table selects by verb and trigger (EPH-I1081 D5)" {
+    // The gap_msgs table replaced the two-flag errdeferGapText selector
+    // (ZA506 D5): row = allocation verb (alloc / create), col = trigger
+    // kind (error return / try). Each cell must carry the message pair
+    // its axes name, or the four ZA103 gap wordings drift silently.
+    try std.testing.expectEqualStrings(
+        "allocation without errdefer before next try",
+        gap_msgs[@intFromBool(false)][@intFromBool(true)].message,
+    );
+    try std.testing.expectEqualStrings(
+        "allocation without errdefer before an error return",
+        gap_msgs[@intFromBool(false)][@intFromBool(false)].message,
+    );
+    try std.testing.expectEqualStrings(
+        "create without errdefer before next try",
+        gap_msgs[@intFromBool(true)][@intFromBool(true)].message,
+    );
+    try std.testing.expectEqualStrings(
+        "create without errdefer before an error return",
+        gap_msgs[@intFromBool(true)][@intFromBool(false)].message,
+    );
 }
 
 // ============================================================================

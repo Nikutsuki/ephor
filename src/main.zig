@@ -27454,9 +27454,8 @@ fn isIndexableName(name: []const u8) bool {
 /// Key order for the occurrence-line binary search in IdentUseIndex.
 /// This is an instantiation adapter, not a forwarding wrapper: std.math.order
 /// is generic, so a fn-typed parameter needs this monomorphized binding.
-/// The ZA505 finding is the generic-adapter limitation (EPH-I1238); D8
-/// replaces this suppression with the value-reference carve-out.
-// ephor:ignore ZA505
+/// The ZA505 value-reference carve-out (EPH-I1238) exempts this shape: the
+/// name serves as a fn value below, a position a generic fn cannot take.
 fn orderLine(key: usize, item: usize) std.math.Order {
     return std.math.order(key, item);
 }
@@ -28101,7 +28100,11 @@ fn hasCompatComponent(path: []const u8) bool {
 //     `return` or `try` prefix allowed) whose argument list is exactly the
 //     parameter list in order (the shallow-module class). A same-name
 //     forward is an interface impl by structure and never fires (the
-//     carve-out).
+//     carve-out). A wrapper whose name the file references as a fn value
+//     is a generic-instantiation adapter and never fires (the
+//     value-reference carve-out, EPH-I1238: an argument segment, an
+//     assignment right-hand side, or a return expression are positions a
+//     generic callee cannot serve).
 //   ZA506 boolean flag parameter — a bool-typed parameter whose name
 //     appears inside an if/switch condition in the body (the
 //     two-functions-in-one-signature class).
@@ -28178,6 +28181,10 @@ const FnIfaceCtx = struct {
     allocator: Allocator,
     path: []const u8,
     sinks: FnIfaceSinks,
+    /// Names the file references as fn values (the ZA505 generic-adapter
+    /// carve-out, EPH-I1238). Borrowed from the per-file pre-pass; the
+    /// keys are owned dupes freed after the file visit.
+    value_refs: *const ValueRefSet,
 };
 
 /// One ready finding for reportFnIfaceIssue: the rule, the owned message,
@@ -28253,11 +28260,170 @@ fn appendSegment(list: SegmentList, seg: []const u8) SegmentList {
     return result;
 }
 
+/// Names one file references as fn values (the ZA505 generic-adapter
+/// carve-out, EPH-I1238; serves REL-ZERO-1 and REL-AB-5). A wrapper whose
+/// name takes a value position — an argument segment, an assignment
+/// right-hand side, or a return expression — is an instantiation adapter:
+/// a generic callee cannot serve those positions, so the wrapper exists to
+/// monomorphize it, and ZA505 stays silent. A passthrough whose name never
+/// takes a value position keeps firing. The keys are owned dupes (the scan
+/// surface is a per-line stack buffer), freed by deinitValueRefSet.
+const ValueRefSet = std.StringHashMapUnmanaged(void);
+
+/// Scan one file for the value-reference names (EPH-I1238). The line
+/// masking mirrors visitFnInterfaceFile's walk (KEEP-IN-SYNC with that
+/// loop): blank, comment, and multiline-string content lines contribute
+/// nothing, and string literals blank before the shape scan.
+fn collectValueRefNames(allocator: Allocator, content: []const u8) !ValueRefSet {
+    var set: ValueRefSet = .empty;
+    errdefer deinitValueRefSet(&set, allocator);
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var mask_buf: [256]u8 = undefined;
+    var in_mline = false;
+    var open_braces: isize = 0;
+    var lines = mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const t = mem.trim(u8, raw, " \t\r");
+        if (t.len == 0 or isCommentOrMultilineString(t)) continue;
+        if (advanceFnIfaceMline(&in_mline, &open_braces, t, &mask_buf)) continue;
+        const code_end = findCommentStart(raw) orelse raw.len;
+        const blanked = blankLiteralContents(raw[0..code_end], &blank_buf);
+        try collectValueRefLine(&set, allocator, blanked);
+    }
+    return set;
+}
+
+/// Free the owned names and the table (every key is a duped slice).
+fn deinitValueRefSet(set: *ValueRefSet, allocator: Allocator) void {
+    var keys = set.keyIterator();
+    while (keys.next()) |key| allocator.free(key.*);
+    set.deinit(allocator);
+}
+
+/// One blanked code line's value positions: return expressions, assignment
+/// right-hand sides, and argument segments (the three shapes a generic fn
+/// cannot serve, EPH-I1238).
+fn collectValueRefLine(set: *ValueRefSet, allocator: Allocator, code: []const u8) !void {
+    try collectReturnValueRefs(set, allocator, code);
+    try collectAssignValueRefs(set, allocator, code);
+    try collectArgValueRefs(set, allocator, code);
+}
+
+/// `return <name>;` (an optional single paren wrap allowed): the returned
+/// name is a value position. The statement cuts at its first `;`.
+fn collectReturnValueRefs(set: *ValueRefSet, allocator: Allocator, code: []const u8) !void {
+    var s: usize = 0;
+    while (s + 6 <= code.len) {
+        const pos = mem.indexOfPos(u8, code, s, "return") orelse return;
+        if (pos > 0 and isIdent(code[pos - 1])) {
+            s = pos + 1;
+            continue;
+        }
+        if (pos + 6 < code.len and isIdent(code[pos + 6])) {
+            s = pos + 1;
+            continue;
+        }
+        if (returnValueName(code, pos)) |name| try recordValueRef(set, allocator, name);
+        s = pos + 6;
+    }
+}
+
+/// The returned name when `code[pos..]` holds `return <name>;`, else null:
+/// the expression is exactly one identifier, optionally paren-wrapped.
+fn returnValueName(code: []const u8, pos: usize) ?[]const u8 {
+    var rest = mem.trim(u8, code[pos + 6 ..], " \t");
+    if (mem.indexOfScalar(u8, rest, ';')) |semi| rest = mem.trim(u8, rest[0..semi], " \t");
+    if (rest.len >= 2 and rest[0] == '(' and rest[rest.len - 1] == ')')
+        rest = mem.trim(u8, rest[1 .. rest.len - 1], " \t");
+    return if (isIndexableName(rest)) rest else null;
+}
+
+/// `= <name>` where the name ends the value (a `;`, `,`, `)`, or `}`
+/// follows, or the line ends): the assignment right-hand side is a value
+/// position. Comparison operators never match — their `=` follows an
+/// operator byte (`==`, `!=`, `<=`, `>=`) or precedes `>` (`=>`).
+fn collectAssignValueRefs(set: *ValueRefSet, allocator: Allocator, code: []const u8) !void {
+    var i: usize = 0;
+    while (i < code.len) : (i += 1) {
+        if (code[i] != '=') continue;
+        if (i > 0 and isComparisonEqByte(code[i - 1])) continue;
+        if (assignValueName(code, i + 1)) |name| try recordValueRef(set, allocator, name);
+    }
+}
+
+/// True when the byte before an `=` marks a comparison, never an
+/// assignment (`==`, `!=`, `<=`, `>=` — Zig has no compound assignment).
+fn isComparisonEqByte(ch: u8) bool {
+    return ch == '=' or ch == '!' or ch == '<' or ch == '>';
+}
+
+/// The right-hand side name of an assignment at `code[from..]`, else null:
+/// the value is exactly one identifier followed by a value boundary.
+fn assignValueName(code: []const u8, from: usize) ?[]const u8 {
+    var i = from;
+    while (i < code.len and (code[i] == ' ' or code[i] == '\t')) i += 1;
+    if (i >= code.len or !isIdent(code[i])) return null;
+    const start = i;
+    while (i < code.len and isIdent(code[i])) i += 1;
+    const name = code[start..i];
+    while (i < code.len and (code[i] == ' ' or code[i] == '\t')) i += 1;
+    if (i < code.len and code[i] != ';' and code[i] != ',' and code[i] != ')' and code[i] != '}')
+        return null;
+    return name;
+}
+
+/// A bare-name segment inside any paren group (a call argument or a
+/// parenthesized expression) is a value position. Control-keyword groups
+/// never count: their names are variable conditions, not fn values.
+fn collectArgValueRefs(set: *ValueRefSet, allocator: Allocator, code: []const u8) !void {
+    var i: usize = 0;
+    while (i < code.len) : (i += 1) {
+        if (code[i] != '(') continue;
+        if (parenFollowsControlKeyword(code, i)) continue;
+        var depth: usize = 0;
+        const close = matchingParenCol(code, i, &depth) orelse continue;
+        const segs = splitTopLevelCommas(code, i + 1, close);
+        for (segs.segs[0..segs.count]) |seg| {
+            const name = mem.trim(u8, seg, " \t\r\n");
+            if (isIndexableName(name)) try recordValueRef(set, allocator, name);
+        }
+        i = close;
+    }
+}
+
+/// The control keywords whose paren group is a condition, never a value
+/// position (EPH-I1238).
+const control_paren_keywords = [_][]const u8{ "if", "while", "for", "switch", "catch" };
+
+/// True when the `(` at `pos` belongs to a control-flow condition: the
+/// preceding code token is a control keyword (`if (`, `while (`, ...).
+fn parenFollowsControlKeyword(code: []const u8, pos: usize) bool {
+    var j = pos;
+    while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t')) j -= 1;
+    if (j == 0 or !isIdent(code[j - 1])) return false;
+    var k = j - 1;
+    while (k > 0 and isIdent(code[k - 1])) k -= 1;
+    const token = code[k..j];
+    for (control_paren_keywords) |kw| {
+        if (mem.eql(u8, token, kw)) return true;
+    }
+    return false;
+}
+
+/// Record one value-referenced name (an owned dupe; the scan surface is a
+/// per-line stack buffer).
+fn recordValueRef(set: *ValueRefSet, allocator: Allocator, name: []const u8) !void {
+    if (set.contains(name)) return;
+    const owned = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned);
+    try set.put(allocator, owned, {});
+}
+
 /// One file's fn-interface pass: walk the lines, track fn spans, and run
-/// the three detectors when each span closes. C import files skip (the
-/// analyzeUnused precedent — their extern decls carry no bodies).
+/// the three detectors when each span closes. C import files never reach
+/// this fn (mergeFnIfaceIssues skips them — the analyzeUnused precedent:
+/// their extern decls carry no bodies).
 fn visitFnInterfaceFile(c: FnIfaceCtx, content: []const u8) !void {
-    if (isCImportFile(c.path, content)) return;
     var scan = FnIfaceScan{};
     var blank_buf: [16 * 1024]u8 = undefined;
     var mask_buf: [256]u8 = undefined;
@@ -28586,7 +28752,9 @@ fn lastCodeLine(text: []const u8) []const u8 {
 /// shape) — where <args> is the fn's parameter list in order. The self
 /// receiver may be passed as the first argument (delegation to a free fn).
 /// A same-name forward is an interface impl by structure and never fires
-/// (the record's carve-out).
+/// (the record's carve-out). A wrapper whose name the file references as a
+/// fn value is a generic-instantiation adapter and never fires (the
+/// value-reference carve-out, EPH-I1238).
 fn checkPassthroughWrapper(
     c: FnIfaceCtx,
     open: FnIfaceOpen,
@@ -28595,6 +28763,10 @@ fn checkPassthroughWrapper(
 ) !void {
     const callee = forwardCallee(body) orelse return;
     if (mem.eql(u8, calleeBaseName(callee.callee), open.name)) return;
+    // Generic-instantiation adapter (EPH-I1238): a generic callee cannot
+    // serve a value position, so the name taking one means the wrapper is
+    // the required monomorphization, not a passthrough.
+    if (c.value_refs.contains(open.name)) return;
     if (!argsForwardParams(callee.args, params)) return;
     const msg = try std.fmt.allocPrint(
         c.allocator,
@@ -28843,7 +29015,8 @@ fn reportFnIfaceIssue(c: FnIfaceCtx, open: FnIfaceOpen, f: FnIfaceFinding) !void
 /// Run the fn-interface pass over the graph and merge its findings: ZA405
 /// into the unused sink, ZA505/ZA506 into the structure sink. Each moved
 /// list transfers atomically, so an OOM mid-merge leaves every owned
-/// message with exactly one errdefer (the EPH-I0690 pattern).
+/// message with exactly one errdefer (the EPH-I0690 pattern). The
+/// value-reference pre-pass (EPH-I1238) runs per file ahead of the walk.
 fn mergeFnIfaceIssues(
     allocator: Allocator,
     g: *ImportGraph,
@@ -28856,10 +29029,14 @@ fn mergeFnIfaceIssues(
     var iter = g.files.iterator();
     while (iter.next()) |entry| {
         const fa = entry.value_ptr.*;
+        if (isCImportFile(fa.path, fa.content)) continue;
+        var value_refs = try collectValueRefNames(allocator, fa.content);
+        defer deinitValueRefSet(&value_refs, allocator);
         try visitFnInterfaceFile(.{
             .allocator = allocator,
             .path = fa.path,
             .sinks = .{ .unused = &unused, .structure = &structure },
+            .value_refs = &value_refs,
         }, fa.content);
     }
     try moveIssues(allocator, sinks.unused, &unused);
@@ -127183,7 +127360,7 @@ test "ZA504 run merge: a ten-line copy reports once with the full span" {
 }
 
 // ============================================================================
-// ZA405/ZA505/ZA506 Tests — fn-interface analysis (EPH-I1077/I1080/I1081)
+// ZA405/ZA505/ZA506 Tests — fn-interface analysis (EPH-I1077/I1080/I1081/I1238)
 // ============================================================================
 
 /// One fn-interface test run: the graph (which owns the borrowed paths)
@@ -127522,6 +127699,89 @@ test "ZA505 exempts generic fns (the compile-time-input exclusion)" {
     );
     defer run.deinit(allocator);
     try expectNoFindings(&run);
+}
+
+// --- ZA505 generic-adapter carve-out (EPH-I1238) -----------------------------
+
+test "ZA505 stays silent when the wrapper name is passed as a fn value" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn orderLine(key: usize, item: usize) u8 {
+        \\    return std.math.order(key, item);
+        \\}
+        \\
+        \\fn useComparator(items: []usize) void {
+        \\    std.sort.binarySearch(usize, items, 0, orderLine);
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA505 stays silent when the wrapper name is returned as a fn value" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn compare(a: usize, b: usize) u8 {
+        \\    return std.math.order(a, b);
+        \\}
+        \\
+        \\fn getComparator() fn (usize, usize) u8 {
+        \\    return compare;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA505 stays silent when the wrapper name is assigned as a fn value" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn compare(a: usize, b: usize) u8 {
+        \\    return std.math.order(a, b);
+        \\}
+        \\
+        \\fn stashComparator() void {
+        \\    _ = compare;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA505 keeps firing when a different name is the value reference" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn wrap(a: u8, b: u8) u8 {
+        \\    return inner(a, b);
+        \\}
+        \\
+        \\fn call(items: []u8) void {
+        \\    doSort(items, lessThan);
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_PASSTHROUGH_WRAPPER);
+}
+
+test "ZA505 keeps firing when the name appears only in a string" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn wrap(a: u8, b: u8) u8 {
+        \\    return inner(a, b);
+        \\}
+        \\
+        \\fn note() u8 {
+        \\    const s = "wrap";
+        \\    return s.len;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_PASSTHROUGH_WRAPPER);
 }
 
 // --- ZA506: boolean flag parameters ------------------------------------------

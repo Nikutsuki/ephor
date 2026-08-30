@@ -43209,11 +43209,6 @@ const Config = struct {
         if (mem.eql(u8, rule, RULE_FILE_TOO_LONG)) return true;
         if (mem.eql(u8, rule, RULE_CYCLOMATIC)) return true;
         if (mem.eql(u8, rule, RULE_COGNITIVE)) return true;
-        // ZA506 ships OFF-until-clean (planner run 52, the B133/EPH-I1232
-        // precedent): ephor's own src carries 41 genuine flag-param sites.
-        // The D-wave burn zeroes them and the flip commit removes this
-        // line, closing EPH-I1081 (EPH-I1232's pattern for I1076).
-        if (mem.eql(u8, rule, RULE_BOOL_FLAG_PARAM)) return true;
         for (off_by_default_prefixes) |prefix| {
             if (mem.startsWith(u8, rule, prefix)) return true;
         }

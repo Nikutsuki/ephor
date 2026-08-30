@@ -184,18 +184,27 @@ $child.StartInfo = $psi
 # The suite's main thread serves the one tags request while the child
 # runs: a Task.Run scriptblock has no runspace on a thread-pool thread,
 # so the accept stays on this thread through GetContextAsync polling.
+# One accept is pending at a time. A wait that times out keeps waiting
+# on the same task: an abandoned task would still hold the next
+# connection (EPH-I1237).
 $ctxTask = $listener.GetContextAsync()
 $child.Start() | Out-Null
 $served = $false
 while (-not $child.HasExited) {
-    if ($ctxTask.Wait(500)) {
+    if ($ctxTask.Wait(200)) {
         $ctx = $ctxTask.Result
         $body = [System.Text.Encoding]::UTF8.GetBytes($tagsJson)
         $ctx.Response.StatusCode = 200
         $ctx.Response.ContentType = "application/json"
         $ctx.Response.ContentLength64 = $body.Length
-        $ctx.Response.OutputStream.Write($body, 0, $body.Length)
-        $ctx.Response.OutputStream.Close()
+        try {
+            $ctx.Response.OutputStream.Write($body, 0, $body.Length)
+        } catch {
+            # The child aborted the tags read. A killed child leaves the
+            # response half-written. The request was still served.
+        } finally {
+            try { $ctx.Response.OutputStream.Close() } catch { }
+        }
         $served = $true
         break
     }
@@ -341,40 +350,63 @@ function runPubkeyInstall {
     $psi.Environment["EPHOR_RELEASE_PUBKEY"] = $testPubkey
     $child = [System.Diagnostics.Process]::new()
     $child.StartInfo = $psi
-    # The suite's main thread serves the three fetches in arrival order
-    # while the child runs; path routing keeps the bodies straight. The
-    # loop ends when all three are served or the child exits.
     $child.Start() | Out-Null
-    $servedTags = $false
-    $servedArchive = $false
-    $servedSig = $false
-    $requestsServed = 0
-    while (-not $child.HasExited -and $requestsServed -lt 3) {
-        $ctxTask = $listener.GetContextAsync()
-        if (-not $ctxTask.Wait(500)) { continue }
-        $ctx = $ctxTask.Result
+    $script:servedTags = $false
+    $script:servedArchive = $false
+    $script:servedSig = $false
+    # Serve one accepted request: route the body by path and mark the
+    # served flag. Script scope holds the flags, so the serve loop and
+    # the final drain share them.
+    function servePubkeyRequest {
+        param([System.Net.HttpListenerContext]$ctx)
         $path = $ctx.Request.Url.AbsolutePath
+        $body = $null
         if ($path -eq "/tags.json") {
             $body = $tagsBody
-            $servedTags = $true
+            $script:servedTags = $true
         } elseif ($path -eq "/archive.tar.gz") {
             $body = $archiveBody
-            $servedArchive = $true
+            $script:servedArchive = $true
         } elseif ($path -eq "/sig.minisig") {
             $body = $sigBody
-            $servedSig = $true
-        } else {
-            $ctx.Response.StatusCode = 404
-            $ctx.Response.ContentLength64 = 0
-            $ctx.Response.OutputStream.Close()
-            continue
+            $script:servedSig = $true
         }
-        $ctx.Response.StatusCode = 200
-        $ctx.Response.ContentType = "application/octet-stream"
-        $ctx.Response.ContentLength64 = $body.Length
-        $ctx.Response.OutputStream.Write($body, 0, $body.Length)
-        $ctx.Response.OutputStream.Close()
-        $requestsServed += 1
+        try {
+            if ($null -eq $body) {
+                $ctx.Response.StatusCode = 404
+                $ctx.Response.ContentLength64 = 0
+            } else {
+                $ctx.Response.StatusCode = 200
+                $ctx.Response.ContentType = "application/octet-stream"
+                $ctx.Response.ContentLength64 = $body.Length
+                $ctx.Response.OutputStream.Write($body, 0, $body.Length)
+            }
+        } catch {
+            # The over-cap child aborts the response mid-body when the
+            # cap fires, so the write can throw on the closed
+            # connection. The request was served. The close below is
+            # best-effort.
+        } finally {
+            try { $ctx.Response.OutputStream.Close() } catch { }
+        }
+    }
+    # Serve every request the child makes until it exits. One accept is
+    # pending at a time: a wait that times out keeps waiting on the
+    # same task. An abandoned task still holds the next connection, and
+    # the loop never reads it again (EPH-I1237: the old 500 ms fixed
+    # wait lost whole pubkey runs when a slow child stretched one
+    # request past the window).
+    $ctxTask = $listener.GetContextAsync()
+    while (-not $child.HasExited) {
+        if (-not $ctxTask.Wait(200)) { continue }
+        servePubkeyRequest $ctxTask.Result
+        $ctxTask = $listener.GetContextAsync()
+    }
+    # The child can exit while its final request is still in flight.
+    # One bounded wait on the pending accept serves it, so the flags
+    # report the real channel traffic.
+    if ($ctxTask.Wait(300)) {
+        servePubkeyRequest $ctxTask.Result
     }
     if (-not $child.WaitForExit(90000)) {
         $child.Kill($true)
@@ -388,9 +420,9 @@ function runPubkeyInstall {
         rc = $rc
         out = [System.IO.File]::ReadAllText($outLog)
         err = [System.IO.File]::ReadAllText($errLog)
-        servedTags = $servedTags
-        servedArchive = $servedArchive
-        servedSig = $servedSig
+        servedTags = $script:servedTags
+        servedArchive = $script:servedArchive
+        servedSig = $script:servedSig
     }
 }
 

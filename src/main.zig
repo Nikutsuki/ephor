@@ -2441,22 +2441,19 @@ const CFGBuildCtx = struct {
             // A line-start else whose braced arm closes on this line
             // owns the whole line: the pre-walk attribution skipped the
             // closed arm, and no later line extends the else body, so
-            // it would otherwise carry no end_line (EPH-I1063).
-            self.closeClaimedSameLineArm(else_body, line, claimed_pending);
+            // it would otherwise carry no end_line (EPH-I1063). Only the
+            // claimed close needs the span repair — a same-line `} else`
+            // pairs the keyword with the close the walk already handled.
+            if (claimed_pending) self.closeClaimedSameLineArm(else_body, line);
         }
     }
 
-    /// Close the span of a claimed line-start else body whose braced arm
-    /// closes on its own line. For a line-start else any close event
-    /// closes the else's own arm — the keyword opens the line, so
-    /// nothing else can close on it (EPH-I1063).
-    fn closeClaimedSameLineArm(
-        self: *CFGBuildCtx,
-        else_body: usize,
-        line: usize,
-        claimed_pending: bool,
-    ) void {
-        if (!claimed_pending) return;
+    /// Close the span of a line-start else body whose braced arm closes
+    /// on its own line. The caller gates on the claimed-close state. For
+    /// a line-start else any close event closes the else's own arm — the
+    /// keyword opens the line, so nothing else can close on it
+    /// (EPH-I1063).
+    fn closeClaimedSameLineArm(self: *CFGBuildCtx, else_body: usize, line: usize) void {
         for (self.event_scratch.items) |event| {
             if (event.kind != .close_control) continue;
             self.cfg.blocks.items[else_body].end_line = line;
@@ -2588,26 +2585,17 @@ const CFGBuildCtx = struct {
         try self.handleBlockEnd(line);
     }
 
-    /// Attribute the line's span to its block. A line that starts and
-    /// ends inside a branch condition's open parens is condition text:
-    /// it belongs to the block that evaluates the condition, and the
-    /// closing line holds the body's start (EPH-I0102). A line that
-    /// claims a deferred close (a line-start else) owns nothing of the
-    /// closed arm: its end_line stays at the close line, so a free in
-    /// the else's same-line arm never pairs same-block with the closed
-    /// arm's free (EPH-I1063). Everything else stays with the current
-    /// block.
-    fn attributeLineSpan(
-        self: *CFGBuildCtx,
-        line: usize,
-        paren_at_start: usize,
-        claims_deferred: bool,
-    ) void {
-        if (self.cond_origin != null and paren_at_start > 0 and self.paren_depth > 0) {
-            self.cfg.blocks.items[self.cond_origin.?].end_line = line;
-        } else if (!claims_deferred) {
-            self.cfg.blocks.items[self.current_block].end_line = line;
-        }
+    /// Attribute the line's span to the open branch condition when it is
+    /// condition text: a line that starts and ends inside a condition's
+    /// open parens belongs to the block that evaluates the condition,
+    /// and the closing line holds the body's start (EPH-I0102). On a
+    /// match the condition block's end_line is set and true returns so
+    /// the caller keeps the current block's span untouched.
+    fn attributeConditionSpan(self: *CFGBuildCtx, line: usize, paren_at_start: usize) bool {
+        if (self.cond_origin == null or paren_at_start == 0 or self.paren_depth == 0)
+            return false;
+        self.cfg.blocks.items[self.cond_origin.?].end_line = line;
+        return true;
     }
 
     /// A pending brace-less if/else opener whose next line is a statement
@@ -2629,19 +2617,20 @@ const CFGBuildCtx = struct {
     /// line, EPH-I1063), and close the saved entry as no-else when the
     /// line neither claims nor carries one. Comment lines never reach
     /// here; blank lines carry no code, so they must not clear the
-    /// deferral.
+    /// deferral. The caller runs handleElse for a virtual else before
+    /// this call, so a virtual line already consumed the saved entry and
+    /// the pending guard below reports it as unsettled.
     fn settleDeferredElse(
         self: *CFGBuildCtx,
         line: usize,
         code: []const u8,
-        virtual_else: bool,
-        claims_deferred: bool,
+        pattern: CFPattern,
     ) !bool {
         if (self.pending_else == null) return false;
         if (code.len == 0) return false;
-        if (virtual_else) return false;
-        if (!claims_deferred) try self.finishPendingElse(line);
-        return claims_deferred;
+        const claims = scanClaimsElse(pattern, self.event_scratch.items);
+        if (!claims) try self.finishPendingElse(line);
+        return claims;
     }
 
     /// Opener whose control `{` is on a later line (Allman, multi-line
@@ -2682,15 +2671,19 @@ const CFGBuildCtx = struct {
         const pattern = detectCFPattern(code);
         const paren_at_start = self.paren_depth;
         const scan = try self.scanLineBraces(code, pattern, next_body);
+        if (virtual_else) try self.handleElse(code, line, 0);
         // The line claims a deferred close (a line-start else): the
         // closed arm's span must end at its close line, not extend over
         // the claiming line (EPH-I1063). A deferred close with no else
         // claiming it closes as no-else before this line is attributed.
-        const claims_deferred = self.pending_else != null and code.len > 0 and
-            !virtual_else and scanClaimsElse(pattern, scan.events);
-        const settled = try self.settleDeferredElse(line, code, virtual_else, claims_deferred);
-        if (virtual_else) try self.handleElse(code, line, 0);
-        self.attributeLineSpan(line, paren_at_start, settled);
+        const settled = try self.settleDeferredElse(line, code, pattern);
+        // A line that claims a deferred close owns nothing of the closed
+        // arm: its end_line stays at the close line, so a free in the
+        // else's same-line arm never pairs same-block with the closed
+        // arm's free (EPH-I1063). Everything else stays with the current
+        // block.
+        if (!self.attributeConditionSpan(line, paren_at_start) and !settled)
+            self.cfg.blocks.items[self.current_block].end_line = line;
         if (self.paren_depth == 0) self.cond_origin = null;
         try self.finishWhileCondition();
         try self.walkLineEvents(pattern, code, line);
@@ -2942,9 +2935,7 @@ const CFGBuildCtx = struct {
             .has_else = prelude.has_else,
         };
         for (events, 0..) |event, idx| {
-            const next_is_else = idx + 1 < events.len and
-                events[idx + 1].kind == .else_keyword;
-            try self.walkOneEvent(&walk, event, next_is_else);
+            try self.walkOneEvent(&walk, event, idx);
         }
         if (walk.record_spans) try self.recordTrailingSpan(line, walk.span_col, code.len);
         // Opener whose control `{` is on a later line (Allman / multi-line
@@ -2960,7 +2951,7 @@ const CFGBuildCtx = struct {
         self: *CFGBuildCtx,
         walk: *EventWalkCtx,
         event: ControlEvent,
-        next_is_else: bool,
+        idx: usize,
     ) !void {
         if (walk.record_spans) try self.advanceSpan(walk.line, &walk.span_col, event);
         switch (event.kind) {
@@ -2988,7 +2979,9 @@ const CFGBuildCtx = struct {
             .close_control, .close_virtual => {
                 try self.closeBodyMarkers(event);
                 if (walk.record_arms) try self.recordArmSpan(walk, event);
-                if (next_is_else) return self.finishDeferredBeforeElse(walk.line);
+                const events = self.event_scratch.items;
+                if (idx + 1 < events.len and events[idx + 1].kind == .else_keyword)
+                    return self.finishDeferredBeforeElse(walk.line);
                 try self.handleBlockEndOrDefer(walk.line);
             },
         }

@@ -23264,6 +23264,18 @@ fn reportTestBlock(ctx: *const TestScanCtx, state: *const TestFileScanState) !vo
 /// EPH-I0444: generated/giant lines only. The ZT band masks those
 /// chunk-wise via BlankChunkIter, EPH-I0423).
 fn blankLiteralContents(line: []const u8, buf: []u8) []const u8 {
+    return maskLiteralContents(line, buf, .blank);
+}
+
+/// The quoted-identifier treatment of one masked line (EPH-I1249):
+/// `.blank` treats a `@"name"` span as a string literal and blanks it
+/// (the classic rule), `.keep` preserves a brace-free quoted name
+/// verbatim so escaped-identifier references stay searchable.
+const QuotedNameMode = enum { blank, keep };
+
+/// One masked line (EPH-I1249): the mode decides the quoted-identifier
+/// treatment, every other rule matches the classic blankLiteralContents.
+fn maskLiteralContents(line: []const u8, buf: []u8, mode: QuotedNameMode) []const u8 {
     if (line.len > buf.len) return line;
     var i: usize = 0;
     while (i < line.len) {
@@ -23275,6 +23287,10 @@ fn blankLiteralContents(line: []const u8, buf: []u8) []const u8 {
             break;
         }
         const start = i;
+        if (maskQuotedIdent(line, buf, i, mode)) |end| {
+            i = end;
+            continue;
+        }
         if (skipLiteral(line, &i)) {
             // Blank the literal contents AND both quote delimiters.
             blankRange(buf, start, i);
@@ -23284,6 +23300,38 @@ fn blankLiteralContents(line: []const u8, buf: []u8) []const u8 {
         i += 1;
     }
     return buf[0..line.len];
+}
+
+/// Mask or preserve the quoted identifier opening at `line[i]`
+/// (`line[i] == '"'` directly after `@`), writing the span into `buf`
+/// and returning the index past it. Null when the byte is not a quoted
+/// identifier opener (a real string literal — the caller falls through
+/// to the string skip) or when the name never closes on this line (the
+/// caller's string skip blanks it the classic way). `.keep` copies a
+/// brace-free name verbatim and blanks a brace-bearing one (its brace
+/// never reaches brace tracking); `.blank` blanks the span outright.
+fn maskQuotedIdent(line: []const u8, buf: []u8, i: usize, mode: QuotedNameMode) ?usize {
+    if (mode != .keep or line[i] != '"' or i == 0 or line[i - 1] != '@') return null;
+    const end = skipQuotedIdent(line, i + 2);
+    // skipQuotedIdent clamps at the line end, so a closing quote at
+    // `end - 1` is the closed-on-this-line signature.
+    if (line[end - 1] != '"') return null;
+    if (spanHasBrace(line, i, end)) {
+        blankRange(buf, i, end);
+    } else {
+        @memcpy(buf[i..end], line[i..end]);
+    }
+    return end;
+}
+
+/// True when text[start..end] carries a brace byte (the preservation
+/// guard, EPH-I1249): a brace-bearing quoted name still blanks so brace
+/// tracking never sees a name's brace.
+fn spanHasBrace(text: []const u8, start: usize, end: usize) bool {
+    for (text[start..end]) |ch| {
+        if (ch == '{' or ch == '}') return true;
+    }
+    return false;
 }
 
 /// Blank `buf[start..end]` to spaces (literal content never reaches brace
@@ -28290,6 +28338,9 @@ const FnIfaceScan = struct {
     active: ?FnIfaceOpen = null,
     depth: usize = 0,
     sig_parens: usize = 0,
+    /// Brace depth of the anonymous-container return-type block still
+    /// open in the signature (the EPH-I1250 type-block skip).
+    sig_type_depth: usize = 0,
 };
 
 /// One source line in the forms the pass needs: the literal-blanked code
@@ -28685,14 +28736,17 @@ fn walkPendingFnLine(
     pending: FnIfaceOpen,
 ) !void {
     var sig_parens = scan.sig_parens;
-    const open_rel = fnIfaceBodyBraceAt(line.blanked, 0, &sig_parens);
+    var sig_type_depth = scan.sig_type_depth;
+    const open_rel = fnIfaceBodyBraceAt(line.blanked, 0, &sig_parens, &sig_type_depth);
     scan.sig_parens = sig_parens;
+    scan.sig_type_depth = sig_type_depth;
     if (open_rel) |brace_rel| {
         scan.pending = null;
+        scan.sig_type_depth = 0;
         var open = pending;
         open.body_brace = line.line_offset + brace_rel;
         try openFnIfaceSpan(c, scan, line, open);
-    } else if (endsWithCodeSemicolon(line.t)) {
+    } else if (sig_type_depth == 0 and endsWithCodeSemicolon(line.t)) {
         // A wrapped bodiless decl (`fn f(\n a: u8\n);`) drops here.
         scan.pending = null;
     }
@@ -28707,7 +28761,13 @@ fn detectFnIfaceDef(c: FnIfaceCtx, scan: *FnIfaceScan, line: FnIfaceLine) !void 
     if (isBodilessFnDecl(line.t)) return;
     const fn_name = pubFnNameAt(line.t, pos + 3) orelse return;
     var sig_parens: usize = 0;
-    const open_rel = fnIfaceBodyBraceAt(line.blanked, line.lead + pos, &sig_parens);
+    var sig_type_depth: usize = 0;
+    const open_rel = fnIfaceBodyBraceAt(
+        line.blanked,
+        line.lead + pos,
+        &sig_parens,
+        &sig_type_depth,
+    );
     const pending = makeFnIfacePending(line, pos, fn_name);
     if (open_rel) |brace_rel| {
         var open = pending;
@@ -28716,23 +28776,60 @@ fn detectFnIfaceDef(c: FnIfaceCtx, scan: *FnIfaceScan, line: FnIfaceLine) !void 
         return;
     }
     scan.sig_parens = sig_parens;
+    scan.sig_type_depth = sig_type_depth;
     scan.pending = pending;
 }
 
 /// Scan one blanked line from `from` for the body `{`: the first brace at
 /// paren depth 0 that is not a signature container (`error{...}`,
-/// `struct{...}` return types). The paren depth is written back on every
-/// path. Distinct from the 2-arg sigBodyBraceAt (the ZA209 shim scanner):
+/// `struct{...}` return types). A container brace enters type-block
+/// tracking instead: every brace inside the block — a nested fn's body
+/// included — is type material until the block's matching `}` closes,
+/// and only a brace after the block can open the body (EPH-I1250 — the
+/// anonymous-struct return type's trailing initializer is the body, and
+/// a nested fn inside the type block must never open it early). The
+/// paren depth and the type depth are written back on every path.
+/// Distinct from the 2-arg sigBodyBraceAt (the ZA209 shim scanner):
 /// this one adds the container exclusion and the start offset.
-fn fnIfaceBodyBraceAt(blanked: []const u8, from: usize, sig_parens: *usize) ?usize {
+fn fnIfaceBodyBraceAt(
+    blanked: []const u8,
+    from: usize,
+    sig_parens: *usize,
+    type_depth: *usize,
+) ?usize {
     var i: usize = from;
     while (i < blanked.len) : (i += 1) {
         const ch = blanked[i];
-        if (ch == '(') sig_parens.* += 1;
-        if (ch == ')' and sig_parens.* > 0) sig_parens.* -= 1;
-        if (ch == '{' and sig_parens.* == 0 and !sigContainerOpen(blanked, i)) return i;
+        if (advanceTypeBlock(ch, type_depth)) continue;
+        if (ch == '(') {
+            sig_parens.* += 1;
+            continue;
+        }
+        if (ch == ')' and sig_parens.* > 0) {
+            sig_parens.* -= 1;
+            continue;
+        }
+        if (ch != '{' or sig_parens.* != 0) continue;
+        if (sigContainerOpen(blanked, i)) {
+            type_depth.* = 1;
+        } else {
+            return i;
+        }
     }
     return null;
+}
+
+/// Advance one blanked byte through the open return-type block
+/// (EPH-I1250): braces update the depth and every other byte is block
+/// material, so a nested fn's body inside an anonymous-struct return
+/// type never opens the outer span. Returns true while a block is open
+/// (the byte was consumed); false at depth 0 (the caller scans the byte
+/// as signature).
+fn advanceTypeBlock(ch: u8, depth: *usize) bool {
+    if (depth.* == 0) return false;
+    if (ch == '{') depth.* += 1;
+    if (ch == '}') depth.* -= 1;
+    return true;
 }
 
 /// Open a span at a body brace already recorded on `open`, then walk the
@@ -28806,12 +28903,30 @@ fn analyzeClosedFn(c: FnIfaceCtx, content: []const u8, open: FnIfaceOpen) !void 
     var masked: std.ArrayListUnmanaged(u8) = .empty;
     defer masked.deinit(c.allocator);
     try appendMaskedBody(c.allocator, &masked, body);
+    // The keep-quoted surface (EPH-I1249) builds only when a quoted
+    // param exists — escaped-identifier references survive there and
+    // nowhere else.
+    var keep_masked: std.ArrayListUnmanaged(u8) = .empty;
+    defer keep_masked.deinit(c.allocator);
+    if (hasQuotedParam(ps)) try appendMaskedBodyKeepQuoted(c.allocator, &keep_masked, body);
     try checkPassthroughWrapper(c, open, body, ps);
     try checkBoolFlagParams(c, open, body, ps);
-    if (!open.is_pub) try checkUnusedParams(c, open, masked.items, ps);
+    if (!open.is_pub) try checkUnusedParams(c, open, .{
+        .masked = masked.items,
+        .keep_quoted = keep_masked.items,
+    }, ps);
     try checkUnnecessaryVars(c, open, masked.items);
     try checkRedundantElse(c, open, masked.items);
     try checkSimplifiableBoolReturns(c, open, masked.items);
+}
+
+/// True when any parameter name is the escaped-identifier form (`@"..."`,
+/// EPH-I1249): only those fns build the keep-quoted surface.
+fn hasQuotedParam(params: []const FnParam) bool {
+    for (params) |p| {
+        if (p.name.len > 0 and p.name[0] == '@') return true;
+    }
+    return false;
 }
 
 /// True when a parameter's type is literally `type`: the implicitly-
@@ -29110,16 +29225,30 @@ fn conditionParens(code: []const u8, after_kw: usize) ?[]const u8 {
 /// convention). `masked` is the shared comment-stripped, literal-blanked
 /// body (analyzeClosedFn builds it), so a name that appears only in a
 /// string or comment stays unused.
+/// The two ZA405 body surfaces (EPH-I1249): the classic masked body
+/// (quoted identifiers blanked — the shared scan surface) and the
+/// keep-quoted body (built only when a quoted param exists). The
+/// keep-quoted probe runs for escaped-identifier params alone, and only
+/// for word membership — never for the keyword scans.
+const UnusedParamBodies = struct {
+    masked: []const u8,
+    keep_quoted: []const u8,
+};
+
 fn checkUnusedParams(
     c: FnIfaceCtx,
     open: FnIfaceOpen,
-    masked: []const u8,
+    bodies: UnusedParamBodies,
     params: []const FnParam,
 ) !void {
     for (params) |p| {
         if (p.is_self or p.name.len == 0) continue;
         if (p.name[0] == '_') continue;
-        if (containsIdentWord(masked, p.name)) continue;
+        if (containsIdentWord(bodies.masked, p.name)) continue;
+        // A `@"name"` reference blanks on the classic surface: the
+        // keep-quoted surface preserves it, so the escaped-identifier
+        // param still counts as used (EPH-I1249).
+        if (p.name[0] == '@' and containsIdentWord(bodies.keep_quoted, p.name)) continue;
         const msg = try std.fmt.allocPrint(
             c.allocator,
             "function '{s}' never uses parameter '{s}'",
@@ -29365,7 +29494,46 @@ fn nameOccurrenceMutates(masked: []const u8, pos: usize, name: []const u8) bool 
     if (isBuiltinFirstArg(masked, pos)) return true;
     if (asmOutputOperand(masked, pos)) return true;
     if (destructuringAssignAt(masked, pos + name.len)) return true;
+    if (switchOperandPointerCapture(masked, pos, name)) return true;
     return nameMutableTail(masked, pos + name.len);
+}
+
+/// True when the occurrence at `pos` is the operand of a `switch` whose
+/// block carries a `|*v|` prong capture (EPH-I1251): the capture binds a
+/// mutable pointer to the payload, so the binding must be var. The
+/// `switch (x) |e| {` operand-capture form stays outside the match (the
+/// accepted FN direction). A `|*` inside a nested block silences too —
+/// the FP-safe direction, like every name-level judgement here.
+fn switchOperandPointerCapture(masked: []const u8, pos: usize, name: []const u8) bool {
+    var i = skipMaskedWs(masked, pos + name.len);
+    if (i >= masked.len or masked[i] != ')') return false;
+    // The paren before the name must open the switch condition.
+    var w = pos;
+    while (w > 0 and isMaskedWs(masked[w - 1])) w -= 1;
+    if (w == 0 or masked[w - 1] != '(') return false;
+    var k = w - 1;
+    while (k > 0 and isMaskedWs(masked[k - 1])) k -= 1;
+    if (!wordEndsAt(masked[0..k], "switch")) return false;
+    i = skipMaskedWs(masked, i + 1);
+    if (i >= masked.len or masked[i] != '{') return false;
+    return blockHasPointerCapture(masked, i);
+}
+
+/// True when the block opened at `open_brace` (masked[i] == '{') carries
+/// a `|*` pointer capture before its matching close (EPH-I1251). Brace
+/// depth bounds the scan at the block's end.
+fn blockHasPointerCapture(masked: []const u8, open_brace: usize) bool {
+    var depth: usize = 0;
+    var i = open_brace;
+    while (i < masked.len) : (i += 1) {
+        if (masked[i] == '{') depth += 1;
+        if (masked[i] == '}') {
+            if (depth == 0) return false;
+            depth -= 1;
+        }
+        if (masked[i] == '|' and i + 1 < masked.len and masked[i + 1] == '*') return true;
+    }
+    return false;
 }
 
 /// True when the occurrence at `pos` is an inline-asm operand
@@ -29431,14 +29599,7 @@ fn nameMutableTail(masked: []const u8, after_name: usize) bool {
         if (masked[i] != '.') return false;
         i = skipSegmentMarker(masked, i + 1);
         if (i >= masked.len) return false;
-        // A quoted field name (`x.@"field"`) masks to `@` plus the blanked
-        // literal span (blankLiteralContents blanks the quotes and the
-        // content): skip the span and keep walking, so a call or a store
-        // on a later segment still reads as a mutation (EPH-I1247).
-        if (masked[i] == '@') {
-            i = skipMaskedWs(masked, i + 1);
-            continue;
-        }
+        if (skipFieldSegment(masked, &i)) continue;
         if (!isIdent(masked[i])) return false;
         // Walk the segment name ident-only: identRunEnd swallows dots and
         // would strand the walk on the `?` of a `.?` marker.
@@ -29446,6 +29607,24 @@ fn nameMutableTail(masked: []const u8, after_name: usize) bool {
         i = skipMaskedWs(masked, i);
     }
     return false;
+}
+
+/// True when masked[i] opens a quoted field-name segment (`x.@"field"`:
+/// the classic mask leaves `@` plus the blanked span, whose whitespace
+/// the skip walks, EPH-I1247) or a private-field marker (`x.#field`, the
+/// bun dialect, EPH-I1252: the marker and its name ident run skip):
+/// advance `i` past the segment, so a call or a store on a later segment
+/// still reads as a mutation.
+fn skipFieldSegment(masked: []const u8, i: *usize) bool {
+    if (masked[i.*] == '@') {
+        i.* = skipMaskedWs(masked, i.* + 1);
+        return true;
+    }
+    if (masked[i.*] != '#') return false;
+    var j = skipMaskedWs(masked, i.* + 1);
+    while (j < masked.len and isIdent(masked[j])) j += 1;
+    i.* = skipMaskedWs(masked, j);
+    return true;
 }
 
 /// Skip an optional-unwrap or deref marker after a chain dot and its
@@ -29905,17 +30084,44 @@ fn boolReturnValue(inner: []const u8) ?bool {
 }
 
 /// Append the comment-stripped, literal-blanked body to `masked` (the
-/// ZA405 search surface).
+/// shared fn-interface search surface). Quoted identifiers blank like
+/// any literal — the keyword scans must never see a name's content.
 fn appendMaskedBody(
     allocator: Allocator,
     masked: *std.ArrayListUnmanaged(u8),
     body: []const u8,
 ) !void {
+    return appendMaskedBodyMode(allocator, masked, body, .blank);
+}
+
+/// The keep-quoted twin (EPH-I1249): quoted identifiers survive, so an
+/// escaped-identifier parameter's body reference matches. Built only for
+/// fns with a quoted param, and consumed only by the ZA405 membership
+/// probe — never by the keyword scans.
+fn appendMaskedBodyKeepQuoted(
+    allocator: Allocator,
+    masked: *std.ArrayListUnmanaged(u8),
+    body: []const u8,
+) !void {
+    return appendMaskedBodyMode(allocator, masked, body, .keep);
+}
+
+/// One masked body build: the mode decides the quoted-identifier
+/// treatment (maskLiteralContents), every other rule is shared.
+fn appendMaskedBodyMode(
+    allocator: Allocator,
+    masked: *std.ArrayListUnmanaged(u8),
+    body: []const u8,
+    mode: QuotedNameMode,
+) !void {
     var blank_buf: [16 * 1024]u8 = undefined;
     var lines = mem.splitScalar(u8, body, '\n');
     while (lines.next()) |line| {
         const code_end = findCommentStart(line) orelse line.len;
-        try masked.appendSlice(allocator, blankLiteralContents(line[0..code_end], &blank_buf));
+        try masked.appendSlice(
+            allocator,
+            maskLiteralContents(line[0..code_end], &blank_buf, mode),
+        );
         try masked.append(allocator, '\n');
     }
 }
@@ -30071,6 +30277,18 @@ fn unusedFnCandidate(t: []const u8) ?UnusedFnCand {
     return .{ .name = fn_name.name, .name_start = pos + 3, .name_end = fn_name.end };
 }
 
+/// True when the candidate's signature pins the C ABI through a suffix
+/// `callconv(.c/.C/.Stdcall)` mark (EPH-I1253): the mark sits after the
+/// parameter list and before the body brace (`fn wbin_measure(...)
+/// callconv(.C) void {`). `sig_view` runs from the `fn` keyword across
+/// the wrapped-signature lines (bounded by the lookahead cap), so a
+/// multi-line suffix exempts the same way the single-line form does.
+fn candidateSigSuffixIsCAbi(sig_view: []const u8) bool {
+    const close = paramListEnd(sig_view) orelse return false;
+    const body_open = bodyBraceAfter(sig_view, close + 1) orelse sig_view.len;
+    return hasAbiPinnedCallconv(sig_view[close + 1 .. body_open]);
+}
+
 /// Scan every file: collect the private fn candidates and every code
 /// identifier reference (the ZT105 tokenizer).
 fn scanFilesForUnusedFns(
@@ -30143,12 +30361,23 @@ fn scanUnusedFnLine(ctx: UnusedFnFileCtx, raw: []const u8, line_num: usize) !voi
     };
     if (unusedFnCandidate(t)) |cand| {
         const t_off = @intFromPtr(t.ptr) - @intFromPtr(raw.ptr);
-        try ctx.scan.decls.append(ctx.allocator, .{
-            .path = ctx.path,
-            .line = line_num,
-            .col = t_off + cand.name_start + 1,
-            .name = cand.name,
-        });
+        const t_abs = @intFromPtr(t.ptr) - @intFromPtr(ctx.content.ptr);
+        // The suffix-form C-ABI check looks past the line (a wrapped
+        // signature carries the mark on a later line, EPH-I1253).
+        const fn_abs = t_abs + cand.name_start - 3;
+        const sig_end = @min(ctx.content.len, fn_abs + max_signature_lookahead);
+        const sig_view = ctx.content[fn_abs..sig_end];
+        const is_c_abi = candidateSigSuffixIsCAbi(sig_view);
+        if (!is_c_abi) {
+            try ctx.scan.decls.append(ctx.allocator, .{
+                .path = ctx.path,
+                .line = line_num,
+                .col = t_off + cand.name_start + 1,
+                .name = cand.name,
+            });
+        }
+        // Tokenize the line except the declared name. A dropped C-ABI
+        // candidate skips the name too: its def is not a call reference.
         try collectUntestedFnIdents(
             &uctx,
             code[0 .. t_off + cand.name_start],
@@ -128824,6 +129053,46 @@ test "ZA405 skips a fn nested inside another fn body (the roll-up)" {
     try expectNoFindings(&run);
 }
 
+test "ZA405 counts an escaped-identifier body reference as a use (EPH-I1249)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn pass(@"type": u32) u32 {
+        \\    return @"type";
+        \\}
+        \\fn drop(@"callconv": u32) u32 {
+        \\    return 1;
+        \\}
+    );
+    defer run.deinit(allocator);
+    // The referenced `@"type"` stays silent; the genuinely unused
+    // `@"callconv"` is the control that the pass ran.
+    try std.testing.expectEqual(@as(usize, 1), run.unused.items.len);
+    try std.testing.expect(mem.indexOf(u8, run.unused.items[0].message, "@\"callconv\"") != null);
+}
+
+test "ZA405 reads the trailing initializer block of a struct-return fn (EPH-I1250)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The Select.zig fmtLoopLive shape: a nested fn's body inside the
+    // anonymous-struct type block must not open the outer span early —
+    // the trailing initializer is the body, and both params are used
+    // there.
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn fmtLoopLive(isel: *u8, loop_inst: u32) struct {
+        \\    isel: *u8,
+        \\    inst: u32,
+        \\    pub fn format(data: @This()) void {
+        \\        _ = data.isel;
+        \\    }
+        \\} {
+        \\    return .{ .isel = isel, .inst = loop_inst };
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
 // --- ZA505: passthrough wrappers ---------------------------------------------
 
 test "ZA505 fires on a single-return forward of all parameters" {
@@ -129487,6 +129756,41 @@ test "ZA406 counts a pointer capture as mutation (the deinit class)" {
         \\fn use(maybe: ?Item) void {
         \\    var item: ?Item = maybe;
         \\    if (item) |*p| p.deinit();
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA406 counts a switch-prong pointer capture as mutation (EPH-I1251)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // `switch (x) { .tag => |*v| v.* = 0 }` binds a mutable pointer to
+    // the payload, so the binding must be var (const fails to compile).
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn onPipe(stream: u32) u32 {
+        \\    var stream_ = stream;
+        \\    switch (stream_) {
+        \\        .owned => |*v| v.* = 0,
+        \\        else => {},
+        \\    }
+        \\    return stream_;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA406 walks a private-field chain segment (the .# dialect, EPH-I1252)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The bun patched-compiler private-field spelling: `self.#stack`
+    // mutates through the instance, so the binding must be var.
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn init(global: u8) u32 {
+        \\    var self: u32 = 0;
+        \\    self.#stack.append(global);
+        \\    return self;
         \\}
     );
     defer run.deinit(allocator);
@@ -130189,6 +130493,57 @@ test "ZA404 exempts C-ABI decls and main" {
         \\extern fn c_thing() void;
         \\export fn exported() void {}
         \\fn main() void {}
+        ,
+    }};
+    var run = try runUnusedFnTest(&diag, allocator, &files);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZA404 exempts the suffix callconv(.C) form (EPH-I1253)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The GTK widget-class callback shape: a C-ABI fn whose caller lives
+    // outside Zig source. The suffix mark pins the ABI the same way the
+    // extern prefix does, so the candidate never fires.
+    const files = [_]UnusedFnTestFile{.{
+        .path = "cb.zig",
+        .content =
+        \\fn wbin_measure(widget: u8, for_size: u8) callconv(.C) void {
+        \\    _ = widget;
+        \\    _ = for_size;
+        \\}
+        \\fn dead_helper() void {}
+        ,
+    }};
+    var run = try runUnusedFnTest(&diag, allocator, &files);
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countUnusedFnWarnings(run.issues.items, "dead_helper"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countUnusedFnWarnings(run.issues.items, "wbin_measure"),
+    );
+}
+
+test "ZA404 exempts a wrapped suffix callconv mark (EPH-I1253)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The suffix mark sits on a later signature line than the `fn`
+    // keyword: the candidate scan must look past the line (bounded by
+    // the signature lookahead).
+    const files = [_]UnusedFnTestFile{.{
+        .path = "cb.zig",
+        .content =
+        \\fn wbin_measure(
+        \\    widget: u8,
+        \\    for_size: u8,
+        \\) callconv(.C) void {
+        \\    _ = widget;
+        \\    _ = for_size;
+        \\}
         ,
     }};
     var run = try runUnusedFnTest(&diag, allocator, &files);

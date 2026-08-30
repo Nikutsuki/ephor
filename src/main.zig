@@ -21636,7 +21636,13 @@ fn isSoleReturnBlock(t: []const u8, open: usize, payload: []const u8) bool {
 // `unreachable` bodies (assertion-style), any `return f(...)` whose callee
 // is unresolved, returns of call-derived locals, and interface/vtable fns
 // (accepted FN — their bodies stay small to satisfy the fn-pointer type,
-// documented). One interface class IS carved out: the noop shim — a body
+// documented). Param types resolve one same-file alias layer (EPH-I1236,
+// REL-ZERO-1, REL-CORPUS-3):
+// a `fail: Error` param whose type is a `pub const Error = error{...}`
+// alias declared in this file records as error-typed, so a bare
+// `return fail;` is an error path. Cross-file aliases stay unresolved and
+// still fire the note (the FP-safe bound). One interface class IS carved
+// out: the noop shim — a body
 // of `_ = param;` discards, no call-containing statement, only constant or
 // void returns, and at most a few non-discard statements (ghostty's
 // KeymapNoop.translate / OpenGL.threadEnter shape). The `!` there is
@@ -21813,10 +21819,87 @@ fn recordOneErrorParam(sig: []const u8, pos: usize, scan: *ErrRetFnScan) void {
     scan.call_ident_count += 1;
 }
 
-/// Record error-TYPED fn params (`err: anyerror`, `e: error{X}`) from a
-/// signature line: a bare `return err;` of one is an error path even
-/// though the ident is neither a catch payload nor call-derived.
-fn recordErrorTypedParams(sig: []const u8, scan: *ErrRetFnScan) void {
+/// Bound on same-file error-alias names the ZA209 param-type resolution
+/// consults (EPH-I1236). A file declaring more aliases overflows the
+/// table; the overflowed table then treats every bare-identifier param
+/// type as error-typed — the over-suppression (FP-safe) direction for a
+/// note rule.
+const max_file_error_aliases = 16;
+
+/// File-scoped error-alias table (EPH-I1236, REL-ZERO-1, REL-CORPUS-3):
+/// the names of `pub const Name = error{...}` / `const Name = error{...}`
+/// declarations in ONE file, borrowed from the file content. Same-file
+/// only — a cross-file alias stays unresolved, so its fn still fires
+/// ZA209 (the safe direction, the B140 lock-struct-index bound).
+const FileErrorAliases = struct {
+    names: [max_file_error_aliases][]const u8 = undefined,
+    count: usize = 0,
+    overflow: bool = false,
+
+    fn add(self: *FileErrorAliases, name: []const u8) void {
+        if (self.overflow) return;
+        for (self.names[0..self.count]) |existing| {
+            // A test-section copy of one declaration costs a slot once.
+            if (mem.eql(u8, existing, name)) return;
+        }
+        if (self.count >= self.names.len) {
+            self.overflow = true;
+            return;
+        }
+        self.names[self.count] = name;
+        self.count += 1;
+    }
+
+    fn contains(self: *const FileErrorAliases, name: []const u8) bool {
+        if (self.overflow) return true; // fail toward silence
+        for (self.names[0..self.count]) |existing| {
+            if (mem.eql(u8, existing, name)) return true;
+        }
+        return false;
+    }
+};
+
+/// The declared name on a same-file error-alias line — `pub const Error =
+/// error{...}` or `const Error = error{...}` — or null (EPH-I1236). The
+/// match is start-anchored on the trimmed line, so a comment or
+/// multiline-string line never matches while an indented declaration
+/// does.
+fn errorAliasDeclName(t: []const u8) ?[]const u8 {
+    var rest = t;
+    if (mem.startsWith(u8, rest, "pub ")) rest = rest[4..];
+    if (!mem.startsWith(u8, rest, "const ")) return null;
+    rest = rest[6..];
+    var i: usize = 0;
+    while (i < rest.len and isIdent(rest[i])) i += 1;
+    if (i == 0) return null;
+    const name = rest[0..i];
+    rest = mem.trimStart(u8, rest[i..], " \t");
+    return if (mem.startsWith(u8, rest, "= error{")) name else null;
+}
+
+/// Build the per-file error-alias table (EPH-I1236) from every trimmed
+/// line. The whole file is scanned up front, so an alias declared AFTER
+/// its user resolves too.
+fn buildFileErrorAliases(aliases: *FileErrorAliases, lines: []const []const u8) void {
+    for (lines) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        if (errorAliasDeclName(t)) |nm| aliases.add(nm);
+    }
+}
+
+/// Record error-TYPED fn params from a signature line: the three textual
+/// type markers and bare identifiers typed by a same-file error alias
+/// (EPH-I1236). A `fail: Error` param records `fail` when this file
+/// declares `pub const Error = error{...}` (or `const Error = ...`), so a
+/// bare `return fail;` is an error path. Cross-file aliases stay
+/// unresolved and still fire the note, and an aliased pointer type
+/// (`fail: *Error`) is not the bare-alias shape, so it stays out too —
+/// both the FP-safe direction.
+fn recordErrorTypedParams(
+    sig: []const u8,
+    scan: *ErrRetFnScan,
+    aliases: *const FileErrorAliases,
+) void {
     const markers = [_][]const u8{ ": anyerror", ": error{", ": error." };
     for (markers) |marker| {
         var from: usize = 0;
@@ -21824,6 +21907,19 @@ fn recordErrorTypedParams(sig: []const u8, scan: *ErrRetFnScan) void {
             from = pos + marker.len;
             recordOneErrorParam(sig, pos, scan);
         }
+    }
+    // Alias-typed params: each `: Name` pair where Name sits in the
+    // same-file alias table. The colon scan is string-aware — a default
+    // value like `x: []const u8 = "a: b"` is data, never a type.
+    var cls = LineClassifier.init(sig);
+    var from: usize = 0;
+    while (mem.indexOfPos(u8, sig, from, ": ")) |pos| {
+        from = pos + 2;
+        if (cls.isInsideString(pos)) continue;
+        var end = from;
+        while (end < sig.len and isIdent(sig[end])) end += 1;
+        if (end == from) continue;
+        if (aliases.contains(sig[from..end])) recordOneErrorParam(sig, pos, scan);
     }
 }
 
@@ -22087,6 +22183,7 @@ const ErrRetLineCtx = struct {
     all_lines: []const []const u8,
     scan: *ErrRetFnScan,
     blank_buf: *[512]u8,
+    aliases: *const FileErrorAliases,
 };
 
 /// Apply one line to the ZA209 fn scan: open a fn, record evidence, fold
@@ -22107,7 +22204,7 @@ fn processErrRetLine(ctx: ErrRetLineCtx, line: []const u8, idx: usize) !void {
     // Signature lines (before the body brace) may declare error-typed
     // params on their own continuation lines — record them from the
     // content-backed line, never from the joined stack buffer.
-    if (!ctx.scan.body_started) recordErrorTypedParams(code, ctx.scan);
+    if (!ctx.scan.body_started) recordErrorTypedParams(code, ctx.scan, ctx.aliases);
     scanErrRetEvidence(code, ctx.scan);
     // Braces count only real code: trailing comments stripped, string
     // and char literal contents blanked (a `"}"` must not close the fn).
@@ -22131,6 +22228,12 @@ fn checkUselessErrorReturns(
 ) !void {
     var scan = ErrRetFnScan{};
     var blank_buf: [512]u8 = undefined;
+    // The same-file error-alias table (EPH-I1236): params typed by a
+    // local error-set alias record as error-typed, so `return fail;` of
+    // one is an error path. Built from the whole file up front, so an
+    // alias declared after its user resolves too.
+    var aliases = FileErrorAliases{};
+    buildFileErrorAliases(&aliases, all_lines);
     const ctx = ErrRetLineCtx{
         .a = a,
         .issues = issues,
@@ -22138,6 +22241,7 @@ fn checkUselessErrorReturns(
         .all_lines = all_lines,
         .scan = &scan,
         .blank_buf = &blank_buf,
+        .aliases = &aliases,
     };
     for (all_lines, 0..) |line, idx| {
         try processErrRetLine(ctx, line, idx);
@@ -119916,6 +120020,124 @@ test "ZA209: labeled-block error path is not scanned — the note fires (EPH-I00
     try std.testing.expectEqual(
         @as(usize, 1),
         countRuleIssues(run.issues.items, "za209_labeled.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: error-alias-typed param return is silent (EPH-I1236)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The skytale src/skytale/gui/webview.zig checkNative shape: `fail:
+    // Error` is typed by the file's own `pub const Error = error{...}`
+    // alias, and `return fail;` genuinely fails. Pre-fix the param
+    // recorded as a plain value, the return counted no error path, and
+    // the never-fails note fired (the E0b FP). The one-layer same-file
+    // resolution silences it (EPH-I1236, REL-ZERO-1, REL-CORPUS-3).
+    const content =
+        \\pub const Error = error{
+        \\    gui_run_failed,
+        \\    gui_destroy_failed,
+        \\};
+        \\
+        \\fn checkNative(code: c_int, fail: Error) Error!void {
+        \\    if (code == 0) return;
+        \\    return fail;
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_alias.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        countRuleIssues(run.issues.items, "za209_alias.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: alias-typed param never returned still fires (EPH-I1236)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Recording the param is evidence for `return fail;` only: a body
+    // that never returns the param stays a genuine never-fails fn, and
+    // the note must survive the resolution (EPH-I1236 positive control).
+    const content =
+        \\pub const Error = error{Nope};
+        \\
+        \\fn f(fail: Error) Error!void {
+        \\    const v: u32 = 1;
+        \\    const w: u32 = v + 2;
+        \\    const z: u32 = w * 3;
+        \\    const q: u32 = z + 4;
+        \\    const r: u32 = q * 5;
+        \\    _ = r;
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_alias_unused.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_alias_unused.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: unresolved error-alias param still fires (EPH-I1236)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The same-file bound: with no `pub const Error = error{...}` in the
+    // fixture (an alias imported from another file), the param stays
+    // unresolved and the note still fires — the FP-safe direction that
+    // keeps cross-file coverage (EPH-I1236).
+    const content =
+        \\fn checkNative(code: c_int, fail: Error) Error!void {
+        \\    if (code == 0) return;
+        \\    return fail;
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_alias_unresolved.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_alias_unresolved.zig", RULE_USELESS_ERROR_RETURN),
+    );
+}
+
+test "ZA209: alias name inside a string default stays data (EPH-I1236)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The colon scan is string-aware: `"msg: Error"` is default-value
+    // data, never a `msg: Error` param typing. Without the guard the
+    // in-string colon records `msg` as error-typed, and `return msg;`
+    // reads as an error path — a genuine never-fails fn goes silent.
+    // The guard keeps the note (EPH-I1236).
+    const content =
+        \\pub const Error = error{Nope};
+        \\
+        \\fn f(msg: []const u8 = "msg: Error") Error!void {
+        \\    const v: u32 = 1;
+        \\    const w: u32 = v + 2;
+        \\    const z: u32 = w * 3;
+        \\    _ = z;
+        \\    return msg;
+        \\}
+    ;
+    var run = try runErrorsCheck(&diag, allocator, "za209_alias_strdefault.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "za209_alias_strdefault.zig", RULE_USELESS_ERROR_RETURN),
     );
 }
 

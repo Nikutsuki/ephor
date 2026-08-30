@@ -184,7 +184,7 @@ const ToolKind = enum {
 /// Threaded.zig dirAccessWindows), so an X_OK gate would be a silent no-op
 /// there, and the exec at spawn time is the authoritative gate. The gap
 /// between this check and the late spawn is a TOCTOU window (std documents
-/// the same race for access()); it is accepted because the environment is
+/// the same race for access()). It is accepted because the environment is
 /// operator-controlled and a swapped path fails at spawn with a clear
 /// error.
 fn resolveToolFromEnv(
@@ -233,7 +233,7 @@ fn resolveToolFromEnv(
 
 /// Resolve the bare tool name through PATH to an absolute path
 /// (EPH-I0163). The first PATH entry whose dir/name resolves as an
-/// existing non-directory wins; the name gets a ".exe" suffix on
+/// existing non-directory wins. The name gets a ".exe" suffix on
 /// Windows, where the PATH entries hold extensionless names. An empty
 /// PATH entry (including the empty-list shape) and an unresolvable
 /// candidate skip silently — PATH conventions are per-platform, and the
@@ -267,7 +267,7 @@ fn initToolPaths(diag: *DiagCtx, environ_map: *const std.process.Environ.Map) vo
     tool_zig_path = resolveToolFromEnv(diag, .zig, environ_map.get("EPHOR_ZIG_PATH"), path_env);
     tool_curl_path = resolveToolFromEnv(diag, .curl, environ_map.get("EPHOR_CURL_PATH"), path_env);
     // Release-verification temp base (EPH-I0287): install.sh's mktemp
-    // ${TMPDIR:-/tmp} shape. TEMP and TMP cover Windows; the fallback keeps
+    // ${TMPDIR:-/tmp} shape. TEMP and TMP cover Windows. The fallback keeps
     // a valid base when no temp env exists.
     verify_tmp_base = environ_map.get("TMPDIR") orelse
         environ_map.get("TEMP") orelse
@@ -291,7 +291,7 @@ fn initToolPaths(diag: *DiagCtx, environ_map: *const std.process.Environ.Map) vo
 /// sink is installed. Tests install a per-test capture sink and assert on
 /// the diagnostics in-process (the EPH-I0314 warning-absence seam).
 const DiagSink = struct {
-    /// Sink state (a test capture struct; null-context fns ignore it).
+    /// Sink state (a test capture struct. Null-context fns ignore it).
     ctx: *anyopaque,
     /// Writes one formatted diagnostic message.
     writeFn: *const fn (ctx: *anyopaque, msg: []const u8) void,
@@ -306,13 +306,13 @@ const DiagCtx = struct {
     /// to raw stderr (or through diag_sink when one is installed), which
     /// the runner echoes into the gate log on success (build_runner "no
     /// matter the result") but never counts against the step. Error-path
-    /// tests mute parse diagnostics and assert on the resulting state;
-    /// the mute keeps that echoed stderr quiet.
+    /// tests mute parse diagnostics and assert on the resulting state.
+    /// The mute keeps that echoed stderr quiet.
     cli_diagnostics_enabled: bool = true,
     /// JSON output mode (--format=json): the shared stderr stream carries
     /// the machine JSON guarantee, so human diagnostics must not reach it
-    /// (EPH-I0213). A pre-scan of argv arms this before the config load;
-    /// parseSimpleFlag sets it when the format flag parses. Once armed the
+    /// (EPH-I0213). A pre-scan of argv arms this before the config load.
+    /// ParseSimpleFlag sets it when the format flag parses. Once armed the
     /// latch stays on for the whole run, even when a later --format=text
     /// switches the output format back.
     json_stream: bool = false,
@@ -442,7 +442,7 @@ fn testDiagCtx() DiagCtx {
 const max_source_file_bytes = 10 * 1024 * 1024;
 
 /// Cap on the stashed invalid CI-gate value (B13-17). The longest valid
-/// fail_on value is 7 bytes ("warning"); 64 bytes leaves room for a
+/// fail_on value is 7 bytes ("warning"). 64 bytes leaves room for a
 /// malformed token worth naming in the diagnostic.
 const bad_gate_value_buf_bytes = 64;
 
@@ -450,7 +450,7 @@ const bad_gate_value_buf_bytes = 64;
 /// The default stderr path never formats (std.debug.print direct), so
 /// the cap bounds only sink-bearing runs, which tests install. The
 /// largest production messages are a path (<= Fs.max_path_bytes) plus
-/// under 1 KiB of static text; 8 KiB covers every production class. An
+/// under 1 KiB of static text. 8 KiB covers every production class. An
 /// over-cap message keeps its head — the diagnostic prefix — by the
 /// same truncation policy as the stashBadGateValue clamp (B13-17).
 const diag_msg_buf_bytes = 8192;
@@ -479,7 +479,7 @@ fn unlatchErrorDiag(diag: *DiagCtx) void {
 /// Print a CLI/config diagnostic unless the run has muted the channel or
 /// the output stream is the JSON machine guarantee (EPH-I0213). With a
 /// sink installed (EPH-I1051) the message formats once into a fixed
-/// buffer and goes through the sink; without one the call passes
+/// buffer and goes through the sink. Without one the call passes
 /// straight to std.debug.print, so production output is byte-identical
 /// with the pre-sink code.
 fn cliDiag(diag: *DiagCtx, comptime fmt: []const u8, args: anytype) void {
@@ -519,7 +519,7 @@ fn cliDiag(diag: *DiagCtx, comptime fmt: []const u8, args: anytype) void {
 
 /// Test capture sink for cliDiag (EPH-I1051): install on a DiagCtx, run
 /// the code under test, assert on the captured bytes in-process. The
-/// buffer is sized for the diagnostics the pins emit; an over-cap write
+/// buffer is sized for the diagnostics the pins emit. An over-cap write
 /// keeps the truncated head and sets `truncated`, so the test's content
 /// assertions still fail loudly on the missing tail.
 const CaptureSink = struct {
@@ -567,7 +567,7 @@ test "cliDiag routes through the sink; the latches still gate it (EPH-I1051)" {
 test "cliDiag over-cap format keeps the head and sets the sink truncated latch (EPH-I1051)" {
     // The >8192-byte format output trips the cliDiag fixed buffer's
     // WriteFailed, the head-preserving truncation at the catch site
-    // (the policy the previous tests never pinned); the 8192-byte head
+    // (the policy the previous tests never pinned). The 8192-byte head
     // then overflows the 512-byte capture, which keeps its own truncated
     // head and sets the latch. Both truncations preserve the diagnostic
     // prefix, so the assertion pins the delivered head byte-for-byte:
@@ -745,7 +745,7 @@ const EdgeKind = enum {
     branch_false, // Conditional false branch
     loop_back, // Loop back edge to the loop header (body close, continue)
     error_path, // Error handling path (catch, errdefer)
-    // `break` exit to the loop merge; a loop-else rewires it to the
+    // `break` exit to the loop merge. A loop-else rewires it to the
     // post-else merge (a break bypasses the else) (EPH-I0094)
     break_jump,
 };
@@ -762,7 +762,7 @@ const BlockType = enum {
     if_block, // if-statement true branch
     else_block, // else branch
     // else-if arm: merge_block is the chain merge and catch_origin_block is
-    // the condition-false block; an unclaimed close wires BOTH to the merge
+    // the condition-false block. An unclaimed close wires BOTH to the merge
     // (always deferred, so handleBlockEnd never sees this type) (EPH-I0087)
     else_if_block,
     while_block, // while loop
@@ -782,8 +782,8 @@ const StackEntry = struct {
     // consults — every reader gates on block_type first, so the null
     // never dereferences (EPH-I0325, band-B01a F10).
     catch_origin_block: ?usize,
-    // Control `{` has not been seen yet (Allman style / multi-line condition);
-    // the next `{` at paren-depth 0 on a non-opener line belongs to this entry.
+    // Control `{` has not been seen yet (Allman style / multi-line condition).
+    // The next `{` at paren-depth 0 on a non-opener line belongs to this entry.
     pending_brace: bool = false,
 };
 
@@ -796,7 +796,7 @@ fn isLoopBlock(bt: BlockType) bool {
 
 /// Column span one basic block owns on a source line shared by several
 /// blocks. A same-line if/else packs the branch header, both arms, and
-/// the post-merge text into one line; whole-line ranges cannot attribute
+/// the post-merge text into one line. Whole-line ranges cannot attribute
 /// statements on it, so the walk records the split (EPH-I0111).
 const ColSpan = struct {
     line: usize,
@@ -807,7 +807,7 @@ const ColSpan = struct {
 
 /// Column span of a same-line braced arm on a line without an else
 /// (`if (c) { x = 1; }`). A fill inside the arm runs on the guarded path
-/// only; the gen side uses the span to move the fill onto the arm block,
+/// only. The gen side uses the span to move the fill onto the arm block,
 /// and the read side attributes a same-arm read the same way, so a read
 /// inside the arm after the fill is covered while a read after the
 /// construct stays uncovered (EPH-I0111, EPH-I0873).
@@ -949,7 +949,7 @@ const cf_patterns = [_]CFPatternEntry{
     .{ .prefix = "} else", .exact = false, .word_bound = true, .result = .else_start },
     // Line-start else-if (close on previous line); word-delimited like if/if(
     // A bare `else if` line (condition on a later line, Allman style)
-    // carries no trailing token; the exact entry catches it before the
+    // carries no trailing token. The exact entry catches it before the
     // spaced and paren forms (EPH-I0323, band-B01a F8).
     .{ .prefix = "else if", .exact = true, .result = .else_if },
     .{ .prefix = "else if ", .exact = false, .result = .else_if },
@@ -978,7 +978,7 @@ const cf_patterns = [_]CFPatternEntry{
     .{ .prefix = "}", .exact = true, .result = .block_end },
 };
 
-/// True for a catch line whose braces stay open; the unbalanced shape
+/// True for a catch line whose braces stay open. The unbalanced shape
 /// then classifies as a catch block opener.
 fn isUnbalancedCatchBlock(trimmed: []const u8) bool {
     if (mem.indexOf(u8, trimmed, "catch ") == null) return false;
@@ -1071,13 +1071,13 @@ fn matchesCFPatternEntry(trimmed: []const u8, p: CFPatternEntry) bool {
     return trimmed.len == p.prefix.len or !isIdent(trimmed[p.prefix.len]);
 }
 
-/// Detect the control-flow pattern of a trimmed line; first table match
+/// Detect the control-flow pattern of a trimmed line. First table match
 /// wins, and non-control lines fall through to the catch and prong tests.
 /// Documented approximation (EPH-I0750): a whole switch on one line
 /// (`switch (v) { 1 => { x = 1; }, _ => {}, }`) matches the switch_start
 /// table entry first, so no prong line dispatches handleSwitchArm and the
 /// arm bodies attribute to the header block. The unformatted single-line
-/// shape is rare; zig fmt expands it to the multi-line form that scans
+/// shape is rare. Zig fmt expands it to the multi-line form that scans
 /// correctly (the EPH-I0679 machinery). The pin lives in the buildCFG
 /// switch test family.
 /// EPH-I0115: a leading block label is stripped before the table match
@@ -1102,11 +1102,11 @@ fn detectCFPattern(t: []const u8) CFPattern {
 }
 
 /// Quote state for line scanners: string and char literals are mutually
-/// exclusive; comments and code live outside both.
+/// exclusive. Comments and code live outside both.
 const QuoteMode = enum { none, str, char };
 
 /// Step the quote machine while a string literal is open: an escape skips
-/// its next char; the closing quote returns the machine to code position.
+/// its next char. The closing quote returns the machine to code position.
 fn stepStringQuote(mode: *QuoteMode, c: u8) ?usize {
     if (c == '\\') return 1;
     if (c == '"') mode.* = .none;
@@ -1114,7 +1114,7 @@ fn stepStringQuote(mode: *QuoteMode, c: u8) ?usize {
 }
 
 /// Step the quote machine while a char literal is open: an escape skips
-/// its next char; the closing quote returns the machine to code position.
+/// its next char. The closing quote returns the machine to code position.
 fn stepCharQuote(mode: *QuoteMode, c: u8) ?usize {
     if (c == '\\') return 1;
     if (c == '\'') mode.* = .none;
@@ -1122,7 +1122,7 @@ fn stepCharQuote(mode: *QuoteMode, c: u8) ?usize {
 }
 
 /// Step the quote machine in code position: an opening quote opens the
-/// matching literal; any other char is plain code.
+/// matching literal. Any other char is plain code.
 fn stepNoneQuote(mode: *QuoteMode, c: u8) ?usize {
     if (c == '"') {
         mode.* = .str;
@@ -1149,7 +1149,7 @@ fn scanQuoteStep(mode: *QuoteMode, c: u8) ?usize {
 /// Iterate one line's code-position chars: quote content is skipped, and
 /// only code chars reach the caller (EPH-I1232 C2a, REL-GATE-2, REL-AB-5). The scan-loop
 /// prologue idiom — a local QuoteMode, an index from 0, and the same
-/// 8-line quote-aware walk head — repeated across the scanner fns; this
+/// 8-line quote-aware walk head — repeated across the scanner fns. This
 /// iterator owns the uniform part, and each site keeps its own cut
 /// condition and body. `next` yields the index of the next code char in
 /// `line`, or null at the line end. The caller's loop carries
@@ -1204,9 +1204,9 @@ const LineStep = struct {
 /// Line-level iteration over a function-body line slice (EPH-I1232 C3,
 /// REL-GATE-2, REL-AB-5): the trim + comment-skip line prologue shared by
 /// the line-walk family, with the per-site body as the varying part.
-/// `forward` yields lines start_idx..end_idx in order; `backward` yields
+/// `forward` yields lines start_idx..end_idx in order. `backward` yields
 /// (from_idx-1) down to stop_idx — the pre-migration `while (i > stop) {
-/// i -= 1; ... }` shape; comment-only and multiline-opener lines never
+/// i -= 1; ... }` shape. Comment-only and multiline-opener lines never
 /// yield either way. `nextCodeLineBack` also strips the trailing comment
 /// and skips lines whose code part is empty (EPH-I0095). `nextChar` is
 /// the walk's inner step: the C2c carriedScanStep head folded in, so the
@@ -1224,7 +1224,7 @@ const LineWalk = struct {
     cur_idx: usize = 0,
     char_i: usize = 0,
 
-    /// Forward walk over lines start_idx..end_idx; `start_col` applies on
+    /// Forward walk over lines start_idx..end_idx. `start_col` applies on
     /// the first yielded line whose index is start_idx (a skipped origin
     /// line loses the column, like the pre-migration walks).
     fn forward(
@@ -1320,7 +1320,7 @@ const LineWalk = struct {
     /// Next code-position char across the walk's lines: quote content
     /// skips, and a `\\` multiline opener or a `//` comment opener cuts
     /// the line — the walk moves to the next line (EPH-I0751). Yields
-    /// the column within the current trimmed line; the caller's loop
+    /// the column within the current trimmed line. The caller's loop
     /// carries `: (walk.advanceChar())`. The current line's index is
     /// cur_idx, its text `text`. The caller-owned `mode` carries across
     /// lines, like the C2c carriedScanStep head this folds.
@@ -1487,7 +1487,7 @@ const BodyStart = enum { none, brace, label_block, statement };
 /// same-line statement body).
 /// Index just past a `|payload|` capture's closing `|` and any following
 /// whitespace, or null when the capture never closes (peekBodyStart,
-/// peekElseBody share the strict skip; the tolerant no-op form for loop
+/// peekElseBody share the strict skip. The tolerant no-op form for loop
 /// headers is skipPayloadCapture).
 fn payloadCaptureEnd(code: []const u8, j: usize) ?usize {
     const close = mem.indexOfScalarPos(u8, code, j + 1, '|') orelse return null;
@@ -1627,7 +1627,7 @@ fn classifyBracedJumpBody(code: []const u8, start: usize, end: usize) JumpKind {
 /// close AFTER the keyword closes the line-start else's own arm (opened
 /// after the keyword), never the saved entry — the line-start else
 /// claims the deferral (EPH-I1063). The else_keyword event marks the
-/// boundary; the line-start else emits none, so closes on its line
+/// boundary. The line-start else emits none, so closes on its line
 /// never refuse.
 fn scanClaimsElse(pattern: CFPattern, events: []const ControlEvent) bool {
     if (pattern != .else_start and pattern != .else_if) return false;
@@ -1672,8 +1672,8 @@ fn backSkipWhitespace(code: []const u8, j: usize) usize {
     return k;
 }
 
-/// Walk backwards from the `)` at code[j - 1] to its matching `(`;
-/// returns the `(` index, or 0 when the group never balances. Callers
+/// Walk backwards from the `)` at code[j - 1] to its matching `(`.
+/// Returns the `(` index, or 0 when the group never balances. Callers
 /// verify the `)` themselves.
 fn backSkipParenGroup(code: []const u8, j: usize) usize {
     var k = j;
@@ -1692,7 +1692,7 @@ fn backSkipParenGroup(code: []const u8, j: usize) usize {
 /// function body or control block. Same-line backward lookback, generalized
 /// from isErrorSetOpen (EPH-I0012): also catches spaced keywords and
 /// parenthesized containers like `union(enum) {`. The paren-group skip is
-/// not quote-aware; a mis-skip degrades to "not a container", which is the
+/// not quote-aware. A mis-skip degrades to "not a container", which is the
 /// safe direction (fn-body/expression classification still applies).
 fn sigContainerOpen(code: []const u8, i: usize) bool {
     var j = backSkipWhitespace(code, i);
@@ -1706,13 +1706,13 @@ fn sigContainerOpen(code: []const u8, i: usize) bool {
 }
 
 /// Brace kinds on the CFG build brace stack. Only `.control` braces have a
-/// matching block-stack entry; every other kind is invisible to dispatch.
+/// matching block-stack entry. Every other kind is invisible to dispatch.
 const BraceKind = enum { fn_body, sig_container, control, expr };
 
 /// Ordered control event emitted by the per-line brace scan. buildCFG walks
 /// the list in position order instead of dispatching once per line, so a
 /// line like `if (a) { f(); } else { g(); }` opens and closes both blocks.
-/// The column locates the event in the trimmed, comment-stripped line; the
+/// The column locates the event in the trimmed, comment-stripped line. The
 /// walk uses it to split block ownership of a line shared by several
 /// blocks (EPH-I0111).
 const ControlEvent = struct {
@@ -1733,14 +1733,14 @@ const BraceScanOut = struct {
     saw_control_open: bool = false, // `{` was claimed as a control brace
     body_return: bool = false, // the virtual body statement is a `return`
     // The same-line body statement (virtual or `{ break; }`) is a loop
-    // break/continue; the walk wires it at the matching close (EPH-I0094).
+    // break/continue. The walk wires it at the matching close (EPH-I0094).
     body_jump: JumpKind = .none,
     // An else keyword whose body is pending on a later line (Allman else,
     // or a payload-else with nothing after the payload): the walk marks
     // the else entry pending so the next line's `{` or statement claims
     // it (EPH-I0119, EPH-I0089).
     saw_else_pending: bool = false,
-    // Ordered events for the line; slices CFGBuildCtx.event_scratch, so it
+    // Ordered events for the line. Slices CFGBuildCtx.event_scratch, so it
     // is valid only until the next scanLineBraces call.
     events: []const ControlEvent = &.{},
 };
@@ -1761,7 +1761,7 @@ const LineScanCtx = struct {
     // virtual open claimed after it means the else body is on this line,
     // so the pending mark must not survive (EPH-I0089).
     last_else_col: ?usize = null,
-    // Index of the latest control `{` on this line; a same-line `}` pop
+    // Index of the latest control `{` on this line. A same-line `}` pop
     // extracts the braced body text between them (EPH-I0094).
     last_control_open: ?usize = null,
     out: BraceScanOut = .{},
@@ -1783,7 +1783,7 @@ const CFGBuildCtx = struct {
     block_stack: *std.ArrayListUnmanaged(StackEntry),
     allocator: Allocator,
     current_block: usize,
-    // Kind-tagged stack of unmatched braces; a `}` is a control-block end
+    // Kind-tagged stack of unmatched braces. A `}` is a control-block end
     // iff it pops a `.control` brace. Owned by buildCFG (same pattern as
     // block_stack).
     brace_stack: *std.ArrayListUnmanaged(BraceKind),
@@ -1795,11 +1795,11 @@ const CFGBuildCtx = struct {
     // has not arrived yet. The next non-comment line either claims it
     // (handleElse) or finishPendingElse wires the no-else close.
     pending_else: ?StackEntry = null,
-    // Set by scanLineBraces when the line's virtual body is a `return`;
-    // consumed by the walk at the matching close_virtual.
+    // Set by scanLineBraces when the line's virtual body is a `return`.
+    // Consumed by the walk at the matching close_virtual.
     body_return: bool = false,
     // Set by scanLineBraces when the line's same-line body is a loop
-    // break/continue; consumed by the walk at the matching close (EPH-I0094).
+    // break/continue. Consumed by the walk at the matching close (EPH-I0094).
     body_jump: JumpKind = .none,
     paren_depth: usize, // carried across lines for multi-line conditions
     seen_fn_body: bool, // the fn body's own `{` is the scan baseline, never counted
@@ -1821,7 +1821,7 @@ const CFGBuildCtx = struct {
 
     /// Accumulate a continuation line of a deferred multi-line while
     /// condition (EPH-I0130). The opener line appended its own text in
-    /// handleBranch; every later line with the condition still open
+    /// handleBranch. Every later line with the condition still open
     /// extends it.
     fn extendWhileCondition(self: *CFGBuildCtx, code: []const u8) !void {
         if (self.while_lit == null or self.paren_depth == 0) return;
@@ -1841,7 +1841,7 @@ const CFGBuildCtx = struct {
         self.while_lit = null;
     }
 
-    /// Clear the top entry's pending control brace; returns true when a
+    /// Clear the top entry's pending control brace. Returns true when a
     /// pending claim was consumed (the `{` belongs to that entry).
     fn clearTopPending(self: *CFGBuildCtx) bool {
         const items = self.block_stack.items;
@@ -1880,10 +1880,10 @@ const CFGBuildCtx = struct {
     }
 
     /// Classify one `{` at index i and push its kind onto the brace stack.
-    /// Precedence: inside parens is always expression; signature containers
-    /// (`error{`, `struct {`, ...) are not bodies; the first remaining
-    /// paren-depth-0 `{` is the fn body; an opener's first `{`, an else
-    /// keyword's block `{`, and pending claims are control; everything else
+    /// Precedence: inside parens is always expression. Signature containers
+    /// (`error{`, `struct {`, ...) are not bodies. The first remaining
+    /// paren-depth-0 `{` is the fn body. An opener's first `{`, an else
+    /// keyword's block `{`, and pending claims are control. Everything else
     /// (switch arms, bare blocks, literals) is expression.
     fn classifyOpenBrace(self: *CFGBuildCtx, i: usize, line_scan: *LineScanCtx) !void {
         if (self.paren_depth > 0) {
@@ -1939,7 +1939,7 @@ const CFGBuildCtx = struct {
     }
 
     /// Push a control brace and emit the open event (openControlBrace,
-    /// tryVirtualBodyOpen share the pair; the line_scan updates around
+    /// tryVirtualBodyOpen share the pair. The line_scan updates around
     /// each emission stay per-caller).
     fn pushControlOpen(self: *CFGBuildCtx, i: usize) !void {
         try self.brace_stack.append(self.allocator, .control);
@@ -1958,7 +1958,7 @@ const CFGBuildCtx = struct {
         });
     }
 
-    /// Classify one `}` at index i: pop the brace stack; emit `.close_control`
+    /// Classify one `}` at index i: pop the brace stack. Emit `.close_control`
     /// iff it pops a `.control` brace. A mid-line `}` after a statement also
     /// closes the arm (`_ = c; } else {`): the kind-tagged brace stack makes
     /// the pop unambiguous, and deferring it to a later pop-dispatching line
@@ -2051,7 +2051,7 @@ const CFGBuildCtx = struct {
     }
 
     /// Pop the virtual control brace pushed by tryVirtualBodyOpen (top of
-    /// stack by construction; defensive against unbalanced input).
+    /// stack by construction, defensive against unbalanced input).
     fn popVirtualControl(self: *CFGBuildCtx) void {
         const items = self.brace_stack.items;
         if (items.len > 0 and items[items.len - 1] == .control)
@@ -2059,7 +2059,7 @@ const CFGBuildCtx = struct {
     }
 
     /// Close an open virtual body: the statement ended (`;`) or the line
-    /// did; emit the close event that a braced body's `}` would produce.
+    /// did. Emit the close event that a braced body's `}` would produce.
     fn closeVirtualBody(self: *CFGBuildCtx, col: usize, line_scan: *LineScanCtx) !void {
         if (!line_scan.virtual_open) return;
         line_scan.virtual_open = false;
@@ -2162,7 +2162,7 @@ const CFGBuildCtx = struct {
         self.event_scratch.clearRetainingCapacity();
         // The condition-end line of a multi-line if/else-if opener may
         // carry the body. A same-line brace-less while body takes a
-        // virtual body (EPH-I0129); the for opener stays excluded (see
+        // virtual body (EPH-I0129). The for opener stays excluded (see
         // virtualOkFor).
         const cond_end = self.paren_depth > 0 and self.topIsPendingIfElse();
         var line_scan: LineScanCtx = .{
@@ -2233,7 +2233,7 @@ const CFGBuildCtx = struct {
         try self.cfg.addEdge(self.current_block, header, .loop_back);
     }
 
-    /// Mark the current block as a return exit; no fall-through edge
+    /// Mark the current block as a return exit. No fall-through edge
     /// leaves it.
     fn handleReturn(self: *CFGBuildCtx) !void {
         self.cfg.blocks.items[self.current_block].is_return = true;
@@ -2269,7 +2269,7 @@ const CFGBuildCtx = struct {
     /// Wire a loop-control jump out of the current block and mark it
     /// jump-terminal so close wiring adds no fall-through edge from it
     /// (EPH-I0094). A break exits to the loop's merge (rewired past a
-    /// loop-else by rewireBreakJumps); a continue re-enters at the header,
+    /// loop-else by rewireBreakJumps). A continue re-enters at the header,
     /// modeled as a loop_back edge so definite-assignment keeps its
     /// zero-trip discipline. With no enclosing loop entry (invalid code)
     /// nothing is wired and the block keeps fall-through semantics.
@@ -2302,7 +2302,7 @@ const CFGBuildCtx = struct {
         }
     }
 
-    /// Open a switch entry; every arm branches from the current header
+    /// Open a switch entry. Every arm branches from the current header
     /// block, and arm closes fall into the entry's merge.
     fn handleSwitchStart(self: *CFGBuildCtx) !void {
         const merge_block = try self.cfg.addBlock();
@@ -2368,7 +2368,7 @@ const CFGBuildCtx = struct {
     }
 
     /// Entry for handleElse: a deferred close (lone `}` on an earlier line)
-    /// claims its saved entry; a same-line `} else` pops the entry directly
+    /// claims its saved entry. A same-line `} else` pops the entry directly
     /// (pending_else is null there by construction — a close event precedes
     /// the else keyword). The entry may be a loop entry in both cases
     /// (EPH-I0086).
@@ -2385,7 +2385,7 @@ const CFGBuildCtx = struct {
         const claimed_pending = self.pending_else != null;
         const entry = self.takeElseEntry() orelse return;
         // An else-if entry carries the chain merge in merge_block and the
-        // condition-false block in catch_origin_block; every other entry
+        // condition-false block in catch_origin_block. Every other entry
         // reserves merge_block as the else body and gets a fresh merge.
         const chained = entry.block_type == .else_if_block;
         // An else-if entry always carries its condition-false block
@@ -2510,7 +2510,7 @@ const CFGBuildCtx = struct {
         if (isLoopBlock(entry.block_type)) {
             if (!terminal) try self.wireLoopBack(entry);
         } else {
-            // A return-terminal body exits too; only catch and switch
+            // A return-terminal body exits too. Only catch and switch
             // bodies can carry one here, because the inline-return else
             // pushes no entry and a virtual else body is a single
             // statement that never sets the return flag (EPH-I0322).
@@ -2521,9 +2521,9 @@ const CFGBuildCtx = struct {
         self.setStartLine(line + 1);
     }
 
-    /// Close the top entry; an if/else close defers its merge wiring into
+    /// Close the top entry. An if/else close defers its merge wiring into
     /// pending_else so a next-line else can still claim the entry (the
-    /// double-pop fix; else_if chains defer every link). A loop close
+    /// double-pop fix. Else_if chains defer every link). A loop close
     /// defers the same way so the loop's own else claims the loop entry
     /// instead of popping the outer one (EPH-I0086). Everything else
     /// closes immediately.
@@ -2551,7 +2551,7 @@ const CFGBuildCtx = struct {
 
     /// Wire a deferred close that no else claimed: an if/else body falls
     /// through to the entry's merge, mirroring handleBlockEnd's generic
-    /// branch; a loop close mirrors its loop branch (EPH-I0086). An else-if
+    /// branch. A loop close mirrors its loop branch (EPH-I0086). An else-if
     /// close also wires the chain fallthrough: the condition-false path
     /// reaches the merge without touching the arm (EPH-I0087). A
     /// jump-terminal or return-terminal body already wired its exit, so
@@ -2620,7 +2620,7 @@ const CFGBuildCtx = struct {
     /// span must end at its close line, not extend over the claiming
     /// line, EPH-I1063), and close the saved entry as no-else when the
     /// line neither claims nor carries one. Comment lines never reach
-    /// here; blank lines carry no code, so they must not clear the
+    /// here. Blank lines carry no code, so they must not clear the
     /// deferral. The caller runs handleElse for a virtual else before
     /// this call, so a virtual line already consumed the saved entry and
     /// the pending guard below reports it as unsettled.
@@ -2638,7 +2638,7 @@ const CFGBuildCtx = struct {
     }
 
     /// Opener whose control `{` is on a later line (Allman, multi-line
-    /// condition); an inline-return else has no brace coming at all.
+    /// condition). An inline-return else has no brace coming at all.
     fn markOpenerPending(
         self: *CFGBuildCtx,
         pattern: CFPattern,
@@ -2655,7 +2655,7 @@ const CFGBuildCtx = struct {
     /// payload-else with nothing after the payload): mark the else entry
     /// pending so the next line's `{` claims it as a control open or its
     /// statement becomes the virtual body (EPH-I0119, EPH-I0089). A body
-    /// claim after the else keyword already cleared the flag; an
+    /// claim after the else keyword already cleared the flag. An
     /// inline-return else has no body line at all.
     fn markElsePending(self: *CFGBuildCtx, scan: BraceScanOut, code: []const u8) void {
         if (!scan.saw_else_pending) return;
@@ -2693,7 +2693,7 @@ const CFGBuildCtx = struct {
         try self.walkLineEvents(pattern, code, line);
         self.markOpenerPending(pattern, scan, code);
         self.markElsePending(scan, code);
-        // The virtual body lived in the true block; close the opener at
+        // The virtual body lived in the true block. Close the opener at
         // this line's end. A body line that opened its own construct
         // (nested if, braced loop) leaves the opener lingering as pre-B2 —
         // documented approximation, no recursive nesting (B2.4).
@@ -2717,13 +2717,13 @@ const CFGBuildCtx = struct {
         self.setStartLine(line);
     }
 
-    /// Route a line pattern to its CFG handler; patterns that neither
+    /// Route a line pattern to its CFG handler. Patterns that neither
     /// open nor pop change nothing in the graph. Only control openers
     /// dispatch here: both callers (walkOneEvent open_control and the
     /// walkLineEvents tail) guard with isControlOpener, so the
     /// pop/arm/return patterns (block_end, switch_arm, return_stmt)
     /// are unreachable here and route through their own walk handlers
-    /// (EPH-I0999; also relieves EPH-I0059 branch pressure).
+    /// (EPH-I0999. Also relieves EPH-I0059 branch pressure).
     /// EPH-I0059 decision (recorded 2026-08-25): at 7 arms (7 ZA304
     /// branches, 8 ZA305 CCN, flat-chain shaped) the lookup-table
     /// refactor of the three handleBranch arms is not warranted — the
@@ -2740,7 +2740,7 @@ const CFGBuildCtx = struct {
             .switch_start => try self.handleSwitchStart(),
             // The dispatch-path else sits at the line's pattern position
             // (after leading `}`s for the mid-line forms, at 0 for the
-            // line-start forms); the walk's else_keyword events carry the
+            // line-start forms). The walk's else_keyword events carry the
             // exact col instead (EPH-I0113).
             .else_start, .else_if => try self.handleElse(
                 t,
@@ -2802,7 +2802,7 @@ const CFGBuildCtx = struct {
     }
 
     /// Capture the open of a same-line braced arm: the dispatched
-    /// opener's block owns the arm's span; a non-opener line (Allman `{`
+    /// opener's block owns the arm's span. A non-opener line (Allman `{`
     /// claiming a pending entry) has no arm block of its own
     /// (EPH-I0846/49). On an else-carrying line only an arm opened after
     /// the line's first else keyword records: the chain arms and the
@@ -2886,7 +2886,7 @@ const CFGBuildCtx = struct {
     }
 
     /// Record the span the current block owns up to an event boundary and
-    /// advance the segment start. A close's span includes its `}`; every
+    /// advance the segment start. A close's span includes its `}`. Every
     /// other event ends the segment at its own column (EPH-I0111).
     fn advanceSpan(self: *CFGBuildCtx, line: usize, span_col: *usize, event: ControlEvent) !void {
         const end = if (event.kind == .close_control or
@@ -2915,7 +2915,7 @@ const CFGBuildCtx = struct {
     /// Walk the line's ordered control events (event_scratch, filled by the
     /// scanLineBraces call immediately before), dispatching CFG handlers in
     /// position order. The line's pattern supplies the construct kind for
-    /// the opener dispatch; a close directly before an `.else_keyword` is
+    /// the opener dispatch. A close directly before an `.else_keyword` is
     /// popped by handleElse, not handleBlockEnd.
     fn walkLineEvents(self: *CFGBuildCtx, pattern: CFPattern, code: []const u8, line: usize) !void {
         switch (pattern) {
@@ -2943,7 +2943,7 @@ const CFGBuildCtx = struct {
         }
         if (walk.record_spans) try self.recordTrailingSpan(line, walk.span_col, code.len);
         // Opener whose control `{` is on a later line (Allman / multi-line
-        // condition): push the entry now; the pending mark claims that brace.
+        // condition): push the entry now. The pending mark claims that brace.
         if (!walk.opener_dispatched and isControlOpener(pattern))
             try self.dispatchPattern(pattern, code, line);
     }
@@ -2967,7 +2967,7 @@ const CFGBuildCtx = struct {
                 }
                 // A chain arm's open follows the else_keyword that already
                 // dispatched, so the capture runs regardless of the latch
-                // (EPH-I0113); the capture's own gates scope which arms
+                // (EPH-I0113). The capture's own gates scope which arms
                 // record.
                 self.captureArmOpen(walk, event);
             },
@@ -3001,7 +3001,7 @@ const CFGBuildCtx = struct {
 
     /// Consume same-line body classifications at a close event: a virtual
     /// `return` body marks its block exactly like a braced body line's
-    /// return_stmt dispatch (consumed once — an else may follow); a
+    /// return_stmt dispatch (consumed once — an else may follow). A
     /// break/continue body wires its jump before the close pops the entry,
     /// exactly like a braced body line's break_stmt dispatch (EPH-I0094).
     fn closeBodyMarkers(self: *CFGBuildCtx, event: ControlEvent) !void {
@@ -3097,7 +3097,7 @@ fn hasInlineElseReturn(t: []const u8) bool {
 /// body, not a chain header (EPH-I0119). An unclosed payload or a
 /// payload-else without an `if` degrades to the plain-else model, the
 /// FN-safe direction. An `else` word inside a leading string literal can
-/// hide the keyword; the callers' whole-word event scan keeps that out
+/// hide the keyword. The callers' whole-word event scan keeps that out
 /// of the mid-line path, and the dispatch path's else sits at the
 /// line's pattern position.
 fn elseChainsIntoIf(t: []const u8, else_pos: usize) bool {
@@ -3136,7 +3136,7 @@ fn postPayloadIfChains(t: []const u8, j: usize) bool {
     return false;
 }
 
-/// Build the control-flow graph for one function body; the caller owns
+/// Build the control-flow graph for one function body. The caller owns
 /// the returned graph and frees it with deinit.
 fn buildCFG(
     allocator: Allocator,
@@ -3413,12 +3413,12 @@ fn hasIdentNeighbor(t: []const u8, pos: usize, len: usize) bool {
 /// and char literals and comment spans. A `..` inside `/* */` or a `//`
 /// tail is prose: reading it as a range would fabricate a view free of the
 /// tracked var (EPH-I1008, the F2 comment-spoofing class). Only a view
-/// free covers the tracked allocation; an element free releases a single
+/// free covers the tracked allocation. An element free releases a single
 /// element's memory (EPH-I0361). Nested brackets (`buf[f(i)]`,
-/// `buf[rows[0].idx]`) stay element accesses; a range nested deeper than
+/// `buf[rows[0].idx]`) stay element accesses. A range nested deeper than
 /// the group's own depth (`buf[arr[a..b]]`) does not make the outer
 /// access a view. A range inside call parens (`buf[f(a..b)]`) is index
-/// expression data, never a group-level range (EPH-I1010; the shape
+/// expression data, never a group-level range (EPH-I1010. The shape
 /// cannot parse in Zig, but the textual scan must not fabricate a view
 /// from it). Sibling groups continue the scan (`buf[a..][b]`): the chain
 /// is a view only when EVERY group is a range, because one element access
@@ -3482,7 +3482,7 @@ fn siblingGroupOpen(t: []const u8, mode: *QuoteMode, close: usize) ?usize {
 
 /// Position of the delimiter that closes the group opened at `open`, or
 /// null when the line ends unbalanced. The opening delimiter is read from
-/// the text (`t[open]`); `close_c` is its partner. Quote and comment
+/// the text (`t[open]`). `close_c` is its partner. Quote and comment
 /// spans inside the group never count as delimiters.
 fn delimiterClose(
     t: []const u8,
@@ -3526,7 +3526,7 @@ fn nextCodePos(t: []const u8, mode: *QuoteMode, i: usize) ?usize {
 
 /// Index of the first code char after the comment span starting at `i`,
 /// or null when `i` does not start a comment. A `//` tail covers the rest
-/// of the line and returns an index past the line end; a `/* */` span
+/// of the line and returns an index past the line end. A `/* */` span
 /// covers to its closing `*/` (EPH-I1008). The caller stores `end - 1`
 /// before its loop increment, so the returned index is exact.
 fn commentEndIndex(t: []const u8, i: usize) ?usize {
@@ -3675,15 +3675,15 @@ fn hasReassignmentBetween(
 
 /// Check if position is an assignment target (not a read) - includes subscript
 /// Check if text starts with an assignment `=`: `==` is a comparison and
-/// `=>` is a switch prong; neither assigns.
+/// `=>` is a switch prong. Neither assigns.
 fn isAssignmentOp(text: []const u8) bool {
     if (!mem.startsWith(u8, text, "=")) return false;
     return text.len == 1 or (text[1] != '=' and text[1] != '>');
 }
 
-/// Fold one `[`/`]` byte into a bracket depth; true when the byte closed
+/// Fold one `[`/`]` byte into a bracket depth. True when the byte closed
 /// a bracket group (hasAssignmentAfterBracket, skipBracketed share the
-/// fold; the depth-0 tails stay per-caller). The decrement saturates: a
+/// fold. The depth-0 tails stay per-caller). The decrement saturates: a
 /// stray closer never underflows the depth.
 fn bracketCloseAt(depth: *usize, c: u8) bool {
     if (c == '[') {
@@ -3792,7 +3792,7 @@ fn hasLeftDot(t: []const u8, pos: usize) bool {
 /// `t`: not mid-identifier (`box`) and not a field of another var
 /// (`foo.x`, `foo . x` — EPH-I0786/90). The fill/read scans share this
 /// left-boundary core and differ only in their right-side checks
-/// (EPH-I0100). Each call to next() yields the next position; callers
+/// (EPH-I0100). Each call to next() yields the next position. Callers
 /// apply their right-side checks at the yielded position.
 const VarOccurrenceIter = struct {
     t: []const u8,
@@ -3812,13 +3812,13 @@ const VarOccurrenceIter = struct {
 };
 
 /// Var-name occurrences on one line that sit outside string and comment
-/// data (the classify+query head hasDirectFill and isPartialFill share;
+/// data (the classify+query head hasDirectFill and isPartialFill share,
 /// EPH-I1232 C6, REL-GATE-2, REL-AB-5). Unlike VarOccurrenceIter,
 /// left-boundary filtering belongs to the caller: hasDirectFill credits
 /// the `&Struct.var` field form (isAmpFillOccurrence), isPartialFill
 /// rejects field positions with its own hasLeftDot check. The iterator
 /// owns its classifier, so each iteration walks the line once
-/// (EPH-I0153); callers apply their right-side checks at the yielded
+/// (EPH-I0153). Callers apply their right-side checks at the yielded
 /// position.
 const VarCodeOccurrenceIter = struct {
     t: []const u8,
@@ -3915,7 +3915,7 @@ fn isElementWriteThrough(after: []const u8) bool {
     return false;
 }
 
-/// True when the occurrence is the write target; a write does not read
+/// True when the occurrence is the write target. A write does not read
 /// the old value.
 fn isAssignmentTarget(t: []const u8, name: []const u8, pos: usize) bool {
     if (pos + name.len >= t.len) return false;
@@ -3955,12 +3955,12 @@ fn isFieldChainAssignment(after: []const u8) bool {
 
 /// The block owning a whole source line, or null when no block's range
 /// covers it (a trailing empty merge block keeps start > end, EPH-I0094).
-/// Block ranges overlap on construct-open/close lines; the scan takes
+/// Block ranges overlap on construct-open/close lines. The scan takes
 /// the FIRST match — the oldest block, the condition side — which is
 /// load-bearing: a construct's condition and body share the open line,
 /// and the condition-side block's edges model the branch, so fills and
 /// reads on that line must attribute to it (band-B01a assumption A1,
-/// EPH-I0326). O(blocks) per lookup; per-line callers compose O(B x L),
+/// EPH-I0326). O(blocks) per lookup. Per-line callers compose O(B x L),
 /// bounded by the 10 MB file cap — an interval index is only worth it
 /// if profiling shows one.
 fn findBlockForLine(cfg: *const ControlFlowGraph, line: usize) ?usize {
@@ -3974,7 +3974,7 @@ fn findBlockForLine(cfg: *const ControlFlowGraph, line: usize) ?usize {
 /// wins: a same-line if/else packs the branch, the arms, and the merge
 /// into one line, and whole-line ranges cannot separate them (EPH-I0111).
 /// Lines without spans fall back to the whole-line range. O(spans) per
-/// lookup; spans cover only same-line constructs, so the scan is short
+/// lookup. Spans cover only same-line constructs, so the scan is short
 /// in practice (band-B01a F12, EPH-I0326).
 fn findBlockForLineCol(cfg: *const ControlFlowGraph, line: usize, col: usize) ?usize {
     for (cfg.col_spans.items) |span| {
@@ -4032,7 +4032,7 @@ fn isElseBodyStart(t: []const u8) bool {
 /// True when a line opens a conditional body for the fill-before-use scan:
 /// an `if`/`else` at line start, an `else`/`if` after leading
 /// block-closing `}` chars, or a `while`/`for` loop opener. The leading
-/// `}` chars pay the depth down during the char scan; this increment
+/// `}` chars pay the depth down during the char scan. This increment
 /// re-opens it for the new arm's body, so a fill inside an else arm stays
 /// conditional instead of looking like a top-level statement (EPH-I0087,
 /// EPH-I0108). A loop body is conditional the same way: the loop may run
@@ -4071,7 +4071,7 @@ fn declInitializerStart(t: []const u8) ?usize {
     return null;
 }
 
-/// True when the line reads the var; declarations, fills, and assignment
+/// True when the line reads the var. Declarations, fills, and assignment
 /// targets do not read it.
 fn isRealUseOfVar(check_line: []const u8, name: []const u8) bool {
     // Decl lines: the LHS name is the declaration, not a read — only RHS
@@ -4203,7 +4203,7 @@ const FillScan = struct {
 /// payload) or inside the continuation group. The loop may run zero
 /// trips, and the continuation runs only after a trip completes, so both
 /// positions stay conditional (EPH-I0129, EPH-I1178). A direct
-/// assignment and a fill call defer; an element store (`arr[i] = v`,
+/// assignment and a fill call defer. An element store (`arr[i] = v`,
 /// `p.* = v`), a field write, or a slice keeps the documented-strictness
 /// win: an element store kills the whole variable (EPH-I0132), so the
 /// historical silent verdict stands. A condition-position fill keeps the
@@ -4219,7 +4219,7 @@ fn loopBodyFillAt(t: []const u8, name: []const u8, fill_col: ?usize) bool {
         return findFillCallOccurrence(t, name) == fill;
     }
     // Between the condition's `)` and the body start only the payload and
-    // the continuation live; a fill occurrence there is a continuation
+    // the continuation live. A fill occurrence there is a continuation
     // fill. loopBodyStartCol returned null only when the condition does
     // not close on this line, so the close column resolves here.
     const cond_close = loopCondCloseCol(t) orelse return false;
@@ -4256,7 +4256,7 @@ fn loopCondCloseCol(t: []const u8) ?usize {
     return null;
 }
 
-/// Skip a `|payload|` capture at `j` (the for-loop header form); without
+/// Skip a `|payload|` capture at `j` (the for-loop header form). Without
 /// one the position is unchanged.
 fn skipPayloadCapture(t: []const u8, j: usize) usize {
     if (j >= t.len or t[j] != '|') return j;
@@ -4266,8 +4266,8 @@ fn skipPayloadCapture(t: []const u8, j: usize) usize {
     return k;
 }
 
-/// Skip a `: (continuation)` group at `j` (the while-header form);
-/// without one the position is unchanged.
+/// Skip a `: (continuation)` group at `j` (the while-header form).
+/// Without one the position is unchanged.
 fn skipLoopContinuation(t: []const u8, j: usize) usize {
     if (j >= t.len or t[j] != ':') return j;
     var k = j + 1;
@@ -4323,7 +4323,7 @@ fn isElseBraceOpen(code: []const u8, i: usize) bool {
 /// True when `name` is a type/container keyword whose parenthesized
 /// header precedes a brace: `switch (y) {`, `union(enum) {`,
 /// `enum(u8) {`. The caller redirects a switch header brace to a
-/// conditional block (EPH-I0334); the other header braces stay
+/// conditional block (EPH-I0334). The other header braces stay
 /// expression braces (EPH-I0106).
 fn isContainerKeyword(name: []const u8) bool {
     const keywords = [_][]const u8{ "switch", "union", "enum", "struct", "error", "opaque" };
@@ -4346,14 +4346,14 @@ fn identBefore(code: []const u8, pos: usize) []const u8 {
 /// Cap on one line's nested paren depth for the forward paren scans
 /// (EPH-I0340). A deeper nesting returns null — the callers fail safe
 /// (a header is not a container header, a position is not in a call
-/// arg). Real code nests far below this; the bound only guards hostile
+/// arg). Real code nests far below this. The bound only guards hostile
 /// generated lines.
 const max_paren_stack = 64;
 
 /// Literal-masked paren walk over code[0..end]: the stack records each
-/// opener's index while the depth counts open groups; null on stack
+/// opener's index while the depth counts open groups. Null on stack
 /// overflow (parenHeaderKeyword, unmatchedOpenParenBefore share the
-/// walk; the depth-0 fallback and the stack read stay per-caller).
+/// walk. The depth-0 fallback and the stack read stay per-caller).
 fn parenStackScan(
     cls: *LineClassifier,
     code: []const u8,
@@ -4531,7 +4531,7 @@ const CondNesting = struct {
         }
     }
 
-    /// Close one `}`: pay off a pending expression brace first; only a
+    /// Close one `}`: pay off a pending expression brace first. Only a
     /// remainder closes a conditional block.
     fn closeBrace(self: *CondNesting) void {
         if (self.pending_expr > 0) {
@@ -4543,8 +4543,8 @@ const CondNesting = struct {
 
     /// True when the `{` at code[i] opens an expression (struct literal,
     /// call arg, block expression) rather than a control block. Inside
-    /// parens or a pending expression every brace is an expression brace;
-    /// otherwise the preceding non-space char decides: `.`, `=`, `,` and
+    /// parens or a pending expression every brace is an expression brace.
+    /// Otherwise the preceding non-space char decides: `.`, `=`, `,` and
     /// friends open expressions, `|` ends a payload, and an identifier
     /// opens an expression unless it is the `else` keyword. A `)` ends a
     /// control keyword's condition, except when the matching `(` belongs
@@ -4591,7 +4591,7 @@ const CondNesting = struct {
     /// list `switch (c) { 1 => x = 1, else => {} }` (and its two-line
     /// braced variant) has no such line, so the fill counts as
     /// unconditional and ZA607 misses the warning the multi-line shape
-    /// gives (accepted, fail-unsafe). Zero corpus occurrences; zig fmt
+    /// gives (accepted, fail-unsafe). Zero corpus occurrences. Zig fmt
     /// expands the shape to a multi-line list, which splits correctly.
     fn isSwitchHeaderBrace(self: *const CondNesting, code: []const u8, i: usize) bool {
         if (self.paren_depth > 0 or self.pending_expr > 0) return false;
@@ -4663,7 +4663,7 @@ fn hasUnconditionalFillBeforeUse(
 
 /// Point where an assignment takes effect: the character just past the
 /// statement-terminating `;`. A read before this point observes the value
-/// from BEFORE the assignment; a read at or after it observes the new value.
+/// from BEFORE the assignment. A read at or after it observes the new value.
 const AssignEffect = struct {
     line: usize, // index into the function-body lines
     col: usize, // column within the trimmed line
@@ -4710,8 +4710,8 @@ fn foldBracketDepth(depth: *usize, c: u8) void {
 /// Scan forward from (start_idx, start_col) for the `;` that terminates the
 /// statement. Multi-line statements (`x = create(\n ... \n);`) end at the
 /// `;` on the LAST line, so a read inside the statement's own span is not
-/// covered. Falls back to the no-assignment sentinel when no `;` is found;
-/// effectCoversRead then reports uncovered rather than guessing.
+/// covered. Falls back to the no-assignment sentinel when no `;` is found.
+/// EffectCoversRead then reports uncovered rather than guessing.
 fn statementEffectPos(
     lines: []const []const u8,
     start_idx: usize,
@@ -4729,7 +4729,7 @@ fn statementEffectPos(
     return no_assign_effect;
 }
 
-/// Fold one bracket char into a carried depth; true when a closing char
+/// Fold one bracket char into a carried depth. True when a closing char
 /// brings the depth to exactly zero (the group closed on this line).
 fn bracketGroupClosed(depth: *usize, c: u8) bool {
     switch (c) {
@@ -4791,8 +4791,8 @@ fn nextAssignmentOccurrence(
         if (hasLeftDot(t, pos)) continue;
         if (pos + var_name.len < t.len and
             isIdent(t[pos + var_name.len])) continue;
-        // String literal content is data, not an assignment (EPH-I0124);
-        // a comment's text is prose. Both would fake a fill occurrence
+        // String literal content is data, not an assignment (EPH-I0124).
+        // A comment's text is prose. Both would fake a fill occurrence
         // that hides the real same-line fill from the effect scan.
         if (scan.cls.isInsideString(pos)) continue;
         if (scan.comment_start != null and pos >= scan.comment_start.?) continue;
@@ -4888,13 +4888,13 @@ fn isAddressOfCallForm(t: []const u8, pos: usize) bool {
 /// Next occurrence of var_name at or after s.* that is a fill-CALL target,
 /// advancing s.* past the matched name. Two classes: `&var` passed as a
 /// call argument (`fill(&x)`, `foo.read(&x)` — the call-fill heuristic
-/// writes through the pointer; the grouping-paren form `&(x)` matches the
+/// writes through the pointer. The grouping-paren form `&(x)` matches the
 /// same arm, EPH-I0822), and the bare `@memset(var` / `@memcpy(var`
 /// destination. Slice-index forms (`&x[0]`, `@memset(x[0..], v)`) and
 /// plain slice occurrences (`x[0..n]`) are hasDirectFill Pattern-2
 /// territory and deliberately do NOT match — they keep whole-line coverage
 /// (EPH-I0102). A non-call `&x` (`const p = &x;`) is untrackable aliasing,
-/// not a fill; the `&(x)` spelling keeps that verdict (its paren sits at
+/// not a fill. The `&(x)` spelling keeps that verdict (its paren sits at
 /// the name, and the lookback starts before the amp). A non-call
 /// `(&x)` — a parenthesized address-of outside any call — DOES match: the
 /// lookback finds the grouping paren and cannot tell it from a call paren,
@@ -4957,12 +4957,12 @@ fn methodFillOpenParenAt(t: []const u8, pos: usize, var_name: []const u8) ?usize
 /// loop-carried fills regressed the corpus (ghostty uucode grapheme.zig
 /// `table.set(...)` inside comptime loops: the fill read as
 /// trip-conditional and the return fired an FP). Narrowing the drop for
-/// those keeps the corpus-clean boundary; the modifying-method FN stays
+/// those keeps the corpus-clean boundary. The modifying-method FN stays
 /// the accepted residual (EPH-I1173 record).
 fn isMethodFillLine(t: []const u8, var_name: []const u8) bool {
     if (hasInitCallOnVar(t, var_name)) return true;
-    // A marker call carrying `&x` keeps the address-of fill treatment;
-    // a stdlib modifying method stays under the drop (EPH-I1173 record:
+    // A marker call carrying `&x` keeps the address-of fill treatment.
+    // A stdlib modifying method stays under the drop (EPH-I1173 record:
     // the ghostty grapheme.zig corpus regression).
     return hasMethodCallOnVar(t, var_name) and
         !hasModifyingMethodCall(t, var_name) and
@@ -5003,7 +5003,7 @@ fn foldHeaderDepths(c: u8, paren: *usize, bracket: *usize) void {
     }
 }
 
-/// Fold one code-position char into the oneline-loop body depth; returns
+/// Fold one code-position char into the oneline-loop body depth. Returns
 /// the verdict when the char decides the loop's fate on this line:
 /// closed (a depth-0 `;` ends a brace-less body, or the body brace's
 /// `}` balances), or multi-line (a `}` with no body brace on this line —
@@ -5161,8 +5161,8 @@ const DefAssignCtx = struct {
 /// only a block's own predecessors instead of scanning every edge per
 /// block per pass — the sweep's O(passes * B * E) became O(B + E) per
 /// variable. The pred lists exclude loop-back edges and terminal-return
-/// preds (the filters the former computeBlockEntry applied per query);
-/// the has-successor memo serves that filter.
+/// preds (the filters the former computeBlockEntry applied per query).
+/// The has-successor memo serves that filter.
 const BlockNeighbors = struct {
     /// [num_blocks + 1]: pred_flat range per block
     pred_offsets: []usize,
@@ -5279,7 +5279,7 @@ const GenOccurrence = struct {
 /// Attribute one fill occurrence to the block that owns its column and
 /// merge its effect point into that block's first-effect set. A fill
 /// inside a same-line braced if arm runs on the guarded path only, so it
-/// must not cover a same-line read after the construct; later-line reads
+/// must not cover a same-line read after the construct. Later-line reads
 /// on the unguarded path stay uncovered — the fill gens the arm's own
 /// block, never the entry block (EPH-I0846/49). The arm span carries the
 /// arm block from the opener dispatch, so a later blank line that
@@ -5304,9 +5304,9 @@ fn recordGenEffect(ctx: *const DefAssignCtx, occ: GenOccurrence, gen_sets: *GenS
 /// Column of the bracketed occurrence of var_name whose bracket span
 /// contains the fill-call open paren at `col`, or null. In
 /// `hash_buf[0..formatHashHex(&hash_buf, x)]` the fill-call sits inside
-/// the slice bounds; the analyzer assumes the slice is taken after both
+/// the slice bounds. The analyzer assumes the slice is taken after both
 /// bound expressions complete, so the fill completes first and the
-/// bracketed read observes the filled value (EPH-I1230; serves
+/// bracketed read observes the filled value (EPH-I1230. Serves
 /// REL-ZERO-1, the RT-1 zero-warning sweep, and REL-AB-5, the corpus
 /// A/B byte-identity). The langref does not pin the bounds' evaluation
 /// order, so that assumption is a documented approximation in the
@@ -5453,7 +5453,7 @@ fn lineFillsVar(t: []const u8, var_name: []const u8) bool {
 /// Position of the next `&var_name` occurrence at or after `start` with a
 /// word boundary after the name and outside strings/comments, or null
 /// (hasAddressOfVar, firstUntrackableAddressOfCol share the candidate
-/// walk; the classifier stays caller-owned so one init covers the
+/// walk. The classifier stays caller-owned so one init covers the
 /// whole-line scan).
 fn nextAmpVarOccurrence(
     cls: *LineClassifier,
@@ -5894,7 +5894,7 @@ fn analyzeDefiniteAssignment(
 /// Record each var's first untrackable address escape (`const p = &x;`,
 /// `return &x;`): the body-line index and the `&` column. Writes through
 /// the escaped pointer are invisible to the fill analysis, so reads at
-/// or after the escape point stay suppressed; reads before it are
+/// or after the escape point stay suppressed. Reads before it are
 /// analyzable (EPH-I1174 — the former whole-function drop narrowed to
 /// the post-escape window). A `&var` call argument stays tracked: the
 /// call-fill heuristic covers it at statement precision (EPH-I0102).
@@ -5993,7 +5993,7 @@ fn payloadBindingCol(t: []const u8, var_name: []const u8) ?usize {
 /// shadows var_name, or null when the shape is not confidently bounded —
 /// the caller then records no span and the reads fire toward warning,
 /// the fail-safe direction (EPH-I1175, EPH-I1192). Only for/while/if
-/// opener lines admit the walk; an else-line binding (the post-payload
+/// opener lines admit the walk. An else-line binding (the post-payload
 /// chain form) falls back to the null arm.
 const LineSpan = struct {
     from_idx: usize,
@@ -6124,7 +6124,7 @@ fn isBranchOpener(t: []const u8) bool {
 /// removePayloadShadowedVars (dfaf0f3) — and the reads fire the same
 /// way. Firing is the documented residual for shadow text, which is a
 /// 0.15+ compile error (a payload capture shadowing an outer local,
-/// adjudicated at EPH-I1188; zero corpus instances) — the EPH-I0826
+/// adjudicated at EPH-I1188, zero corpus instances) — the EPH-I0826
 /// documented-residual arm, EPH-I1192.
 fn collectPayloadShadowSpans(
     undef_vars: *const std.StringHashMap(usize),
@@ -6192,7 +6192,7 @@ fn forLoopIndexAssign(t: []const u8, vn: []const u8, depth: *usize) bool {
 /// body: a method call on it, an asm output constraint, a struct-field
 /// assignment, a mutable slice passed to a call, an inline-for element
 /// fill, or an array element assignment inside a loop (EPH-I0339). The
-/// whole-body scan runs once per candidate var; each sub-check is
+/// whole-body scan runs once per candidate var. Each sub-check is
 /// line-bounded.
 fn isIndirectlyInitialized(
     lines: []const []const u8,
@@ -6443,7 +6443,7 @@ fn readIsUncovered(sc: *const ReadScanCtx, var_name: []const u8, idx: usize) boo
 /// Read-window suppressions for one variable: the address-escape tail
 /// window (EPH-I1174) and the payload-shadow interior span (EPH-I1175).
 /// Reads inside either are untrackable or ambiguous, so they stay
-/// suppressed; reads outside are analyzable.
+/// suppressed. Reads outside are analyzable.
 const ReadSuppression = struct {
     escape: ?EscapePoint = null,
     shadow: ?LineSpan = null,
@@ -6483,10 +6483,10 @@ fn checkVarDefiniteAssignment(
     defer er_memo.deinit(ctx.allocator);
 
     // The queue worklist visits each block at most twice per variable
-    // (once per def-state flip; see DefFlowSets.num_edges for the drain
-    // bound); the queue and the in-queue marks are per-variable scratch
+    // (once per def-state flip. See DefFlowSets.num_edges for the drain
+    // bound). The queue and the in-queue marks are per-variable scratch
     // (EPH-I0335). Sized to B + 2E + 1 — the provable drain bound
-    // (EPH-I1058); the former 2B+1 cap overflowed on two-arm
+    // (EPH-I1058). The former 2B+1 cap overflowed on two-arm
     // conditional chains (bun cli/Arguments.zig).
     const queue_capacity = ctx.num_blocks +| 2 *| ctx.neighbors.succ_flat.len +| 1;
     const queue = try ctx.allocator.alloc(usize, queue_capacity);
@@ -6496,7 +6496,7 @@ fn checkVarDefiniteAssignment(
     @memset(in_queue, false);
 
     // The visit-count return pins the drain bound in a test
-    // (EPH-I0335); the production caller needs only the fixpoint.
+    // (EPH-I0335). The production caller needs only the fixpoint.
     _ = runDefiniteAssignmentWorklist(ctx.neighbors, .{
         .gen = gen_sets.gen,
         .def_entry = def_entry,
@@ -6567,7 +6567,7 @@ fn windowVerdict(
 /// var_name in a block that dominates the read. An else-if arm runs only
 /// when the prior arms fail: its assignment does not dominate a later
 /// plain `if (c)` read. A guard-if gated by a conditional or loop the
-/// read does not share may never run while the read does; the assignment
+/// read does not share may never run while the read does. The assignment
 /// then does not dominate the read either (EPH-I0329).
 fn windowHasCorrelatedAssignment(
     lines: []const []const u8,
@@ -6605,7 +6605,7 @@ fn nextGuardHopLine(lines: []const []const u8, search_from: usize) ?usize {
 /// level (blockContainsAssignment), the guard-if must not be an else-if
 /// arm, and every enclosing conditional or loop of the guard-if must also
 /// enclose the read (guardDominatesRead — EPH-I0329, band-B01b F-03). The
-/// condition is compared textually; a reassignment of a condition
+/// condition is compared textually. A reassignment of a condition
 /// variable between the guard and the read is an accepted approximation
 /// (the condition is assumed stable). A multi-line condition whose
 /// brace-bearing line carries no keyword is missed, and a guard-if or
@@ -6617,14 +6617,14 @@ fn nextGuardHopLine(lines: []const []const u8, search_from: usize) ?usize {
 /// Documented residual (EPH-I0826): a LOOP-carried guard — a write loop
 /// gated by one counter and a read loop gated by the same counter —
 /// stays invisible to this suppressor. The RhyOS
-/// net/dns_recursive.zig:2034 shape (`var tmp: [20]u8 = undefined`; the
-/// digit loop writes tmp[tmp_len] and bumps tmp_len; the reverse loop
+/// net/dns_recursive.zig:2034 shape (`var tmp: [20]u8 = undefined`. The
+/// digit loop writes tmp[tmp_len] and bumps tmp_len. The reverse loop
 /// reads tmp[tmp_len - 1 - ri] under `ri < tmp_len`) has no unassigned
 /// read at runtime: tmp_len counts the writes, so the read loop's
 /// counter bounds the read to written elements. Correlating the two
 /// loops needs an invariant proof (the write loop increments tmp_len
 /// exactly once per element write) that the line-based guard model
-/// cannot carry soundly. The verdict is the fail-safe over-warn; the
+/// cannot carry soundly. The verdict is the fail-safe over-warn. The
 /// site is the regression pin (test "ZA607: loop-carried counter guard
 /// over-warns (EPH-I0826, documented residual)").
 fn isCorrelatedGuardRead(
@@ -6752,7 +6752,7 @@ fn loopIncrementSpan(
     // into the span (EPH-I1177). hasOnelineLoopClose carries the
     // quote-masked whole-line close walk (EPH-I0789). A tail write
     // after the same-line body sits on this line too and breaks the
-    // correlation (EPH-I1187). The walks return the raw end; the
+    // correlation (EPH-I1187). The walks return the raw end. The
     // increment-seen gate below applies to every verdict.
     const end: ?usize = if (is_braced)
         if (hasOnelineLoopClose(t)) blk: {
@@ -6778,7 +6778,7 @@ const LoopWalkCtx = struct {
 /// End line (exclusive) of a braced loop body: the close-first line whose
 /// leading closes bring the body depth to zero, or the non-close-first
 /// line whose trailing `}` closes the body (EPH-I1209). A tail after the
-/// close sits outside the body; a counter write there breaks the guard's
+/// close sits outside the body. A counter write there breaks the guard's
 /// zero-reading correlation, so the walk fails closed (EPH-I1191) — the
 /// exact-equality walk missed the close on a tail-carrying line and
 /// swallowed the write into the span. Nested blocks keep the walk open:
@@ -6788,8 +6788,8 @@ const LoopWalkCtx = struct {
 /// net-zero convention, so one-line blocks and struct literals leave the
 /// depth unchanged. Line comments are masked before the brace
 /// accounting, so a comment brace never opens or closes the body
-/// (EPH-I1213). found_inc carries the increment-seen state (EPH-I1177);
-/// the verdicts return the raw end, and loopIncrementSpan applies the
+/// (EPH-I1213). found_inc carries the increment-seen state (EPH-I1177).
+/// The verdicts return the raw end, and loopIncrementSpan applies the
 /// seen gate (ZA506 D7, EPH-I1081).
 fn bracedLoopBodyEnd(
     ctx: LoopWalkCtx,
@@ -6841,7 +6841,7 @@ fn foldNonCloseLine(t: []const u8, depth: usize) usize {
 /// Byte index past the first code-position `}` that brings the running
 /// depth (from `depth`, at least 1) to zero, or null when the line never
 /// closes (EPH-I1209). The caller invokes it after the net fold reached
-/// zero; a mixed line whose interspersed opens keep the running depth
+/// zero. A mixed line whose interspersed opens keep the running depth
 /// above zero diverges from the fold (the EPH-I1208 convention) and
 /// fails the walk closed.
 fn trailingClosePos(code: []const u8, depth: usize) ?usize {
@@ -6913,7 +6913,7 @@ fn tailWritesCounter(tail: []const u8, counter: []const u8) bool {
 /// statement-end walk stops at the body's own `;`, so a write after the
 /// body stays outside the span and breaks the correlation (the B100 r1
 /// F1 shape). An Allman brace on the next line stays excluded
-/// (EPH-I1177). The verdicts return the raw end; loopIncrementSpan
+/// (EPH-I1177). The verdicts return the raw end. LoopIncrementSpan
 /// applies the increment-seen gate (ZA506 D7, EPH-I1081).
 fn bracelessLoopBodyEnd(
     ctx: LoopWalkCtx,
@@ -6970,7 +6970,7 @@ fn lineHasIncrement(t: []const u8, name: []const u8) bool {
 
 /// Operator length of the one-step increment forms after the var name:
 /// `+=` is 2 bytes, `+%=` is 3 — or null. The rhs slice must start past
-/// the WHOLE operator; the former fixed 2-byte slice read `+%= 1` as
+/// the WHOLE operator. The former fixed 2-byte slice read `+%= 1` as
 /// `= 1` and missed the one-step form (EPH-I1189).
 fn oneStepOpLen(after: []const u8) ?usize {
     if (mem.startsWith(u8, after, "+%=")) return 3;
@@ -6982,7 +6982,7 @@ fn oneStepOpLen(after: []const u8) ?usize {
 /// increment the trip model assumes. A one-line loop body shares its
 /// line with the header, so a tail write after the body (`{ x = 1; }
 /// count = 7;` — the B100 r1 F1 hole in same-line form) sits on the
-/// opener line; admitting the span with it would hide the write and
+/// opener line. Admitting the span with it would hide the write and
 /// silence a read the zero-trip path reaches unfilled (EPH-I1187).
 fn lineHasOtherCounterWrite(t: []const u8, name: []const u8) bool {
     var iter = VarOccurrenceIter{ .t = t, .name = name };
@@ -7143,7 +7143,7 @@ fn lineWritesName(t: []const u8, name: []const u8) bool {
 }
 
 /// True when any line inside the loop body fills `var_name`. body_end
-/// is exclusive; a one-line body (body_end == loop_idx + 1) fills on
+/// is exclusive. A one-line body (body_end == loop_idx + 1) fills on
 /// the opener line itself, past the body start (EPH-I1177).
 fn loopBodyFillsVar(
     lines: []const []const u8,
@@ -7306,8 +7306,8 @@ fn isElseArmOpener(t: []const u8) bool {
 }
 
 /// Strip a leading block label (`outer: for ...`) so the opener
-/// classifiers see the keyword. A labeled block runs unconditionally;
-/// only the labeled loop forms gate execution (EPH-I0329).
+/// classifiers see the keyword. A labeled block runs unconditionally.
+/// Only the labeled loop forms gate execution (EPH-I0329).
 fn stripLabel(t: []const u8) []const u8 {
     if (t.len == 0 or !isIdent(t[0])) return t;
     const colon = mem.indexOfScalar(u8, t, ':') orelse return t;
@@ -7356,7 +7356,7 @@ fn isConditionalOpenerLine(t: []const u8) bool {
 /// within [stop, idx). A plain block (a function body, a bare block) runs
 /// unconditionally and does not gate the line. The walk mirrors
 /// findEnclosingIfCondition's brace accounting (EPH-I0225). The walk
-/// stops collecting at the buffer bound; the caller reads a full count
+/// stops collecting at the buffer bound. The caller reads a full count
 /// as "truncated" (EPH-I0847).
 fn enclosingConditionalLines(
     lines: []const []const u8,
@@ -7396,7 +7396,7 @@ fn lineSetContains(set: []const usize, line: usize) bool {
 ///
 /// The cand walk is anchored at the guard-if (its enclosers sit above it),
 /// so a divergent opener beyond the old read-anchored window is still
-/// caught; the window now reaches 40 lines above the guard-if itself
+/// caught. The window now reaches 40 lines above the guard-if itself
 /// (EPH-I0847). A divergent opener beyond that window is missed — accepted
 /// false negative, the window named here. The read walk covers only the
 /// cand span, so the scan stays proportional to the guard-read distance
@@ -7553,7 +7553,7 @@ fn isDirectAssignOccurrence(t: []const u8, var_name: []const u8, pos: usize) boo
 
 /// Advance the brace state over `t[start..end]`. A `{` raises the depth, a
 /// `}` lowers it and tracks the minimum. String and char content carries
-/// no braces (EPH-I0107); a `\\` opener ends the code region (EPH-I0751).
+/// no braces (EPH-I0107). A `\\` opener ends the code region (EPH-I0751).
 fn scanBraceRegion(t: []const u8, start: usize, end: usize, state: *BraceScanState) void {
     var i = start;
     while (i < end) : (i += 1) {
@@ -7839,7 +7839,7 @@ const or_guard_body_window = 20;
 ///
 /// A read on its own guard-if's opener line (the one-line body form
 /// `if (c) { return x; }`) is enclosed by that if when the read column
-/// sits inside the body braces; a condition read before the `{` is not
+/// sits inside the body braces. A condition read before the `{` is not
 /// enclosed — the condition evaluates before the body runs (EPH-I0846/49).
 ///
 /// One backward-walk hit: the line of the nearest enclosing if and its
@@ -7849,7 +7849,7 @@ const EnclosingIfHit = struct { idx: usize, cond: []const u8 };
 /// The nearest enclosing if above read_idx inside the lookback window:
 /// its line index and its condition text, or null when the walk finds no
 /// opener. The backward walk and the brace accounting are the
-/// findEnclosingIfCondition/findEnclosingIfLine head (EPH-I1232 C3); the
+/// findEnclosingIfCondition/findEnclosingIfLine head (EPH-I1232 C3). The
 /// two callers read the slice and the line respectively.
 fn findEnclosingIfHit(lines: []const []const u8, read_idx: usize) ?EnclosingIfHit {
     const stop = read_idx -| enclosing_block_lookback;
@@ -7865,7 +7865,7 @@ fn findEnclosingIfHit(lines: []const []const u8, read_idx: usize) ?EnclosingIfHi
 }
 
 /// Condition of the nearest enclosing if above the read, or null. The
-/// one-line body form answers from the read's own line; otherwise the
+/// one-line body form answers from the read's own line. Otherwise the
 /// backward walk finds the opener line and its condition
 /// (findEnclosingIfHit). The walk stops enclosing_block_lookback lines
 /// back (EPH-I0225). An opener beyond the window is missed (accepted
@@ -7884,7 +7884,7 @@ fn findEnclosingIfCondition(
 /// Condition of an if whose opener shares the read's line, when the read
 /// column sits inside the if's body braces (the one-line body form
 /// `if (c) { return x; }`). The body region runs from the opener's `{`
-/// (after the condition's close paren) to its matching `}`; string and
+/// (after the condition's close paren) to its matching `}`. String and
 /// char content carries no braces. A condition read before the `{` is not
 /// enclosed (EPH-I0846/49).
 fn onelineIfBodyCondition(t: []const u8, col: usize) ?[]const u8 {
@@ -7896,7 +7896,7 @@ fn onelineIfBodyCondition(t: []const u8, col: usize) ?[]const u8 {
 
 /// The body brace region of a one-line if: the `{` after the condition's
 /// close paren and the matching `}`. A read inside the region is enclosed
-/// by the if; a read beyond the close sits outside (a later construct on
+/// by the if. A read beyond the close sits outside (a later construct on
 /// the same line owns it).
 const OnelineIfBody = struct {
     open: usize,
@@ -8009,7 +8009,7 @@ fn hasIfCondition(t: []const u8, cond: []const u8) bool {
 }
 
 /// Per-variable memo for the early-return suppressor (EPH-I0335,
-/// band-B01b F-09): one forward pass collects every if/else chain; the
+/// band-B01b F-09): one forward pass collects every if/else chain. The
 /// per-read query is O(1). The former shape rescanned 0..read_idx per
 /// read — O(lines) per read, O(lines^2) per variable on hostile
 /// content.
@@ -8105,7 +8105,7 @@ fn recordIfStartInterval(
 /// mirrors the former per-read scan exactly — the same if-start
 /// detection, chain parse, and skip rules — so the verdicts match at
 /// every read position. Each completed chain contributes the interval
-/// of read lines it suppresses; a difference array merges the intervals
+/// of read lines it suppresses. A difference array merges the intervals
 /// into the per-line qualify mask (EPH-I0335).
 ///
 /// The suppressor's narrative: if all code paths that do not assign
@@ -8117,8 +8117,8 @@ fn recordIfStartInterval(
 /// facts, and the one-line else-if chain's arms are not modeled at all
 /// — `if (a) { x = 1; } else if (b) { return 1; } return x;` stays
 /// silent on the A=false,B=false uninit path because the CFG gives the
-/// if-arm's fill the entry-block credit (EPH-I0872, pinned by test;
-/// the chain parsers collect branches only past a depth-zero close, so
+/// if-arm's fill the entry-block credit (EPH-I0872, pinned by test.
+/// The chain parsers collect branches only past a depth-zero close, so
 /// a same-line else-if arm never joins the list).
 fn buildEarlyReturnMemo(
     a: Allocator,
@@ -8494,15 +8494,15 @@ fn branchHasExit(
 
 /// True when a one-line plain-else arm's last statement exits
 /// unconditionally: `else { return 0; }`, `else { x = 1; return 0; }`,
-/// `} else { return 0; }`. The last statement runs whenever the arm runs;
-/// a conditional tail never counts — an `else if` header is a conditional
+/// `} else { return 0; }`. The last statement runs whenever the arm runs.
+/// A conditional tail never counts — an `else if` header is a conditional
 /// tail, and a trailing `if (q) return;` in the arm stays conditional
 /// (EPH-I0846/49).
 fn oneLineElseArmTailExits(t: []const u8) bool {
     // The arm keyword must lead the line, possibly past block-closing
     // `}` chars: a bare "else" substring inside a string literal or an
     // identifier is not an arm (EPH-I0846/49). The arm's own `{` is the
-    // first brace after the keyword; an `else if` header carries no arm
+    // first brace after the keyword. An `else if` header carries no arm
     // of its own and never exits unconditionally.
     var rest = t;
     while (rest.len > 0 and rest[0] == '}') {
@@ -8528,7 +8528,7 @@ const LastStmtScan = struct {
     mode: QuoteMode = .none,
 
     /// Advance the state over one character. A depth-0 `;` completes the
-    /// current statement; a nested brace pair makes the whole construct
+    /// current statement. A nested brace pair makes the whole construct
     /// the current statement (a trailing `if (q) return;` stays a
     /// conditional statement, never an exit).
     fn step(self: *LastStmtScan, c: u8, j: usize) void {
@@ -8576,7 +8576,7 @@ const LastStmtScan = struct {
 };
 
 /// True when the last top-level statement of an arm body exits. A nested
-/// brace pair makes the whole construct the statement; a trailing
+/// brace pair makes the whole construct the statement. A trailing
 /// conditional (`if (q) return;`) is never an exit.
 fn lastStatementExits(body: []const u8) bool {
     var scan: LastStmtScan = .{};
@@ -8696,16 +8696,16 @@ fn guardNullAtOrIf(lines: []const []const u8, read_idx: usize, guard: []const u8
 /// Check if a variable read is safe due to `or` short-circuit evaluation.
 /// Pattern: `if (g == null or i > var_name)` inside a loop, where the
 /// variable is assigned at the if-block body's top level. When `g ==
-/// null` holds, the RHS is never evaluated; when `g != null`, the body
+/// null` holds, the RHS is never evaluated. When `g != null`, the body
 /// ran on an earlier iteration and assigned the variable.
 ///
 /// The narrative is enforced, not assumed (EPH-I0330, band-B01b F-04):
 /// the if must sit inside a loop, the LHS must be a null equality on a
 /// guard that is null at the if (guardNullAtOrIf), and the body must
 /// assign the variable at its top level. Accepted approximations: the
-/// body scan stops at or_guard_body_window lines; a guard made non-null
+/// body scan stops at or_guard_body_window lines. A guard made non-null
 /// inside the loop after the guarded if stays safe by construction (the
-/// body assigns the variable); an enclosing loop opener beyond the
+/// body assigns the variable). An enclosing loop opener beyond the
 /// lookback window is missed.
 fn isOrShortCircuitSafe(
     lines: []const []const u8,
@@ -8769,7 +8769,7 @@ fn parenBalanceOutsideQuotes(t: []const u8) i32 {
 /// B + 2E (the initial fill plus at most two re-enqueues per included
 /// edge) — EPH-I1058. The former 2B+1 cap is safe only when
 /// 2E <= B + 1, which a chain of two-arm conditionals breaches (bun
-/// cli/Arguments.zig parse: B=518, E=759, 1038 enqueues; the 2B+1 cap
+/// cli/Arguments.zig parse: B=518, E=759, 1038 enqueues. The 2B+1 cap
 /// overflowed with a deterministic abort — the release-blocking corpus
 /// crash). The queue
 /// form replaces the former sweep's O(passes * B * E) with O(B + E) per
@@ -8864,7 +8864,7 @@ fn isBindingNameAt(t: []const u8, var_name: []const u8, i: usize) bool {
 /// introduction (`var x`, `const x`, `|x|`), `.len` compile-time
 /// property, string literal, line comment, fill destination (`&x` or a
 /// bare @memset/@memcpy dest — a fill statement must not "read" its own
-/// destination, EPH-I0102; the grouping-paren form `&(x)` is the same
+/// destination, EPH-I0102. The grouping-paren form `&(x)` is the same
 /// address-of, EPH-I0822), or an assignment target.
 ///
 /// The `.len` exemption is a deliberate false negative (EPH-I0338,
@@ -9283,8 +9283,8 @@ fn initBlockFreeState(
 
 /// Collect the function's tracked allocations. The vocabulary covers
 /// allocator-method allocations (`.alloc`, `.create`, `.dupe`,
-/// `.toOwnedSlice`, and the qualified stdlib allocators — compat tables);
-/// container `.init(` forms are deliberately absent (EPH-I0360, band-B02
+/// `.toOwnedSlice`, and the qualified stdlib allocators — compat tables).
+/// Container `.init(` forms are deliberately absent (EPH-I0360, band-B02
 /// F20 class): `ArrayList(T).init(allocator)` allocates no backing store
 /// at init — growth happens lazily on append — so a "leak" verdict would
 /// be conditional on container use the line model cannot see, and
@@ -9314,14 +9314,14 @@ fn collectMemSafetyAllocs(
     var allocs = std.StringHashMap(CFGAllocation).init(allocator);
     // The map has no self-owning defer: a put failure after earlier
     // successful puts would drop the storage of the entries already
-    // inserted (OOM-path leak, EPH-I0895 sweep; B45-1).
+    // inserted (OOM-path leak, EPH-I0895 sweep, B45-1).
     errdefer allocs.deinit();
     // Buffer for joining zig-fmt wrapped multi-line calls (`.alloc(\n u8, ...`)
     var join_buf: [max_join_bytes]u8 = undefined;
     for (lines, 0..) |_, idx| {
         const actual_line = func_line + idx;
         // Split decl RHS (`const x =\n try allocator.alloc(...)`) joins
-        // first; the paren join covers wrapped args (EPH-I0675).
+        // first. The paren join covers wrapped args (EPH-I0675).
         const t = joinSplitDeclRhs(lines, idx, &join_buf, &all_alloc_names) orelse
             joinParenContinuation(lines, idx, &join_buf);
         // Type-based allocation detection: .alloc() or .create() on tracked allocators
@@ -9482,7 +9482,7 @@ fn captureCloseLine(
 /// depth 1. Quote data never reaches the brace counter — a brace inside a
 /// string or char literal would corrupt the depth walk — and a `\\`
 /// opener's tail is string data, so it ends the scan. The quote mode is
-/// per-line through QuoteWalk; only the depth carries across lines
+/// per-line through QuoteWalk. Only the depth carries across lines
 /// (EPH-I1232 C2c). The flat form keeps ZA302 nesting at 3 here (EPH-I0792).
 fn lineClosesBraceGroup(code: []const u8, start: usize, depth: *usize) bool {
     var walk = QuoteWalk.initAt(code, start);
@@ -9981,7 +9981,7 @@ const TailFreeEvidence = struct {
 
 /// Scan the tail after the `else` at `from` for its free evidence. A
 /// free at relative brace depth <= 1 counts as the arm's own level (the
-/// arm's own braces open depth 1); one inside a deeper construct is an
+/// arm's own braces open depth 1). One inside a deeper construct is an
 /// unverified nested shape and never reads definite (EPH-I1064).
 fn scanTailFreeEvidence(
     t: []const u8,
@@ -10104,7 +10104,7 @@ fn elsePrecedesSecondFree(t: []const u8, free_pos: usize) bool {
 
 /// True when a cleanup call pattern (`.free(` or `.destroy(`) starts at a
 /// code position at or after `from` (the pattern set of
-/// firstFreePatternPos; hasRealFreePattern excludes `.deinit(`).
+/// firstFreePatternPos. HasRealFreePattern excludes `.deinit(`).
 fn freePatternAfter(t: []const u8, from: usize) bool {
     var lit = types.LiteralState.forLine(t) orelse return false;
     var i: usize = from;
@@ -10440,7 +10440,7 @@ fn updateFreeEntry(cfg: *const ControlFlowGraph, bstate: *BlockFreeState, bid: u
 /// scan only sees a block's own lines, so a free two or more hops before a
 /// use and every loop-carried free stayed invisible (audit F1/F14). Two
 /// bool lattices share one sweep: def (MUST) inits optimistic-top and
-/// intersects down, may (MAY) inits bottom and unions up; both transfers
+/// intersects down, may (MAY) inits bottom and unions up. Both transfers
 /// are the same monotone free op, so the 2n+1 cap mirrors
 /// runDefiniteAssignmentWorklist's proven bound.
 fn propagateFreeState(cfg: *const ControlFlowGraph, bstate: *BlockFreeState) void {
@@ -10508,7 +10508,7 @@ fn hasElseBranchMarker(t: []const u8) bool {
 /// caller decides whether the marker sits shallow enough to separate the
 /// pair (EPH-I0791 for `=>`, EPH-I0806 for else/orelse). A line-starting
 /// `orelse {` cannot sit inside a literal or comment (the first char of a
-/// masked region would have to open it); the `} orelse` and `} else` forms
+/// masked region would have to open it). The `} orelse` and `} else` forms
 /// scan code positions only (EPH-I0342). An own-line `else {` separator
 /// line is deliberately NOT a marker (EPH-I1087 residual): the mid-line
 /// `} else {` marker's suppression of the else-arm pair is the
@@ -10589,7 +10589,7 @@ fn hasExclusiveBranchBetween(
 /// fires (EPH-I0834 residual, zero corpus occurrences). Textual and
 /// fail-open toward reporting: an arm header that merely sits between free
 /// and use at a shallow-enough indent suppresses only when the use sits
-/// inside its arm (armHeaderSeparates); the use-on-a-later-arm-header-line
+/// inside its arm (armHeaderSeparates). The use-on-a-later-arm-header-line
 /// geometry keeps suppressing (accepted FN — the any-switch-text-between
 /// class, pinned by the EPH-I0356 residual test).
 ///
@@ -10676,7 +10676,7 @@ fn armHeaderSeparates(
 /// opens a brace group that contains it. The span runs from the arm header
 /// line through its brace-group close (the header line itself for a
 /// non-braced arm). A use inside the span shares the free's arm (definite
-/// on the taken path); a use past it runs after the arm's join (conditional,
+/// on the taken path). A use past it runs after the arm's join (conditional,
 /// EPH-I0356).
 fn freeArmRegion(
     lines: []const []const u8,
@@ -10742,14 +10742,14 @@ const SameBlockFreeResult = struct {
     rebound: bool,
     /// The free line found in the block scan: the last free of the tracked
     /// var before the scanned line (EPH-I0344). This is the same-block
-    /// verdict's own reference; it must NOT be written back into
+    /// verdict's own reference. It must NOT be written back into
     /// alloc_info.freed_line, which the cross-block readers and the alias
     /// pass rely on as the immutable detection record.
     freed_line: usize = 0,
 };
 
 /// Build a same-block free verdict (checkSameBlockFree,
-/// checkAliasBlockFree share the literal; the rebound field stays
+/// checkAliasBlockFree share the literal. The rebound field stays
 /// per-caller — the alias walk never observes a root rebind).
 fn sameBlockFreeResult(
     freed: bool,
@@ -10893,7 +10893,7 @@ fn emitAliasSameBlockVerdict(
 /// the severity grade (err for a free on every path, warning for the
 /// conditional reach — EPH-I0345), and the free line the verdict cites.
 /// The same-block verdict cites its own block scan's free — always the
-/// reaching free for the use; cross-block and alias verdicts cite the
+/// reaching free for the use. Cross-block and alias verdicts cite the
 /// detection record (EPH-I0344 r1).
 const UAFSite = struct {
     var_name: []const u8,
@@ -11028,7 +11028,7 @@ fn sameBlockFreeSeverity(
     return .warning;
 }
 
-/// Check if a variable was freed in the same block; emit UAF if so.
+/// Check if a variable was freed in the same block. Emit UAF if so.
 fn checkSameBlockUAF(
     ctx: *const FreeScanCtx,
     sbf: SameBlockFreeResult,
@@ -11060,7 +11060,7 @@ fn checkSameBlockUAF(
 
 /// True when the line belongs to a zig-fmt wrapped free statement: the
 /// free's own arguments, never uses of the freed var (EPH-I0351). Tracks
-/// the open paren depth across the continuation lines; a line with a
+/// the open paren depth across the continuation lines. A line with a
 /// free pattern starts the span when its parens stay unclosed.
 fn isFreeContinuationLine(t: []const u8, depth: *i32) bool {
     if (depth.* > 0) {
@@ -11109,7 +11109,7 @@ fn detectAliasUseAfterFree(ctx: *const FreeScanCtx) !void {
 /// anchors at the rebind block's entry — the state before the rebind
 /// executes still carries the free's def/may grade on the paths reaching
 /// it. The conditional free + root rebind shape (`if (c) { free(buf); }
-/// buf = other; use(a);`) grades warning; the straight-line free stays
+/// buf = other; use(a);`) grades warning. The straight-line free stays
 /// err. A rebind line outside the CFG falls back to err, the
 /// conservative grade.
 fn aliasUAFSeverity(ctx: *const FreeScanCtx, rebind_line: ?usize, use_bid: usize) Severity {
@@ -11129,7 +11129,7 @@ fn aliasUAFSeverity(ctx: *const FreeScanCtx, rebind_line: ?usize, use_bid: usize
 /// lattice no longer describes the alias there) and the grade anchors at
 /// the rebind block's entry state — the free's def/may grade on the
 /// paths reaching the rebind (EPH-I0838). The conditional free + root
-/// rebind shape grades warning; the straight-line free stays err. A
+/// rebind shape grades warning. The straight-line free stays err. A
 /// rebind nested inside the free's own conditional arm can over-grade
 /// (the anchor reads the rebind's own paths, not the use's), accepted
 /// residual of the rebind-point approximation.
@@ -11190,7 +11190,7 @@ fn reportAliasUAF(ctx: *const FreeScanCtx, alias_name: []const u8, freed_line: u
         if (verdict == .emitted) break;
         if (verdict != .not_in_block) continue;
         // The lattice gate and grade hold only while the root still points
-        // at the tracked allocation; a root rebind detaches the lattice
+        // at the tracked allocation. A root rebind detaches the lattice
         // from the alias's target (EPH-I0835).
         const rebind_line = firstReassignmentLine(
             ctx.scan.lines,
@@ -11251,7 +11251,7 @@ fn appendDoubleFreeIssue(sink: *const FreeIssueSink, site: DoubleFreeSite) !void
     }
     const pfx = if (site.severity == .warning) "conditional " else "";
     // A loop-carried verdict would name the flagged line as its own first
-    // free; state the prior-iteration cause instead (EPH-I0676 reviewer F3).
+    // free. State the prior-iteration cause instead (EPH-I0676 reviewer F3).
     const msg = if (site.loop_carried)
         try std.fmt.allocPrint(
             sink.allocator,
@@ -11295,7 +11295,7 @@ fn checkLineForDoubleFree(ctx: *const FreeScanCtx, t: []const u8, actual_line: u
     try detectCrossBlockDoubleFree(ctx, t, actual_line, bid);
 }
 
-/// Check same-block double free and emit issue if found; returns true if freed.
+/// Check same-block double free and emit issue if found. Returns true if freed.
 fn checkSameBlockDoubleFree(
     ctx: *const FreeScanCtx,
     sbf: SameBlockFreeResult,
@@ -11303,8 +11303,8 @@ fn checkSameBlockDoubleFree(
     actual_line: usize,
 ) !bool {
     if (!sbf.freed) return false;
-    // The same-block scan's own free line names the first free (EPH-I0344);
-    // alloc_info.freed_line is the cross-block record and is not mutated by
+    // The same-block scan's own free line names the first free (EPH-I0344).
+    // Alloc_info.freed_line is the cross-block record and is not mutated by
     // same-block verdicts.
     const freed = sbf.freed_line;
     const lines = ctx.scan.lines;
@@ -11313,7 +11313,7 @@ fn checkSameBlockDoubleFree(
     // second free's own line is the construct's arm divider, not a path
     // separator — when every arm of the construct frees the tracked var,
     // every path runs a second free and the pair is definite (the
-    // pre-fix shape was silent); unverified arm shapes (another var,
+    // pre-fix shape was silent). Unverified arm shapes (another var,
     // nested, free-less chain prefix) cap at the conditional warning
     // (EPH-I1064, EPH-I1065). The separator must sit at the pair's
     // indent or shallower (the gate's own min-indent discipline): a
@@ -11420,7 +11420,7 @@ const DeferPairCtx = struct {
 
 /// Which registered-free pass the shared collector runs: defer-registered
 /// or errdefer-registered (detectDeferDoubleFree,
-/// detectErrdeferDirectFree share the walk; the two modes differ only in
+/// detectErrdeferDirectFree share the walk. The two modes differ only in
 /// the accept filter and the conditional mark).
 const CollectMode = enum { defer_frees, errdefer_frees };
 
@@ -11480,7 +11480,7 @@ fn collectRegisteredFrees(
 
 /// The accept filter for collectRegisteredFrees: a defer-mode line must
 /// sit in defer scope (single-line prefix or block) and never in
-/// errdefer scope; an errdefer-mode line must be a single-line errdefer
+/// errdefer scope. An errdefer-mode line must be a single-line errdefer
 /// free without a block opener or a guard if.
 fn registeredFreeLineAccepted(
     comptime mode: CollectMode,
@@ -11528,8 +11528,8 @@ test "collectRegisteredFrees: mode dispatch pins the defer/errdefer filters (EPH
         .aliases = &aliases,
     };
 
-    // Defer mode: the single-line defer free and the block-body free;
-    // the errdefer lines never join.
+    // Defer mode: the single-line defer free and the block-body free.
+    // The errdefer lines never join.
     var defers = try collectRegisteredFrees(a, &ctx, .defer_frees);
     defer defers.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), defers.items.len);
@@ -11537,7 +11537,7 @@ test "collectRegisteredFrees: mode dispatch pins the defer/errdefer filters (EPH
     try std.testing.expect(!defers.items[0].is_conditional);
     try std.testing.expectEqual(@as(usize, 3), defers.items[1].line);
 
-    // Errdefer mode: only the single-line unguarded errdefer free; the
+    // Errdefer mode: only the single-line unguarded errdefer free. The
     // block opener and the guarded form stay out, and the mark is true.
     var errdefers = try collectRegisteredFrees(a, &ctx, .errdefer_frees);
     defer errdefers.deinit(a);
@@ -11602,7 +11602,7 @@ fn deferFreeIsConditional(
 /// reassignment can make the defer target different memory — in which case
 /// free-then-reassign is the CORRECT pattern. The reverse order
 /// (defer, then reassign, then direct free) is still a definite double-free
-/// of the NEW allocation; suppressing on any later reassignment is therefore
+/// of the NEW allocation. Suppressing on any later reassignment is therefore
 /// an accepted heuristic FN, not a proof of safety.
 fn hasReassignmentAfter(
     lines: []const []const u8,
@@ -11631,11 +11631,11 @@ const FreeSpan = struct {
 /// appears in the span (first, second] at an indent no deeper than both
 /// statements, and the SECOND statement sits inside that header's arm (the
 /// header line itself or its braced body — armHeaderSeparates). Same-arm
-/// pairs have no arm header between them; a defer OUTSIDE the switch is
+/// pairs have no arm header between them. A defer OUTSIDE the switch is
 /// shallower than any arm header (still reported). The span excludes the
 /// first statement's own line, so an inline arm free `.b => free(buf),`
 /// cannot self-match its own header when a post-join statement sits at the
-/// arm indent (EPH-I0343); the second line stays in, because
+/// arm indent (EPH-I0343). The second line stays in, because
 /// `.b => use(buf)` proves sibling-arm exclusivity with the use's own
 /// header (EPH-I0010). The containment clause keeps a post-join statement
 /// at the arm indent from being suppressed by the NEXT arm's header: the
@@ -11899,7 +11899,7 @@ fn pairDirectFreeWithDefers(
     for (site.frees) |df| {
         const first = @min(df.line, site.free_line);
         // Reassignment after the first free: safe only when the direct free
-        // precedes the rebound value's lifetime; defer→reassign→free is a
+        // precedes the rebound value's lifetime. Defer→reassign→free is a
         // definite double-free of the NEW allocation. Staying silent here is
         // an accepted heuristic FN (see hasReassignmentAfter).
         if (hasReassignmentAfter(ctx.lines, ctx.func_line, first, ctx.var_name)) continue;
@@ -11990,7 +11990,7 @@ const CfgReachSearch = struct {
     }
 
     /// Explore one edge out of the current block. True when the edge
-    /// reaches the target block; otherwise unseen successors push onto
+    /// reaches the target block. Otherwise unseen successors push onto
     /// the stack and the walk continues.
     fn exploreEdge(self: *CfgReachSearch, cur: usize, edge: CFGEdge) !bool {
         if (edge.from != cur) return false;
@@ -12172,21 +12172,21 @@ fn loopBodyLineStep(
     }
     if (rest[0] == ':') {
         // While/for continue expression: skip its paren group and keep
-        // scanning for the body (EPH-I0749). The group can span lines;
-        // a missing paren yields no extent (fail open toward silence).
+        // scanning for the body (EPH-I0749). The group can span lines.
+        // A missing paren yields no extent (fail open toward silence).
         const g = continueTailEnd(lines, idx, base, rest) orelse return null;
         return .{ .rescan = .{ .line = g.line, .col = g.col } };
     }
     if (rest[0] == '{') return .{ .done = bracedBodyExtent(lines, func_line, idx, base) };
     // Brace-less body: its statement shares this line (fused) or is this
-    // next-line statement; either way the body spans this line only.
+    // next-line statement. Either way the body spans this line only.
     return .{ .done = .{ .first = func_line + idx, .last = func_line + idx } };
 }
 
 /// The textual line extent of the loop body whose header ends on
 /// header_line, or null when the extent cannot be bounded (the vote then
 /// stays silent rather than guessing). A braced body spans strictly between
-/// its brace lines; a brace-less body spans only its statement's line, so a
+/// its brace lines. A brace-less body spans only its statement's line, so a
 /// statement after the loop never reads as loop-carried (EPH-I0676
 /// reviewer F1: the CFG merges that statement into the back-edge block).
 /// A while/for continue tail (`: (expr)`) is skipped and the scan resumes
@@ -12199,12 +12199,12 @@ fn loopBodyLineStep(
 /// its paren group (and any `:` tail group) to the body `{`. The silent
 /// class is the shape whose header end line carries no resolving `(`: a
 /// single-line condition whose CONTINUE TAIL wraps (the end line is the
-/// tail's close line — `1) {`, no `(`; the wc_multi_a probe stays
+/// tail's close line — `1) {`, no `(`. The wc_multi_a probe stays
 /// silent), and the fused single-line body below. A wrapped CONDITION
 /// whose end line carries the `: (cont)` tail fires (the wc_multi_b and
 /// wc_multi_c probes — the tail's paren group resolves to the body
 /// brace), and an Allman body brace on its own line fires (wc_allman —
-/// the walk finds the `{` on the next line; adjudicated correct, the
+/// the walk finds the `{` on the next line. Adjudicated correct, the
 /// extent is well-defined and the defect real). Accepted bound
 /// (EPH-I0749): a fused
 /// single-line braced body (`while (c) { f(); }`) still yields null —
@@ -12267,8 +12267,8 @@ fn scanLoopBodyExtent(
 /// "multi-line" itself (B86j+B87 r2 F2, named on loopBodyLineExtent with
 /// the live-verified shapes): the end line must carry a `(` resolving to
 /// the body brace. A wrapped continue TAIL stays silent (the end line
-/// carries none); a wrapped CONDITION whose end line carries the tail
-/// fires; an Allman body brace fires. The fused single-line body stays
+/// carries none). A wrapped CONDITION whose end line carries the tail
+/// fires. An Allman body brace fires. The fused single-line body stays
 /// silent — the documented bound of loopBodyLineExtent (EPH-I0749),
 /// pinned by "ZA106: fused single-line loop body stays silent
 /// (EPH-I0749)".
@@ -12449,8 +12449,8 @@ const SiblingArm = struct {
 /// True when the skip path's sibling arm of the block at bid also frees
 /// the variable: the cross-block mirror of the same-line
 /// elsePrecedesSecondFree gate (EPH-I1017 F1, EPH-I1086). Two directions.
-/// Forward: the branch_true edge into bid names the construct header;
-/// the header's branch_false target is the sibling (the else body of an
+/// Forward: the branch_true edge into bid names the construct header.
+/// The header's branch_false target is the sibling (the else body of an
 /// if, the loop-else body of a while/for). The sibling counts only when
 /// it is a genuine arm: a multi-line else/loop-else body opens with its
 /// `} else {` arm-header line, and an inline single-line arm shares the
@@ -12470,7 +12470,7 @@ const SiblingArm = struct {
 /// nested construct skips on the enclosing arm's other paths, so its
 /// else-arm pair stays conditional.
 /// Reverse (EPH-I1086): the branch_false edge into bid names the
-/// construct header; the header's branch_true target is the sibling (the
+/// construct header. The header's branch_true target is the sibling (the
 /// then body of an if). The reverse direction requires multi-line arms
 /// (a single-line arm shares the header line and the span scan cannot
 /// tell the arms apart), excludes loop headers (a break path skips the
@@ -12747,7 +12747,7 @@ fn detectCrossBlockDoubleFree(
     // The own-line both-arms escape (EPH-I1030): an else separator on the
     // second free's own line is the construct's arm divider, not a path
     // separator — when every arm of the construct frees the tracked var,
-    // every path runs a second free and the pair is definite; unverified
+    // every path runs a second free and the pair is definite. Unverified
     // arm shapes (another var, nested, free-less chain prefix) cap at
     // the conditional warning (EPH-I1064, EPH-I1065). The separator
     // must sit at the pair's indent or shallower (the gate's own
@@ -12777,9 +12777,9 @@ fn detectCrossBlockDoubleFree(
     // the variable, the second free runs on every path through the
     // construct — definite even though the block itself is
     // conditionally reached (EPH-I1017 F1, the cross-block mirror of the
-    // same-line elsePrecedesSecondFree gate; EPH-I1086 extends it to the
+    // same-line elsePrecedesSecondFree gate. EPH-I1086 extends it to the
     // branch_false direction). The own-line escape (EPH-I1030) reads the
-    // both-arms shape directly off the second free's line; only the
+    // both-arms shape directly off the second free's line. Only the
     // definite verdict upgrades (a conditional verdict falls through to
     // the warning grade).
     const sibling_both = pa.def_freed and try siblingArmAlsoFrees(ctx, bid);
@@ -12955,7 +12955,7 @@ fn collectCFGAllocations(
     var allocs = std.ArrayListUnmanaged(CFGAlloc).empty;
     // The list has no self-owning defer: an append failure after earlier
     // successful appends would drop the entries' storage (OOM-path leak,
-    // EPH-I0895 sweep; B45-1).
+    // EPH-I0895 sweep, B45-1).
     errdefer allocs.deinit(ctx.allocator);
 
     // Pre-scan: build type-tracked allocator sets
@@ -12980,7 +12980,7 @@ fn collectCFGAllocations(
     for (ctx.body.lines, 0..) |_, idx| {
         const actual_line = ctx.body.func_line + idx;
         // Split decl RHS (`const x =\n try allocator.alloc(...)`) joins
-        // first; the paren join covers wrapped args (EPH-I0675).
+        // first. The paren join covers wrapped args (EPH-I0675).
         const t = joinSplitDeclRhs(ctx.body.lines, idx, &join_buf, &all_alloc_names) orelse
             joinParenContinuation(ctx.body.lines, idx, &join_buf);
 
@@ -13003,7 +13003,7 @@ fn collectCFGAllocations(
             .name = name,
             .line = actual_line,
             // The col comes from the JOINED text, which can exceed the
-            // physical line for a split-RHS decl; clamp it into the
+            // physical line for a split-RHS decl. Clamp it into the
             // physical line so Issue.col stays displayable (EPH-I0986).
             .col = @min(alloc_info.col + 1, phys.len),
             .block = block,
@@ -13195,7 +13195,7 @@ const HandoffScanState = struct {
 };
 
 /// Advance the handoff scan across one masked line. Inside an open return
-/// construct the depths advance and a close sets blocked; on a return
+/// construct the depths advance and a close sets blocked. On a return
 /// opener line the occurrence walk runs first (a direct call argument on
 /// `return try f(x)` transfers), then the construct tracking starts and
 /// the plain reference check is skipped. A blocked line skips the check
@@ -13331,7 +13331,7 @@ fn hasGuardToken(seg: []const u8) bool {
         hasRealKeyword(seg, "=>");
 }
 
-/// Scan for a defer that covers the alloc; see hasCoveringDefer.
+/// Scan for a defer that covers the alloc. See hasCoveringDefer.
 fn hasImmediateDefer(
     alloc: *CFGAlloc,
     lines: []const []const u8,
@@ -13707,7 +13707,7 @@ fn hasManagedFreeReceiver(lines: []const []const u8, name: []const u8) bool {
 /// the model cannot distinguish a store from a read on a dotted receiver
 /// (disclosed over-credit bound, review r2). Plain functions
 /// (`f(name)`) and single-ident receivers (`list.append(name)`) stay
-/// outside this detector; the stdlib container methods keep their own
+/// outside this detector. The stdlib container methods keep their own
 /// path. Runs on comment-stripped, string-blanked code.
 fn isContainerArgHandoff(
     t: []const u8,
@@ -13877,7 +13877,7 @@ fn isDerefTransfer(t: []const u8, name: []const u8) bool {
 /// var — a transfer only when the store TARGET can own the allocation.
 /// A write whose LHS root IS the tracked owner (`buf[0] = v`, `buf.field =
 /// v`, `buf.* = v`, `buf = v`) initializes or rebinds the allocation:
-/// ownership stays in this scope (EPH-I0346, band-B02 F7; EPH-I0825). A
+/// ownership stays in this scope (EPH-I0346, band-B02 F7, EPH-I0825). A
 /// `_` target discards the value, never transfers. The owner value must
 /// sit on the RHS — a store of some other value (`x.buf = y`) moves
 /// nothing. `self.buf = buf` (root `self`) still transfers.
@@ -13951,7 +13951,7 @@ fn skipLhsTailSpaces(lhs: []const u8, end: usize) usize {
 
 /// CFG-based defer coverage analysis (ZA101/ZA102).
 /// Detects allocations where defer only exists on some paths. Backward
-/// coverage ANDs over all successors; the loop cycle deadlock (header
+/// coverage ANDs over all successors. The loop cycle deadlock (header
 /// needs body, body needs header) is a documented FP-lean bound, and the
 /// linear fallback hasDeferFreeInFunction masks it for defers at the
 /// alloc's indent or shallower (EPH-I0682, F6a). A guarded single-line
@@ -14099,7 +14099,7 @@ fn scanBlocksForPatterns(
 }
 
 /// The two roles a line plays for one carried defer depth: the block's
-/// opener line restarts its own depth; a body line contributes its brace
+/// opener line restarts its own depth. A body line contributes its brace
 /// balance while the block stays open (EPH-I0883).
 const DeferDepthStep = enum { opener, body };
 
@@ -14144,7 +14144,7 @@ const BlockLineScan = struct {
     errdefer_depth: usize = 0,
 
     /// Advance the two defer depths from this line's keyword. The opener
-    /// line restarts its depth; every following line contributes its brace
+    /// line restarts its depth. Every following line contributes its brace
     /// balance (EPH-I0883, EPH-I0894). The two keywords differ in which
     /// exit paths their frees cover, so the depths stay separate
     /// (EPH-I0349).
@@ -14169,7 +14169,7 @@ const BlockLineScan = struct {
     /// covers only the branch path, so the block must not read as
     /// directly freed. Comment text is stripped first — a trailing
     /// comment mentioning `defer` must not flip the verdict (EPH-I0682,
-    /// F6b; review r1 fix 1).
+    /// F6b, review r1 fix 1).
     fn recordFreeLattices(
         self: *BlockLineScan,
         state: *BlockCoverageState,
@@ -14258,7 +14258,7 @@ const ExitFreeLoopInfo = struct {
 /// Mark the loops whose bodies hold no early exit (EPH-I0116). For each
 /// loop_back edge, walk the body blocks forward from the header's
 /// body-side edges. A body that can exit before the post-loop code
-/// keeps the FP-lean deadlock verdict (EPH-I0682, F6a); a cycle without
+/// keeps the FP-lean deadlock verdict (EPH-I0682, F6a). A cycle without
 /// early exits always completes, so the post-loop free dominates every
 /// path through it. The per-cycle proof lives in CycleWalk.
 fn collectExitFreeLoops(
@@ -14371,7 +14371,7 @@ const ExitFreeSpanCtx = struct {
 /// True when any masked line in the cycle's span carries a
 /// word-bounded return/try/break/continue keyword at a code position
 /// (EPH-I0116, EPH-I1179). The body scan covers every visited body
-/// block; the header scan
+/// block. The header scan
 /// covers only the CONDITION lines — the header block can hold
 /// pre-loop statements before the condition (the entry block doubles
 /// as the header when the loop opens the function body), and a `try`
@@ -14412,7 +14412,7 @@ fn exitFreeSpanHasExitKeyword(
 
 /// True when a masked line in `start_line..end_line` (inclusive) carries
 /// an exit keyword (EPH-I0116). Lines shorter than the mask buffer are
-/// blanked code; longer lines fall back raw (documented bound). The two
+/// blanked code. Longer lines fall back raw (documented bound). The two
 /// exit-keyword range probes (spanHasExitKeyword's former walk,
 /// conditionSpanHasExitKeyword's second walk) share the scan.
 fn scanRangeHasExitKeyword(
@@ -14454,7 +14454,7 @@ fn firstWhileForLine(
 
 /// True when a masked line in the header's CONDITION range carries an
 /// exit keyword (EPH-I0116). The condition starts at the first line
-/// with a word-bounded while/for keyword; when none appears, only the
+/// with a word-bounded while/for keyword. When none appears, only the
 /// header's last line is scanned.
 fn conditionSpanHasExitKeyword(
     lines: []const []const u8,
@@ -14676,7 +14676,7 @@ fn checkDeferCoverageForAlloc(
     )) return null;
 
     // The message names the actual shape (EPH-I0725): a defer free for
-    // this alloc in some block means partial coverage; total absence
+    // this alloc in some block means partial coverage. Total absence
     // means a missing defer.
     if (state.anyDeferExists())
         return buildPartialCoverageIssue(ctx.body.file_path, alloc);
@@ -14900,7 +14900,7 @@ fn isTryAllocation(
 }
 
 /// The expression of a bare `return <identifier>;` — exactly one identifier
-/// followed by `;`. A leading digit excludes literals (`return 0;`); a `.`,
+/// followed by `;`. A leading digit excludes literals (`return 0;`). A `.`,
 /// `(`, or `[` follower excludes field/call/subscript expressions.
 fn isBareIdentReturnExpr(expr: []const u8) bool {
     if (expr.len == 0) return false;
@@ -14914,7 +14914,7 @@ fn isBareIdentReturnExpr(expr: []const u8) bool {
 /// `return <bare-identifier>;` anywhere in the line (word-bounded, outside
 /// strings) — `return err;`, `if (bad) return err;`. In an error-returning
 /// function a bare-identifier return is either the captured error variable
-/// or a success value abandoning the alloc; both leave the alloc
+/// or a success value abandoning the alloc. Both leave the alloc
 /// untransferred on that path, so either way a LATER transfer cannot cover it.
 fn hasBareIdentReturn(t: []const u8) bool {
     // One classifier walk per line (EPH-I0153): candidates ascend.
@@ -14933,7 +14933,7 @@ fn hasBareIdentReturn(t: []const u8) bool {
 /// True when the line is a single-line conditional transfer of `name`:
 /// `if (<guard>) return <name>;` with nothing else after the return.
 /// The if-return covers only the guard-true path, so it is not a
-/// dominating transfer; the guard-false path keeps the alloc alive, so
+/// dominating transfer. The guard-false path keeps the alloc alive, so
 /// it is not an uncovered exit either. The transfer scan passes the
 /// line and keeps looking for a dominating transfer or an uncovered
 /// exit (EPH-I0063). A conditional return of any OTHER name leaves the
@@ -14943,7 +14943,7 @@ fn hasBareIdentReturn(t: []const u8) bool {
 /// predicate sees the if line and its first return, so the one-line
 /// twin transfers. A two-line twin (`else return buf;` on its own
 /// line) fails the guard-head check and the else line stops the scan
-/// as a bare-ident exit (hasBareIdentReturn); it stays silent only
+/// as a bare-ident exit (hasBareIdentReturn). It stays silent only
 /// because code after a both-arms return is dead (EPH-I0917). The
 /// guard head must be exactly the word `if`: a leading
 /// statement (`sink(); if (x) return buf;`) is not the shape.
@@ -15006,7 +15006,7 @@ fn isUncoveredErrorExit(t: []const u8, name: []const u8) bool {
 /// True when the line carries the canonical single-line error-propagation
 /// form `catch |X| return X;` (EPH-I0069): the catch captures the error
 /// and returns it, so the line is an error-path exit a later transfer
-/// cannot cover. Word-bounded and literal-masked on the anchor; the
+/// cannot cover. Word-bounded and literal-masked on the anchor. The
 /// capture name and the returned name must be the same identifier. The
 /// block form (`catch |X| { return X; }`) stays outside this detector —
 /// its return line stops the ownership scan via hasBareIdentReturn, and
@@ -15118,7 +15118,7 @@ const ErrdeferWalk = struct {
 /// after the block closes — the line-order scan never joins branches (review
 /// r1 fix 2). Comment and multiline-string lines never transfer, and
 /// string contents never match — prose fakes no coverage (EPH-I0369,
-/// band-B03 F5). The scan is line-order; the first dominating transfer or
+/// band-B03 F5). The scan is line-order. The first dominating transfer or
 /// uncovered exit decides. Residual bound: the alloc and the transfer
 /// share one block, so a transfer that covers the alloc's own paths and a
 /// later exit in another block of the same depth is credited
@@ -15185,7 +15185,7 @@ const TransferBraceScan = struct {
     pos: usize = 0,
     overflowed: bool = false,
     /// Brace-kind classification for this scan: false (default) counts
-    /// control braces (isControlBrace — the transfer gate); true counts
+    /// control braces (isControlBrace — the transfer gate). True counts
     /// scope braces (isScopeBrace — the span walk, labeled blocks
     /// included, EPH-I0832). Additive: Set A's call sites keep the
     /// default.
@@ -15234,8 +15234,8 @@ fn applyBraceChar(scan: *TransferBraceScan, code: []const u8, pos: usize) bool {
 /// (`.{`) are value expressions — their braces are not blocks and never
 /// gate a transfer (EPH-I0368). Bound: the look-back stays within this
 /// line, so an Allman-style `{` on its own line after a condition reads
-/// as neutral and the transfer inside still credits (review r1 note;
-/// zig fmt tolerates the form after a multi-line condition, so fmt-clean
+/// as neutral and the transfer inside still credits (review r1 note.
+/// Zig fmt tolerates the form after a multi-line condition, so fmt-clean
 /// files can carry it).
 fn isControlBrace(code: []const u8, pos: usize) bool {
     const i = braceTokenEnd(code, pos);
@@ -15368,7 +15368,7 @@ fn continueBlockCollection(
     // record cannot fake coverage for it (band-B03 F19, EPH-I0380).
     // The depth scan below runs on the SAME masked code: a lone `{` or
     // `}` inside a string is text, never block structure. A balanced
-    // string pair is neutral under both scans; the mask changes only the
+    // string pair is neutral under both scans. The mask changes only the
     // unbalanced cases — a raw lone `{` inflates the depth past the real
     // close and swallows following lines, a raw lone `}` closes the block
     // early and drops its cleanup record (EPH-I0987).
@@ -15443,14 +15443,14 @@ fn collectTryAllocFromLine(
         // The statement span ends at the first `;` at brace depth 0: a
         // trigger inside it is the alloc's own try, never a gap
         // (split-RHS decls carry the try on a continuation line,
-        // EPH-I0675; mirrors hasErrorReturnGap).
+        // EPH-I0675. Mirrors hasErrorReturnGap).
         const stmt_end = ctx.func_line +
             findAllocStatementEnd(ctx.lines, site.line - ctx.func_line);
         try ctx.try_allocs.append(ctx.allocator, .{
             .name = name,
             .line = site.line,
             // The col comes from the joined text, which can exceed the
-            // physical line for a split-RHS decl; clamp it into the
+            // physical line for a split-RHS decl. Clamp it into the
             // physical line so Issue.col stays displayable (EPH-I0986).
             .col = @min(alloc_info.col + 1, phys.len),
             .is_create = alloc_info.is_create,
@@ -15473,7 +15473,7 @@ fn tryAppendCleanupInfo(
 ) !void {
     if (!hasRealCleanupPattern(items)) return;
     const content = try allocator.dupe(u8, items);
-    // The dupe is owned by the record only after the append commits; a
+    // The dupe is owned by the record only after the append commits. A
     // failed append must release it (band-B03 F15, EPH-I0375).
     errdefer allocator.free(content);
     try errdefers.append(allocator, .{
@@ -15525,7 +15525,7 @@ fn collectDeferFromLine(
     ctx.bs.depth = 1;
     ctx.bs.content.clearRetainingCapacity();
     // Keep the statement prefix in the collected content so the cleanup
-    // record preserves the defer/errdefer kind (EPH-I0367); the depth
+    // record preserves the defer/errdefer kind (EPH-I0367). The depth
     // scan skips the opening brace exactly like the prefix-stripped form.
     // The scan runs on masked code like continueBlockCollection's: a lone
     // `{` inside a string on the opening line must not inflate the block
@@ -15575,9 +15575,9 @@ fn isScopeBrace(code: []const u8, pos: usize) bool {
 /// line-end sampling misses, so an errdefer in an if-block never covers
 /// a chained else/else-if trigger (EPH-I0832). Uses TransferBraceScan's
 /// machinery with the isScopeBrace classification (labeled blocks
-/// included; value literals never open scopes). On a brace-stack
+/// included. Value literals never open scopes). On a brace-stack
 /// overflow (nesting past 64) the walk returns 0 — for the alloc span
-/// that reads as unbounded (loud: every trigger counts); for the
+/// that reads as unbounded (loud: every trigger counts). For the
 /// errdefer span it reads as in-force (quiet: covered) — the fail-open
 /// direction, reachable only past 64-deep nesting. The fn-body brace
 /// classifies non-scope under isScopeBrace (a return type precedes the
@@ -15619,8 +15619,8 @@ fn scopeEndOf(line: usize, lines: []const []const u8, func_line: usize) usize {
 /// coincidental name match (Zig forbids use-before-decl). A nested
 /// errdefer cancels at its block's normal exit WITHOUT freeing, so it
 /// covers only triggers inside its own block span (EPH-I0367, band-B03
-/// F3; the spans come from scopeEndOf). A nested DEFER runs at the block
-/// close and frees there, so it covers everything after it; the
+/// F3. The spans come from scopeEndOf). A nested DEFER runs at the block
+/// close and frees there, so it covers everything after it. The
 /// non-dominating-branch shape (`if (c) { defer free(buf); }` with the
 /// if untaken) stays a disclosed line-order bound.
 fn findMatchingErrdefer(
@@ -15653,16 +15653,16 @@ const ErrdeferGapCtx = struct {
 
 /// Per-trigger gap test: a trigger (try or error-return) after the alloc
 /// leaks unless a covering errdefer/defer sits between the alloc and the
-/// trigger. A defer always covers (it runs at its block's close); an
+/// trigger. A defer always covers (it runs at its block's close). An
 /// errdefer covers only while its own block is open AND the alloc is
 /// still alive — the block's normal exit cancels the errdefer without
-/// freeing (EPH-I0367, band-B03 F3; spans from scopeEndOf).
+/// freeing (EPH-I0367, band-B03 F3. Spans from scopeEndOf).
 /// Line-granular model: a trigger inside the alloc's own statement never
 /// counts (`trigger_line <= stmt_end`): the alloc's own try is the
 /// statement's error exit, and a split-RHS decl carries that try on a
 /// continuation line, so the span extends past the decl line (EPH-I0675).
 /// Each physical line yields one distinct trigger line, so a second `try`
-/// on the alloc line is invisible to the gap test; a no-free try line
+/// on the alloc line is invisible to the gap test. A no-free try line
 /// appends twice, and the duplicate is idempotent (band-B03 F11,
 /// EPH-I0378).
 fn isGapTrigger(
@@ -15678,7 +15678,7 @@ fn isGapTrigger(
         const alive = m.alloc_scope_end == 0 or trigger_line < m.alloc_scope_end;
         const in_force = m.ed_scope_end == 0 or trigger_line < m.ed_scope_end;
         // Covered when the alloc is dead (its block closed) or the
-        // errdefer is still in force; the alive-with-closed-errdefer case
+        // errdefer is still in force. The alive-with-closed-errdefer case
         // is the gap.
         if (!alive or in_force) return false;
         return true;
@@ -15730,7 +15730,7 @@ fn hasDirectFreeBetween(
 
 /// Gap test for error-return triggers. An error return inside the alloc's own
 /// catch/orelse statement is skipped (the allocation failed there — nothing
-/// to free); an error return covered by a manual free is skipped (idiom).
+/// to free). An error return covered by a manual free is skipped (idiom).
 fn hasErrorReturnGap(
     alloc: *const TryAlloc,
     matched: ?MatchedCleanup,
@@ -15773,7 +15773,7 @@ const gap_msg_create_err_ret: ErrdeferGapMsg = .{
 };
 
 /// Two-axis gap message table (ZA506 D5): row 0 = allocation verb
-/// `alloc` (is_create false), row 1 = `create`; col 0 = error-return
+/// `alloc` (is_create false), row 1 = `create`. Col 0 = error-return
 /// trigger (try_gap false), col 1 = try trigger. Indexed by
 /// @intFromBool, so the selection carries no branch.
 const gap_msgs = [2][2]ErrdeferGapMsg{
@@ -15877,7 +15877,7 @@ const ErrdeferLineCtx = struct {
 /// Line-granular model: one alloc record per physical line. A no-free
 /// try line appends the same trigger line twice — once at its no-free
 /// detection site (the no_free branch below or a no-free branch inside
-/// collectTryAllocFromLine) and once at the has_try append; the gap test
+/// collectTryAllocFromLine) and once at the has_try append. The gap test
 /// is idempotent over duplicates, so the duplicates do not change the
 /// verdict (band-B03 F11, EPH-I0378).
 fn scanErrdeferLine(ctx: *const ErrdeferLineCtx, line: []const u8, idx: usize) !void {
@@ -15892,7 +15892,7 @@ fn scanErrdeferLine(ctx: *const ErrdeferLineCtx, line: []const u8, idx: usize) !
     )) return;
     // Alloc detection runs on the joined logical line so wrapped calls
     // (type first-arg on the next line) and split decl RHSs (`const x =\n
-    // try allocator.alloc(...)`) are visible; line-structure detection
+    // try allocator.alloc(...)`) are visible. Line-structure detection
     // (defer blocks, try presence) stays on the physical line. The try
     // gate reads the joined text only for the split-decl form: a try in a
     // wrapped ARG (`allocator.alloc(u8, try f())`) is the alloc's
@@ -16099,8 +16099,8 @@ const ImportGraph = struct {
     /// Enables O(1) lookup in `findImportsForPath` — without it, every
     /// recursive reachability step called realpath() on every file in
     /// the graph, producing O(N²) openat storms (millions of syscalls
-    /// on ~1,400-file codebases). Neither key nor value is owned here;
-    /// both alias the `files` map's entries.
+    /// on ~1,400-file codebases). Neither key nor value is owned here.
+    /// Both alias the `files` map's entries.
     resolved_to_key: std.StringHashMapUnmanaged([]const u8),
     scan_root: ?[]const u8,
     /// Total content bytes held by `files` (EPH-I0199). Increment-only:
@@ -16132,7 +16132,7 @@ const ImportGraph = struct {
     /// Hardlinks cannot span devices, so the gate stays exact for its
     /// target shape. The cross-device collapse is the documented bound
     /// of the inode-only key. When std.Io gains a device identity, key
-    /// on (device, inode) and drop this bound; the test "inode gate
+    /// on (device, inode) and drop this bound. The test "inode gate
     /// bound" fails the build the moment the field lands.
     /// Entries with inode 0 bypass the gate: filesystems that report 0
     /// for every entry would otherwise collapse distinct files.
@@ -16150,8 +16150,8 @@ const ImportGraph = struct {
     build_zig_read: bool,
 
     /// Once-guard for the null-root containment warning (EPH-I0172). The
-    /// warning never fires in production (every handler sets scan_root);
-    /// the flag keeps the defensive path from spamming when it does.
+    /// warning never fires in production (every handler sets scan_root).
+    /// The flag keeps the defensive path from spamming when it does.
     root_missing_logged: bool,
 
     fn init(allocator: Allocator, diag: *DiagCtx) ImportGraph {
@@ -16245,7 +16245,7 @@ const ImportGraph = struct {
 
     fn scanDirectory(self: *ImportGraph, dir_path: []const u8) !void {
         // RED4-7 (EPH-I0210): no-follow on the root open. The containment
-        // gates realpath the root at check time; an actor swapping it for
+        // gates realpath the root at check time. An actor swapping it for
         // a symlink between that realpath and this open must fail here
         // instead of walking a different tree than the one gated. A
         // symlinked scan root now fails closed with the open error below.
@@ -16398,7 +16398,7 @@ const ImportGraph = struct {
 
     fn analyzeFile(self: *ImportGraph, file_path: []const u8) !void {
         // RED4-7 (EPH-I0210): no-follow on the open. The walk records
-        // files from their dirent kind; a file swapped for a symlink
+        // files from their dirent kind. A file swapped for a symlink
         // between the dirent read and this open must fail the open (the
         // silent skip below) instead of redirecting the read outside the
         // scanned tree.
@@ -16452,7 +16452,7 @@ const ImportGraph = struct {
         // textual path would overwrite the stored FileAnalysis without
         // deinit, leaking its content, path copies, and imports. The
         // walk gate (EPH-I0823) and the entry dedupe (EPH-I0812/I0817)
-        // make a duplicate unreachable today; the guard keeps the
+        // make a duplicate unreachable today. The guard keeps the
         // ownership guarantee unconditional, so a future ingest path
         // cannot silently reopen the leak.
         const gop = try self.files.getOrPut(analysis.path);
@@ -16535,7 +16535,7 @@ const ImportGraph = struct {
     /// ACCEPTED MISS (EPH-I0300): a const whose @import value opens on the
     /// NEXT line (`const x =\n@import("y.zig");`) is not extracted, and
     /// neither is the multiline-paren shape (`@import(\n"y.zig",\n)`).
-    /// extractBareImports covers the bare-import side; the continuation
+    /// extractBareImports covers the bare-import side. The continuation
     /// shapes are missed by design and stay pinned as accepted until a
     /// future scan covers them deliberately.
     fn findImportPath(content: []const u8, start: usize) ?[]const u8 {
@@ -16799,7 +16799,7 @@ const ImportGraph = struct {
         }
         // 2. Try parent of target path (EPH-I0161): the parent search
         // is gated. The operator's own tree (the cwd and its ancestors)
-        // stays the documented exempt channel; a foreign parent needs
+        // stays the documented exempt channel. A foreign parent needs
         // --include-parent.
         const trimmed = mem.trimEnd(u8, cfg.path, "/");
         const parent = std.fs.path.dirname(trimmed) orelse ".";
@@ -17084,7 +17084,7 @@ const ImportGraph = struct {
     }
 
     /// Handle one directory entry during the module-name search. A
-    /// subdirectory recurses one level deeper; a name match marks every
+    /// subdirectory recurses one level deeper. A name match marks every
     /// .zig file under the directory reachable. Void: every failure is
     /// the skip-entry form (the pre-refactor `catch continue`), and the
     /// void signature keeps the error set inference acyclic between the
@@ -17175,7 +17175,7 @@ const ImportGraph = struct {
     };
 
     /// Open `dir_path` with the walk's no-follow options and return the
-    /// dir plus its iterator; null when the open fails (the walkers
+    /// dir plus its iterator. Null when the open fails (the walkers
     /// treat a missing or swapped dir as a skip).
     fn openWalkDir(self: *ImportGraph, dir_path: []const u8) ?WalkDir {
         const dir = Fs.cwd(self.diag.io).openDir(
@@ -17295,7 +17295,7 @@ const ImportGraph = struct {
         }
         // Fallback: path may already be a files key (no realpath needed),
         // or may be a path form we have not indexed. A single pointer
-        // lookup on the primary map handles the former; we deliberately
+        // lookup on the primary map handles the former. We deliberately
         // do NOT call realpath on every file here — that is what blew up.
         if (self.files.getPtr(path)) |entry| return entry.imports.items;
         return null;
@@ -17305,7 +17305,7 @@ const ImportGraph = struct {
     /// (EPH-I1060). A main is only compilable as a root module, so in a
     /// build.zig-blind scan it is root-surface evidence: build.zig must
     /// reference the file for the main to exist at all. The word boundary
-    /// after "main" keeps `pub fn mainOld` from counting; a `pub fn main`
+    /// after "main" keeps `pub fn mainOld` from counting. A `pub fn main`
     /// method inside a container type also counts — the documented bound
     /// of this probe (conservative: it only silences ZA501, never fires).
     fn contentDeclaresMain(content: []const u8) bool {
@@ -17438,11 +17438,11 @@ const ImportGraph = struct {
     /// Tally the graph's per-file counters into ProjectStats. The count
     /// is the graph's, exactly: the check flow builds the graph as the
     /// scan path UNION the joined entry points (EPH-I0784), so its
-    /// summary Files line includes out-of-root entries; the stats
+    /// summary Files line includes out-of-root entries. The stats
     /// command scans the path alone (EPH-I0541). Markers are matched as
     /// raw bytes only: a comptime-concatenated spelling ("TO" ++ "DO")
     /// renders the text at comptime and never self-counts when ephor
-    /// scans its own source (EPH-I0538, EPH-I1053; README "Get project
+    /// scans its own source (EPH-I0538, EPH-I1053, README "Get project
     /// stats").
     fn getStats(self: *ImportGraph) ProjectStats {
         var s = ProjectStats{};
@@ -17509,7 +17509,7 @@ fn collectNoFreeAllocatorNames(
     var names = std.StringHashMapUnmanaged(void){};
     // The map has no self-owning defer: a put failure after earlier
     // successful puts would drop the storage of the entries already
-    // inserted (OOM-path leak, EPH-I0895 class; EPH-I1007).
+    // inserted (OOM-path leak, EPH-I0895 class, EPH-I1007).
     errdefer names.deinit(a);
 
     // Scan function signature for arena-named Allocator parameters.
@@ -17700,7 +17700,7 @@ fn trackNoFreeTypeInit(
 /// needs cross-file return-type resolution: arenaAlloc's body returns
 /// `self._arena.?.allocator()` on an ArenaAllocator field, and the
 /// call site usually sits in another file. That symbol-resolving pass
-/// is out of scope here; until it lands, the class stays flagged (the
+/// is out of scope here. Until it lands, the class stays flagged (the
 /// safe direction — a method named arenaAlloc could still return a
 /// need-free allocator) and is pinned by the EPH-I0067 test.
 fn trackAllocatorAlias(
@@ -17758,7 +17758,7 @@ fn collectNoFreeFieldNames(
     var names = std.StringHashMapUnmanaged(void){};
     // The map has no self-owning defer: a put failure after earlier
     // successful puts would drop the storage of the entries already
-    // inserted (OOM-path leak, EPH-I0895 class; EPH-I1007).
+    // inserted (OOM-path leak, EPH-I0895 class, EPH-I1007).
     errdefer names.deinit(a);
     const field_type_patterns = compat.getNoFreeFieldTypePatterns();
 
@@ -17839,7 +17839,7 @@ fn matchesNoFreeFieldType(type_part: []const u8, pats: []const []const u8) bool 
 /// on "arena" only (ADR-0007): a need-free var or field whose name merely
 /// CONTAINS "arena" (arena_count, arenas, notarena, child_arena) keeps
 /// its free requirement. The substring form over-suppressed and hid real
-/// leaks (band-B04 F1, EPH-I0387); the exact form's FN budget (genuine
+/// leaks (band-B04 F1, EPH-I0387). The exact form's FN budget (genuine
 /// arena allocators with non-exact names) is documented in ADR-0007.
 fn isArenaName(name: []const u8) bool {
     return mem.eql(u8, name, "arena");
@@ -17947,7 +17947,7 @@ fn collectAllAllocatorNames(
     var names = std.StringHashMapUnmanaged(void){};
     // The map has no self-owning defer: a put failure after earlier
     // successful puts would drop the storage of the entries already
-    // inserted (OOM-path leak, EPH-I0895 class; EPH-I1007).
+    // inserted (OOM-path leak, EPH-I0895 class, EPH-I1007).
     errdefer names.deinit(a);
 
     // All allocator type init patterns from stdlib vocabulary (compat layer)
@@ -18037,7 +18037,7 @@ fn trackAllocatorParams(
             if (isFnBodyOpenLine(t)) break;
             continue;
         };
-        // Extract parameter name (word before the colon); isIdent covers
+        // Extract parameter name (word before the colon). IsIdent covers
         // underscores, so no separate '_' arm is needed (EPH-I0392).
         var start = colon_pos;
         while (start > 0 and isIdent(t[start - 1])) start -= 1;
@@ -18152,7 +18152,7 @@ fn scanNoFreeCallArgs(
 /// blanked to spaces, byte positions preserved. A `(` or `)` inside prose
 /// can neither start nor close a call scan, and the paren-depth walk of
 /// the args region stays honest (EPH-I0391). Per-line masking writes
-/// into an exact-sized destination, so every line masks fully; the 16 KiB
+/// into an exact-sized destination, so every line masks fully. The 16 KiB
 /// literal-blanker bound applies at the multi-line signature scans, not
 /// here.
 fn maskContentLines(a: Allocator, content: []const u8) ![]u8 {
@@ -18165,7 +18165,7 @@ fn maskContentLines(a: Allocator, content: []const u8) ![]u8 {
         const code_end = findCommentStart(line) orelse line.len;
         // Comment tail (and trailing \r): prose, never call structure.
         @memset(masked[start + code_end .. end], ' ');
-        // Literal contents within the code part; blankLiteralContents
+        // Literal contents within the code part. BlankLiteralContents
         // writes the masked bytes into its destination buffer directly.
         _ = blankLiteralContents(line[0..code_end], masked[start .. start + code_end]);
         start = end + 1;
@@ -18266,7 +18266,7 @@ fn classifyReturnType(ret: []const u8) ReturnKind {
     // classification reports the never-fails note on the outer line (a
     // fn pointer cannot fail) and swallows the inner fn's own note — the
     // wrong-victim class (sig sync/once_cell.zig:194, EPH-I1042 join
-    // r1). The outer fn returns a value; the pointee's error union
+    // r1). The outer fn returns a value. The pointee's error union
     // registers when the inner fn's own signature is scanned.
     if (mem.startsWith(u8, t, "fn ") or mem.startsWith(u8, t, "fn(")) return .value;
     // The OUTER binding operator decides the kind. A wrapper-prefixed fn
@@ -18369,7 +18369,7 @@ const MethodCall = struct { receiver: []const u8, method: []const u8 };
 /// Residual (band-B04 F12, EPH-I0398): multiple calls on one line resolve
 /// the LAST one only — the earlier calls are invisible to the resolution.
 /// Position-resolved extraction would need the call site's offset, which
-/// the memory analyses do not carry; zig-fmt keeps one statement per line,
+/// the memory analyses do not carry. Zig-fmt keeps one statement per line,
 /// so the shape is rare. Pinned by the EPH-I0398 multi-call test.
 fn extractMethodCall(t: []const u8) ?MethodCall {
     var result: ?MethodCall = null;
@@ -18511,7 +18511,7 @@ fn explicitAnnotTypeName(after_name: []const u8) ?[]const u8 {
 
 /// Skip one compound-type prefix item at `ts`: `*`/`?` markers, `const`/
 /// `volatile`/`allowzero` qualifiers, slice/array heads, `align(N)` specs,
-/// error-union heads. Returns true when the cursor advanced; each advance
+/// error-union heads. Returns true when the cursor advanced. Each advance
 /// is at least one byte, so the caller's prefix loop is bounded by the
 /// slice length.
 fn skipTypePrefix(type_start: []const u8, ts: *usize) bool {
@@ -18699,7 +18699,7 @@ const FnSigScan = struct {
 };
 
 /// Return-type text for an Allman-style closer line (`)` alone): the
-/// first following line up to its `{`. Hand-formatted code only; zig fmt
+/// first following line up to its `{`. Hand-formatted code only. Zig fmt
 /// always emits `) T {` on one line (EPH-I0388).
 fn allmanReturnType(
     lines: []const []const u8,
@@ -18750,7 +18750,7 @@ fn scanFnSignatureRet(
 
 /// Continuation phase of the signature scan: lines after the fn line
 /// carry the closer when zig fmt wrapped the signature. Comment and
-/// string contents never count parens; a `;` before the closer aborts
+/// string contents never count parens. A `;` before the closer aborts
 /// (the text is not a wrapped-signature continuation, so the line class
 /// keeps its no-registration behavior). Returns null when the window is
 /// exhausted without a closer.
@@ -18766,7 +18766,7 @@ fn scanContinuationRet(
         const raw = lines[li];
         const code_end = findCommentStart(raw) orelse raw.len;
         const masked = blankLiteralContents(raw[0..code_end], &blank_buf);
-        // matchingParenCol walks one line for the closer; depth carries
+        // matchingParenCol walks one line for the closer. Depth carries
         // across continuation lines (the line's own offset IS the column,
         // so a zero open base returns it directly).
         if (matchingParenCol(masked, 0, depth)) |offset| {
@@ -18788,7 +18788,7 @@ fn scanContinuationRet(
 /// Self-parameter type name for a multi-line signature whose `self:`
 /// param sits on a continuation line at or before the closer (zig fmt
 /// wraps the param list). The returned slice points into `lines` and
-/// dies with the content; the call site uses only its nullity (EPH-I0388).
+/// dies with the content. The call site uses only its nullity (EPH-I0388).
 fn selfTypeInContinuation(
     lines: []const []const u8,
     idx: usize,
@@ -19040,7 +19040,7 @@ fn isNoFreeCallChainFull(
 
 /// The single-marker form of the no-free chain check: `marker` opens the
 /// accessor, an alloc method must follow, and the source name before the
-/// marker must be tracked; inline no-free init patterns in the receiver
+/// marker must be tracked. Inline no-free init patterns in the receiver
 /// text also anchor (EPH-I0831).
 fn noFreeChainAt(
     t: []const u8,
@@ -19183,13 +19183,13 @@ fn structFieldStorePos(t: []const u8, alloc_name: []const u8) ?usize {
 /// covers an EARLIER `buf` allocation even when the later `buf` shadows
 /// the first — the return may hand out the shadow, not the original
 /// allocation, so the suppression is a disclosed FN under shadowing. The
-/// line model cannot see scopes; scope-tracking the names would need the
+/// line model cannot see scopes. Scope-tracking the names would need the
 /// CFG and is not planned (pinned by the EPH-I0397 integration test).
 fn isReturnTransfer(t: []const u8, name: []const u8) bool {
     if (name.len == 0) return false;
     const expr = afterReturnKeyword(t) orelse return false;
     if (!mem.startsWith(u8, expr, ".{")) return isPlainReturnTransfer(expr, name);
-    // Tuple literal: a transfer only when it closes on this line; unclosed
+    // Tuple literal: a transfer only when it closes on this line. Unclosed
     // openers are tracked across lines by checkReturnTupleLine. The
     // closer probe is code-position-masked: a `};` inside a string is
     // data and must not cut the element region short (EPH-I0900).
@@ -19198,7 +19198,7 @@ fn isReturnTransfer(t: []const u8, name: []const u8) bool {
     return isReturnTupleElement(t, name, .{ .from = open + 2, .to = close });
 }
 
-/// A trimmed line of exactly `return <expr>` yields `<expr>`; anything else
+/// A trimmed line of exactly `return <expr>` yields `<expr>`. Anything else
 /// (including identifiers like `returning`) yields null.
 fn afterReturnKeyword(t: []const u8) ?[]const u8 {
     if (!mem.startsWith(u8, t, "return")) return null;
@@ -19263,7 +19263,7 @@ fn isReturnTupleElement(t: []const u8, name: []const u8, region: TupleElementReg
 }
 
 /// The character after a tuple element candidate (skipping spaces) must be
-/// `,`, `}`, or end-of-line (multi-line element); an identifier continuation
+/// `,`, `}`, or end-of-line (multi-line element). An identifier continuation
 /// (`buffer`), field/subscript/call follower (`.`, `[`, `(`), or operator is
 /// a read of the name, not an element transfer.
 fn hasElementFollower(t: []const u8, end0: usize) bool {
@@ -19282,7 +19282,7 @@ fn hasElementFollower(t: []const u8, end0: usize) bool {
 /// isReturnTupleElement re-enters this per name candidate, so a line
 /// with k candidates runs k independent walks — bounded by the candidate
 /// count per line and the 40-line tuple window. The classifier cannot
-/// carry across calls without threading line state; the doc's
+/// carry across calls without threading line state. The doc's
 /// "one walk per line" phrasing was the overstatement, now corrected.
 fn parenDepthAt(t: []const u8, from: usize, pos: usize, base: usize) usize {
     var cls = LineClassifier.init(t);
@@ -19309,7 +19309,7 @@ const ReturnTupleScan = struct {
 
 /// Advance the armed multi-line return-tuple scan across one line and
 /// report the element-hit verdict (returnTupleTransfersHere,
-/// checkReturnTupleLine share the armed branch; the unarmed opener
+/// checkReturnTupleLine share the armed branch. The unarmed opener
 /// probes stay per-caller). Both closer probes are code-position-masked:
 /// a `};` inside a string or comment is data and must not disarm the
 /// scan early (EPH-I0900).
@@ -19327,16 +19327,16 @@ fn advanceReturnTupleScan(t: []const u8, name: []const u8, scan: *ReturnTupleSca
 
 /// Track a multi-line `return .{ ... };` tuple across lines (bounded). While
 /// armed (`scan.remaining > 0`) each line is checked for the alloc name as a
-/// tuple element at the carried paren depth until the `};` closer; otherwise
+/// tuple element at the carried paren depth until the `};` closer. Otherwise
 /// an unclosed `return .{` opener arms the scan (the opener line itself may
 /// carry the first element). All per-line checks run on the caller's masked
 /// code (comments stripped, literal contents blanked), so comment text
 /// mentioning the alloc name, and unbalanced parens inside comments or char
 /// literals, cannot skew the element match or the carried paren depth
-/// (EPH-I0369 mechanism; residual (3) of EPH-I0063 re-verified dead at batch
+/// (EPH-I0369 mechanism. Residual (3) of EPH-I0063 re-verified dead at batch
 /// 14 — probe `.tmp/probe-b14/i0063_res3.zig` and corpus scan: 40 comment
 /// lines with trailing identifiers inside 1192 multi-line return regions, 2
-/// with unbalanced parens; none affect the verdict).
+/// with unbalanced parens. None affect the verdict).
 fn checkReturnTupleLine(t: []const u8, name: []const u8, scan: *ReturnTupleScan) bool {
     if (scan.remaining > 0) return advanceReturnTupleScan(t, name, scan);
     const expr = afterReturnKeyword(t) orelse return false;
@@ -19458,7 +19458,7 @@ fn stepTopLevelComma(c: u8, depth: *i32) CommaSkipVerdict {
 /// Return the position just after the first comma at bracket depth zero
 /// following `start`, or null when the call closes first. Nested parens,
 /// brackets, and braces inside the skipped argument (array dims, tuple
-/// types) do not count; the call's own closing paren ends the search.
+/// types) do not count. The call's own closing paren ends the search.
 fn skipPastTopLevelComma(t: []const u8, start: usize) ?usize {
     var depth: i32 = 0;
     var s = start;
@@ -19472,7 +19472,7 @@ fn skipPastTopLevelComma(t: []const u8, start: usize) ?usize {
 
 /// Argument start for type-first allocating calls (`std.mem.replaceOwned`).
 /// When the first argument looks like a comptime type (hasTypeFirstArg),
-/// skip it and return the second argument's start; otherwise keep first-arg
+/// skip it and return the second argument's start. Otherwise keep first-arg
 /// semantics so custom `.replaceOwned(a, b)` methods behave as before.
 fn typeFirstAllocArgStart(t: []const u8, start: usize) ?usize {
     if (!hasTypeFirstArg(t, start)) return start;
@@ -19578,8 +19578,8 @@ fn isFirstArgArena(t: []const u8) bool {
 }
 
 /// Find the position after an allocating-call pattern (standalone or qualified).
-/// For type-param-first patterns the position is the SECOND argument's start;
-/// for third-arg patterns it is the THIRD argument's start (EPH-I1113).
+/// For type-param-first patterns the position is the SECOND argument's start.
+/// For third-arg patterns it is the THIRD argument's start (EPH-I1113).
 /// Null when the line has no allocating pattern.
 fn findAllocArgStart(t: []const u8) ?usize {
     const m = matchAllocArgPattern(t) orelse return null;
@@ -19598,7 +19598,7 @@ fn findAllocArgStart(t: []const u8) ?usize {
 /// type param is skipped the same way as the single-line path.
 fn extractMultilineFirstArg(t: []const u8, lines: []const []const u8, idx: usize) ?[]const u8 {
     // A match means extractStandaloneAllocator returned null because the arg
-    // is on the next line; verified below by the trailing open paren.
+    // is on the next line. Verified below by the trailing open paren.
     const m = matchAllocArgPattern(t) orelse return null;
 
     // Check that the line ends with an open paren (possibly with trailing whitespace)
@@ -19611,7 +19611,7 @@ fn extractMultilineFirstArg(t: []const u8, lines: []const []const u8, idx: usize
     switch (m.kind) {
         .first_arg => return extractFirstArgIdent(next_line, 0),
         // The third-arg allocator sits at least two argument lines past
-        // the opener; the one-line lookahead cannot reach it. Unmodeled
+        // the opener. The one-line lookahead cannot reach it. Unmodeled
         // (the FN-only direction) (EPH-I1113).
         .third_arg => return null,
         .type_first => {},
@@ -19721,7 +19721,7 @@ fn isFunctionArgTransfer(t: []const u8, alloc_name: []const u8) bool {
 /// paren between the amp and the chain (`&(opts.buf)`, EPH-I0816) bridges
 /// the walk when the byte left of it is '&' or '(': the paren belongs to
 /// the address-of expression, and zig fmt keeps the form. The walk stops
-/// at the first non-chain byte; a '&' there starts the chain only when the
+/// at the first non-chain byte. A '&' there starts the chain only when the
 /// byte right of it is not space/tab. The discrimination rests on zig
 /// fmt's symmetric-whitespace enforcement for binary operators: on
 /// fmt-clean code an infix bitwise-and (`flags & opts.buf`) always has
@@ -20146,7 +20146,7 @@ const max_backward_lookback: usize = 64;
 
 /// Backward lookback window handed to the multi-line suppression
 /// consumers: the last max_backward_lookback lines before `idx`, or the
-/// whole prefix when shorter; null at the first line (EPH-I0425).
+/// whole prefix when shorter. Null at the first line (EPH-I0425).
 fn backwardLookbackWindow(lines: []const []const u8, idx: usize) ?[]const []const u8 {
     if (idx == 0) return null;
     const start = if (idx > max_backward_lookback) idx - max_backward_lookback else 0;
@@ -20237,7 +20237,7 @@ fn findSilentCatchCol(
         // the body brace on a following code line — the same empty catch
         // as the same-line form, invisible to the opener check above.
         // Only end-of-line or a trailing comment may follow the catch on
-        // its own line; a split verdict (`unreachable;`, a fallback
+        // its own line. A split verdict (`unreachable;`, a fallback
         // expression) belongs to ZA202/ZA207, never ZA201.
         const rest = mem.trim(u8, t[site.rest..], " \t");
         if (rest.len > 0 and !mem.startsWith(u8, rest, "//")) continue;
@@ -20343,8 +20343,8 @@ fn isVarOccurrenceInCode(
 }
 
 /// Self-fill forms for one occurrence at `i`: var_name[...] in a write
-/// context (slice forms keep the load-bearing fill verdict, EPH-I0102;
-/// bare element reads do not fill, EPH-I0752) and var_name = direct
+/// context (slice forms keep the load-bearing fill verdict, EPH-I0102.
+/// Bare element reads do not fill, EPH-I0752) and var_name = direct
 /// assignment.
 fn isSelfFillOccurrence(t: []const u8, var_name: []const u8, i: usize) bool {
     const end_i = i + var_name.len;
@@ -20386,7 +20386,7 @@ fn hasDirectFill(t: []const u8, var_name: []const u8) bool {
 /// Check if &var_name is passed to a call that fills its output buffer.
 fn hasFillCall(t: []const u8, var_name: []const u8) bool {
     // read/recv/decode/bufPrint take the output buffer as first arg or via
-    // pointer; random.bytes/.final/.encrypt/.decrypt/.hash fill an output
+    // pointer. Random.bytes/.final/.encrypt/.decrypt/.hash fill an output
     // buffer, while siblings like .update(input) only read theirs.
     const markers = [_][]const u8{
         ".read(",        ".recv(",  ".readAll(", ".decode(",  "bufPrint(",
@@ -20442,7 +20442,7 @@ fn isFillPattern(t: []const u8, var_name: []const u8) bool {
     // &var / &Struct.var / var[...] = / direct assignment, at any occurrence
     if (hasDirectFill(t, var_name)) return true;
 
-    // @memcpy(dest, src) fills dest and reads src; @memset(dest, value) fills
+    // @memcpy(dest, src) fills dest and reads src. @memset(dest, value) fills
     // dest — only the first-arg destination counts
     if (isBuiltinDest(t, var_name, "@memcpy(")) return true;
     if (isBuiltinDest(t, var_name, "@memset(")) return true;
@@ -20477,7 +20477,7 @@ const FillState = enum { none, partial };
 /// full-slice form (`buf[0..] = v`) and the address form
 /// (`@memset(&buf, v)`) cover the whole var and stay complete fills.
 /// A line holding both a partial and a complete write reads partial
-/// (conservative fire direction); the shape is vanishingly rare.
+/// (conservative fire direction). The shape is vanishingly rare.
 fn isPartialFill(t: []const u8, var_name: []const u8) bool {
     if (isCommentOrMultilineString(t)) return false;
     var iter = VarCodeOccurrenceIter.init(t, var_name);
@@ -20491,7 +20491,7 @@ fn isPartialFill(t: []const u8, var_name: []const u8) bool {
         const contents = t[end_i + 1 .. close - 1];
         if (!hasTopLevelRange(contents)) return true; // element write
         // Bounded slices (`buf[0..n]`, `buf[a..b]`, `buf[a..]`) leave
-        // bytes undefined; only `buf[0..]` covers the whole var.
+        // bytes undefined. Only `buf[0..]` covers the whole var.
         const trimmed = mem.trim(u8, contents, " \t");
         if (!mem.eql(u8, trimmed, "0..")) return true;
     }
@@ -20535,7 +20535,7 @@ fn returnKwCol(code: []const u8) ?usize {
 /// Column of the first escaping occurrence of `var_name` at or after
 /// `from` on a return line, or null. The classification lives in
 /// isEscapingOccurrence (slice-field reads and comparisons stay
-/// non-escaping, EPH-I1170); this walk adds the string mask.
+/// non-escaping, EPH-I1170). This walk adds the string mask.
 fn escapingOccurrenceCol(code: []const u8, var_name: []const u8, from: usize) ?usize {
     var cls = LineClassifier.init(code);
     var iter = VarOccurrenceIter{ .t = code, .name = var_name, .from = from };
@@ -20551,7 +20551,7 @@ fn escapingOccurrenceCol(code: []const u8, var_name: []const u8, from: usize) ?u
 /// (`return buf[0..n];`), an index into a slice
 /// (`return buf[0..4][0];` — the fill state tracks none/partial, not
 /// which indices were written, so the read byte cannot be proven
-/// written; conservative fire), and value-propagating expressions
+/// written, conservative fire), and value-propagating expressions
 /// (`return buf + 1;`). Non-escaping forms: element reads
 /// (`return buf[0];`), field reads on the var or on a slice
 /// (`return buf.len;`, `return buf[0..4].len;` — metadata carries no
@@ -20563,7 +20563,7 @@ fn isEscapingOccurrence(code: []const u8, var_name: []const u8, pos: usize) bool
     var after = pos + var_name.len;
     if (after >= code.len) return true;
     var rest = mem.trimStart(u8, code[after..], " \t");
-    // A bracket group: element reads stay silent; slices keep tracking
+    // A bracket group: element reads stay silent. Slices keep tracking
     // their suffix (a `.` after the `]` is a field read, a second
     // bracket is an element access into the slice).
     if (rest.len > 0 and rest[0] == '[') {
@@ -20726,7 +20726,7 @@ fn isStructFieldPattern(t: []const u8, col: usize) bool {
 
 /// Bounded set of pending undefined vars per file. ZA204 previously tracked
 /// a single slot, so `var a = undefined; var b = undefined;` never tracked
-/// `b` while `a` was pending. 8 slots cover realistic scopes; past that, new
+/// `b` while `a` was pending. 8 slots cover realistic scopes. Past that, new
 /// decls are skipped (bounded memory) rather than silently evicting older
 /// ones closest to their scope end.
 const max_pending_undefined = 8;
@@ -20734,7 +20734,7 @@ const max_pending_undefined = 8;
 const PendingUndefinedSet = struct {
     items: [max_pending_undefined]PendingUndefined = undefined,
     len: usize = 0,
-    // Multi-line decl state: a `var x =` line arms the next line; a
+    // Multi-line decl state: a `var x =` line arms the next line. A
     // following line that is just `undefined;`/`undefined,`/`undefined }`
     // completes the declaration.
     armed_name: ?[]const u8 = null,
@@ -20947,7 +20947,7 @@ fn lastVarConstKeyword(before: []const u8) ?usize {
 
 /// Extract the declared name when `col` (an `= undefined` match) belongs to
 /// a `var`/`const` declaration earlier on the same line. Handles multiple
-/// decls on one line (`var a = undefined; var b = undefined;`); a `;`
+/// decls on one line (`var a = undefined; var b = undefined;`). A `;`
 /// between the decl keyword and col means the decl closed a previous
 /// statement.
 fn extractVarDeclNameBefore(t: []const u8, col: usize) ?[]const u8 {
@@ -21060,7 +21060,7 @@ fn isModuleLevelDecl(raw_line: []const u8) bool {
 /// (`buf[i] = undefined`) are NOT cleanup — they clear one element of a
 /// live object, a leak-shaped single-element write that ZA204 must report
 /// (EPH-I0418, band B06 F13). isStructFieldPattern already covers
-/// dot-prefixed field writes; no other suppression applies here.
+/// dot-prefixed field writes. No other suppression applies here.
 fn isCleanupUndefinedPattern(t: []const u8, undefined_col: usize) bool {
     // The undefined_col points to the `=` in `= undefined`
     if (undefined_col < 2) return false;
@@ -21243,8 +21243,8 @@ fn trackDeferBlock(t: []const u8, state: *ErrorAnalysisState) void {
         state.in_defer_block = r.in_block;
         state.defer_brace_depth = r.depth;
     }
-    // Mid-line defer: `defer` is a keyword, so identifiers cannot fake it;
-    // string and comment positions never count. The raw "defer" pre-filter
+    // Mid-line defer: `defer` is a keyword, so identifiers cannot fake it.
+    // String and comment positions never count. The raw "defer" pre-filter
     // bounds the classifier walks to lines that contain the substring.
     if (mem.indexOf(u8, t, "defer") == null) return;
     if (containsAnyPatternInCode(t, &defer_keyword_pats)) state.has_defer_in_func = true;
@@ -21490,7 +21490,7 @@ fn removePendingField(state: *ErrorAnalysisState, i: usize) void {
 /// any path segment is exactly `test` or `tests`. Both `/` and `\`
 /// separate segments, so Windows paths classify too. WHY: one classifier
 /// serves every test-context suppression (ZA201/202/203/208, ZA204's
-/// skip, ZT104, ZT105); the old loose `/test` substring matched
+/// skip, ZT104, ZT105). The old loose `/test` substring matched
 /// `/testbed/` and `/testing/`, and the old strict form missed a
 /// top-level `test/` dir and Windows separators (EPH-I0422, band B06 F16).
 fn isTestFilePath(path: []const u8) bool {
@@ -21646,7 +21646,7 @@ fn isSoleReturnBlock(t: []const u8, open: usize, payload: []const u8) bool {
 // of `_ = param;` discards, no call-containing statement, only constant or
 // void returns, and at most a few non-discard statements (ghostty's
 // KeymapNoop.translate / OpenGL.threadEnter shape). The `!` there is
-// forced by the interface, so the note is unactionable; real infallible
+// forced by the interface, so the note is unactionable. Real infallible
 // logic (calls, computed returns, or simply no discards) keeps firing.
 // Nested fns roll up into the outer fn (same precedent as
 // ZT101): their evidence silences the outer fn, never the reverse.
@@ -21656,7 +21656,7 @@ const max_err_ret_call_idents = 4;
 
 /// Cap on non-discard body statements for the ZA209 interface-shim
 /// carve-out: a shim is a handful of param discards plus at most a
-/// constant return; more real statements means real logic (the ghostty
+/// constant return. More real statements means real logic (the ghostty
 /// draw* class), which keeps the note.
 const max_shim_body_stmts = 4;
 
@@ -21684,7 +21684,7 @@ const ErrRetFnScan = struct {
     call_ident_count: usize = 0,
     call_idents: [max_err_ret_call_idents][]const u8 = undefined,
     /// Interface-shim evidence: `_ = expr;` discards with a call-free RHS
-    /// mark unused interface params; every other `;`-terminated statement
+    /// mark unused interface params. Every other `;`-terminated statement
     /// is body work — real work when it contains a call, and any computed
     /// (non-constant) return disqualifies the shim.
     shim_discards: usize = 0,
@@ -21821,7 +21821,7 @@ fn recordOneErrorParam(sig: []const u8, pos: usize, scan: *ErrRetFnScan) void {
 
 /// Bound on same-file error-alias names the ZA209 param-type resolution
 /// consults (EPH-I1236). A file declaring more aliases overflows the
-/// table; the overflowed table then treats every bare-identifier param
+/// table. The overflowed table then treats every bare-identifier param
 /// type as error-typed — the over-suppression (FP-safe) direction for a
 /// note rule.
 const max_file_error_aliases = 16;
@@ -22034,7 +22034,7 @@ fn scanReturnConstness(seg: []const u8, scan: *ErrRetFnScan) void {
 
 /// Classify one accumulated `;`-terminated statement for the shim
 /// carve-out: `_ = expr;` with a call-free RHS is a param discard (a `_ =
-/// foo();` call-result discard is real work, not a shim marker); anything
+/// foo();` call-result discard is real work, not a shim marker). Anything
 /// else is body work — real when it contains a call — and returns are
 /// checked for computed expressions. Leading block braces are stripped so
 /// `} _ = self;` still anchors the discard.
@@ -22061,7 +22061,7 @@ fn classifyShimStatement(seg_raw: []const u8, scan: *ErrRetFnScan) void {
 /// Accumulate one literal-blanked body slice into the shim statement
 /// buffer, classifying each completed (`;`-terminated) statement.
 /// Statements span lines (a zig-fmt-wrapped call finalizes at its distant
-/// `;`, keeping its parens visible); semicolon-free constructs (a comptime
+/// `;`, keeping its parens visible). Semicolon-free constructs (a comptime
 /// dispatch switch) never finalize and are dropped at fn end.
 fn scanShimEvidence(blanked: []const u8, scan: *ErrRetFnScan) void {
     for (blanked) |c| {
@@ -22083,7 +22083,7 @@ fn scanShimEvidence(blanked: []const u8, scan: *ErrRetFnScan) void {
 }
 
 /// Feed one literal-blanked line into the shim scan. Signature lines only
-/// contribute text after the body's opening `{`; lines inside the body
+/// contribute text after the body's opening `{`. Lines inside the body
 /// contribute in full. The body brace is paren-aware: an inline
 /// `enum { a, b }` param's brace is signature text, and feeding its member
 /// text into the shim buffer would merge it with the first body statement
@@ -22417,7 +22417,7 @@ const ExitDeferCtx = struct {
 /// ZA206, and an `exit(` inside a string literal before the real call
 /// never suppresses it — every occurrence is scanned, not just the first
 /// (EPH-I0416, band B06 F10). A bare `exit(` is an arbitrary user
-/// function, not a process exit; only the qualified forms fire.
+/// function, not a process exit. Only the qualified forms fire.
 fn findExitCallInCode(t: []const u8) ?usize {
     // One classifier walk plus one comment-start walk per call
     // (EPH-I0153): candidates ascend within a call.
@@ -22612,7 +22612,7 @@ const ScanCtx = struct {
 
 /// Drive one per-file analyzer over every file in the graph and merge
 /// its findings (EPH-I1232, EPH-I0419): the iterator prologue that six
-/// graph analyzers once duplicated. `visit` runs per entry; the OOM
+/// graph analyzers once duplicated. `visit` runs per entry. The OOM
 /// path frees the partial list with errdefer. The fn-typed param sits
 /// on the def line, so passing a file-local visit fn records a
 /// delegation edge and ZT101/ZT105 reachability crosses the hop
@@ -22640,7 +22640,7 @@ fn visitErrorFile(c: ScanCtx, a: FileAnalysis) anyerror!void {
 
 /// Run the error-handling analyzers (ZA201-ZA210) over every file in the
 /// graph and return the merged issue list. WHY: this driver is the only
-/// top-level analyzer the band left undocumented; its list carries
+/// top-level analyzer the band left undocumented. Its list carries
 /// heap-owned messages, so the OOM path frees the partial list with
 /// errdefer (EPH-I0419, band B06 F14).
 fn analyzeErrors(
@@ -22825,7 +22825,7 @@ fn hasWholeWord(seg: []const u8, comptime word_p: fn ([]const u8) bool) bool {
             continue;
         }
         if (word_p(seg[start..i])) return true;
-        // An uppercase letter opens the next word; an underline is consumed.
+        // An uppercase letter opens the next word. An underline is consumed.
         if (seg[i] == '_') {
             start = i + 1;
             i = start;
@@ -23187,7 +23187,7 @@ fn isTestRefLine(t: []const u8) bool {
 /// the testing allocator or FailingAllocator. std.testing.allocator (and
 /// FailingAllocator wrapping it) reports leaks as test failures at deinit,
 /// so a block using either already has an assertion mechanism (ZT102).
-/// `testing.allocator` matches any dotted path ending in it; whole-identifier
+/// `testing.allocator` matches any dotted path ending in it. Whole-identifier
 /// boundaries keep `contesting.allocator` from matching.
 fn referencesTestingAllocator(neutral: []const u8) bool {
     return hasIdentRef(neutral, "testing.allocator") or
@@ -23261,7 +23261,7 @@ fn reportTestBlock(ctx: *const TestScanCtx, state: *const TestFileScanState) !vo
 /// opener's tail blanks to end of line for the same reason (EPH-I0671).
 /// Lines longer than `buf` fall back to the raw line — a literal brace on
 /// an over-cap line still reaches brace tracking (documented bound,
-/// EPH-I0444: generated/giant lines only; the ZT band masks those
+/// EPH-I0444: generated/giant lines only. The ZT band masks those
 /// chunk-wise via BlankChunkIter, EPH-I0423).
 fn blankLiteralContents(line: []const u8, buf: []u8) []const u8 {
     if (line.len > buf.len) return line;
@@ -23315,7 +23315,7 @@ const BlankChunkIter = struct {
         return .{ .line = line, .buf = buf, .cls = LineClassifier.init(line) };
     }
 
-    /// Mask the next chunk of the line into `buf`; null when the line is
+    /// Mask the next chunk of the line into `buf`. Null when the line is
     /// exhausted (covers an empty line). The call site iterates with
     /// `while (iter.next()) |chunk|`, so the optional is the rule.
     fn next(self: *BlankChunkIter) ?[]const u8 {
@@ -23376,7 +23376,7 @@ const max_lie_candidates = 8;
 
 /// Per-test-block ZT101 state: the fns the test name claims to exercise.
 /// Whether any was called is decided at block close from the accumulated
-/// body calls plus file-local call-graph reachability; `referenced` marks
+/// body calls plus file-local call-graph reachability. `referenced` marks
 /// candidates appearing as values in the body.
 const LieTestState = struct {
     candidates: [max_lie_candidates][]const u8 = undefined,
@@ -23460,7 +23460,7 @@ const FnDef = struct {
 /// Extract the fn defined on this trimmed line, if any: a real `fn name`
 /// with a word boundary on BOTH sides — `findRealFnDef` alone accepts the
 /// "fn " inside `has_fn and ...`, inventing a fn named `and`. The name is
-/// a plain identifier or the `@"..."` quoted form; both spellings come
+/// a plain identifier or the `@"..."` quoted form. Both spellings come
 /// from pubFnNameAt so a quoted decl matches a quoted call site's
 /// callSiteName spelling (EPH-I0442, EPH-I0908).
 fn extractFnDef(t: []const u8) ?FnDef {
@@ -23491,7 +23491,7 @@ const DelegationEdge = struct {
 /// names excluded from candidacy. Keys and callee names borrow the file
 /// content, which outlives the maps. The graph includes excluded fns as
 /// intermediate nodes — a test reaching fn X through a local helper (or a
-/// pipeline entry delegating to X) is not lying; the call edge is a fact.
+/// pipeline entry delegating to X) is not lying. The call edge is a fact.
 /// `asserting` holds every fn whose own body contains an assertion call —
 /// the ZT102 helper-mediation witness set: a test delegating to one of
 /// these verifies through it, so the block is never smoke. `defs` and
@@ -23529,7 +23529,7 @@ const FnCallFacts = struct {
     /// fn whose body contains an assertion call joins the `asserting`
     /// witness set (ZT102 helper-mediation, the EPH-I0048-tightened
     /// witness predicate — word-boundary verbs minus the enum
-    /// token-matcher shape); nested-fn assertions roll up into the outer
+    /// token-matcher shape). Nested-fn assertions roll up into the outer
     /// fn, the same FP-safe precedent as the call edges.
     fn recordCallees(
         self: *FnCallFacts,
@@ -23799,7 +23799,7 @@ fn braceDelta(depth: usize, blanked: []const u8) usize {
 
 /// Brace depth at an offset into one literal-blanked line, with `/* */`
 /// spans skipped (EPH-I0925): only code braces before the offset count.
-/// The input is literal-blanked, so string/char braces are already data;
+/// The input is literal-blanked, so string/char braces are already data.
 /// `/* */` spans are mid-edit text — Zig has no block comments (the
 /// I0916 ruling) — but their braces must not shift the depth. `//` tails
 /// never reach the caller's slice (findCommentStart strips them), so the
@@ -23866,7 +23866,7 @@ fn looksLikeCodeRef(word: []const u8) bool {
 
 /// ZT101 candidates from a string-form test name (`rest` starts with `"`).
 /// A word becomes a candidate only when it looks like a code reference AND
-/// exactly names a non-excluded local fn; prose words fail both gates —
+/// exactly names a non-excluded local fn. Prose words fail both gates —
 /// the exact-match requirement is the FP guard.
 fn lieStateFromStringName(
     rest: []const u8,
@@ -23913,7 +23913,7 @@ fn identWordEnd(text: []const u8, start: usize) usize {
 
 /// Extract ZT101 state from a test opener line (`t` starts with "test "):
 /// ident form (`test fooBar`) contributes the name itself — an explicit
-/// identifier, no prose ambiguity, so no shape filter; string form splits
+/// identifier, no prose ambiguity, so no shape filter. String form splits
 /// into words. Anonymous `test {` has no name to lie about.
 fn extractLieTestState(
     t: []const u8,
@@ -23935,7 +23935,7 @@ fn extractLieTestState(
 }
 
 /// Cap on distinct call targets collected per test body (ZT101). A test
-/// calling more is pathological; over-cap shrinks the reachable set, which
+/// calling more is pathological. Over-cap shrinks the reachable set, which
 /// can only cost a TP — never invent an FP — so the cap stays generous.
 const max_body_calls = 512;
 
@@ -23957,7 +23957,7 @@ fn collectLineCalls(
 }
 
 /// Max call-graph depth when resolving helper-mediated calls (ZT101). Deeper
-/// mediation chains are pathological; the cap keeps the walk bounded.
+/// mediation chains are pathological. The cap keeps the walk bounded.
 const max_call_depth = 8;
 
 /// Bounded call-graph work item: a callee plus its hop depth.
@@ -23967,7 +23967,7 @@ const ReachWork = struct {
 };
 
 /// Work-stack + visited set for computeReachableCalls, bundled to keep
-/// param counts low. Consumed LIFO (stack pop — a DFS); the traversal
+/// param counts low. Consumed LIFO (stack pop — a DFS). The traversal
 /// order is irrelevant without the depth cap, because the visited set
 /// makes the uncapped reachability result order-independent (EPH-I0436).
 const ReachBfs = struct {
@@ -24001,7 +24001,7 @@ const ReachBfs = struct {
 
 /// All fn names reachable from a test body's direct calls through the
 /// file-local call graph (depth-capped, cycle-safe via the reachable set
-/// itself; traversal order is a DFS, irrelevant to the result without the
+/// itself. Traversal order is a DFS, irrelevant to the result without the
 /// depth cap — under the cap a name first pushed at the cap never expands,
 /// so the capped result can depend on order). The
 /// direct calls are included: a body that calls the
@@ -24043,7 +24043,7 @@ fn sharesImplCallee(
 
 /// ZT101: a test whose name references a local fn but whose body never
 /// calls it — directly, through file-local helpers, or via the candidate's
-/// own implementation — lies about what it verifies; `zig build test`
+/// own implementation — lies about what it verifies. `zig build test`
 /// reports it green either way. Comptime name dispatch is invisible:
 /// `@field(ns, "parseHeader")(...)` leaves only a string occurrence, and
 /// string contents are data, not call evidence — such tests fire, with a
@@ -24122,7 +24122,7 @@ fn isCleanupCatchForm(clc: CatchLineCtx) bool {
 
 /// ZT104 message for one catch site in test context, else null.
 /// In test context ZA201 (empty catch) and ZA202 (catch unreachable) are
-/// suppressed; ZT104 is their exact replacement — a test that cannot
+/// suppressed. ZT104 is their exact replacement — a test that cannot
 /// observe failure lies, because `zig build test` reports it green either
 /// way. `catch undefined` is deliberately NOT covered: ZA207 keeps firing
 /// in tests (UB earns the warning) as the strictly stronger reporter, so a
@@ -24220,7 +24220,7 @@ fn trackTestDeferBlock(neutral: []const u8, state: *TestFileScanState) void {
 /// Mark ZT101 candidates referenced as values on the test block's START
 /// line (ZA506 D6, EPH-I1081): only text after the opening `{` counts —
 /// the test's own name precedes the brace and is not a body reference.
-/// Non-start lines call markLieReferences directly; the caller holds the
+/// Non-start lines call markLieReferences directly. The caller holds the
 /// starts_test state and dispatches.
 fn markTestStartLieReferences(code: []const u8, state: *TestFileScanState) void {
     const blanked = blankLiteralContents(code, &state.blank_buf);
@@ -24264,7 +24264,7 @@ fn scanLineCatches(
 /// `test"x" {`, `test{`, and the Allman forms where the brace (or the
 /// name) sits on a later line (probed with zig ast-check, 2026-08-12,
 /// EPH-I0435). `test` is a reserved keyword, so no identifier can start
-/// with it; the boundary still requires a non-identifier byte after the
+/// with it. The boundary still requires a non-identifier byte after the
 /// keyword to reject `testing` and friends.
 fn isTestOpenerLine(t: []const u8) bool {
     return mem.startsWith(u8, t, "test") and (t.len == 4 or !isIdent(t[4]));
@@ -24272,7 +24272,7 @@ fn isTestOpenerLine(t: []const u8) bool {
 
 /// A carried brace-less `test "name"` opener (the Allman form, EPH-I0435):
 /// `active` when a previous line opened a test declaration whose block
-/// brace has not arrived; `line` is the opener's line number — the report
+/// brace has not arrived. `line` is the opener's line number — the report
 /// anchor and lie-name source when the block opens.
 const PendingTest = struct {
     active: bool = false,
@@ -24294,7 +24294,7 @@ const TestOpener = struct {
 /// is the next token after the name — so a later fn def (`test "x"` then
 /// `fn f() void {`) never opens a phantom block. Blank and comment lines
 /// keep a pending opener alive (the grammar allows whitespace and
-/// comments between the name and the block); the first non-blank line
+/// comments between the name and the block). The first non-blank line
 /// without a leading `{` drops it. Two probed shapes stay unhandled by
 /// design: the name on its own line (`test` then `"name"` then `{`) and
 /// a name that itself contains a `{` (`test "a{b"` with the block brace
@@ -24542,7 +24542,7 @@ fn collectTestBlocks(
 }
 
 // --- ZT105: untested public functions (project-level) ---
-// `zig build test` can only report on tests that exist; it cannot see the
+// `zig build test` can only report on tests that exist. It cannot see the
 // public API surface no test exercises at all. ZT105 collects every pub fn
 // declaration in the project and reports those whose name never appears in
 // test context. Test evidence spans the whole project corpus: identifiers
@@ -24658,7 +24658,7 @@ const UntestedFnScanCtx = struct {
 
 /// Mutable per-file state for the ZT105 pass (bundled for param counts).
 /// The buffers back literal-blanking and the signature-normalization
-/// window; the reachability seeds live on the shared evidence (the
+/// window. The reachability seeds live on the shared evidence (the
 /// project pass runs once, after every file is scanned).
 const UntestedFnFileState = struct {
     in_test: bool = false,
@@ -24666,7 +24666,7 @@ const UntestedFnFileState = struct {
     blank_buf: [16 * 1024]u8 = undefined,
     sig_buf: [max_signature_lookahead]u8 = undefined,
     /// Brace-less `test "name"` opener carried to the next line (the
-    /// Allman form, EPH-I0435); blank and comment lines keep it alive.
+    /// Allman form, EPH-I0435). Blank and comment lines keep it alive.
     pending: PendingTest = .{},
     /// The previous significant line's ending token (EPH-I0913): blank
     /// and comment-only lines keep it, so a continuation `.field` line
@@ -24687,7 +24687,7 @@ const pub_fn_prefixes = [_][]const u8{
 
 /// The fn name declared after a matched prefix: `.name` borrows the line,
 /// `.end` is the offset just past the name (for a quoted name, past the
-/// closing quote). A plain identifier scans as before; a `@"..."` quoted
+/// closing quote). A plain identifier scans as before. A `@"..."` quoted
 /// name (EPH-I0031) yields its inner content — the spelling a call site
 /// shares. Malformed quotes yield null: a broken decl is not a candidate.
 const PubFnName = struct {
@@ -24751,10 +24751,10 @@ fn quotedIdentSpan(code: []const u8, i: usize) ?QuotedIdentSpan {
 /// Returns the index just past the quoted name, or null when `i` does not
 /// open a well-formed quoted identifier (EPH-I0031). A quoted field name
 /// in a struct literal (`.{ .@"cwd" = ... }`) still aliases — the plain
-/// `.field` form is excluded by the run tokenizer (EPH-I0909); the quoted
+/// `.field` form is excluded by the run tokenizer (EPH-I0909). The quoted
 /// literal shape is rare enough to leave conservative. The per-run flags
 /// bundle (ZA506 D6) carries the test-context state the same way
-/// collectIdentRunEvidence receives it; only `in_test_context` selects
+/// collectIdentRunEvidence receives it. Only `in_test_context` selects
 /// the destination set here.
 fn collectQuotedIdentEvidence(
     ctx: *const UntestedFnScanCtx,
@@ -24862,7 +24862,7 @@ fn lineTailOf(code: []const u8) LineTail {
 /// a pointer deref `*`, or an optional unwrap `?`) rather than a
 /// struct-literal / enum-tag dot (EPH-I0911). A field-access field name
 /// may hold a fn value (`@import("row.zig").neverExtendBg`), so it keeps
-/// the conservative aliasing; a literal/tag dot never does (EPH-I0909).
+/// the conservative aliasing. A literal/tag dot never does (EPH-I0909).
 /// The lookback skips indentation: a dot at the start of a line
 /// continues the previous line's value expression, whose ending token
 /// decides (`prev`, EPH-I0913). Boundary: a `)` base separated from the
@@ -24893,7 +24893,7 @@ fn isFieldAccessDot(code: []const u8, dot: usize, prev: LineTail) bool {
 /// name, never dot-split: quoted content is one byte string. A bare
 /// `.field` run in non-test value position (struct-literal LHS/shorthand,
 /// enum tag) is a field name, not a fn reference, and never aliases
-/// (EPH-I0909); a dotted chain (`x.field`) stays conservative — the field
+/// (EPH-I0909). A dotted chain (`x.field`) stays conservative — the field
 /// may hold a fn value. `prev_tail` is the previous significant line's
 /// ending token, consulted when the dot sits at the start of a
 /// continuation line (EPH-I0913).
@@ -25106,7 +25106,7 @@ fn scanUntestedFnLine(
     // Every test context seeds the reachability pass — inline test blocks
     // and whole test files alike: a helper called from either is a live
     // edge into the project call graph (EPH-I0429). Test files contribute
-    // their whole content as evidence already; the seeds add the edges.
+    // their whole content as evidence already. The seeds add the edges.
     if (in_test_context) {
         try collectTestRootCalls(code, &ctx.evidence.seeds, ctx.allocator);
     }
@@ -25136,7 +25136,7 @@ fn mergeCalleesIntoIndex(
 /// foo_test.zig that calls a helper defined in foo.zig still exercises
 /// every pub fn the helper's body reaches — the 2-hop cross-file chain
 /// the file-local walk could not see. The index merges every file's
-/// callee facts by name; a name defined in several files expands through
+/// callee facts by name. A name defined in several files expands through
 /// all of them, the same name-based over-approximation the per-file
 /// graph already made (note severity, and the direction is fewer notes).
 /// The collateral is bounded by nothing but the name: tigerbeetle's
@@ -25254,16 +25254,16 @@ fn reportUntestedPubFns(
 // half: what one run of a block can exercise. A block whose body carries
 // no call site invokes no function, so executing it covers no function
 // body: the runner counts it as a passing test while it verifies nothing
-// dynamic. ZT105 names the pub fns no test reaches; ZT106 names the tests
+// dynamic. ZT105 names the pub fns no test reaches. ZT106 names the tests
 // that reach nothing — the two directions of the golden rule's mechanical
 // floor. Note severity and FN-tolerant by design (EPH-I1089): anything
 // that could hide an invocation counts as one — `if (`/`while (`/`switch (`
 // condition parens read as call sites, and any @builtin like @compileError
 // does too — so a block fires only when its body provably calls nothing.
 // Accepted FN bounds: the two unhandled Allman shapes and same-line double
-// test decls the listing skips stay silent; a body that only declares
+// test decls the listing skips stay silent. A body that only declares
 // items (nested consts, comptime blocks without calls) fires — the block
-// executes no call either way; a body whose brace group never balances
+// executes no call either way. A body whose brace group never balances
 // stays silent (fail open).
 
 /// The first code-position `{` of a test block's body, starting at the
@@ -25284,7 +25284,7 @@ fn testBodyOpenPos(
         const code_end = findCommentStart(lines[idx]) orelse lines[idx].len;
         const code = lines[idx][0..code_end];
         // The trimmed blanked line keeps braceGroupEndLine's column frame
-        // (trimmed, literal-blanked); blanking preserves length.
+        // (trimmed, literal-blanked). Blanking preserves length.
         const neutral = mem.trim(u8, blankLiteralContents(code, blank_buf), " \t\r");
         const col = mem.indexOfScalar(u8, neutral, '{') orelse continue;
         return .{ .idx = idx, .col = col };
@@ -25293,12 +25293,12 @@ fn testBodyOpenPos(
 }
 
 /// The body-open scan bound (EPH-I1089): the Allman opener's brace sits on
-/// the next line at most; the bound also caps a hostile broken file.
+/// the next line at most. The bound also caps a hostile broken file.
 const test_body_open_scan = 8;
 
 /// ZT106: report each discovered test block whose body carries no call
 /// site (EPH-I1089). The body span runs from the block's opener through
-/// its brace group's close line; an unbounded body stays silent. Blocks
+/// its brace group's close line. An unbounded body stays silent. Blocks
 /// arrive sorted by file, so the per-file line split runs once per file.
 fn reportInvocationlessTestBlocks(
     allocator: Allocator,
@@ -25571,7 +25571,7 @@ const FnLockRecord = struct {
 
 /// LIFO capacity of the defer brace-kind stack (EPH-I0928): brace
 /// nesting inside one defer context. 64 matches the bit width of the
-/// kind word; an overflow fails loud (pushDeferBrace).
+/// kind word. An overflow fails loud (pushDeferBrace).
 const max_defer_stack_depth = 64;
 
 /// Index of struct names declared in ONE file, each mapped to whether the
@@ -25623,7 +25623,7 @@ const ConcurrencyScanState = struct {
     /// Literal-blanking buffer for one file pass (16 KB): an over-cap
     /// line returns unblanked, so a literal brace on it still counts
     /// toward brace depth (documented bound, EPH-I0444 — rare,
-    /// generated/giant lines only; see blankLiteralContents).
+    /// generated/giant lines only. See blankLiteralContents).
     blank_buf: [16 * 1024]u8 = undefined,
 
     fn deinit(self: *ConcurrencyScanState) void {
@@ -25713,7 +25713,7 @@ fn isSemaphoreAcquire(seg: []const u8) bool {
 
 /// ZC101 release family, paired to acquires by `releaseMatchesAcquire`.
 /// The Uncancelable unlock variants are not std 0.16 but appear in
-/// third-party lock impls; over-matching releases only ever suppresses a
+/// third-party lock impls. Over-matching releases only ever suppresses a
 /// warning — the safe direction.
 fn isReleaseMethod(seg: []const u8) bool {
     const methods = [_][]const u8{
@@ -25809,7 +25809,7 @@ fn isDiscardedAcquire(code: []const u8, call_start: usize) bool {
 /// defer_depth reads zero. The mixed scalar broke the invariant twice
 /// (reviewer r2 F1): a `} defer {` continuation disarmed to zero
 /// mid-line and re-opened with in_defer stuck false, so the
-/// continuation body's acquires recorded plain (FP); a close-then-open
+/// continuation body's acquires recorded plain (FP). A close-then-open
 /// line (`} if (c) {`) left a stale depth the next armed defer walked
 /// from, so its own close never reached zero and in_defer stayed true
 /// past the block (silent). A keyword line whose only `{` sits inside
@@ -25828,7 +25828,7 @@ fn trackConcurrencyDefer(
 ) void {
     const kw = keyword_code_pos orelse blanked.len;
     // The first `{` at/after the keyword opens the deferred statement's
-    // block (EPH-I0928); a line with no keyword has no opener (the kw
+    // block (EPH-I0928). A line with no keyword has no opener (the kw
     // sentinel sits past the line end, so no brace position matches it).
     const opener_pos = mem.indexOfPos(u8, blanked, kw, "{") orelse blanked.len;
     for (blanked, 0..) |c, i| {
@@ -25895,7 +25895,7 @@ fn popDeferBrace(state: *ConcurrencyScanState) void {
 
 /// Open a fn record when a pending fn def gains its body `{` (ZC101).
 /// A pending def ended by `;` first is a bodiless extern decl — drop it.
-/// Fns nested inside another fn are not tracked separately; their calls
+/// Fns nested inside another fn are not tracked separately. Their calls
 /// roll up into the outer fn's record (widens coverage — FP-safe).
 /// The body brace is the first `{` OUTSIDE the signature's parens: a
 /// `.{}` default param value opens no record of its own, so a wrapped
@@ -25970,7 +25970,7 @@ fn firstConcParen(sig: []const []const u8) ?ConcPos {
 
 /// Collect the param-list text from (line, col) through its matching
 /// depth-1 ')' into a fresh buffer (EPH-I1228). The returned slice is
-/// caller-owned; group chars keep their depth for the segment walk.
+/// caller-owned. Group chars keep their depth for the segment walk.
 fn collectConcSigText(
     allocator: Allocator,
     sig: []const []const u8,
@@ -26002,7 +26002,7 @@ fn isConcListEnd(c: u8, depth: usize) bool {
 }
 
 /// Depth delta of one param-list char (EPH-I1228): openers deepen,
-/// closers shallow; other chars leave the depth unchanged.
+/// closers shallow. Other chars leave the depth unchanged.
 fn concDepthDelta(c: u8) i32 {
     if (c == '(' or c == '{') return 1;
     if (c == ')' or c == '}') return -1;
@@ -26134,7 +26134,7 @@ fn stripConcTypeToken(t: []const u8) []const u8 {
 fn isDomainLockCall(state: *const ConcurrencyScanState, receiver: []const u8) bool {
     if (mem.indexOfScalar(u8, receiver, '.') != null) return false;
     // The open fn record is always the last appended (same invariant as
-    // ConcurrencyScanState.current); the const path avoids the mutable
+    // ConcurrencyScanState.current). The const path avoids the mutable
     // accessor here.
     const rec = &state.records.items[state.records.items.len - 1];
     for (rec.params.items) |param| {
@@ -26281,7 +26281,7 @@ fn scanConcurrencyCalls(state: *ConcurrencyScanState, lc: ConcLineCtx) !void {
         if (kind == .other) continue;
         // A free-function release pairs by its first argument (the lock
         // object), not by the module receiver (`compat.fileUnlock(file)`
-        // releases `file`; a bare `fileUnlock(file)` has no receiver at
+        // releases `file`. A bare `fileUnlock(file)` has no receiver at
         // all). An argument-less call of the name is not followed.
         const receiver = if (isFreeFnReleaseMethod(seg))
             firstCallArg(lc.blanked, site.open_paren) orelse continue
@@ -26523,7 +26523,7 @@ fn closeOpensArm(rest: []const u8) bool {
 }
 
 /// Index just past a `/*` block comment starting at `i` (t[i] == '/',
-/// t[i + 1] == '*'); the line end when the comment is unterminated.
+/// t[i + 1] == '*'). The line end when the comment is unterminated.
 fn skipBlockComment(t: []const u8, i: usize) usize {
     var j = i + 2;
     while (j + 1 < t.len and !(t[j] == '*' and t[j + 1] == '/')) j += 1;
@@ -26637,7 +26637,7 @@ fn scanConcurrencyLine(
     // depth — the brace depth at the keyword, so a `} defer ...` or
     // `{ defer ...` continuation registers at the post-close or
     // inside-block depth (EPH-I0439). Computed BEFORE
-    // trackConcurrencyDefer mutates block state; for lines inside an
+    // trackConcurrencyDefer mutates block state. For lines inside an
     // open defer block the depth captured at the opener applies.
     // Only code braces count: `code` is comment-stripped by
     // findCommentStart (the `// }` line-comment form never reaches the
@@ -26725,13 +26725,13 @@ fn hasPlainReleaseAtDepth(
 
 /// True when any OTHER fn record in the file releases this acquire — the
 /// cross-function acquire/release idiom (zls: `pool.mutex.lock()` in
-/// `stringToSliceLock`, unlocked in `LockedString.release`; InternPool's
+/// `stringToSliceLock`, unlocked in `LockedString.release`. InternPool's
 /// `ip.lock` pairs). The receiver field-chain text must match exactly.
 /// File-local bound (EPH-I0443): the scan holds one file's fn records,
 /// so a release living in ANOTHER file never pairs here — a cross-file
 /// lock API draws the warning below, not a note. Over-warn only (a
 /// resolved handle flagged), the same bound ZC104's join search
-/// discloses; a project-wide receiver index would close the gap.
+/// discloses. A project-wide receiver index would close the gap.
 fn hasCrossFnRelease(
     records: []const FnLockRecord,
     self_idx: usize,
@@ -26783,11 +26783,11 @@ fn emitUnlockNotDeferred(sink: *const ConcurrencyIssueSink, acq: LockAcquire) !v
 
 /// ZC101 verdict cascade for one acquire: a same-fn defer release whose
 /// statement depth covers the acquire (even a conditional one) is
-/// covered; a top-level plain release is a note (error paths before it
-/// skip it); a tiny acquire wrapper is intentional API design; a
+/// covered. A top-level plain release is a note (error paths before it
+/// skip it). A tiny acquire wrapper is intentional API design. A
 /// branch-scoped release whose other half lives in a sibling release fn
-/// (zls tryLockConfig/unlockConfig) is that idiom; a lone branch-scoped
-/// release is a note (some paths release, some leak); no release anywhere
+/// (zls tryLockConfig/unlockConfig) is that idiom. A lone branch-scoped
+/// release is a note (some paths release, some leak). No release anywhere
 /// is a warning.
 fn evaluateAcquire(
     sink: *const ConcurrencyIssueSink,
@@ -26891,7 +26891,7 @@ fn buildLockEvents(
 /// branch-scoped (deferred) release fired on only some held paths.
 /// `arm` records sibling-chain membership: after an arm-opening close
 /// (`} else {` or `},`) a later same-depth acquire is a DISJOINT path,
-/// never a re-lock; the flag survives only while each subsequent close
+/// never a re-lock. The flag survives only while each subsequent close
 /// opens another arm — a plain close ends the chain and later blocks are
 /// sequential (their paths overlap).
 const HeldLock = struct {
@@ -26952,7 +26952,7 @@ fn emitDoubleLock(
 }
 
 /// Acquire transition for the ZC102 walk. Semaphore waits are exempt (a
-/// counting semaphore may wait twice legally); a tryLock-family second
+/// counting semaphore may wait twice legally). A tryLock-family second
 /// acquire cannot block (the try simply fails), so it never deadlocks.
 fn onWalkAcquire(walk: *DoubleLockWalk, acq: LockAcquire) !void {
     if (isSemaphoreAcquire(acq.method)) return;
@@ -26975,7 +26975,7 @@ fn onWalkAcquire(walk: *DoubleLockWalk, acq: LockAcquire) !void {
 }
 
 /// Plain-release transition. A release at the acquire's own depth or
-/// shallower runs on every held path and clears the hold; a BRANCH-
+/// shallower runs on every held path and clears the hold. A BRANCH-
 /// scoped release (deeper than the acquire) runs only on the branch's
 /// paths, so the hold is downgraded to path-conditional (F4) — a later
 /// re-acquire still warns on the non-releasing paths.
@@ -26998,10 +26998,10 @@ fn onWalkDeferRelease(walk: *DoubleLockWalk, rel: LockRelease) !void {
 
 /// Fire the pending deferred releases whose scope this close ends (F1):
 /// a defer at depth D runs when its depth-D block exits (the close drops
-/// to D-1; braces decrement one level at a time, so every scope's close
+/// to D-1. Braces decrement one level at a time, so every scope's close
 /// is observed). A release covering the held acquire (ZC101's
 /// deferCovers, including the tryLock guard-block exception) fires on
-/// every held path and clears the hold; any other matching defer fired
+/// every held path and clears the hold. Any other matching defer fired
 /// on a subset of paths — downgrade the hold to path-conditional.
 fn fireScopedDefers(walk: *DoubleLockWalk, c: BlockClose) void {
     var i: usize = 0;
@@ -27031,7 +27031,7 @@ fn deferFireOne(walk: *DoubleLockWalk, rel: LockRelease) void {
 /// Close transition: fire scoped defers first (they execute at this
 /// scope's exit), then update held records. A non-arm close at or below
 /// an arm-close's depth ends the sibling chain (F2) — later blocks are
-/// sequential; an arm-opening close keeps the chain alive (the next
+/// sequential. An arm-opening close keeps the chain alive (the next
 /// prong or else-if is still a sibling).
 fn onWalkClose(walk: *DoubleLockWalk, c: BlockClose) void {
     fireScopedDefers(walk, c);
@@ -27065,7 +27065,7 @@ fn applyLockEvent(walk: *DoubleLockWalk, ev: LockEvent) !void {
 /// ZC102: walk one fn's lock events in source order, tracking per-receiver
 /// held state. A blocking acquire while the receiver is held on the same
 /// linear path (or on overlapping paths once the hold is path-
-/// conditional) is a double lock; acquires in sibling if/else arms or
+/// conditional) is a double lock. Acquires in sibling if/else arms or
 /// switch prongs are disjoint paths and never flagged.
 fn evaluateDoubleLock(sink: *const ConcurrencyIssueSink, rec: *const FnLockRecord) !void {
     var events = try buildLockEvents(sink.allocator, rec);
@@ -27142,7 +27142,7 @@ fn checkTryLockDefer(sink: *const ConcurrencyIssueSink, rec: *const FnLockRecord
 /// acquire is in-file evidence by construction.
 /// Evaluate every fn record once the file scan is complete — cross-fn
 /// evidence needs the whole file first. ZC101 judges each acquire's
-/// coverage; ZC102 walks the ordered lock flow for re-acquires; ZC103
+/// coverage. ZC102 walks the ordered lock flow for re-acquires. ZC103
 /// checks the conditional-tryLock defer warning.
 fn evaluateLockRecords(
     sink: *const ConcurrencyIssueSink,
@@ -27177,7 +27177,7 @@ const SpawnScanCtx = struct {
 /// True for `std.Thread.spawn` and alias forms (`Thread.spawn` when
 /// std.Thread is imported by name) — but NOT `MyThread.spawn` (the dot
 /// boundary rejects it), `child.spawn`, or `exe.spawn` (process spawning
-/// has no join/detach requirement; std.process.Child is reaped by wait()).
+/// has no join/detach requirement. Std.process.Child is reaped by wait()).
 fn isThreadSpawnTarget(target: []const u8) bool {
     if (mem.eql(u8, target, "Thread.spawn")) return true;
     return mem.endsWith(u8, target, ".Thread.spawn");
@@ -27287,12 +27287,12 @@ fn hasReturnOf(code: []const u8, name: []const u8) bool {
 /// comments are never evidence — a "t.join()" in a format string joins
 /// nothing. The `.dotted` boundary admits a preceding `.` on the join
 /// search (the last-segment fallback's `receiver.field.join(` admission,
-/// EPH-I0904); the exact-name search keeps the strict boundary so
+/// EPH-I0904). The exact-name search keeps the strict boundary so
 /// `event.t.join(` never satisfies a local `t`.
 /// File-local bound (EPH-I0443): the search covers the spawn's own file
 /// only, so a handle stored here and joined in ANOTHER file draws the
 /// warning below. Over-warn, the safe direction (the last-segment
-/// fallback only ever suppresses); a project-wide join search would
+/// fallback only ever suppresses). A project-wide join search would
 /// close the gap.
 fn findSpawnResolution(
     ctx: SpawnScanCtx,
@@ -27531,7 +27531,7 @@ fn countIdentInCode(code: []const u8, name: []const u8) usize {
 /// (`const dbl = dbl;`) is a use. Every caller answers "used or not"
 /// (> 0), so the scan returns 1 at the first confirmed use: the fallback
 /// cost is the content prefix up to the first use, not the whole file
-/// (EPH-I0438). Exact counting lives in IdentUseIndex (EPH-I0762); this
+/// (EPH-I0438). Exact counting lives in IdentUseIndex (EPH-I0762). This
 /// scan stays as the fallback for non-identifier names and as the
 /// verdict oracle.
 fn countRealIdentUses(content: []const u8, name: []const u8, decl_line: usize) usize {
@@ -27545,7 +27545,7 @@ fn countRealIdentUses(content: []const u8, name: []const u8, decl_line: usize) u
         const code = line[0..code_end];
         if (line_num == decl_line) {
             // The alias is the one plain occurrence the declaration
-            // itself contributes; a second plain occurrence on the line
+            // itself contributes. A second plain occurrence on the line
             // confirms a use. Member accesses on the line are initializer
             // parts, never uses (EPH-I0445).
             if (countIdentInCodeMode(code, name, .plain) > 1) return 1;
@@ -27863,8 +27863,8 @@ const CloneLine = struct {
     line: usize,
 };
 
-/// One file in the clone scan. path/content borrow the graph's storage;
-/// the stream owns only its array.
+/// One file in the clone scan. path/content borrow the graph's storage.
+/// The stream owns only its array.
 const CloneFile = struct {
     path: []const u8,
     content: []const u8,
@@ -27966,7 +27966,7 @@ fn analyzeClones(
 }
 
 /// Build one file's normalized-line stream. Lines inside test bodies and
-/// comment/multiline-string-only lines never join; code lines enter as
+/// comment/multiline-string-only lines never join. Code lines enter as
 /// trimmed, comment-stripped byte ranges. The test-body walk mirrors
 /// collectFileTestBlocks so both passes agree on block membership, plus
 /// one deliberate superset: the closing brace of each test block leaves
@@ -28139,7 +28139,7 @@ fn reportCloneRun(
 
 /// The witness for one run: the smallest (file, stream) occurrence of the
 /// head window's content outside the run, or a second in-run offset when
-/// the run is self-contained. Bucket lookups are by hash; the caller
+/// the run is self-contained. Bucket lookups are by hash. The caller
 /// re-verifies the bytes (cloneWindowsMatch) before reporting.
 fn findCloneWitness(scan: *const CloneScan, run: CloneRun) ?CloneOccurrence {
     const digest = scan.files.items[run.file].hashWindow(run.head);
@@ -28177,7 +28177,7 @@ fn occBefore(a: CloneOccurrence, b: CloneOccurrence) bool {
 }
 
 /// Byte-verify that two windows carry identical normalized content. The
-/// bucket match is a 64-bit hash; this recheck guards hash collisions.
+/// bucket match is a 64-bit hash. This recheck guards hash collisions.
 fn cloneWindowsMatch(
     scan: *const CloneScan,
     a_file: u32,
@@ -28237,7 +28237,7 @@ fn hasCompatComponent(path: []const u8) bool {
 //     appears inside an if/switch condition in the body (the
 //     two-functions-in-one-signature class).
 //   ZA507 redundant else — an else whose if-branch ends in
-//     return/break/continue (the guard-clause style; note severity).
+//     return/break/continue (the guard-clause style, note severity).
 //     else-if links, switch `else =>` prongs, and error-capture elses
 //     stay silent.
 //   ZA508 simplifiable boolean return — `if (x) return true else return
@@ -28254,9 +28254,9 @@ const FnIfaceOpen = struct {
     name_rel_end: usize,
     /// Byte offset of the `fn` keyword (the signature start).
     sig_start: usize,
-    /// Byte offset of the body's opening `{`; set when the body opens.
+    /// Byte offset of the body's opening `{`. Set when the body opens.
     body_brace: usize,
-    /// Byte offset of the body's closing `}`; set when the span closes.
+    /// Byte offset of the body's closing `}`. Set when the span closes.
     body_end: usize,
     is_pub: bool,
     /// extern/export/callconv prefix seen before the `fn` keyword.
@@ -28281,7 +28281,7 @@ const ParamParse = struct {
 };
 
 /// Per-file scan state for the fn-interface pass. Pending holds a def whose
-/// signature has not reached its body brace; active holds the open fn whose
+/// signature has not reached its body brace. Active holds the open fn whose
 /// body is being walked. The depth invariant: while active, `depth` counts
 /// the braces still open inside the body and is never 0 (the body's own
 /// brace is the innermost open).
@@ -28317,7 +28317,7 @@ const FnIfaceCtx = struct {
     path: []const u8,
     sinks: FnIfaceSinks,
     /// Names the file references as fn values (the ZA505 generic-adapter
-    /// carve-out, EPH-I1238). Borrowed from the per-file pre-pass; the
+    /// carve-out, EPH-I1238). Borrowed from the per-file pre-pass. The
     /// keys are owned dupes freed after the file visit.
     value_refs: *const ValueRefSet,
 };
@@ -28398,7 +28398,7 @@ fn appendSegment(list: SegmentList, seg: []const u8) SegmentList {
 }
 
 /// Names one file references as fn values (the ZA505 generic-adapter
-/// carve-out, EPH-I1238; serves REL-ZERO-1 and REL-AB-5). A wrapper whose
+/// carve-out, EPH-I1238. Serves REL-ZERO-1 and REL-AB-5). A wrapper whose
 /// name takes a value position — an argument segment, an assignment
 /// right-hand side, or a return expression — is an instantiation adapter:
 /// a generic callee cannot serve those positions, so the wrapper exists to
@@ -28550,7 +28550,7 @@ fn parenFollowsControlKeyword(code: []const u8, pos: usize) bool {
     return false;
 }
 
-/// Record one value-referenced name (an owned dupe; the scan surface is a
+/// Record one value-referenced name (an owned dupe. The scan surface is a
 /// per-line stack buffer).
 fn recordValueRef(set: *ValueRefSet, allocator: Allocator, name: []const u8) !void {
     if (set.contains(name)) return;
@@ -28600,9 +28600,9 @@ fn visitFnInterfaceFile(c: FnIfaceCtx, content: []const u8) !void {
 
 /// Advance the fn-interface multiline-string state for one non-blank,
 /// non-`\\`/`//` line. Returns true when the line is string content and
-/// the caller must skip it. A mid-line `\\` opener enters the string; a
+/// the caller must skip it. A mid-line `\\` opener enters the string. A
 /// terminator-shaped line (`;`/`,` or a closer, EPH-I0973/I0974) leaves
-/// it; every other line stays content.
+/// it. Every other line stays content.
 fn advanceFnIfaceMline(in_mline: *bool, open_braces: *isize, t: []const u8, mask_buf: []u8) bool {
     if (!in_mline.*) {
         if (hasMidLineMultilineOpener(t)) {
@@ -28920,7 +28920,7 @@ fn checkPassthroughWrapper(
     // one. A dotted ref could bind a method, but the same bytes also read
     // as a field or slice-length access (`items.len`), so no value-ref
     // form silences a receiver-typed wrapper — the FN-eliminating
-    // direction; a method genuinely taken as a fn value stays a rare
+    // direction. A method genuinely taken as a fn value stays a rare
     // un-silenced firing.
     const has_self_receiver = params.len > 0 and params[0].is_self;
     if (!has_self_receiver and c.value_refs.contains(open.name)) return;
@@ -28963,7 +28963,7 @@ fn forwardCallee(body: []const u8) ?ForwardCall {
     const open_paren = mem.indexOfScalar(u8, expr, '(') orelse return null;
     const callee = mem.trim(u8, expr[0..open_paren], " \t\r\n");
     // A leading dot is the anonymous-struct literal shorthand (`.init(x)`
-    // means `.{ .init = x }`), not a call; a leading @ is a builtin.
+    // means `.{ .init = x }`), not a call. A leading @ is a builtin.
     if (callee.len == 0 or callee[0] == '@' or callee[0] == '.') return null;
     for (callee) |ch| {
         if (ch != '.' and !types.isIdent(ch)) return null;
@@ -29005,7 +29005,7 @@ const ForwardNames = struct {
     has_self: bool = false,
 };
 
-/// Collect the non-self parameter names; null when a malformed name or
+/// Collect the non-self parameter names. Null when a malformed name or
 /// the cap would break the comparison.
 fn collectForwardNames(params: []const FnParam) ?ForwardNames {
     var result: ForwardNames = .{};
@@ -29609,7 +29609,7 @@ fn checkRedundantElse(c: FnIfaceCtx, open: FnIfaceOpen, masked: []const u8) !voi
 
 /// Next word-boundary `else` in the masked body at or after `from` (the
 /// masked body has no string/comment content, so a plain boundary check
-/// suffices; `orelse` fails the leading boundary).
+/// suffices. `orelse` fails the leading boundary).
 fn maskedElsePos(masked: []const u8, from: usize) ?usize {
     var s = from;
     while (mem.indexOfPos(u8, masked, s, "else")) |pos| {
@@ -29921,7 +29921,7 @@ fn appendMaskedBody(
 }
 
 /// Report one fn-interface finding into the rule's sink. ZA405/ZA406
-/// findings join the unused list; ZA505/ZA506/ZA507/ZA508 join the
+/// findings join the unused list. ZA505/ZA506/ZA507/ZA508 join the
 /// structure list.
 fn reportFnIfaceIssue(c: FnIfaceCtx, open: FnIfaceOpen, f: FnIfaceFinding) !void {
     const is_unused = mem.eql(u8, f.rule, RULE_UNUSED_PARAM) or
@@ -30032,7 +30032,7 @@ const UnusedFnScan = struct {
     /// The reference set rides the ZT105 evidence: `tested` holds every
     /// identifier run in code position (the maximal suppression set — the
     /// ZT105 tokenizer in its test-context mode). `aliased`/`seeds`/
-    /// `decls` stay empty; the ZA404 candidate list is the scan's own.
+    /// `decls` stay empty. The ZA404 candidate list is the scan's own.
     evidence: UntestedFnEvidence = UntestedFnEvidence{},
 
     fn deinit(self: *UnusedFnScan, allocator: Allocator) void {
@@ -30235,7 +30235,7 @@ const ComplexityState = struct {
     // EPH-I1059/EPH-I1093/EPH-I1096: extern / export / callconv(.c) /
     // callconv(.Stdcall) fns. The pinned ABI fixes the parameter list
     // (skytale proc_pidinfo carries 5 params the macOS libproc C API
-    // fixes; export pins the C ABI; .Stdcall is the WinAPI class), so
+    // fixes. Export pins the C ABI. .Stdcall is the WinAPI class), so
     // ZA303 never fires on them.
     is_c_abi: bool = false,
     cyclomatic: usize = 1,
@@ -30582,8 +30582,8 @@ fn isFlatChain(state: *const ComplexityState) bool {
 /// 3. The qualifying shape is the TOP-LEVEL dispatcher (fn > switch, arms
 /// directly in the switch scope): a guard-wrapped switch costs 2 excess
 /// per arm and falls outside the bound. Arms with real logic (embedded
-/// branches, try/catch, else blocks) blow the excess bound and stay out;
-/// so does a two-arm switch whose arms carry ifs (the EPH-I0884 probe).
+/// branches, try/catch, else blocks) blow the excess bound and stay out.
+/// So does a two-arm switch whose arms carry ifs (the EPH-I0884 probe).
 fn isFlatSwitch(state: *const ComplexityState) bool {
     return state.switch_arms > 0 and
         state.cognitive <= state.cyclomatic + state.switch_arms and
@@ -30661,9 +30661,9 @@ fn isDataTableLogicChar(t: []const u8, pos: usize, c: u8) bool {
     switch (c) {
         '[', ']', '+', '-', '*', '/', '%', '&', '|' => return true,
         '^', '!', '<', '~', '?', '@', '\\' => return true,
-        // `=>` is the arm arrow (data); `==` is a comparison (logic).
+        // `=>` is the arm arrow (data). `==` is a comparison (logic).
         '=' => return pos + 1 < t.len and t[pos + 1] == '=',
-        // `=>` is the arrow (data); a lone `>` is a comparison (logic).
+        // `=>` is the arrow (data). A lone `>` is a comparison (logic).
         '>' => return pos == 0 or t[pos - 1] != '=',
         '(' => {
             // A call is an identifier char directly before the paren.
@@ -30686,7 +30686,7 @@ fn isDataTableLogicChar(t: []const u8, pos: usize, c: u8) bool {
 /// standalone else branch), operators and indexing (`[ ] + - * / % & | ^
 /// ! < > ~ ? @ \`), and calls — a `(` preceded by an identifier that is
 /// not a control keyword (`switch (`/`return switch (` are headers, so
-/// they pass; `myFn(` is logic).
+/// they pass. `myFn(` is logic).
 fn disqualifiesDataTable(t: []const u8) bool {
     var lit = types.LiteralState.forLine(t) orelse return false;
     var i: usize = 0;
@@ -30698,7 +30698,7 @@ fn disqualifiesDataTable(t: []const u8) bool {
     inline for (.{ "if", "while", "for", "try", "catch", "orelse", "and", "or", "defer", "errdefer", "comptime", "inline", "break", "continue", "noinline" }) |kw| {
         if (hasToken(t, kw)) return true;
     }
-    // A standalone else block is logic; the arm form `else =>` is data.
+    // A standalone else block is logic. The arm form `else =>` is data.
     return hasElseBranch(t);
 }
 
@@ -30915,7 +30915,7 @@ fn findRealFnDef(t: []const u8) ?usize {
 
 /// Detect function start and initialize complexity state
 /// Bounded lookahead when counting params of a multi-line signature — a
-/// wrapped param list is at most a few hundred bytes; 16 KiB caps the scan on
+/// wrapped param list is at most a few hundred bytes. 16 KiB caps the scan on
 /// pathological input without ever truncating a realistic signature.
 const max_signature_lookahead = 16384;
 
@@ -31093,7 +31093,7 @@ fn paramListEnd(sig: []const u8) ?usize {
 /// caller pins: `callconv(.c)` or `callconv(.C)` (the C calling convention,
 /// EPH-I1059) or `callconv(.Stdcall)` (the Windows WinAPI convention — the
 /// same ABI-pinned class, EPH-I1093). The closing `)` in each needle keeps
-/// `callconv(.cc)` and `callconv(.Cdecl)` out; the ident-boundary filter
+/// `callconv(.cc)` and `callconv(.Cdecl)` out. The ident-boundary filter
 /// guards the left edge of the needle.
 fn hasAbiPinnedCallconv(t: []const u8) bool {
     inline for (.{ "callconv(.c)", "callconv(.C)", "callconv(.Stdcall)" }) |mark| {
@@ -31123,7 +31123,7 @@ fn openFnState(
         // marker sits on a later line than the keyword line.
         .is_type_factory = isTypeFactory(sig),
         .is_data_dispatch = pending.is_data_dispatch,
-        // EPH-I0277: every fn opens as a data-table candidate; body lines
+        // EPH-I0277: every fn opens as a data-table candidate. Body lines
         // with logic disqualify it.
         .is_data_table = true,
         // EPH-I1059: the C ABI pins the parameter list, so ZA303 skips it.
@@ -31211,7 +31211,7 @@ fn detectFnStart(view: LineView, state: *ComplexityState, line_num: usize) void 
     // The signature wrapped past this line: defer the state open until the
     // body `{` arrives. A `;` terminator means a bodiless decl — drop it.
     // Only a code `{` inside the parens (a `.{}` default) reaches this
-    // drop; the plain one-line decl returned at isBodilessFnDecl.
+    // drop. The plain one-line decl returned at isBodilessFnDecl.
     if (endsWithCodeSemicolon(t)) return;
     state.pending = pending;
 }
@@ -31327,7 +31327,7 @@ fn elseFamilyNest(t: []const u8, state: *const ComplexityState) usize {
 /// open, at the block's actual open depth. A leading close (`} else {`)
 /// is already processed, so the else block opens one level shallower than
 /// the pre-line nest+1 guess — the old marker leaked +1 cog_nest for the
-/// rest of the fn. One marker per line; a keyword line whose only `{` is a
+/// rest of the fn. One marker per line. A keyword line whose only `{` is a
 /// masked literal sets none (EPH-I0818).
 fn markCognitiveScope(scan: *BraceScan, state: *ComplexityState) void {
     if (!scan.scope_open or scan.scope_marked) return;
@@ -31354,7 +31354,7 @@ fn updateBraceState(
 /// Apply one `{` open (updateBraceState).
 /// EPH-I0811: a `{` right after a code `.` opens an anonymous
 /// struct/array literal — data, not a control-flow block. It adds no
-/// depth; its paired close skips too (LIFO, below). The adjacency is
+/// depth. Its paired close skips too (LIFO, below). The adjacency is
 /// exact: `.` + `{` is the one literal token, and scan.prev_c only
 /// ever holds code chars. Depths >= 32 cannot be recorded, so the
 /// brace counts there and stays balanced by its real close (mirrors
@@ -31370,7 +31370,7 @@ fn applyOpenBrace(scan: *BraceScan, state: *ComplexityState) void {
         // EPH-I0451: a switch prong's open brace adds no depth. Skipping
         // only the open left every block prong at net -1 and ended fns
         // mid-switch, so the skip is recorded per depth and the matching
-        // close skips too. Only the line's first `{` is the prong's; later
+        // close skips too. Only the line's first `{` is the prong's. Later
         // opens on the line are inner braces and count. Depths >= 32
         // cannot be recorded, so the brace counts there and stays balanced
         // by its real close.
@@ -31389,7 +31389,7 @@ fn applyOpenBrace(scan: *BraceScan, state: *ComplexityState) void {
 /// always the innermost open at its depth, so its close arrives
 /// before any prong or control close.
 /// EPH-I0451: closes pair LIFO. A close at a depth with a pending
-/// skipped open matches that open and skips too; inner counted
+/// skipped open matches that open and skips too. Inner counted
 /// braces always balance before this close arrives.
 fn applyCloseBrace(state: *ComplexityState) bool {
     if (state.nest < 32 and state.lit_opens[state.nest] > 0) {
@@ -31443,7 +31443,7 @@ fn processComplexityLine(
 ) !void {
     const t = view.t;
     // A nested fn start (e.g. a method of a local struct) makes
-    // detectFnStart reset state; report the in-flight fn's accumulated
+    // detectFnStart reset state. Report the in-flight fn's accumulated
     // verdicts first or they are silently discarded.
     if (resetsInFlightFn(view, state)) try reporter.report(state);
     const was_in_fn = state.in_fn;
@@ -31585,10 +31585,10 @@ const AstTierObs = struct {
 
 /// AST tier driver: parse each file with the host std.Ast and run the
 /// AST-native rules (currently ZA111). Files with parse errors are skipped
-/// inside the tier; the line tier still covers them. A non-null
+/// inside the tier. The line tier still covers them. A non-null
 /// `obs.parse` receives one ZA503 warning per file the host parser
 /// rejects (EPH-I0742) — the check pipeline routes those to the
-/// structure report; commands without that report pass null. `obs.skips`
+/// structure report. Commands without that report pass null. `obs.skips`
 /// records the path of every skipped file, observed from the tier's own
 /// per-file skip counter (EPH-I1197), so the skip note can name the
 /// files.
@@ -31635,7 +31635,7 @@ fn recordSkipPath(
 
 /// Byte length of the unicode sequence starting at `bytes[i]`, or 1 for an
 /// ASCII char and for a malformed/continuation byte. Valid sequences
-/// collapse to one codepoint; malformed bytes stay byte-counted so garbage
+/// collapse to one codepoint. Malformed bytes stay byte-counted so garbage
 /// never under-reports (EPH-I0248). A cluster counts only when the line
 /// carries every continuation byte (each in 0x80-0xBF) and the first one
 /// respects the overlong/surrogate sub-ranges (firstContinuationValid).
@@ -31676,7 +31676,7 @@ fn isContinuationByte(b: u8) bool {
 }
 
 /// Advance `i` over a tab or CR at `line[i.*]`, returning the column
-/// after it (tabs expand to 4-space boundaries); null when the byte is
+/// after it (tabs expand to 4-space boundaries). Null when the byte is
 /// neither — the caller counts it as a codepoint.
 fn advanceTabOrCr(line: []const u8, col: usize, i: *usize) ?usize {
     if (line[i.*] == '\t') {
@@ -31837,7 +31837,7 @@ fn reportLineTooLong(
 /// - "DO NOT EDIT": sig wycheproof.zig (`//! DO NOT EDIT! ...`),
 ///   ghostty nerd_font_attributes.zig (`//! DO NOT EDIT BY HAND!`), and
 ///   zls src/Config.zig (generated by src/tools/config_gen.zig)
-/// libqt6zig's generated bindings carry no banner; that class stays an
+/// libqt6zig's generated bindings carry no banner. That class stays an
 /// accepted corpus cost (README "Generated files", EPH-I1062).
 const generated_banner_tokens = [_][]const u8{
     "Code generated",
@@ -31848,7 +31848,7 @@ const generated_banner_tokens = [_][]const u8{
 /// True when `content` carries a generated-file banner in its head: one
 /// of `generated_banner_tokens` inside a comment among the first two
 /// non-empty lines. Every banner verified in the corpus sits on line 1
-/// or 2; the two-line window keeps a prose mention on line 3 or later
+/// or 2. The two-line window keeps a prose mention on line 3 or later
 /// from marking hand-written code generated, and the comment-line
 /// requirement keeps a string literal on line one from matching. Both
 /// bounds are pinned by the EPH-I1062 test.
@@ -32157,7 +32157,7 @@ fn isConstTypeModifier(t: []const u8, pos: usize) bool {
 /// declaration: its segment — from the previous `;` or `}` (or the line
 /// start) up to the keyword — begins with the extern prefix (`extern ` or
 /// `pub extern `). Extern declaration names are ABI-fixed and can never
-/// conform, so the naming checks skip them; a same-line trailing
+/// conform, so the naming checks skip them. A same-line trailing
 /// declaration starts its own segment and stays checked (EPH-I0901). The
 /// boundary scan is raw: a `;` or `}` inside a string cannot be the last
 /// boundary before a code keyword (the string must close before the code
@@ -32242,7 +32242,7 @@ fn checkConstDeclName(
 /// the name's end to the next top-level `;` (findDeclEnd), or to the
 /// line end when the declaration has no `=` or continues on a later
 /// line. The segment's own `=` is the first at or after the name, so a
-/// same-line neighbor's RHS never classifies the checked decl; a
+/// same-line neighbor's RHS never classifies the checked decl. A
 /// declaration without its own `=` has no RHS to classify — the empty
 /// segment reads as a plain value (EPH-I0896).
 fn declSegmentAt(t: []const u8, name_end: usize) []const u8 {
@@ -32452,7 +32452,7 @@ fn checkTypeReturningFnName(ctx: NamingLineCtx, name: []const u8, name_col: usiz
     });
 }
 
-/// Check error naming against the configured convention (ZA703; default
+/// Check error naming against the configured convention (ZA703. Default
 /// TitleCase, the community standard — the stdlib itself declares TitleCase
 /// error names).
 ///
@@ -32529,7 +32529,7 @@ const ErrorSetTriviaVerdict = enum { continue_scan, stop, member };
 /// Classify one error-set trivia byte at `i` (skipErrorSetTrivia): a
 /// comment opener or `||` stops the walk, a string literal and a brace
 /// step the scan forward, and anything else is a member start. `{`
-/// deepens and `}` shallows the caller's set depth; the `}` that closes
+/// deepens and `}` shallows the caller's set depth. The `}` that closes
 /// the set stops the walk too.
 fn stepErrorSetTrivia(t: []const u8, i: *usize, depth: *usize) ErrorSetTriviaVerdict {
     const c = t[i.*];
@@ -32553,7 +32553,7 @@ fn stepErrorSetTrivia(t: []const u8, i: *usize, depth: *usize) ErrorSetTriviaVer
 
 /// Check error set members on this line against the configured convention
 /// (caller guarantees the line is inside an error block). `_`-prefixed
-/// names are exempt; std-lib names are NOT — a project DECLARES its own
+/// names are exempt. Std-lib names are NOT — a project DECLARES its own
 /// members, so it can rename a member that collides with a std name
 /// (EPH-I0473). References never fire at all (EPH-I1075), so the std-name
 /// exemption applies to declarations only, and only in snake_case mode
@@ -32643,7 +32643,7 @@ fn trackErrorBlockDepth(t: []const u8, depth: *usize) void {
 
 /// Verdict of one error-block depth-track step (trackErrorBlockDepth):
 /// keep scanning, or stop — a `\\` multiline tail or a line comment
-/// ends the walk; their braces and `error{` text are data, not syntax.
+/// ends the walk. Their braces and `error{` text are data, not syntax.
 const ErrorBlockDepthVerdict = enum { continue_scan, stop };
 
 /// Advance one char of the error-block depth track
@@ -32985,7 +32985,7 @@ fn findTypeBodyBrace(content: []const u8, kw_end: usize) usize {
     return i;
 }
 
-/// Swallow one char inside a `//` or `\\` run; both end at newline.
+/// Swallow one char inside a `//` or `\\` run. Both end at newline.
 fn scanSwallowComment(scan: *ClosureBodyScan, c: u8) bool {
     if (!scan.in_line_comment and !scan.in_ml_str) return false;
     if (c == '\n') {
@@ -33021,7 +33021,7 @@ fn scanSkipQuoted(scan: *ClosureBodyScan, content: []const u8, i: usize) ?usize 
     return null;
 }
 
-/// Enter a `//` or `\\` run (consuming its second char); null otherwise.
+/// Enter a `//` or `\\` run (consuming its second char). Null otherwise.
 fn scanStartComment(scan: *ClosureBodyScan, content: []const u8, i: usize) ?usize {
     if (content[i] == '/' and i + 1 < content.len and content[i + 1] == '/') {
         scan.in_line_comment = true;
@@ -33072,7 +33072,7 @@ const CFGState = struct {
     // seen, parens and signature containers (anonymous enum/struct param
     // types, error sets, default-value literals) are tracked separately so a
     // container's `}` on its own line cannot truncate extraction.
-    // isize: a stray `)` must not underflow-panic; negative depth degrades to next-fn recovery.
+    // isize: a stray `)` must not underflow-panic. Negative depth degrades to next-fn recovery.
     paren_depth: isize = 0,
     sig_container_depth: usize = 0,
     body_started: bool = false,
@@ -33283,8 +33283,8 @@ fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
     const fn_pos = mem.indexOf(u8, t, "fn ") orelse return false;
 
     if (fn_pos > 0) {
-        // An OPEN string literal at fn_pos makes `fn ` data (fixture text);
-        // a CLOSED string before it must not hide the declaration (EPH-I0471).
+        // An OPEN string literal at fn_pos makes `fn ` data (fixture text).
+        // A CLOSED string before it must not hide the declaration (EPH-I0471).
         if (isInsideString(t, fn_pos)) return false;
         // Comment text is prose, not a declaration. findCommentStart is
         // string-aware, so a `//` inside a closed string cannot hide the fn.
@@ -33310,13 +33310,13 @@ fn detectCFGFuncStart(t: []const u8, state: *CFGState, line_num: usize) bool {
     state.sig_in_str = false;
     // Detect if function returns errors: ) ! or !void, !bool, etc.
     // (shared marker set — continuation signature lines are OR-ed in by
-    // trackCFGBraces while the body has not started, EPH-I0072; the
+    // trackCFGBraces while the body has not started, EPH-I0072. The
     // depth-0 return-position gate is EPH-I0075)
     state.fn_returns_error = lineHasErrorReturnMarker(t, 0);
 
     // Detect noreturn functions: memory leaks do not matter in noreturn
     // fns, so the leak-coverage rules (ZA101/ZA103) skip them
-    // (EPH-I0073; the word-bounded depth-gated marker is the same
+    // (EPH-I0073. The word-bounded depth-gated marker is the same
     // helper's twin).
     state.fn_is_noreturn = lineHasNoreturnMarker(t, 0);
 
@@ -33410,7 +33410,7 @@ fn scanCFGSignatureLine(t: []const u8, state: *CFGState) usize {
     return t.len;
 }
 
-/// Advance one signature-scan char (scanCFGSignatureLine); returns the
+/// Advance one signature-scan char (scanCFGSignatureLine). Returns the
 /// index just past the body brace when the body opens at this char, or
 /// null to keep scanning. Tracks paren depth and signature containers
 /// (anonymous enum/struct param types, error sets, default-value
@@ -33453,8 +33453,8 @@ fn lineEndsInStringContinuation(t: []const u8) bool {
 }
 
 /// True when the `{` at index i opens an error set (`error {...}`) rather
-/// than a function body. Whitespace between `error` and `{` is tolerated;
-/// that is the parity with the naming-side twin matchesErrorSetOpen
+/// than a function body. Whitespace between `error` and `{` is tolerated.
+/// That is the parity with the naming-side twin matchesErrorSetOpen
 /// (EPH-I0470). A left boundary guard mirrors the twin: an identifier
 /// byte before `error` rejects the match, so `myerror {` is a return
 /// type, not the keyword. Same-line lookback only: an `error` keyword
@@ -33542,7 +33542,7 @@ fn deinitIssuePayloads(items: []Issue, a: Allocator) void {
 /// try-alloc count as M (EPH-I1006). The 10 MiB source cap (EPH-I0150)
 /// bounds the input file, not the blowup: a single attacker-controlled
 /// function of hundreds of thousands of lines is a hang class. These caps
-/// bound the families' input; a function past either cap skips the family
+/// bound the families' input. A function past either cap skips the family
 /// with a note. Measured 2026-08-16: an adversarial single-alloc function
 /// costs ~2.5 s at the 2048-line cap, and the four-project corpus runs at
 /// 0.91-4.34 s per project (zls 0.91, ghostty 4.34, sig 3.87, tigerbeetle
@@ -33572,7 +33572,7 @@ const MemCapNoteCtx = struct {
 };
 
 /// Emit the skip note for a memory-family cap: the function exceeds the
-/// named cap, so the family skips it. A note never fails a gate; it keeps
+/// named cap, so the family skips it. A note never fails a gate. It keeps
 /// the skip visible in the report (EPH-I0350).
 fn appendMemFamilyCapNote(ctx: MemCapNoteCtx) !void {
     const msg = try std.fmt.allocPrint(
@@ -33586,7 +33586,7 @@ fn appendMemFamilyCapNote(ctx: MemCapNoteCtx) !void {
 
 /// Shared skip-note emission: append the caller's owned message as a
 /// memory-family cap note. The caller keeps its errdefer next to the
-/// allocation, so the free mirrors the alloc in the same scope; the note
+/// allocation, so the free mirrors the alloc in the same scope. The note
 /// owns the message after a successful append (message_owned).
 fn appendCapNote(ctx: MemCapNoteCtx, msg: []const u8) !void {
     try ctx.out.append(ctx.a, .{
@@ -33615,7 +33615,7 @@ fn appendErrdeferTailCapNote(ctx: MemCapNoteCtx) !void {
     try appendCapNote(ctx, msg);
 }
 
-/// True when the allocation count exceeds the family cap; the skip note is
+/// True when the allocation count exceeds the family cap. The skip note is
 /// emitted then, and the caller returns without analyzing (EPH-I0350).
 fn overAllocCapEmitsNote(
     p: MemCapNoteCtx,
@@ -33627,7 +33627,7 @@ fn overAllocCapEmitsNote(
     return true;
 }
 
-/// True when the try-alloc count exceeds the family cap; the ZA103 tail
+/// True when the try-alloc count exceeds the family cap. The ZA103 tail
 /// emits its own note then, and the caller returns without analyzing
 /// (EPH-I1006).
 fn overErrdeferCapEmitsNote(
@@ -33662,7 +33662,7 @@ fn isNoFreeRecipient(run: CFGRunCtx) bool {
 }
 
 /// The memory-family tail: ZA103 errdefer coverage and the must-return-ref
-/// check. The line cap bounds the tail's ZA103 walk too (EPH-I1006); ZA110
+/// check. The line cap bounds the tail's ZA103 walk too (EPH-I1006). ZA110
 /// stays uncapped — checkMustReturnRef is a single linear pass.
 fn runDeferredTailAnalyses(run: CFGRunCtx) !void {
     const a = run.file.allocator;
@@ -33710,7 +33710,7 @@ fn runDeferredTailAnalyses(run: CFGRunCtx) !void {
     // ZA103 tail joins the alloc cap, EPH-I1006): the appendSlice transfer
     // needs the same guard as r1/r2 — on an OOM the array defer frees only
     // the backing array, so the errdefer frees the payloads without the
-    // array; after a successful transfer the payloads belong to out
+    // array. After a successful transfer the payloads belong to out
     // (EPH-I0895).
     var r3_owns_payloads = true;
     errdefer if (r3_owns_payloads) deinitIssuePayloads(r3.items, a);
@@ -33741,7 +33741,7 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
     // The out.appendSlice transfer is the EPH-I0882 consumer side: on an
     // OOM the array defer frees only the backing array, so r1's
     // message_owned payloads would leak. The errdefer frees the payloads
-    // without the array; after a successful transfer the payloads belong
+    // without the array. After a successful transfer the payloads belong
     // to out and a later failure must not free them again (EPH-I0895).
     var r1_owns_payloads = true;
     errdefer if (r1_owns_payloads) deinitIssuePayloads(r1.items, a);
@@ -33764,7 +33764,7 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
     // skip note reaches it through analyzeCFGDeferCoverage's
     // overAllocCapEmitsNote (EPH-I0350). The appendSlice transfer needs
     // the same guard — on an OOM the array defer frees only the backing
-    // array, so the errdefer frees the payloads without the array; after
+    // array, so the errdefer frees the payloads without the array. After
     // a successful transfer the payloads belong to out (EPH-I0895, B45-1).
     var r2_owns_payloads = true;
     errdefer if (r2_owns_payloads) deinitIssuePayloads(r2.items, a);
@@ -33780,12 +33780,12 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
 // Zig has no move semantics: `return list;` copies the container header into
 // the result slot, so the returned value and the local share one backing
 // allocation. The PLAIN idiom (`var list = ...; return list;`) is safe —
-// the local is dead after the copy and the caller holds the only owner; it
+// the local is dead after the copy and the caller holds the only owner. It
 // is the stdlib/community ownership-transfer pattern, so firing on it is a
 // false positive (39/39 hits on ephor itself were exactly this idiom).
 // The defect is the armed defer: `defer list.deinit()` runs at scope close,
 // AFTER the copy — the returned value's backing is freed before the caller
-// can use it (certain use-after-free; a double-free once the caller deinits).
+// can use it (certain use-after-free, a double-free once the caller deinits).
 // errdefer does NOT fire on the success path, so it is correctly silent.
 // Accepted FNs (v1): labeled-block returns (`break :blk list`) — tracked
 // for ZA110 under EPH-I0481 (EPH-I0046 covers the labeled-block shape for
@@ -33795,8 +33795,8 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
 // w.deinit(); return w.list;`) stays silent: whether the whole-owner
 // deinit frees the returned field's backing is owner-dependent, the same
 // uncertainty that scopes the v2 direction (EPH-I1046). Copy
-// aliases drop when the alias or its RHS reassigns after the declaration;
-// the sweep is conservative — a conditional rebind also drops, FN-only
+// aliases drop when the alias or its RHS reassigns after the declaration.
+// The sweep is conservative — a conditional rebind also drops, FN-only
 // (EPH-I1048).
 //
 // v2 (EPH-I0038): `return self.field;` from a managed-container fn copies
@@ -33806,7 +33806,7 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
 // return x;` — returned path is the local x, v2-invisible — or
 // `self.list = .empty; return self.list;`). v2 fires on a non-local
 // field path with no armed exact-path defer when no reset of that exact
-// path is visible before the return line (inclusive; a statement after a
+// path is visible before the return line (inclusive. A statement after a
 // return cannot compile). A visible reset anywhere — even a conditional
 // one — suppresses: the FN-only conservative direction. Receiver shapes
 // are not discriminated: a by-value or pointer receiver and a module
@@ -33828,10 +33828,10 @@ fn runCFGMemoryAnalyses(run: CFGRunCtx) !void {
 const max_sig_join_lines = 16;
 const max_sig_bytes = 1024;
 const max_tracked_locals = 64;
-/// Armed-defer-path cap; overflow is FN-only — the extra defer never arms
+/// Armed-defer-path cap. Overflow is FN-only — the extra defer never arms
 /// a return (same direction as the locals and alias caps, EPH-I0485).
 const max_defer_paths = 8;
-/// Copy-alias cap; overflow is FN-only — the extra alias never matches a
+/// Copy-alias cap. Overflow is FN-only — the extra alias never matches a
 /// defer path (same direction as the locals and defer-path caps).
 const max_alias_copies = 16;
 
@@ -33959,7 +33959,7 @@ fn returnExprPath(t: []const u8, expr_from: usize) ?[]const u8 {
 /// and same-line statements after a `;` are real returns, so the scan
 /// iterates all occurrences instead of requiring a line-leading return
 /// (EPH-I0478). String and comment text is data (the caller strips
-/// comments; literals are masked here).
+/// comments. Literals are masked here).
 fn returnedLocalPath(t: []const u8) ?[]const u8 {
     var cls = LineClassifier.init(t);
     var from: usize = 0;
@@ -33981,7 +33981,7 @@ const MustReturnRefCtx = struct {
     fp: []const u8,
 };
 
-/// Record `var/const x` declarations (bounded; overflow only narrows the
+/// Record `var/const x` declarations (bounded. Overflow only narrows the
 /// defer-armed set — never a false positive).
 fn trackLocalDecl(
     t: []const u8,
@@ -34033,8 +34033,8 @@ fn hasRealDeferKeyword(t: []const u8) bool {
 /// Append one `.deinit(`/`.close(` receiver path (ident chain) to the
 /// scan's `paths`, tagged with the armed method (EPH-I1117: close is the
 /// resource release for Io.File/Io.Dir, the deinit-free managed
-/// containers). Same leading/trailing-dot and `..` guards as v1;
-/// duplicate paths are skipped so a repeated release cannot starve the
+/// containers). Same leading/trailing-dot and `..` guards as v1.
+/// Duplicate paths are skipped so a repeated release cannot starve the
 /// cap. The scan struct carries the path set so the signature stays
 /// within the parameter threshold.
 fn collectManagedPath(
@@ -34212,7 +34212,7 @@ fn collectDeferDeinitPaths(
     var from: usize = 0;
     if (state.active) {
         // The statement began on an earlier line: the code prefix is its
-        // continuation until it terminates; new defer statements may
+        // continuation until it terminates. New defer statements may
         // follow on the same line after that.
         state.active = false;
         depth = state.depth;
@@ -34234,7 +34234,7 @@ fn collectDeferDeinitPaths(
 
 /// A single-copy alias: `const out = list;` binds `out` to `list`'s defer
 /// paths, so `return out;` dangles when `defer list.deinit();` is armed
-/// (EPH-I0480). `decl_line` anchors the var-rebind sweep; const aliases
+/// (EPH-I0480). `decl_line` anchors the var-rebind sweep. Const aliases
 /// cannot rebind.
 const LocalAlias = struct {
     name: []const u8,
@@ -34243,7 +34243,7 @@ const LocalAlias = struct {
     is_var: bool = false,
 };
 
-/// Record `const/var NAME = ident;` as a copy alias (bounded; overflow
+/// Record `const/var NAME = ident;` as a copy alias (bounded. Overflow
 /// only narrows the alias set — never a false positive).
 fn collectCopyAlias(t: []const u8, line_idx: usize, scan: *MustReturnRefScan) void {
     if (scan.alias_count >= max_alias_copies) return;
@@ -34262,7 +34262,7 @@ fn collectCopyAlias(t: []const u8, line_idx: usize, scan: *MustReturnRefScan) vo
 
 /// True when `name` is an assignment target somewhere in `t`: the word
 /// `name` followed by optional whitespace and a single `=` (not `==`,
-/// `<=`, `>=`, `!=`). String data never assigns; the caller strips
+/// `<=`, `>=`, `!=`). String data never assigns. The caller strips
 /// comments. (The position-specific variant is isAssignmentTarget.)
 fn isRebindAssignment(t: []const u8, name: []const u8) bool {
     var cls = LineClassifier.init(t);
@@ -34301,7 +34301,7 @@ fn aliasRebound(fl: []const []const u8, al: LocalAlias) bool {
 
 /// Drop copy aliases that stop aliasing their original RHS after their
 /// declaration (the alias or its RHS rebind), or matching them would
-/// fire on safe code. const aliases cannot rebind; the RHS-rebind sweep
+/// fire on safe code. const aliases cannot rebind. The RHS-rebind sweep
 /// covers both forms (EPH-I1048).
 fn dropReboundVarAliases(fl: []const []const u8, scan: *MustReturnRefScan) void {
     var i: usize = 0;
@@ -34324,7 +34324,7 @@ fn aliasRhsFor(name: []const u8, aliases: []const LocalAlias) ?[]const u8 {
 }
 
 /// Resolve `head` through the copy-alias map to its root name. The walk
-/// is bounded by the map size; valid alias chains are acyclic (EPH-I0480).
+/// is bounded by the map size. Valid alias chains are acyclic (EPH-I0480).
 fn resolveAliasHead(head: []const u8, aliases: []const LocalAlias) []const u8 {
     var cur = head;
     var hops: usize = 0;
@@ -34410,7 +34410,7 @@ fn emitMustReturnRef(ctx: MustReturnRefCtx, site: MustReturnRefSite) !void {
 
 /// Emit the ZA110 v2 dual-owner warning (EPH-I0038): a managed-container
 /// field returned by value with no visible field reset. The returned
-/// header copy and the receiver share one backing; a later deinit on
+/// header copy and the receiver share one backing. A later deinit on
 /// either side frees the other's backing (a double-free when both run).
 fn emitDualOwnerReturn(
     ctx: MustReturnRefCtx,
@@ -34441,10 +34441,10 @@ fn emitDualOwnerReturn(
 /// True when a reset of the exact field path (`self.list = ...`) is
 /// visible on any line from the fn start through the return line. The
 /// take() idiom resets the field so the receiver stops owning the
-/// backing; the returned copy is then the single owner. Comment text is
+/// backing. The returned copy is then the single owner. Comment text is
 /// data (findCommentStart) and string text never assigns
 /// (isRebindAssignment masks literals). A statement after a return on the
-/// same line cannot compile, so the inclusive scan is sound; a reset
+/// same line cannot compile, so the inclusive scan is sound. A reset
 /// before the return on the same line reads correctly. A reset inside a
 /// conditional also suppresses — the FN-only conservative direction
 /// (EPH-I0038).
@@ -34539,7 +34539,7 @@ fn checkMustReturnRef(ctx: MustReturnRefCtx) !void {
     var sig_buf: [max_sig_bytes]u8 = undefined;
     const sig = joinFnSignature(ctx.fl, &sig_buf) orelse return;
     const ret = extractFnReturnType(sig) orelse return;
-    // The managed-container return type is the gate; the payload text is
+    // The managed-container return type is the gate. The payload text is
     // not needed beyond it (the message names the local, not the type).
     if (managedContainerPayload(ret) == null) return;
 
@@ -34616,7 +34616,7 @@ fn buildCFGFilePrescan(allocator: Allocator, content: []const u8) !CFGFilePresca
     return .{ .no_free_fns = no_free_fns, .no_free_fields = no_free_fields };
 }
 
-/// Analyze a single file for CFG memory issues. 48 physical lines; 43
+/// Analyze a single file for CFG memory issues. 48 physical lines. 43
 /// code lines under ephor's own ZA301 counting (blank and comment lines
 /// excluded, EPH-I0788) — under the 50-line ceiling, and ZA301 is not in
 /// the gate's enabled set (band-B11 F13-adjacent, EPH-I0484).
@@ -34754,7 +34754,7 @@ fn testBlockPairingSkipped(lines: []const []const u8, alloc_count: usize) bool {
 
 /// Run the errdefer/direct-free pairing over one finished test block
 /// (EPH-I1200). Test blocks are not fn-shaped, so the CFG memory family's
-/// block-level scans never see their lines (the EPH-I0363 boundary); the
+/// block-level scans never see their lines (the EPH-I0363 boundary). The
 /// B105 qa-gate double-free lived exactly in that gap. The pairing
 /// detector is line-model, so the block gets it alone. The
 /// defer/direct-free pairing stays out of scope: the errdefer class is
@@ -34866,7 +34866,7 @@ fn analyzeCFGMemory(
 /// string literal skew the depth walks in isInsideTypeOf, findCallSiteLine,
 /// and joinParenContinuation — past the comment-stripped boundary arm
 /// (EPH-I0783) on the ZA202 paths. Every analyzer brace walk routes
-/// through the masked computeBraceDepth (EPH-I0894); the raw byte-level
+/// through the masked computeBraceDepth (EPH-I0894). The raw byte-level
 /// brace counter was deleted with its last caller (EPH-I0905).
 fn parenBalance(t: []const u8) i32 {
     return parenBalanceOutsideQuotes(stripLineComment(t));
@@ -34884,7 +34884,7 @@ fn hasAllocCallPattern(t: []const u8) bool {
 }
 
 /// Bounds for joinParenContinuation. zig-fmt wraps call args one per line,
-/// so a handful of lines covers any realistic signature; the byte cap keeps
+/// so a handful of lines covers any realistic signature. The byte cap keeps
 /// the caller's stack buffer small and the join cheap on the hot path.
 const max_join_lines = 4;
 const max_join_bytes = 512;
@@ -34894,7 +34894,7 @@ const max_join_bytes = 512;
 /// and frees as `allocator.free(\n    buf,\n);` — the first line ends right
 /// after `(`, hiding the type/argument from the alloc and free matchers.
 /// Returns the trimmed line unchanged when parens already balance or the
-/// line carries no alloc/free pattern; otherwise joins up to
+/// line carries no alloc/free pattern. Otherwise joins up to
 /// max_join_lines following lines (bounded by buf size). Free and destroy
 /// lines join exactly like alloc lines: the free scanners and the
 /// defer-coverage family read the argument off the joined text
@@ -35443,7 +35443,7 @@ fn collectNullChecksInBlock(ctx: NullSafetyCtx, bid: usize) !void {
 /// fall-through facts when the block owns the line's branch edges. A
 /// true-edge fact holds on the then side, so every block whose range
 /// covers the condition line sees the non-null state. A false-edge fact
-/// holds only after the exit; seeding the owner or the then block would
+/// holds only after the exit. Seeding the owner or the then block would
 /// suppress a deref before the guard or inside the null arm (EPH-I0488).
 /// genFallThroughFact places it at the branch_false successors instead.
 fn collectNullCheckLine(ctx: NullSafetyCtx, bid: usize, ln: usize, idx: usize) !void {
@@ -35568,7 +35568,7 @@ fn predCarriesFact(ctx: NullMeetCtx, pred: NullPredInfo) bool {
 /// Collect the vars an empty inline-arm pred violates (runPredFilter):
 /// a var whose fact is true_edge at a block the arm is reached from via
 /// branch_false. The arm's path is that guard's null side, where the
-/// fact does not hold; every other fact stays valid on the arm's path
+/// fact does not hold. Every other fact stays valid on the arm's path
 /// (EPH-I0863).
 fn violationCollectKeys(
     ctx: NullMeetCtx,
@@ -35645,7 +35645,7 @@ fn buildNullIntersection(
     }
 }
 
-/// Merge the intersection into block `bid`'s checked set; reports
+/// Merge the intersection into block `bid`'s checked set. Reports
 /// whether any new fact landed (the fixpoint-change signal).
 fn mergeNullIntersection(
     ctx: NullMeetCtx,
@@ -35664,7 +35664,7 @@ fn mergeNullIntersection(
 /// True when an optional-suffix trigger (`.?` or `.*`) at `col` sits in
 /// prose, not code: inside a string/char literal, or at or after the
 /// comment start (EPH-I0672, EPH-I1131). One classifier walk plus one
-/// comment-start walk per call (EPH-I0153); the comment start is
+/// comment-start walk per call (EPH-I0153). The comment start is
 /// string-aware, so a `//` inside a string never fakes a comment
 /// (EPH-I0412). A missing comment start clamps to the line length: no
 /// column reaches it.
@@ -35818,7 +35818,7 @@ fn identBeforeColon(t: []const u8, colon: usize) ?[]const u8 {
 /// Scan one line for `IDENT: <nullable-type>` declarations and add each
 /// name to the set. Colons inside string literals are skipped: a string
 /// can carry lookalike decl text (`"ptr: ?*u8"`) that is not a decl.
-/// Names are duped; the caller frees them with the map.
+/// Names are duped. The caller frees them with the map.
 fn collectNullablePtrDeclsInLine(
     allocator: Allocator,
     t: []const u8,
@@ -35851,8 +35851,8 @@ fn collectNullablePtrDeclsInLine(
 /// lookalike decl text that is not a declaration (EPH-I0219 review).
 ///
 /// Accepted limitations: inferred types (`const p = getPtr();`) stay
-/// silent; a name declared nullable anywhere in the fn is treated as
-/// nullable everywhere (shadowing resolves any-match); field derefs
+/// silent. A name declared nullable anywhere in the fn is treated as
+/// nullable everywhere (shadowing resolves any-match). Field derefs
 /// (`self.p.*` extracts `self.p`, never in the set) stay silent.
 /// [*]allowzero u8 and *align(N) allowzero u8 are legal nullable forms the prefix list misses.
 /// A multi-line split (const p: then ?*u8) is missed: zig fmt always joins the decl.
@@ -36151,15 +36151,15 @@ fn isInsideTypeOf(t: []const u8, pos: usize, preceding_lines: ?[]const []const u
     // An opener contains the catch only while its parens stay open at the
     // catch site (EPH-I0492): `const T = @TypeOf(x); y() catch
     // unreachable;` closes the opener, so the catch is runtime code and
-    // must not suppress. A closed opener is skipped; an earlier opener
+    // must not suppress. A closed opener is skipped. An earlier opener
     // may still hold the catch open.
     // Mask the scan to code positions (EPH-I0929): opener text inside a
     // string is data. The pre-fix backward scan accepted it, and
     // parensStayOpen then started mid-string with QuoteMode .none, so the
     // string's closing quote inverted the mask and skipped real parens —
     // `const s = "@TypeOf(x"; y() catch unreachable;` suppressed a
-    // runtime catch. The forward walk checks every code-position opener;
-    // the predicate is existence, so the order is irrelevant.
+    // runtime catch. The forward walk checks every code-position opener.
+    // The predicate is existence, so the order is irrelevant.
     var lit = types.LiteralState.forLine(t) orelse return false;
     var i: usize = 0;
     while (i < pos) : (i += 1) {
@@ -36207,7 +36207,7 @@ fn callCloseParen(t: []const u8, pos: usize) ?usize {
 }
 
 /// Position just after the opening `(` when the catch at `pos` attaches
-/// to a call opened by one of `needles` on this line; null otherwise.
+/// to a call opened by one of `needles` on this line. Null otherwise.
 /// The site's `)` must close the opener's paren group: the group stays
 /// open through the byte before that `)` (band-B12 F24 per-site
 /// discipline — a suppression clears only its own call).
@@ -36270,7 +36270,7 @@ const buf_print_fns = [_][]const u8{ "bufPrint(", "bufPrintZ(" };
 /// Check if `catch unreachable` comes from a bufPrint/bufPrintZ call.
 /// These functions only return error.NoSpaceLeft — programmers size the buffer
 /// to fit max output, making catch unreachable provably correct.
-/// Per-site on the current line; multi-line calls fall back to the
+/// Per-site on the current line. Multi-line calls fall back to the
 /// paren-balanced call-line walk (EPH-I0945).
 fn isBufPrintCatchUnreachable(
     t: []const u8,
@@ -36290,7 +36290,7 @@ fn isBufPrintCatchUnreachable(
 /// malformed-literal panic stays an accepted false negative. Decision
 /// recorded (band-B12 F12, EPH-I0505): the doc arm, because a textual
 /// analyzer cannot verify comptime validation of the literal.
-/// Per-site on the current line; multi-line calls fall back to the
+/// Per-site on the current line. Multi-line calls fall back to the
 /// call-line walk (EPH-I0945).
 fn isSafeStdlibLiteralCall(t: []const u8, pos: usize, preceding_lines: ?[]const []const u8) bool {
     if (siteCallArgStart(t, pos, &safe_stdlib_literal_fns)) |arg_start| {
@@ -36403,7 +36403,7 @@ fn orelseUnreachableIssue(file_path: []const u8, line: usize, col: usize) Issue 
 }
 
 /// ZA203: orelse unreachable will panic on null
-/// Lines/func_line/file_path come from the CFG run context; t is the
+/// Lines/func_line/file_path come from the CFG run context. T is the
 /// caller-trimmed line at idx (line_num is its 1-based source line).
 fn checkOrelseUnreachable(
     run: CFGRunCtx,
@@ -36421,7 +36421,7 @@ fn checkOrelseUnreachable(
 
     if (extractOrelseVar(t, col)) |name| {
         // The fn's lines are already fn-bounded, so the floor is a no-op
-        // here; the line-based tier passes the real function start
+        // here. The line-based tier passes the real function start
         // (EPH-I0864).
         if (hasNullGuard(run.func.lines, idx, 0, name)) return null;
     }
@@ -36633,7 +36633,7 @@ fn parenCloseAt(t: []const u8, open: usize) ?usize {
 /// Tier split (EPH-I0861 closure, EPH-I0864): this guard query feeds the
 /// CFG-tier ZA203 emitter (checkOrelseUnreachable). The line-based ZA203
 /// emitter (checkLineOrelseUnreachable, the errors subcommand) routes
-/// through the same guard verdict since EPH-I0864; its lookback is
+/// through the same guard verdict since EPH-I0864. Its lookback is
 /// fn-bounded through the error scan's function-start tracking.
 fn hasNullGuard(
     lines: []const []const u8,
@@ -36658,7 +36658,7 @@ fn hasNullGuard(
         i -= 1;
         const line = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(line)) continue;
-        // The name pre-filter is a code-position gate only; the binding
+        // The name pre-filter is a code-position gate only. The binding
         // check (lineHasBoundNullGuard → nullPredicateBinds) carries the
         // identifier-boundary exactness: `ax == null` does not bind `x`
         // (EPH-I0493). Both matches anchor on code positions
@@ -36743,9 +36743,9 @@ fn operandFormStart(t: []const u8, end: usize) ?usize {
 /// Offset of the `(` whose group closes at `close`, or null when the
 /// group is unterminated before the line start. Quote-aware: parens
 /// inside string and char literals are data, not structure (EPH-I0906).
-/// The forward walk keeps a bounded open-paren stack; deeper nesting
+/// The forward walk keeps a bounded open-paren stack. Deeper nesting
 /// overflows to null (fail-safe: the operand is not bindable). The
-/// t[0..close] slice is the pre-migration `i < close` bound; the stack
+/// t[0..close] slice is the pre-migration `i < close` bound. The stack
 /// keeps absolute offsets, so the slice changes nothing (EPH-I1232 C2b).
 fn parenOpenBackAt(t: []const u8, close: usize) ?usize {
     var stack = [_]usize{0} ** 64;
@@ -36813,7 +36813,7 @@ fn extractVarFromNullCheck(after_paren: []const u8, pos: usize) ?[]const u8 {
 
 /// Max braced guard-body lines the following-block exit scan accepts
 /// (EPH-I0858). The scan reads at most this many body lines past the
-/// guard line; a body longer than the window loses suppression (known FP
+/// guard line. A body longer than the window loses suppression (known FP
 /// residual, EPH-I0858).
 const max_braced_guard_body_lines = 4;
 
@@ -36846,23 +36846,23 @@ fn trackBraceChar(depth: *i32, c: u8) bool {
 /// nested conditional without an else fires, a nested conditional with
 /// both arms exiting is silent — on both the same-line and the
 /// multi-line forms. The outer-else family (the guard's own else arm,
-/// `{ return null; } else { return null; }`) fires on both forms; for
+/// `{ return null; } else { return null; }`) fires on both forms. For
 /// the nested-then variant (`{ if (q) return null; } else { return
 /// null; }`) the firing is the semantically correct verdict, because
 /// the q-false path still falls through on null. One residual gap: the
 /// walk's multi-line twin of an unbraced then arm (`if (q) return null
 /// else { return null; }`) fires — the walk cannot see an exit line
 /// inside a conditional header — while this judge accepts the
-/// same-line form; the shape is rare and the judge's verdict is the
+/// same-line form. The shape is rare and the judge's verdict is the
 /// semantically correct one. The judge accepts the else-terminated
 /// layout (`if (q) return null else { return null; }`) and, through
 /// the else-fragment join, the semicolon spelling (`if (q) return
-/// null; else { return null; }`); the semicolon spelling is a Zig
+/// null; else { return null; }`). The semicolon spelling is a Zig
 /// parse error, so compilable code never carries it, while a broken
 /// file's guard still suppresses the same way (EPH-I0861). The walk
 /// covers the braced both-arms twin inside a multi-line guard body
 /// (`if (p == null) {` / `if (q) { return null; } else { return
-/// null; }` / `}`) since EPH-I0868; the unbraced-then multi-line gap
+/// null; }` / `}`) since EPH-I0868. The unbraced-then multi-line gap
 /// below remains.
 fn hasSameLineGuardExit(tail: []const u8) bool {
     const stmt = guardExitScanStmt(tail) orelse return false;
@@ -36938,7 +36938,7 @@ fn leadingBracedEnd(stmt: []const u8) ?usize {
 /// True when the statement is a nested conditional whose then and else
 /// arms both hold a direct exit (EPH-I0861): the same-line form of the
 /// walk's depth-2 then+else rule (judgeGuardWalkLine). The then arm may
-/// be braced or a direct exit statement; the else arm must be a braced
+/// be braced or a direct exit statement. The else arm must be a braced
 /// block — the walk's `} else {` parity, so an `else if` chain, which
 /// can still fall through, does not qualify.
 fn nestedBothArmsExit(stmt: []const u8) bool {
@@ -36961,7 +36961,7 @@ fn nestedBothArmsExit(stmt: []const u8) bool {
 
 /// End offset of a braced arm (one past the matching close) when the
 /// arm's body holds an unconditional exit statement at the body's own
-/// depth; null otherwise (EPH-I0861).
+/// depth. Null otherwise (EPH-I0861).
 fn bracedArmExitEnd(arm: []const u8) ?usize {
     var depth: i32 = 0;
     var walk = QuoteWalk.init(arm);
@@ -36976,7 +36976,7 @@ fn bracedArmExitEnd(arm: []const u8) ?usize {
 }
 
 /// End offset of an unbraced arm (one past its terminating `;`) when
-/// the arm is a direct exit statement; null otherwise (EPH-I0861). The
+/// the arm is a direct exit statement. Null otherwise (EPH-I0861). The
 /// else-terminated layout (`if (q) return null else { return null; }`)
 /// carries no `;` at the arm end: the else keyword terminates the arm,
 /// so the direct-exit arm text is accepted without the semicolon
@@ -37099,7 +37099,7 @@ fn hasCodeBrace(line: []const u8) bool {
 /// "if (x == null) return" (also continue/break) holds on the
 /// fall-through edge, which the CFG models as the false edge. The exit
 /// may also sit in the braced body that follows the condition line
-/// (`if (x == null) { return; }`, EPH-I0488); the fact then flows only
+/// (`if (x == null) { return; }`, EPH-I0488). The fact then flows only
 /// where the guard dominates, so a check in one branch never silences a
 /// deref reached through another branch.
 fn classifyNullCheck(t: []const u8, lines: []const []const u8, idx: usize) ?NullCheckFact {
@@ -37116,7 +37116,7 @@ fn classifyNullCheck(t: []const u8, lines: []const []const u8, idx: usize) ?Null
     // Zig idiom: if (x == null) return; guarantees x is non-null after
     if (mem.indexOf(u8, after_paren, " == null)")) |eq_pos| {
         // The window admits max_braced_guard_body_lines body lines past
-        // the guard line; the +1 offsets the exclusive limit (EPH-I0858).
+        // the guard line. The +1 offsets the exclusive limit (EPH-I0858).
         const exit_limit = @min(idx + max_braced_guard_body_lines + 1, lines.len);
         // A same-line exit must sit at the guard's own depth: `return;`
         // and `{ return; }` qualify, `{ if (q) return null; }` does not
@@ -37204,7 +37204,7 @@ fn closesNullPredicate(ctx: []const u8, tail: usize) bool {
 
 /// Max following-block lines the early-return null-guard scan accepts
 /// for the exit below a candidate guard line (EPH-I0860). The walk reads
-/// at most this many body lines past the guard line; an exit farther
+/// at most this many body lines past the guard line. An exit farther
 /// down is stale for ZA801 suppression (EPH-I0225). The bound is
 /// exclusive: the walk covers N-1 lines.
 const max_early_return_guard_body_lines = 4;
@@ -37255,11 +37255,11 @@ const GuardScanCtx = struct {
 /// True when the line can establish a guard: a conditional/loop header
 /// (if/else-if/while/for, including `} else if` after leading closers) or
 /// an assert statement. A boolean assignment `const b = x > 0;` computes a
-/// value; it guards nothing, so it must not feed the guard set (EPH-I0486).
+/// value. It guards nothing, so it must not feed the guard set (EPH-I0486).
 /// The assert match is code-position-only: an assert mentioned in a string
 /// or comment is prose, not a guard. A qualified assert
 /// (`std.debug.assert(m > 0);`) seeds through the same leading-`assert(`
-/// gate; hasAssertGeGuard is the separate textual fallback for the
+/// gate. HasAssertGeGuard is the separate textual fallback for the
 /// decrement family, not this collection gate.
 fn isGuardEstablishingLine(t: []const u8) bool {
     if (opensConditionalBody(t)) return true;
@@ -37278,7 +37278,7 @@ fn guardSourceForLine(t: []const u8) []const u8 {
 }
 
 /// Scan a range of lines for guard patterns, adding to the given map.
-/// Only guard-establishing lines feed the set (EPH-I0486); each var
+/// Only guard-establishing lines feed the set (EPH-I0486). Each var
 /// records the line of its earliest guard in the range.
 fn scanLinesForGuards(
     ctx: GuardScanCtx,
@@ -37478,7 +37478,7 @@ fn computePredIntersection(
 }
 
 /// Merge intersection into a block's entry-guard set, keeping the later
-/// holds-from line; returns true when the set changed.
+/// holds-from line. Returns true when the set changed.
 fn mergeIntoBlock(
     allocator: Allocator,
     intersection: *std.StringHashMapUnmanaged(usize),
@@ -37549,7 +37549,7 @@ const GuardLineCtx = struct {
 };
 
 /// True when a guard on `var_name` holds at the candidate line. A guard
-/// proven at block entry holds from its recorded line onward; a guard
+/// proven at block entry holds from its recorded line onward. A guard
 /// collected in this same block holds from its own line onward. Either
 /// way, a guard on a later line must not silence an earlier line
 /// (EPH-I0486 temporal rule). The decrement amount re-verifies an
@@ -37599,7 +37599,7 @@ fn guardCoversDecrement(
     if (mem.indexOf(u8, guard_line, "assert") != null)
         return judgeAssertBound(guard_line, var_name, amount.?) != .uncovered;
     // The guard source is a suffix of the raw line (the arm region of an
-    // else-open); the join starts at the same offset so a multi-line arm
+    // else-open). The join starts at the same offset so a multi-line arm
     // condition joins from its own `if`, never from the negated
     // antecedent (EPH-I1000).
     return guardLineCoversAmountWithJoin(
@@ -37630,7 +37630,7 @@ fn guardLineClosesBodyOnLine(lines: []const []const u8, guard_idx: usize) bool {
     if (lineCarriesOpenBrace(t)) return true; // braced body closed on the line
     // No brace group: the guard holds past the line only when the body
     // opens on the next line (Allman). A brace-less statement body on
-    // the line closes with the statement; a bare header (Allman `if (m
+    // the line closes with the statement. A bare header (Allman `if (m
     // > 3)` with nothing after the condition) opens no body on the line
     // and must keep covering the body lines below (EPH-I0951, I0976).
     return braceLessBodyOnLine(t);
@@ -37673,7 +37673,7 @@ fn bodyTextAfterCondition(t: []const u8, close: usize) bool {
 }
 
 /// True when the guard line's condition proves `var_name >= amount`.
-/// The condition must close on the line; a continuation-line condition
+/// The condition must close on the line. A continuation-line condition
 /// keeps the shape-only verdict (EPH-I0995). An Allman header's body
 /// open sits on the next line, so the K&R span misses it — the allman
 /// span judges the header the same way (EPH-I0976).
@@ -37729,7 +37729,7 @@ fn guardConditionTextWithJoin(
 /// or past the caps) keeps the shape-only verdict — the span parse on
 /// the joined text is string/comment-aware, so a poisoned join yields
 /// no span and never narrows the old verdict (EPH-I1000). The text at
-/// `first_offset` in the line is the judge region; the join starts
+/// `first_offset` in the line is the judge region. The join starts
 /// there so an else-open line's arm condition never borrows the
 /// negated antecedent's text (EPH-I1000).
 fn guardLineCoversAmountWithJoin(
@@ -37745,7 +37745,7 @@ fn guardLineCoversAmountWithJoin(
 
 /// The proven lower bound of a guard line's condition for `var_name`,
 /// joining a condition that opens on the line but closes on a later
-/// line; null when the condition cannot be judged. The strict twin of
+/// line. Null when the condition cannot be judged. The strict twin of
 /// guardLineCoversAmountWithJoin: the ZA903 lookback must PROVE the
 /// bound, so a shape-only verdict stays null and the candidate fires
 /// (EPH-I1013).
@@ -37762,8 +37762,8 @@ fn guardLineBoundWithJoin(
 }
 
 /// The join caps for a multi-line guard condition: at most this many
-/// lines and this many bytes. A condition past the caps is not joined;
-/// the shape-only verdict stays (EPH-I1000).
+/// lines and this many bytes. A condition past the caps is not joined.
+/// The shape-only verdict stays (EPH-I1000).
 const max_joined_guard_lines = 8;
 const joined_guard_buf = 512;
 
@@ -37813,7 +37813,7 @@ fn joinStringEnd(t: []const u8, start: usize) ?usize {
 }
 
 /// Scan one line of a joined guard condition, tracking the paren depth
-/// of the condition's open group. String content is skipped; a comment
+/// of the condition's open group. String content is skipped. A comment
 /// on the line, an unterminated string, or the close paren each end
 /// the scan with their verdict (EPH-I1000).
 fn scanJoinLine(t: []const u8, start: usize, depth: usize) JoinScanResult {
@@ -37888,20 +37888,20 @@ fn joinGuardCondition(
 }
 
 /// True when the guard-condition span proves `var_name >= amount`. A
-/// parsed bound decides by value; a null bound is classified: an
+/// parsed bound decides by value. A null bound is classified: an
 /// or-tail whose arm proves nothing, a comparison in call position,
 /// and an overflowing literal RHS do not cover — the body can run
 /// unguarded (EPH-I0961, EPH-I0964). A comparison with an identifier
 /// RHS keeps the shape-only verdict — the exact bound needs both
 /// literals, and a var-value analysis is beyond the line-granular
-/// model; the class stays accepted with the shape-only verdict to
+/// model. The class stays accepted with the shape-only verdict to
 /// avoid FP noise on genuinely-guarded corpus code (verified: 8
-/// corpus sites; EPH-I1000 residual). The budget-exhausted null never
+/// corpus sites, EPH-I1000 residual). The budget-exhausted null never
 /// suppresses (EPH-I0966). The conservative-fire class extends to
 /// joined multi-line conditions: a disjunction arm that proves no
 /// bound — an unparseable conjunct like an `==` bound (`m > 1 or
 /// m == 1`) proves nothing in the literal model even when it bounds
-/// the var in reality — fires the same way; the conjunction keeps the
+/// the var in reality — fires the same way. The conjunction keeps the
 /// parseable arm's bound and fires only when the amount exceeds it
 /// (EPH-I1015).
 fn guardSpanCoversAmount(
@@ -38411,10 +38411,10 @@ fn hasPairedIncrementInLines(lines: []const []const u8, var_name: []const u8) bo
 /// side must be the var — a pattern whose operand is another var, or the
 /// pattern right of the index expression, proves nothing (band-B12 F17,
 /// EPH-I0506). The shape assumes the index sits in the short-circuit
-/// right side; an `if` body after the condition stays an accepted
+/// right side. An `if` body after the condition stays an accepted
 /// residual (same as pre-fix).
 fn hasShortCircuitGuardForVar(t: []const u8, var_name: []const u8, limit: usize) bool {
-    // One comment-start walk per call; a fresh classifier per pattern
+    // One comment-start walk per call. A fresh classifier per pattern
     // (EPH-I0416: classifier queries must ascend).
     const comment_start = findCommentStart(t);
     const pats = [_][]const u8{ "== 0 or", "!= 0 and", "!=0 and", "> 0 and" };
@@ -38527,8 +38527,8 @@ fn hasEndsWithStartsWithGuard(lines: []const []const u8, current_idx: usize) boo
     for (lines[check_start..current_idx], check_start..) |line, i| {
         const ctx = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
-        // The function's own signature (index 0) is not a guard source;
-        // skip it so a guard line between the signature and the
+        // The function's own signature (index 0) is not a guard source.
+        // Skip it so a guard line between the signature and the
         // candidate still engages. A signature deeper in the window is
         // a scope boundary (EPH-I0931).
         if (i > 0 and isFuncBoundary(ctx)) return false;
@@ -38568,8 +38568,8 @@ fn hasExitStatement(ctx: []const u8) bool {
 
 /// Position of the first exit keyword (`return`/`break`/`continue`) in
 /// `t`, or null. Mirrors hasExitStatement's matching: the trailing
-/// comment is stripped and the keywords are identifier-boundary-checked;
-/// string contents still count (the accepted EPH-I0494 residual). The
+/// comment is stripped and the keywords are identifier-boundary-checked.
+/// String contents still count (the accepted EPH-I0494 residual). The
 /// same-line zero-exit judge orders the exit against the candidate's
 /// column with this position: an exit after the candidate protects a
 /// different statement, so the candidate is not covered (EPH-I1012).
@@ -38647,7 +38647,7 @@ fn judgeGuardWalkLine(inner: []const u8, depth: i32, state: *GuardWalkState) boo
 /// Only unconditional exits count: a nested conditional or a partial
 /// switch arm inside the block does not dominate the fall-through
 /// (EPH-I0488). The walk tracks brace depth from the guard block's own
-/// open brace; an exit inside a nested block (depth 2) qualifies only
+/// open brace. An exit inside a nested block (depth 2) qualifies only
 /// when the nested conditional's else arm also exits, and the walk stops
 /// when the guard block closes (depth 0).
 fn hasExitInFollowingBlock(lines: []const []const u8, start: usize, limit: usize) bool {
@@ -38711,7 +38711,7 @@ fn isZeroCheckGuard(ctx: ZeroGuardCtx) bool {
 /// Context for the prior-line zero-check guard walk: the candidate's
 /// function slice, its line index, the guarded variable, and the
 /// candidate's subtraction amount. A null amount keeps the legacy
-/// shape-only behavior (a non-literal decrement `x -= n`); a non-null
+/// shape-only behavior (a non-literal decrement `x -= n`). A non-null
 /// amount makes the walk judge the guard's proven bound and the
 /// guard-to-candidate reassignment (EPH-I0936, EPH-I0959, EPH-I0960).
 const PriorGuardCtx = struct {
@@ -38783,7 +38783,7 @@ fn lineCarriesDominatingGuard(pctx: PriorGuardCtx, ctx: []const u8, i: usize) bo
 /// <= 1: with `subtrahend = 2` the walk keeps going past the guard and
 /// the candidate fires (EPH-I0959, EPH-I0960). A guard whose exclusion
 /// a later reassignment breaks (probe C: `x = 0;` between guard and
-/// candidate) does not dominate either; the walk passes it and keeps
+/// candidate) does not dominate either. The walk passes it and keeps
 /// scanning for an earlier guard (the reassignment defeats that guard
 /// too, so an earlier find still fires). A null `subtrahend` keeps the
 /// legacy shape-only verdict for a non-literal decrement (`x -= n`).
@@ -38801,7 +38801,7 @@ fn hasBreakGuardOnPriorLines(
     };
     const check_start = current_idx -| 10;
     // depth: net closes-minus-opens crossed walking back from the
-    // candidate. A close crossing opens a skip to the matching open; a
+    // candidate. A close crossing opens a skip to the matching open. A
     // loop opener whose body closes below the candidate is an enclosing
     // loop and stops the walk.
     var depth: i32 = 0;
@@ -38832,12 +38832,12 @@ fn priorLineWalkVerdict(outcome: ClosedBlockOutcome, i: *usize) ?bool {
 
 /// Judge one non-comment, non-boundary line of the backward walk and
 /// report how the walk continues (hasBreakGuardOnPriorLines): `found` —
-/// a dominating zero-check guard; `exhausted` — an enclosing loop
+/// a dominating zero-check guard. `exhausted` — an enclosing loop
 /// stopped the walk (a guard above a loop opener never dominates an
-/// access inside its body, EPH-I0498); `passed` — the walk resumes at
+/// access inside its body, EPH-I0498). `passed` — the walk resumes at
 /// the given line, the loop opener of a closed sibling (EPH-I0941), or
 /// the line itself when it holds no guard. A positive-balance line
-/// folds its balance into the caller's depth before the guard judge; a
+/// folds its balance into the caller's depth before the guard judge. A
 /// closed block crosses to its open (EPH-I0936, EPH-I0959).
 fn judgeBreakGuardPriorLine(
     pctx: PriorGuardCtx,
@@ -38849,7 +38849,7 @@ fn judgeBreakGuardPriorLine(
         // The enclosing check uses the loop's own body close: a closed
         // sibling loop is not on the candidate's control-flow path as a
         // gate, so the walk passes it (EPH-I0941). A brace-less
-        // next-line body closes at the body's first line; when that
+        // next-line body closes at the body's first line. When that
         // line is the candidate, the loop still encloses it, so `>=`
         // stops the walk on the candidate's own line and a guard above
         // the opener never dominates an access inside its body
@@ -38911,7 +38911,7 @@ fn crossClosedBlock(
 
 /// Judge the matching open line of a closed block (crossClosedBlock)
 /// and return the walk's continuation: a loop opener passes its body
-/// open; an Allman body open passes like the K&R shape (EPH-I0951); a
+/// open. An Allman body open passes like the K&R shape (EPH-I0951). A
 /// non-loop block's open line and body are judged for dominating
 /// guards (EPH-I0941, EPH-I0959). The open line always decides the
 /// walk: no path falls through to further scanning.
@@ -38962,7 +38962,7 @@ fn closedBlockBodyHasGuard(
 /// block sits entirely above the candidate, so its guards still
 /// dominate — every path to the candidate passes the whole block. Loop
 /// opener lines inside the body are skipped like the main walk does.
-/// Returns true on the first zero-check guard match; a function
+/// Returns true on the first zero-check guard match. A function
 /// boundary inside the body ends the scan.
 fn judgeClosedBlockSpan(
     ctx: PriorGuardCtx,
@@ -38987,7 +38987,7 @@ fn isInComptimeBlock(lines: []const []const u8, current_idx: usize) bool {
     var walk = LineWalk.backward(lines, current_idx, 0);
     while (walk.nextLineBack()) |step| {
         const ctx = step.text;
-        // Count braces going backward; literal braces are data (EPH-I0949).
+        // Count braces going backward. Literal braces are data (EPH-I0949).
         brace_depth = trackBraceDepthBackward(ctx, brace_depth);
         // If we are at negative depth, we are inside an enclosing block
         if (brace_depth < 0) {
@@ -39004,8 +39004,8 @@ fn isInComptimeBlock(lines: []const []const u8, current_idx: usize) bool {
 
 /// Verdict for one assert line against the decrement amount: covered —
 /// the assert's literal bound is at least the amount (or the bound is
-/// not a literal and the shape-only heuristic holds); uncovered — the
-/// bound is below the amount; not_binding — no `>=`/`>` comparison on
+/// not a literal and the shape-only heuristic holds). Uncovered — the
+/// bound is below the amount. Not_binding — no `>=`/`>` comparison on
 /// the line has the decremented var as its operand (EPH-I0495).
 const AssertBoundVerdict = enum { covered, uncovered, not_binding };
 
@@ -39052,8 +39052,8 @@ const AssertBoundJudge = struct {
 
 /// Verdict for one `>=`/`> ` comparison occurrence: covered — its
 /// literal bound is at least the amount, or the bound is not a literal
-/// and the shape-only heuristic holds; below — the bound binds the var
-/// but stays under the amount; not_binding — the comparison's operand
+/// and the shape-only heuristic holds. Below — the bound binds the var
+/// but stays under the amount. Not_binding — the comparison's operand
 /// is not the var (EPH-I0493, EPH-I0495).
 const BoundOccurrenceVerdict = enum { covered, below, not_binding };
 
@@ -39096,7 +39096,7 @@ fn assertLineCoversDecrement(
 /// The parsed bound is related to the decrement amount: the assert
 /// covers only when the bound is at least the amount (EPH-I0495). A
 /// non-literal amount or bound keeps the shape-only heuristic (any
-/// `>=`/`>` assert on the var suppresses — documented; the exact
+/// `>=`/`>` assert on the var suppresses — documented. The exact
 /// comparison needs both literals).
 fn hasAssertGeGuard(
     lines: []const []const u8,
@@ -39108,8 +39108,8 @@ fn hasAssertGeGuard(
     for (lines[check_start..current_idx], check_start..) |line, i| {
         const ctx = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
-        // The function's own signature (index 0) is not a guard source;
-        // skip it so an assert between the signature and the candidate
+        // The function's own signature (index 0) is not a guard source.
+        // Skip it so an assert between the signature and the candidate
         // still engages. A signature deeper in the window is a scope
         // boundary (EPH-I0931).
         if (i > 0 and isFuncBoundary(ctx)) return false;
@@ -39149,8 +39149,8 @@ fn hasEarlyReturnLengthGuard(
     while (i < current_idx) : (i += 1) {
         const ctx = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(ctx)) continue;
-        // The function's own signature (index 0) is not a guard source;
-        // skip it so a `.len` guard between the signature and the
+        // The function's own signature (index 0) is not a guard source.
+        // Skip it so a `.len` guard between the signature and the
         // candidate still engages. A signature deeper in the window is
         // a scope boundary (EPH-I0931).
         if (i > 0 and isFuncBoundary(ctx)) return false;
@@ -39303,8 +39303,8 @@ fn subtrahendLiteral(line: []const u8, dash: usize) ?usize {
 /// init text, or the operator after it cannot decrease the value: a
 /// remainder can reduce the init below the literal (`var i = 5 - 3`
 /// inits 2, `var i = 5 / 3` inits 1), so a first-token witness would
-/// silence a real underflow. The first arm keeps the close rule only;
-/// the plus arm binds only when the pre-plus region is one complete
+/// silence a real underflow. The first arm keeps the close rule only.
+/// The plus arm binds only when the pre-plus region is one complete
 /// numeric literal (`var i = n - 100 + 10` inits n - 90, so a
 /// remainder witness on 10 would silence a real underflow) and owns
 /// the `+`-chain remainders (EPH-I0994).
@@ -39356,7 +39356,7 @@ fn remainderLiteralCovers(text: []const u8, subtrahend: usize) bool {
 
 /// True when the operator at `c` can make the value smaller than the
 /// literal before it. The decreasing set is exactly `-`, `/`, `%`,
-/// `*`, `&`, `^`, and `>`; the `>` start covers `>>` and the `*`
+/// `*`, `&`, `^`, and `>`. The `>` start covers `>>` and the `*`
 /// start covers `**`. The remaining binary operators (`+`, `|`, `<<`)
 /// cannot decrease a non-negative left operand (EPH-I0994).
 fn literalAfterOpDecreases(c: u8) bool {
@@ -39368,7 +39368,7 @@ fn literalAfterOpDecreases(c: u8) bool {
 /// between the init and the end of the loop body, proves the
 /// subtraction cannot underflow. The candidate must sit inside a loop
 /// body (EPH-I0497): without the loop the init says nothing about the
-/// iteration; a reassignment (`i = 0`) anywhere in the body, before or
+/// iteration. A reassignment (`i = 0`) anywhere in the body, before or
 /// after the candidate, breaks the proof — an after-candidate write
 /// still reaches the next iteration's candidate run (EPH-I0934). The
 /// window is 20 lines and stops at the function boundary. The init
@@ -39413,8 +39413,8 @@ fn hasInitWitness(
 }
 
 /// One window line's answer to the init-witness scan (hasInitWitness):
-/// `skip` — the line holds no qualifying declaration; `boundary` — a
-/// nested fn signature stops the scan; `witnessed` — the line declares
+/// `skip` — the line holds no qualifying declaration. `boundary` — a
+/// nested fn signature stops the scan. `witnessed` — the line declares
 /// and initializes the index var above the subtrahend with no
 /// reassignment after (EPH-I0497, EPH-I0499, EPH-I0934).
 const InitWitnessVerdict = enum { skip, boundary, witnessed };
@@ -39427,8 +39427,8 @@ fn initWitnessLineVerdict(
 ) InitWitnessVerdict {
     const ctx = mem.trim(u8, lines[init_idx], " \t\r");
     if (isCommentOrMultilineString(ctx)) return .skip;
-    // A nested fn signature inside the window is a scope boundary;
-    // the walk must not descend into it. The callers pass the
+    // A nested fn signature inside the window is a scope boundary.
+    // The walk must not descend into it. The callers pass the
     // function's own lines, so the outer signature always sits at
     // index 0 and is the one exemption (EPH-I0499). At a deeper
     // window (check_start > 0) the first window line is an arbitrary
@@ -39456,7 +39456,7 @@ const NumLit = struct {
 /// prefix and underline semantics: `0x`/`0X` hex, `0b`/`0B` binary,
 /// `0o`/`0O` octal, and underline-separated digits (`1_0` is 10,
 /// `0x1_0` is 16). The digit scan skips underscores and consumes the
-/// base's full alphabet (hex digits for a hex token); the token ends
+/// base's full alphabet (hex digits for a hex token). The token ends
 /// at the first character outside both. The parse then owns the valid
 /// prefix only, so a trailing letter truncates the token (`0x1g`
 /// parses as 1, the scan ends before the `g`). Null comes only from a
@@ -39497,7 +39497,7 @@ fn parseNumericLiteral(inside: []const u8, start: usize) ?NumLit {
 /// (everyLaterBracketWitnessed).
 ///
 /// The end var binds the subtraction's own operand. A plain `n - 1` end
-/// binds `n`; a call-head or paren-group end (`f(n - 1)`, `(n - 1)`)
+/// binds `n`. A call-head or paren-group end (`f(n - 1)`, `(n - 1)`)
 /// binds the argument var the subtraction actually runs on — `f(n - 1)`
 /// evaluates `n - 1` before the call, so an init witness on `n` proves
 /// the end safe (EPH-I0938). A plain-span compound end (`n - 1 - 2`)
@@ -39628,7 +39628,7 @@ fn nextSubBracket(t: []const u8, i: *usize) ?SubBracket {
 /// The first subtraction-bearing bracket on the line, or null
 /// (EPH-I1232): the scan the bracket extract helpers share. A later
 /// subtraction-bearing bracket stays unexamined — the first-match
-/// consumers need only the first; everyLaterBracketWitnessed keeps its
+/// consumers need only the first. EveryLaterBracketWitnessed keeps its
 /// own all-brackets walk.
 fn findFirstSubBracket(t: []const u8) ?SubBracket {
     var i: usize = 0;
@@ -39653,7 +39653,7 @@ fn extractRangeEndSubtraction(t: []const u8) ?IdxSub {
 /// ZA903 witness for the `[0 .. x - N]` slice-end form: the end
 /// underflows when x < N, so the form fires unless a prior declaration
 /// initializes x to a literal >= N with no reassignment between the
-/// init and the scan end (EPH-I0499; the scan end extends to the loop
+/// init and the scan end (EPH-I0499. The scan end extends to the loop
 /// body's close inside a loop — EPH-I0934). The slice end is evaluated
 /// once per expression, so no enclosing loop is required — unlike the
 /// [i - N] iteration form's hasLoopInitGuard. The witness covers only
@@ -39697,9 +39697,9 @@ fn everyLaterBracketWitnessed(
 
 /// True when one subtraction-bearing bracket body carries its own
 /// witness or scope guard (everyLaterBracketWitnessed): a range-end
-/// body needs its own init witness or a zero-check-exit backstop; an
+/// body needs its own init witness or a zero-check-exit backstop. An
 /// index body needs an init witness, an enclosing scope guard, or the
-/// backstop; an unclassifiable body stays a finding — no witness can
+/// backstop. An unclassifiable body stays a finding — no witness can
 /// prove it safe (EPH-I0935, EPH-I0939). The backstop and the scope
 /// guard prove a BOUND: the `== 0` exit proves var >= 1 (subtrahends
 /// <= 1 only) and the enclosing guard must show var >= the body's own
@@ -39730,7 +39730,7 @@ fn laterBracketWitnessed(
 /// the body's close (EPH-I0497, EPH-I0934). The close is part of the
 /// record: the reassignment-scan bound is the verified close, and the
 /// caller never recomputes it (EPH-I0931 review F4). The close is the
-/// brace-derived depth-0 line; a body the slice cuts (a nested
+/// brace-derived depth-0 line. A body the slice cuts (a nested
 /// signature splits the slice) bounds the scan at the slice end, the
 /// conservative fallback (EPH-I0931 review r2).
 const EnclosingLoop = struct {
@@ -39869,7 +39869,7 @@ fn hasConditionalGuardForVar(ctx: []const u8, var_name: []const u8) bool {
 }
 
 /// How an else-open line opens its arm: `} else {` is a plain else
-/// (the antecedent condition is negated for the arm below); `} else if
+/// (the antecedent condition is negated for the arm below). `} else if
 /// (c) {` is an else-if chain arm (its OWN condition guards the arm).
 /// Null when the line is not an else-open. A closed same-line arm
 /// (`} else { x(); }`, net balance -1) is not the arm's opener — the
@@ -39887,7 +39887,7 @@ const ElseOpenKind = enum { plain, chain };
 /// the last `else` word outside strings and comments that directly
 /// follows a closing brace (after whitespace). The last keyword wins:
 /// `} else if (b) { } else {` opens its arm at the final else. The
-/// classic `} else {` line qualifies at its first char; a mid-line
+/// classic `} else {` line qualifies at its first char. A mid-line
 /// else-open (`if (n > 1) { return arr[0]; } else {`) qualifies through
 /// the same brace-predecessor rule (EPH-I0965). A ternary `else`
 /// (`x = if (a) 1 else 2`) never follows a brace and never qualifies.
@@ -40037,7 +40037,7 @@ fn findAllmanJudgeLine(
 
 /// True when the Allman header above the bare `{` body open at
 /// `ctx.open_idx` guards `ctx.var_name`. The header is the first
-/// conditional/loop opener line above; it must carry no `{` and no
+/// conditional/loop opener line above. It must carry no `{` and no
 /// statement end of its own — otherwise the `{` line is a separate
 /// block, not the opener's body (the crossClosedBlock discipline,
 /// EPH-I0951). Pre-fix the walk saw the header at depth 0 and the
@@ -40047,7 +40047,7 @@ fn findAllmanJudgeLine(
 /// no brace and no statement end, so the walk skips them up to the
 /// header's own opener line (EPH-I1018). A classic chain-arm header
 /// (`} else if (...)`) defeats isConditionalStart's line-start
-/// requirement; its arm's own condition still guards the body below
+/// requirement. Its arm's own condition still guards the body below
 /// (EPH-I1019).
 fn allmanHeaderGuardHasVar(ctx: AllmanHeaderCtx, amount: ?usize) bool {
     const judged = findAllmanJudgeLine(ctx.lines, ctx.stop, ctx.open_idx) orelse return false;
@@ -40056,7 +40056,7 @@ fn allmanHeaderGuardHasVar(ctx: AllmanHeaderCtx, amount: ?usize) bool {
 
 /// True when the Allman header above the bare `{` body open at
 /// `open_idx` proves the bound. The amount-aware twin of
-/// allmanHeaderGuardHasVar; the header must be a conditional or loop
+/// allmanHeaderGuardHasVar. The header must be a conditional or loop
 /// opener. An Allman `if` header proves the bound like the `while`
 /// header: its own condition governs the body (EPH-I0952, EPH-I0976).
 /// A multi-line header's continuation lines carry no brace and no
@@ -40134,7 +40134,7 @@ fn openerLineGuardsVar(
 /// An opener beyond the window is missed (accepted false negative). An
 /// else-open crossing marks that the antecedent opener's condition is
 /// NEGATED for the arm below — `if (x > 0) { ... } else { x -= 1; }`
-/// decrements at x == 0 — so the next opener is skipped; an else-if
+/// decrements at x == 0 — so the next opener is skipped. An else-if
 /// arm's own condition still guards its body (EPH-I0963). The else-if
 /// judgment inherits the chain's amount-blind or-tail residual
 /// (band-B12 F17, EPH-I0506). An else-open counts only when the walk
@@ -40169,7 +40169,7 @@ fn hasEnclosingGuardForVar(
 /// Drive one enclosing backward walk (EPH-I1232): the shared loop the
 /// guard and bound twins duplicate. `judges` carries the crossing and
 /// else-open judges plus the else-open line constructor (see
-/// judgeEnclosingWalkLine); a line's verdict — `skip` resumes above,
+/// judgeEnclosingWalkLine). A line's verdict — `skip` resumes above,
 /// `found` answers true, `boundary` answers false. The walk ctx
 /// carries the lines and the anchor index.
 fn EnclosingWalk(comptime Ctx: type) type {
@@ -40198,7 +40198,7 @@ fn EnclosingWalk(comptime Ctx: type) type {
 
 /// One line's answer to the enclosing-guard backward walk
 /// (hasEnclosingGuardForVar): `skip` — the walk resumes at the line
-/// above; `found` — a covering guard; `boundary` — a function boundary
+/// above. `found` — a covering guard. `boundary` — a function boundary
 /// stops the walk.
 const EnclosingWalkVerdict = enum { skip, found, boundary };
 
@@ -40327,7 +40327,7 @@ const GuardCrossingCtx = struct {
 /// only when the var's guard shape and the amount agree (EPH-I0995). A
 /// multi-line condition closes on this `{`-carrying line but opens on
 /// the line above: the opener line never crosses depth 0 (the tail's
-/// `{` reset it), so the line above is judged directly; the
+/// `{` reset it), so the line above is judged directly. The
 /// paren-imbalance gate keeps the check on continuation tails — a
 /// balanced opener line never triggers it (EPH-I1013, EPH-I1019). An
 /// Allman body open is the bare `{` line under the opener: the header's
@@ -40384,10 +40384,10 @@ fn closesGroupOpenedAbove(t: []const u8) bool {
 }
 
 /// True when the guard region's proven lower bound clears the decrement
-/// amount; a null amount keeps the shape-only verdict. A region that
+/// amount. A null amount keeps the shape-only verdict. A region that
 /// proves no bound (an or-tail, a comparison in call position) does not
 /// cover — the body can run unguarded (EPH-I0961, EPH-I0995). The
-/// region is the else-arm suffix of the line; a multi-line arm
+/// region is the else-arm suffix of the line. A multi-line arm
 /// condition joins through the shared judge (EPH-I1000).
 fn guardRegionCovers(
     lines: []const []const u8,
@@ -40481,8 +40481,8 @@ fn skipHorizontalSpace(t: []const u8, from: usize) usize {
 
 /// The per-keyword judgment of guardConditionSpan: `skip` resumes the
 /// keyword walk at the given offset (a keyword with no paren group, or
-/// a rejected if-group); `abort` ends the search with null (a group
-/// that never closes on the line); `found` carries the guard
+/// a rejected if-group). `abort` ends the search with null (a group
+/// that never closes on the line). `found` carries the guard
 /// condition's paren-group span.
 const GuardKeywordVerdict = union(enum) {
     skip: usize,
@@ -40491,7 +40491,7 @@ const GuardKeywordVerdict = union(enum) {
 };
 
 /// Judge one `if`/`while` keyword occurrence (guardConditionSpan): a
-/// `while` group is always the condition; an `if` group needs the block
+/// `while` group is always the condition. An `if` group needs the block
 /// open `{` after it (the ternary-if exclusion) or a brace-less body
 /// with no `else` branch between the group and the statement end —
 /// `x = if (a) 1 else 2; if (n > 0) {` keeps only the second group
@@ -40505,7 +40505,7 @@ fn judgeGuardKeyword(t: []const u8, kw: usize) GuardKeywordVerdict {
     const k = skipHorizontalSpace(t, close + 1);
     if (k < t.len and t[k] == '{') return .{ .found = .{ .start = j + 1, .end = close } };
     // A brace-less body (`if (a > 0) a -= 1;`) is still the opener's
-    // condition; only the ternary-if exclusion (an `else` branch
+    // condition. Only the ternary-if exclusion (an `else` branch
     // between the group and the statement end) rejects the group
     // (EPH-I0995).
     if (braceLessIfBodyEndsBeforeElse(t, close))
@@ -40723,9 +40723,9 @@ const TopLevelScanState = struct {
 };
 
 /// The keyword scan's per-position answer (topLevelKeywordPos): `skip`
-/// — no needle token starts at `i`; `abort` — the region cannot hold
+/// — no needle token starts at `i`. `abort` — the region cannot hold
 /// the needle (an unbalanced close, or the position sits past the
-/// comment start); `found` — the needle is a code-position token at
+/// comment start). `found` — the needle is a code-position token at
 /// `i`.
 const TopLevelScanVerdict = enum { skip, abort, found };
 
@@ -40817,7 +40817,7 @@ fn guardTermBound(
     const op = topLevelComparisonOp(t, start, end) orelse return null;
     if (!comparisonLhsIsVar(t, op, var_name)) return null;
     if (neqZeroEndAt(t, op) != null) {
-        // `n != 0` proves n >= 1; the term must close right after the
+        // `n != 0` proves n >= 1. The term must close right after the
         // zero.
         const zero_end = neqZeroEndAt(t, op).?;
         var k = zero_end;
@@ -40829,7 +40829,7 @@ fn guardTermBound(
 }
 
 /// When t[s..e) is exactly one paren group `(...)`, the close paren
-/// index; else null.
+/// index. Else null.
 fn parenGroupClose(t: []const u8, s: usize, e: usize) ?usize {
     var depth: usize = 1;
     var j = s + 1;
@@ -40879,7 +40879,7 @@ fn comparisonOpStep(
 
 /// Judge the comparison operator at one top-level position
 /// (topLevelComparisonOp): `>` in comparison position and `!= 0` start
-/// an operator; a position inside a string or past the comment start
+/// an operator. A position inside a string or past the comment start
 /// skips or ends the scan (EPH-I0961).
 fn comparisonOpTokenVerdict(
     t: []const u8,
@@ -40967,13 +40967,13 @@ fn allmanOpenerCoversBound(ctx: EnclosingBoundCtx, header_idx: usize) bool {
 /// detection, and function-boundary stop) but judges the comparison's
 /// AMOUNT: `if (n > 0) { arr[0 .. n - 2] }` stays a finding because
 /// n >= 1 does not cover n - 2, while `if (n > 1)` covers it
-/// (EPH-I0959). The ZA903 chain uses this judge; ZA901 keeps the
+/// (EPH-I0959). The ZA903 chain uses this judge. ZA901 keeps the
 /// amount-blind hasEnclosingGuardForVar. A guard-to-candidate
 /// reassignment defeats the opener: `if (n > 1) { n = 1; arr[0 .. n - 2] }`
 /// underflows at n == 1 (EPH-I0962). An else-open crossing marks that
 /// the antecedent opener's condition is NEGATED for the arm below —
 /// `if (n > 1) { ... } else { arr[0 .. n - 2] }` runs the else arm at
-/// n <= 1 — so the antecedent is skipped; an else-if arm's own
+/// n <= 1 — so the antecedent is skipped. An else-if arm's own
 /// condition still guards its body (EPH-I0963). An else-open counts
 /// only when the walk crosses it at depth 0 and the line does not close
 /// the arm on its own line (batch 30 r4, review r3 Finding 1). A
@@ -41047,7 +41047,7 @@ fn judgeEnclosingBoundElseOpen(
 /// subtrahend and no line between reassigns the var. A multi-line
 /// condition closes on this `{`-carrying line but opens on the line
 /// above: the opener line never crosses depth 0 (the tail's `{` reset
-/// it), so the line above is judged directly; the paren-imbalance gate
+/// it), so the line above is judged directly. The paren-imbalance gate
 /// keeps the check on continuation tails — a balanced opener line never
 /// triggers it (EPH-I1013). An Allman body open is the bare `{` line
 /// under the opener: the header's condition never registered because
@@ -41111,7 +41111,7 @@ fn cfgGuardCoversBracket(ctx: GuardLineCtx, sub: IdxSub) bool {
     }
     const gi = guard_idx orelse return false;
     if (!guardCoversDecrement(ctx, gi, sub.idx_var, sub.subtrahend)) return false;
-    // A guard on the candidate's own line leaves no scan range; a
+    // A guard on the candidate's own line leaves no scan range. A
     // later line cannot exist between them.
     const scan_start = gi + 1;
     if (scan_start >= ctx.idx) return true;
@@ -41127,7 +41127,7 @@ fn hasIndexOperandBefore(inside: []const u8, pos: usize) bool {
     if (i == 0) return false;
     const c = inside[i - 1];
     if (isIdent(c) or c == ')' or c == ']' or c == '\'') return true;
-    // `ptr.* - 1` — a dereferenced index is a real operand; `x * -1` is a
+    // `ptr.* - 1` — a dereferenced index is a real operand. `x * -1` is a
     // multiply by a negative, not a subtraction.
     return c == '*' and i >= 2 and inside[i - 2] == '.';
 }
@@ -41139,7 +41139,7 @@ fn hasIndexOperandBefore(inside: []const u8, pos: usize) bool {
 /// suffix-stripping sites), and `-` (a `x - -1` operand is a unary
 /// negative). Those FP classes were judged worse than the resulting FN
 /// residuals (a real underflow behind an `@`-builtin or string-len RHS is
-/// rare; the corpus A/B runs on every gate and has shown no unguarded TP
+/// rare. The corpus A/B runs on every gate and has shown no unguarded TP
 /// class since). Only ident, `(`, and `'` open a real RHS.
 fn hasIndexOperandAfter(inside: []const u8, pos: usize) bool {
     var j = pos + 1;
@@ -41189,7 +41189,7 @@ fn findIndexSubtraction(inside: []const u8) ?usize {
 /// True when `inside` is the `[0 .. x - N]` zero-based slice-end form.
 /// The form is NOT safe on its own: `x - N` underflows when x < N
 /// (EPH-I0499). The candidate finder treats it as any other index
-/// subtraction; only the base extraction keeps skipping it — a range
+/// subtraction. Only the base extraction keeps skipping it — a range
 /// bracket is not an `[x - N]` bracket for the .len-guard binding.
 fn isSafeZeroBasedRange(inside: []const u8) bool {
     const range_pos = mem.indexOf(u8, inside, "..") orelse return false;
@@ -41224,7 +41224,7 @@ fn extractArrayBaseFromIndexArithmetic(t: []const u8) ?[]const u8 {
 
 /// Position of the `if` keyword on `t` at a left word boundary, or null.
 /// The keyword must sit before a `(` after optional spaces: `if (x)` and
-/// `if(x)` match; `diff (x)` and `serif(x)` do not (band-B12 F17,
+/// `if(x)` match. `diff (x)` and `serif(x)` do not (band-B12 F17,
 /// EPH-I0506).
 fn ifKeywordPos(t: []const u8) ?usize {
     var from: usize = 0;
@@ -41318,7 +41318,7 @@ fn countCurlyBalance(line: []const u8) i32 {
 
 /// True when the line's last code-position brace is an opening brace: the
 /// line opens a block. A plain `if (x) {` opener and a `} else {` /
-/// `} else if (x) {` opener both qualify; the else-openers net zero
+/// `} else if (x) {` opener both qualify. The else-openers net zero
 /// braces, so a net-positive test alone would skip them (EPH-I0487).
 fn lineOpensBlock(t: []const u8) bool {
     var cls = LineClassifier.init(t);
@@ -41434,7 +41434,7 @@ fn isPlainIdentChain(s: []const u8) bool {
 /// True when `t` has a lower-bound or zero-exclusion comparison on
 /// `var_name` at or before `limit`: `>`, `>=` (not the `->` or `=>`
 /// arrows), and `!=` with a literal-zero right side. The comparison's
-/// left side must be the var; an upper-bound comparison (`<`, `<=`)
+/// left side must be the var. An upper-bound comparison (`<`, `<=`)
 /// proves no lower bound, and a comparison on another var guards
 /// nothing. An `or`-root with an arm that proves nothing for the var
 /// proves nothing: `x != 0 or y` and `y > 0 or x > 0` run the guarded
@@ -41456,7 +41456,7 @@ fn hasLowerBoundGuardForVar(t: []const u8, var_name: []const u8, limit: usize) b
         if (comment_start != null and i >= comment_start.?) continue;
         // An `or`-root with an arm that proves nothing for the var
         // re-enters the body when that arm holds (`x != 0 or y`, `y > 0
-        // or x > 0`, whitespace variants); an `and`-tail or a same-var
+        // or x > 0`, whitespace variants). An `and`-tail or a same-var
         // or-root keeps the guard (band-B12 F17, EPH-I0506, EPH-I0942).
         if (comparisonOrRootNulls(t, var_name, i)) continue;
         if (comparisonLhsIsVar(t, i, var_name)) return true;
@@ -41471,7 +41471,7 @@ fn hasLowerBoundGuardForVar(t: []const u8, var_name: []const u8, limit: usize) b
 /// holds, so the comparison cannot suppress. An `and`-tail and an
 /// or-root whose arms all bound the var (`x > 0 or x > 5`) keep the
 /// guard. A var-RHS arm (`x > y`) keeps its shape-only acceptance
-/// without an `or`; `x > y or x > z` stays an accepted false positive,
+/// without an `or`. `x > y or x > z` stays an accepted false positive,
 /// the literal-bound judge cannot prove var bounds (band-B12 F17,
 /// EPH-I0506, EPH-I0942).
 fn comparisonOrRootNulls(t: []const u8, var_name: []const u8, op_pos: usize) bool {
@@ -41593,8 +41593,8 @@ fn callGuardScanHolds(
 /// non-empty string literal. A call on another var or an empty needle
 /// proves nothing.
 fn endsWithCallGuardsBase(t: []const u8, pos: usize, call: []const u8, base: []const u8) bool {
-    // Method form: the chain before the call ends with the method name;
-    // the base sits before the final dot.
+    // Method form: the chain before the call ends with the method name.
+    // The base sits before the final dot.
     const method = call[0 .. call.len - 1];
     if (identStartBefore(t, pos + method.len)) |start| {
         const chain = mem.trim(u8, t[start .. pos + method.len], " \t");
@@ -41639,7 +41639,7 @@ fn needleLiteralGuardsBase(t: []const u8, pos: usize) bool {
 
 /// The `and`-conjunction shape: `if (i > 0 and i < n) a[i - 1];`. The
 /// conjunction requires a lower-bound comparison on the index var left
-/// of the index expression; a comparison right of the index (`a[i - 1]
+/// of the index expression. A comparison right of the index (`a[i - 1]
 /// > 0 and ...`) or on another var counts for nothing (band-B12 F17,
 /// EPH-I0506).
 fn hasAndComparisonGuard(t: []const u8, expr: IndexExprLoc) bool {
@@ -41696,7 +41696,7 @@ const ZeroExclusionScanQuery = struct {
 /// True when one `pat` occurrence before the else keyword is the
 /// zero-exclusion on the var (hasElseArmZeroExclusion): an identifier
 /// tail, an `and`-tail, a string-literal position, and a comment
-/// position all disqualify; the surviving occurrence must sit left of
+/// position all disqualify. The surviving occurrence must sit left of
 /// a comparison on the candidate var (band-B12 F17, EPH-I0506).
 fn zeroExclusionPatternHolds(
     q: ZeroExclusionScanQuery,
@@ -42065,7 +42065,7 @@ fn clampCallClosesRhs(rhs: []const u8, name: []const u8) bool {
 /// runs from the last `;` (or line start) to the `=`, stripped of a
 /// `const`/`var` keyword and an optional `: T` annotation (EPH-I0946).
 /// The sibling arm isConstLiteralInit accepts the annotation by
-/// ident-prefix matching; this arm strips it so the bare-ident equality
+/// ident-prefix matching. This arm strips it so the bare-ident equality
 /// check sees the same shape.
 fn assignmentTargetsIdent(t: []const u8, eq: usize, ident: []const u8) bool {
     var start: usize = 0;
@@ -42117,7 +42117,7 @@ fn braceBalance(t: []const u8) isize {
 /// A `}` on the header line closes the body on that line, so a cast below
 /// the line is outside the loop (band-B12 F26d).
 /// The cross-line literal mask of hasCastBoundsProof (EPH-I0944) keeps a
-/// continuation line's `}` out of `depth`; the mask is built before this
+/// continuation line's `}` out of `depth`. The mask is built before this
 /// judge runs.
 fn isRangeForProof(t: []const u8, ident: []const u8, depth: isize) bool {
     if (depth < 0) return false;
@@ -42229,8 +42229,8 @@ fn classifyMultilineContent(lines: []const []const u8, start: usize, idx: usize,
             continue;
         }
         // The terminator starts with an expression terminator (`;` or
-        // `,`) or a closer that validly follows the string (`);`, `};`);
-        // it stays code and ends the string. Every other line below the
+        // `,`) or a closer that validly follows the string (`);`, `};`).
+        // It stays code and ends the string. Every other line below the
         // opener is string content.
         if (isMultilineStringTerminator(t, open_braces)) {
             in_string = false;
@@ -42255,7 +42255,7 @@ fn classifyMultilineContent(lines: []const []const u8, start: usize, idx: usize,
 /// line stays code: `; }` keeps its real `}` and a cast below the closed
 /// loop fires. The invalid-Zig continuation shapes (ZR104 flags them —
 /// `} text`, `) } weird`, `} ;` without an open container) stay masked
-/// like the valid `\\`-starting shape; a `)`/`]`-starting line whose
+/// like the valid `\\`-starting shape. A `)`/`]`-starting line whose
 /// tail reads as a valid closer (`);`, `)) {`, `) } ;`) is code even
 /// when the surrounding region is invalid (EPH-I0974). Residual: a
 /// single-line `\\` string whose real terminator does not start with
@@ -42317,7 +42317,7 @@ const cast_needles = [_]CastNeedle{
     },
 };
 
-/// ZA904: scan one line for one builtin's call sites; report when unguarded.
+/// ZA904: scan one line for one builtin's call sites. Report when unguarded.
 fn checkCastNeedleOnLine(
     sink: CastSink,
     lines: []const []const u8,
@@ -42565,8 +42565,8 @@ fn runFmtCheck(
         buildFmtArgv(path, &fmt_argv, &fmt_scratch),
         .inherit,
     ) catch |err| {
-        // The bare line stays off the JSON machine stream (EPH-I0213);
-        // the ZR104 finding below carries the same fact as machine data.
+        // The bare line stays off the JSON machine stream (EPH-I0213).
+        // The ZR104 finding below carries the same fact as machine data.
         cliDiag(diag, "error: cannot run zig fmt: {}\n", .{err});
         // The run survives this failure: the ZR104 finding below carries
         // it, so the printed-error latch must not keep speaking for a
@@ -42628,7 +42628,7 @@ fn runFmtCheck(
         // finding is noise on such inputs (EPH-I0979). The empty list
         // does not read as ran-clean for an actionable reason: the
         // EPH-I0722 protection covers .exited failures (a missing path,
-        // syntax errors), which the user can fix; a crashed child cannot
+        // syntax errors), which the user can fix. A crashed child cannot
         // be fixed from ephor.
         .signal, .stopped, .unknown => {
             if (issues.items.len != 0) try reportFmtTermFailure(allocator, &issues, path, result);
@@ -42732,7 +42732,7 @@ const ParsedArgv = struct {
 /// and honoring backslash escapes. `"a b"` becomes one token `a b`, and
 /// `\"`/`\'`/`\\` produce the escaped byte literally in any quote state
 /// (simpler than POSIX single-quote semantics, documented deviation,
-/// band-B12 F20, EPH-I0507). Unquoted tokens copy into `scratch`; writes
+/// band-B12 F20, EPH-I0507). Unquoted tokens copy into `scratch`. Writes
 /// stop at either buffer bound and set `truncated` (RED5-1). An
 /// unterminated quote consumes the rest of the command as one token.
 fn parseCommandIntoArgv(
@@ -42850,7 +42850,7 @@ fn buildRuntimeArgv(
 ) !usize {
     if (opts.custom_command) |cmd| {
         // EPH-I0173: the command is operator-typed argv, which may carry
-        // control bytes; it crosses the terminal sanitizer at the echo.
+        // control bytes. It crosses the terminal sanitizer at the echo.
         if (opts.verbose and !opts.json_stream) {
             var safe_cmd = try types.sanitizeTerminal(allocator, cmd);
             defer safe_cmd.deinit(allocator);
@@ -43089,7 +43089,7 @@ fn runRuntimeAnalysis(
 
 /// Failed-spawn path for runRuntimeAnalysis (EPH-I0173): the command
 /// crosses the terminal sanitizer on the bare error line, which stays
-/// off the JSON machine stream (EPH-I0213); the ZR104 finding carries
+/// off the JSON machine stream (EPH-I0213). The ZR104 finding carries
 /// the same fact as machine data.
 fn reportSpawnFailure(
     allocator: Allocator,
@@ -43179,17 +43179,17 @@ const RuntimeEmitCtx = struct {
     root_real: ?[]const u8 = null,
     root_attempted: bool = false,
     /// Dedup/cap state (EPH-I0211). Null disables both (legacy test
-    /// callers); production passes the run-scoped state.
+    /// callers). Production passes the run-scoped state.
     state: ?*RuntimeParseState = null,
     /// Writer seam for the verbose band (EPH-I0288). Tests pass a
     /// capture writer so hostile fixture bytes stay off the green-run
-    /// log; production passes null for the raw stderr path,
+    /// log. Production passes null for the raw stderr path,
     /// byte-identical with the pre-seam output.
     writer: ?*std.Io.Writer = null,
     /// Verbose mode for the runtime band (ZA506 D1, EPH-I1081): the
     /// flag moved from per-handler parameters onto the emit context,
     /// the mode every runtime parser shares. Production sets it from
-    /// RuntimeOptions; tests leave the default false.
+    /// RuntimeOptions. Tests leave the default false.
     verbose: bool = false,
 };
 
@@ -43203,7 +43203,7 @@ const RuntimeIssueSpec = struct {
 /// Shared dedup/cap state for one runtime-analysis run (EPH-I0211). All
 /// three parse passes (GPA stderr, test stdout, test stderr) share one
 /// state, so a line repeated across streams dedups too. The map owns
-/// every inserted key; deinit frees them.
+/// every inserted key. Deinit frees them.
 const RuntimeParseState = struct {
     seen: std.StringHashMapUnmanaged(void) = .empty,
     /// Findings dropped as duplicates or past the cap.
@@ -43236,12 +43236,12 @@ fn printVerboseRuntimeLine(ctx: RuntimeEmitCtx, label: []const u8, t: []const u8
 }
 
 /// Total cap on kept runtime findings (EPH-I0211). A real failing suite
-/// yields well under this; 10 MB of forged output would otherwise mint
+/// yields well under this. 10 MB of forged output would otherwise mint
 /// ~10^6 findings. The over-cap tail counts as suppressed.
 const max_runtime_findings = 1000;
 
 /// Dedup/cap gate for the runtime band (EPH-I0211). False means the
-/// finding is a duplicate or past the cap and must not be appended; the
+/// finding is a duplicate or past the cap and must not be appended. The
 /// suppressed counter covers both classes. With no state the gate is off.
 /// The key joins rule, file, line, and message with 0x01: the message
 /// carries the leak location, so two distinct leaks must not collapse.
@@ -43975,7 +43975,7 @@ fn isRuleToken(tok: []const u8) bool {
 /// suppress ZA301. The config disable/enable lists additionally accept
 /// category prefixes (`"disable": ["ZA3"]` kills the whole category). The
 /// asymmetry is documented in printHelp and the README (README coverage
-/// landed in EPH-I1050). A directive is a surgical, in-code decision; a
+/// landed in EPH-I1050). A directive is a surgical, in-code decision. A
 /// config list is run-wide policy.
 fn ruleListMatches(rest: []const u8, rule: []const u8) bool {
     var tokens = mem.tokenizeAny(u8, rest, " \t\r");
@@ -43987,7 +43987,7 @@ fn ruleListMatches(rest: []const u8, rule: []const u8) bool {
 }
 
 /// True when a directive's post-keyword text covers `rule`: empty text is a
-/// bare directive (suppresses all rules); otherwise the rule must appear in
+/// bare directive (suppresses all rules). Otherwise the rule must appear in
 /// the leading rule-id list.
 fn directiveRestMatches(rest: []const u8, rule: []const u8) bool {
     if (rest.len == 0) return true;
@@ -43996,7 +43996,7 @@ fn directiveRestMatches(rest: []const u8, rule: []const u8) bool {
 
 /// Check if a single line carries an ignore/disable directive that matches
 /// the given rule. The keyword must anchor a plain `//` comment as its first
-/// token; keywords inside prose, strings, or `///` doc comments are inert.
+/// token. Keywords inside prose, strings, or `///` doc comments are inert.
 fn checkLineIgnore(line: []const u8, rule: []const u8) bool {
     const comment_start = findCommentStart(line) orelse return false;
     const dir = parseDirective(line[comment_start..]);
@@ -44057,7 +44057,7 @@ fn isIgnoreCommentLine(line: []const u8, rule: []const u8) bool {
     return mem.startsWith(u8, trimmed, "//") and checkLineIgnore(line, rule);
 }
 
-/// `{` braces left unmatched at end of line; a `}` at depth 0 is ignored,
+/// `{` braces left unmatched at end of line. A `}` at depth 0 is ignored,
 /// matching the scope tracker's floor-at-zero counting. Only braces in code
 /// context count: braces inside strings, char literals, and comments are
 /// data, and counting them leaks the suppression scope past the real
@@ -44147,10 +44147,10 @@ const InlineLineCtx = struct {
 };
 
 /// One line's answer to the inline-ignore scan (isInlineDisabled):
-/// null — keep scanning; true — the target line is suppressed; false —
+/// null — keep scanning. True — the target line is suppressed. False —
 /// the target line is not suppressed and the scan ends. While a scope is
 /// active every line is suppressed (including the one that closes it).
-/// A comment-only ignore line suppresses the next line; when that line
+/// A comment-only ignore line suppresses the next line. When that line
 /// opens a brace scope the suppression extends over the whole scope.
 fn consumeInlineLine(
     scope: *ScopeIgnore,
@@ -44194,7 +44194,7 @@ const RuleFacts = struct {
 /// same unmatchedOpenBraces depth, same consumeIgnoredScopeLine close
 /// semantics, all counting braces in code context only — so cached lookups
 /// reproduce the per-issue rescan verdict exactly. A line entered while a
-/// scope is active is suppressed (including the line that closes it); the
+/// scope is active is suppressed (including the line that closes it). The
 /// scope-opening line itself is always suppressed.
 fn buildRuleFacts(allocator: Allocator, content: []const u8, rule: []const u8) !RuleFacts {
     var facts: RuleFacts = .{};
@@ -44218,7 +44218,7 @@ fn buildRuleFacts(allocator: Allocator, content: []const u8, rule: []const u8) !
 }
 
 /// One line's suppression answer for the fact-building scan
-/// (buildRuleFacts): `suppressed` — the line joins the suppressed set;
+/// (buildRuleFacts): `suppressed` — the line joins the suppressed set.
 /// `clean` — it does not. Mirrors consumeInlineLine's decision tree
 /// branch-for-branch, one line per call with the same scope tracking:
 /// a line entered while a scope is active is suppressed (including the
@@ -44238,7 +44238,7 @@ fn ruleLineSuppressed(
     const prev_ignores = if (prev_line) |pl| isIgnoreCommentLine(pl, rule) else false;
     if (scope.active) {
         // consumeIgnoredScopeLine returns is_target, so true here means the
-        // line is suppressed; the call's purpose is the scope tracking.
+        // line is suppressed. The call's purpose is the scope tracking.
         _ = consumeIgnoredScopeLine(scope, line, true);
         return .suppressed;
     }
@@ -44253,11 +44253,11 @@ fn ruleLineSuppressed(
 
 /// Per-(file, rule) cache of directive suppression facts.
 /// WHY: shouldPrintIssue used to rescan the whole source file for every
-/// issue (O(issues × lines), with the directive parse cost per line); on
+/// issue (O(issues × lines), with the directive parse cost per line). On
 /// issue-count-bound projects (libqt6zig: 2,803 files, ~50-60 min) that
 /// dominated the run. Facts for a (file, rule) pair are built once in a
 /// single pass and then looked up in O(1). Keys are duped into cache-owned
-/// memory so entries never dangle on caller-held slices; deinit frees all.
+/// memory so entries never dangle on caller-held slices. Deinit frees all.
 const IgnoreCache = struct {
     allocator: Allocator,
     files: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(RuleFacts)),
@@ -44311,7 +44311,7 @@ const IgnoreCache = struct {
         // (file, rule) pair answers with ZERO allocations — the point of
         // the cache on issue-count-bound projects. getPtr probes with
         // borrowed keys and mutates nothing, so no unwind hazard exists
-        // on this path; a caller passing key-aliased slices is safe here
+        // on this path. A caller passing key-aliased slices is safe here
         // too, since nothing rehashes while the pointer is borrowed.
         if (self.files.getPtr(file)) |file_entry| {
             if (file_entry.getPtr(rule)) |facts| return facts;
@@ -44320,7 +44320,7 @@ const IgnoreCache = struct {
         // lands BEFORE getOrPut, so the slot always holds an owned key and
         // unwinding never needs a map remove — a future caller may pass
         // transient memory without re-opening the borrowed-key UAF class.
-        // A redundant dupe for an already-cached file is released here; the
+        // A redundant dupe for an already-cached file is released here. The
         // errdefer is disarmed first so a later failure cannot free the
         // released key twice.
         const owned_file = try self.allocator.dupe(u8, file);
@@ -44373,7 +44373,7 @@ const Command = enum {
 };
 
 /// Who set the fail-on gate level. Higher-priority sources override lower
-/// ones; ties go to the LATER occurrence (last-wins within one source).
+/// ones. Ties go to the LATER occurrence (last-wins within one source).
 const FailOnSource = enum { unset, strict_key, fail_on_key, cli };
 
 /// Set the fail-on level unless a higher-priority source already owns it.
@@ -44413,7 +44413,7 @@ const Config = struct {
     // (EPH-I0193). The floor refuses downgrades by default.
     force_upgrade: bool = false,
     // CI gate: exit 1 when findings reach this level. --strict ≡ .warning.
-    // Config "fail_on" is more specific than config "strict"; CLI always wins.
+    // Config "fail_on" is more specific than config "strict". CLI always wins.
     fail_on: FailOn = .never,
     fail_on_source: FailOnSource = .unset,
     // Coverage gate (EPH-I1091): the ephor.json "coverage" block. The
@@ -44425,13 +44425,13 @@ const Config = struct {
     // counts ({"passed": N, "total": M}), written by the gate script.
     coverage_evidence_path: ?[]const u8 = null,
     // ZA703 error-name convention. Absent config key = TitleCase (the
-    // community standard); "snake_case" restores the pre-flip behavior.
+    // community standard). "snake_case" restores the pre-flip behavior.
     error_naming: ErrorNaming = .title_case,
-    // The config file that last applied error_naming (owned; freed in
+    // The config file that last applied error_naming (owned, freed in
     // deinit). The disclosure note (RED3-9, EPH-I0169) prints from this
     // record once the scan root settles.
     error_naming_from_path: ?[]const u8 = null,
-    // Directory of the last successfully loaded config file (owned;
+    // Directory of the last successfully loaded config file (owned,
     // freed in deinit). The .ephor-ignore auto-load consults this dir
     // beside the scan root (EPH-I0737): the operator's own tree keeps
     // the ignore file next to the config that steered the scan.
@@ -44452,7 +44452,7 @@ const Config = struct {
     // --include-parent (EPH-I0161): include the scan path's parent
     // directory in the build-reference search (parent build.zig and the
     // parent module-dir root). Off by default for a parent outside the
-    // operator's working directory; the cwd and its ancestors stay the
+    // operator's working directory. The cwd and its ancestors stay the
     // documented exempt channel either way (README: "the working
     // directory's own build.zig may point outside the scan root").
     include_parent: bool = false,
@@ -44603,7 +44603,7 @@ fn nextPathComponentMatches(
 }
 
 /// One component of excludePatternMatchesPath (EPH-I0076): exact
-/// equality always matches; the extended mode also matches a component
+/// equality always matches. The extended mode also matches a component
 /// that extends the pattern component with a dot.
 fn excludeComponentMatches(
     path_comp: []const u8,
@@ -44620,10 +44620,10 @@ const CONFIG_FILENAME = "ephor.json";
 
 /// Coverage-gate block (EPH-I1091), parsed from ephor.json "coverage".
 /// `present` distinguishes an absent key from an all-default block.
-/// `unreached_pub_fn_ratio_max` < 0 means unset (no ratio gate);
+/// `unreached_pub_fn_ratio_max` < 0 means unset (no ratio gate).
 /// `min_tests` 0 means unset (no test-count gate). The ratio is a
 /// percentage of ZT105-unreached pub fns over all pub fns the scan
-/// collected; the runner legs evaluate only when --coverage-evidence
+/// collected. The runner legs evaluate only when --coverage-evidence
 /// supplies the runner's own counts.
 const CoverageConfig = struct {
     present: bool = false,
@@ -44633,7 +44633,7 @@ const CoverageConfig = struct {
 };
 
 /// Report a config parse failure. CI-gate and fail-closed validation errors
-/// are hard (propagated to the caller as usage errors); every other parse
+/// are hard (propagated to the caller as usage errors). Every other parse
 /// error warns + continues.
 fn reportConfigParseError(
     diag: *DiagCtx,
@@ -44685,7 +44685,7 @@ fn badGateValueSlice(diag: *const DiagCtx) []const u8 {
 
 /// Copy an offending CI-gate value into the fixed stash (B13-17,
 /// EPH-I0520). The value aliases the config content buffer, which the
-/// caller frees right after the parse error is reported; the copy keeps
+/// caller frees right after the parse error is reported. The copy keeps
 /// the catch-site's report read valid past that free.
 fn stashBadGateValue(diag: *DiagCtx, value: []const u8) void {
     const n = @min(value.len, diag.last_bad_gate_value.len);
@@ -44821,7 +44821,7 @@ fn parseCandidateConfig(
 
 /// Length snapshot of every config list a candidate load can append to
 /// (EPH-I0513). A parse that fails partway leaves the values parsed
-/// before the failure in the config; on the false path those partial
+/// before the failure in the config. On the false path those partial
 /// values must unwind, or a later successful parent-config load would
 /// absolutize and gate them against the wrong base.
 const ConfigListSnapshot = struct {
@@ -44869,7 +44869,7 @@ fn rollbackConfigLists(cfg: *Config, allocator: Allocator, snap: ConfigListSnaps
 
 /// Read one config file, warning on any failure that is not a missing
 /// file (B13-9, EPH-I0517). A missing config is the normal parent-fallback
-/// case; an unreadable or oversized file must never silently read as "no
+/// case. An unreadable or oversized file must never silently read as "no
 /// config here" — the pre-fix behavior silently dropped the user's gate
 /// and suppression keys. Returns null when the file cannot be read (the
 /// function never errors: the catch warns and converts to null).
@@ -44899,14 +44899,14 @@ const LoadedConfigCommit = struct {
 /// Commit a successfully loaded config file (EPH-I0689): absolutize and
 /// gate its entries, print the per-file notes, and transfer the scan
 /// root. Split from tryLoadConfigFromDir to keep that function under the
-/// ZA301 cap; the note emission splits again to keep the branch count
+/// ZA301 cap. The note emission splits again to keep the branch count
 /// under the ZA305 cap.
 fn commitLoadedConfig(c: LoadedConfigCommit) !void {
     const allocator = c.lctx.allocator;
     const cfg = c.lctx.cfg;
     const roots: EntriesRoots = .{ .base = c.dir_copy, .scan_root = c.saved_path };
     // ZA506 D2: the trusted channel absolutizes without the containment
-    // gate (RED4-3) and drops nothing; the untrusted channel gates.
+    // gate (RED4-3) and drops nothing. The untrusted channel gates.
     var dropped_entries: usize = 0;
     if (c.trusted) {
         try makeEntriesAbsoluteTrusted(c.lctx, roots);
@@ -44989,7 +44989,7 @@ fn tryLoadConfigFromDir(
     };
     const list_snapshot = snapshotConfigLists(cfg);
     if (!try parseCandidateConfig(lctx, content, source)) {
-        // A failed parse leaves the entries it appended in cfg; those
+        // A failed parse leaves the entries it appended in cfg. Those
         // partial entries would then be absolutized and trusted by a
         // later successful parent-config load against the wrong base
         // (EPH-I0513, B13-5). Roll them back before the caller falls
@@ -44999,8 +44999,8 @@ fn tryLoadConfigFromDir(
         // path_dir value, freeing the operator's original cfg.path buffer
         // mid-parse. Restore the operator's path as an OWNED copy so a
         // mid-parse failure cannot leave the scan root steered. An OOM in
-        // the parse is the only reachable error from an untrusted config;
-        // the gate-class errors are fatal by design and never take this
+        // the parse is the only reachable error from an untrusted config.
+        // The gate-class errors are fatal by design and never take this
         // path. The restore must run on every false exit regardless.
         try setOwnedPath(allocator, cfg, saved_path);
         return false;
@@ -45019,7 +45019,7 @@ fn tryLoadConfigFromDir(
         .entries_before = list_snapshot.entries,
     });
     // A successful target-side load joins whatever the cwd config already
-    // contributed; the dual-load note fires from the check handler
+    // contributed. The dual-load note fires from the check handler
     // (EPH-I0076).
     cfg.target_config_loaded = true;
     return true;
@@ -45094,8 +45094,8 @@ fn noteUntrustedEntriesHints(
 /// Print the error-naming convention disclosure (RED3-9, EPH-I0169): the
 /// ZA703 standard for this run came from a config at or inside the scan
 /// target, so the target defined the standard its own code satisfies. The
-/// convention is an ErrorNaming.str() literal (config-parse validated);
-/// the path crosses the terminal sanitizer (EPH-I0147).
+/// convention is an ErrorNaming.str() literal (config-parse validated).
+/// The path crosses the terminal sanitizer (EPH-I0147).
 fn noteErrorNamingSource(
     diag: *DiagCtx,
     allocator: Allocator,
@@ -45285,7 +45285,7 @@ fn entryPassesTrust(io: std.Io, root_real: ?[]const u8, abs: []const u8) bool {
 /// the caller opens the ORIGINAL textual path — a check/use gap. A tree
 /// mutated DURING the scan could swap a symlink between gate and open
 /// (TOCTOU). The no-active-adversary-during-scan assumption is the
-/// accepted posture for a batch scanner; the README trust-model section
+/// accepted posture for a batch scanner. The README trust-model section
 /// documents the statement (README coverage landed in EPH-I1050).
 fn realpathContained(io: std.Io, root_real: []const u8, candidate: []const u8) bool {
     var cand_buf: [Fs.max_path_bytes]u8 = undefined;
@@ -45307,7 +45307,7 @@ fn passTargetEntryGate(io: std.Io, scan_root: []const u8, candidate: []const u8)
 /// is at start. A `\` escapes the next byte (RED1-9: `\"` must not end the
 /// span). Returns content.len for an unterminated string (RED1-1: callers
 /// must never receive an index past the buffer end). The walk is
-/// parseJsonString's; skip callers keep only the end.
+/// parseJsonString's. Skip callers keep only the end.
 fn skipJsonStringSpan(content: []const u8, start: usize) usize {
     return parseJsonString(content, start).end;
 }
@@ -45528,7 +45528,7 @@ const JsonCodeScanner = struct {
     /// byte is code. Escaped bytes inside a string are consumed in
     /// pairs (the extra step here), so the walk can overshoot a queried
     /// target by one byte — the same constraint LineClassifier
-    /// documents; the escaped byte and the tail of its string share the
+    /// documents. The escaped byte and the tail of its string share the
     /// in-string verdict, so no caller-visible verdict changes.
     fn step(self: *JsonCodeScanner, c: u8) bool {
         if (self.in_comment) {
@@ -45597,7 +45597,7 @@ fn findKeySeparator(content: []const u8, start: usize) usize {
 
 /// Skip the stray value of a key whose separator is missing. The
 /// separator scan stopped at the first string opener, newline, comment
-/// opener, or EOF; a string opener means the stray value is a string,
+/// opener, or EOF. A string opener means the stray value is a string,
 /// so its span is consumed and the following pairs stay aligned
 /// (EPH-I0514).
 fn skipSeparatorlessPairValue(content: []const u8, stop: usize) usize {
@@ -45660,7 +45660,7 @@ fn findConfigObjectEnd(content: []const u8, brace_start: usize) ?usize {
 
 /// One `"key": value` pair head: the key string and the separator stop
 /// index (parseThresholdPair, parseCoveragePair, parseConfigJsonSource
-/// share the head; the missing-separator handling stays per-caller).
+/// share the head. The missing-separator handling stays per-caller).
 const JsonPairKey = struct {
     val: []const u8,
     sep_stop: usize,
@@ -45715,7 +45715,7 @@ fn parseThresholdPair(ctx: ConfigParseCtx, start: usize) usize {
         return i;
     };
     const cap = thresholdCapFor(pair.val) orelse return i;
-    // A CLI-locked field discards this value; clamping it would warn falsely.
+    // A CLI-locked field discards this value. Clamping it would warn falsely.
     if (thresholdCliLocked(ctx.cfg.threshold_cli_mask, pair.val)) return i;
     // EPH-I1135: the CLI channel rejects zero as a hard usage error
     // (EPH-I0522), so the config channel must reject it too — a zero
@@ -45738,7 +45738,7 @@ fn parseThresholdPair(ctx: ConfigParseCtx, start: usize) usize {
 
 /// Where a config text came from and how much ephor may trust it.
 /// trusted == false means only analysis keys (entries, path_dir) are
-/// honored; suppression and CI-gate keys are skipped and counted.
+/// honored. Suppression and CI-gate keys are skipped and counted.
 const ConfigSource = struct {
     trusted: bool,
     path: []const u8, // config file path, for diagnostics
@@ -45978,7 +45978,7 @@ fn handleConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !usize {
     // absent value is skipped, never indexed.
     if (start >= content.len) return start;
     // RED3-x: an untrusted config steers analysis scope only. Keys that
-    // suppress findings or move the CI gate are skipped; the loader prints
+    // suppress findings or move the CI gate are skipped. The loader prints
     // one note per offending file.
     if (!ctx.source.trusted and isSuppressionGateKey(key)) {
         ctx.source.ignored_any.* = true;
@@ -46060,8 +46060,8 @@ fn parseErrorNamingConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8)
 }
 
 /// Handle the ephor.json "coverage" block (null if not that key,
-/// EPH-I1091). The block parses only when the value opens an object;
-/// a non-object value warns and disables the block for the run.
+/// EPH-I1091). The block parses only when the value opens an object.
+/// A non-object value warns and disables the block for the run.
 fn parseCoverageConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !?usize {
     const content = ctx.content;
     if (!mem.eql(u8, key, "coverage")) return null;
@@ -46233,7 +46233,7 @@ fn parseFailOnConfigKey(ctx: ConfigParseCtx, start: usize, key: []const u8) !?us
 }
 
 /// B13-7: true when `c` can follow the "true" token of a strict value.
-/// The boundary set is `,`, `}`, whitespace, and newline; EOF is checked
+/// The boundary set is `,`, `}`, whitespace, and newline. EOF is checked
 /// by the caller.
 fn isStrictValueBoundary(c: u8) bool {
     return c == ',' or c == '}' or c == ' ' or c == '\t' or c == '\r' or c == '\n';
@@ -46339,7 +46339,7 @@ fn configPathDirname(path: []const u8) []const u8 {
 /// True when the config directory at `config_dir` covers the scan target
 /// at `scan_root`: the config sits at or above the scanned tree, so its
 /// keys govern the scan (RED3-4 disclosure geometry, EPH-I0209). Realpath
-/// decides when both sides resolve (the EPH-I0812 pattern); the textual
+/// decides when both sides resolve (the EPH-I0812 pattern). The textual
 /// ancestor test decides otherwise.
 fn configDirCoversScanRoot(io: std.Io, config_dir: []const u8, scan_root: []const u8) bool {
     var dir_buf: [Fs.max_path_bytes]u8 = undefined;
@@ -46387,7 +46387,7 @@ fn parseConfigJson(diag: *DiagCtx, allocator: Allocator, content: []const u8, cf
 }
 
 /// Keys parse in file order. A repeated scalar key resolves last-wins
-/// (setOwnedPath, setFailOn, error_naming overwrite); a repeated list key
+/// (setOwnedPath, setFailOn, error_naming overwrite). A repeated list key
 /// accumulates (each value appends) (B13-12, EPH-I0518). The duplicate
 /// semantics are documented in printHelp and the README (README coverage
 /// landed in EPH-I1050). There is no duplicate detection.
@@ -46595,7 +46595,7 @@ fn findPathDirInContent(content: []const u8) ?[]const u8 {
 
 /// Scan one masked build.zig line for a root_source_file / .root_src
 /// pattern and return the dir portion of the first valid match, or null
-/// (findPathDirInContent). The first valid match per line wins; the
+/// (findPathDirInContent). The first valid match per line wins. The
 /// callers' first-valid-match rule spans lines. A rejected match never
 /// selects a value and never aborts detection.
 fn findPathDirInLine(code: []const u8, patterns: []const []const u8) ?[]const u8 {
@@ -46617,7 +46617,7 @@ fn findPathDirInLine(code: []const u8, patterns: []const []const u8) ?[]const u8
 
 /// Append an owned slice to a string list, freeing it when the append
 /// OOMs (B13-18, EPH-I0520). The slice is in no list until the append,
-/// so only this catch can free it on failure; after the append the
+/// so only this catch can free it on failure. After the append the
 /// caller's list-level errdefer owns the free. The pre-fix callers
 /// map-inserted first, leaking the slice when the append failed between
 /// the two.
@@ -46649,7 +46649,7 @@ fn collectInstallEntries(
     defer added.deinit();
 
     // Add standard entry from root_source_file detection. The joined path
-    // stays owned by `entries` after a successful append; the caller-level
+    // stays owned by `entries` after a successful append. The caller-level
     // errdefer frees it on a later failure.
     const main_path = if (mem.eql(u8, root_dir, "."))
         try allocator.dupe(u8, "main.zig")
@@ -46906,7 +46906,7 @@ fn runZigFetchSave(diag: *DiagCtx, project_dir: std.Io.Dir, url_z: [:0]const u8)
 }
 
 /// Cap on the captured `zig version` output (EPH-I0239). A release
-/// toolchain prints one short line; the cap bounds a hostile PATH zig.
+/// toolchain prints one short line. The cap bounds a hostile PATH zig.
 const zig_version_capture_limit_bytes = 4096;
 
 /// Newest ephor release a Zig below the 0.16.0 floor can build
@@ -47005,8 +47005,8 @@ fn requireZigFloor(diag: *DiagCtx, allocator: Allocator) error{ZigTooOld}!void {
 }
 
 /// Run the install command: adds ephor to project's build system.
-/// If install_version is provided, installs that specific version;
-/// otherwise defaults to the binary's own version (EPHOR_VERSION).
+/// If install_version is provided, installs that specific version.
+/// Otherwise defaults to the binary's own version (EPHOR_VERSION).
 /// project_dir is the project root for the prerequisite gate and the
 /// zig-fetch child. Production passes the process working directory. The
 /// post-fetch steps (recorded hash, ephor.json) run in the process working
@@ -47016,7 +47016,7 @@ fn requireZigFloor(diag: *DiagCtx, allocator: Allocator) error{ZigTooOld}!void {
 /// (EPH-I0235): a CI step doing `ephor install && zig build ephor` must
 /// not proceed on a failed install. The release-signature verification
 /// (EPH-I1225, EPH-I0287) runs after the Zig-version gate and before the
-/// fetch, mirroring the upgrade path; it does no network I/O while the
+/// fetch, mirroring the upgrade path. It does no network I/O while the
 /// embedded key is empty. The zig-fetch spawn must stay after
 /// the version, prerequisite, Zig-version, and verification gates: the
 /// hermetic tests rely on that order (band-T05 F5, EPH-I0572 — the pin
@@ -47085,7 +47085,7 @@ fn installFetchOutcome(diag: *DiagCtx, exited: u8, package_url: []const u8) !voi
 }
 
 /// Cap on the captured zig-fetch output (EPH-I0718). The hint and the
-/// error lines are short; the cap bounds a hostile PATH zig.
+/// error lines are short. The cap bounds a hostile PATH zig.
 const fetch_capture_limit_bytes = 256 * 1024;
 
 /// One install fetch's targets: the nul-terminated spawn URL and the
@@ -47099,7 +47099,7 @@ const InstallFetchTarget = struct {
 /// hand-made build.zig.zon (install.sh creates one) carries
 /// `.fingerprint = 0x0`, and zig fetch answers with a "use this value"
 /// hint naming the computed fingerprint after the package fetch. The
-/// first attempt captures the output; a failure whose output carries the
+/// first attempt captures the output. A failure whose output carries the
 /// hint patches the zon and refetches once, matching install.sh's repair
 /// (install.sh:443-461). A failure without the hint relays the captured
 /// error, then fails the install. The second fetch is authoritative.
@@ -47164,7 +47164,7 @@ fn relayFetchStderr(diag: *DiagCtx, allocator: Allocator, stderr: []const u8) vo
 
 /// Fingerprint hint from a failed zig fetch, searching stderr first then
 /// stdout (EPH-I0718). zig prints "use this value: 0x<hex>" on the error
-/// stream; the stdout arm covers a toolchain that prints diagnostics on
+/// stream. The stdout arm covers a toolchain that prints diagnostics on
 /// the merged stream. Caller frees the result.
 fn parseFingerprintHintFromResult(
     allocator: Allocator,
@@ -47269,7 +47269,7 @@ fn findBuildFnMarker(line: []const u8) ?usize {
 
 /// True when the line carries a code-position `installArtifact(` call
 /// (EPH-I0512). The raw substring matched the call name inside a comment
-/// or a string; the insertion anchor must be a real call.
+/// or a string. The insertion anchor must be a real call.
 fn findInstallArtifactMarker(line: []const u8) bool {
     if (mem.indexOf(u8, line, "installArtifact(")) |col| {
         return isCodeMatchInLine(line, col);
@@ -47349,7 +47349,7 @@ fn refuseBuildZigSymlink(diag: *DiagCtx) error{UpgradeFailed} {
 fn patchBuildZig(diag: *DiagCtx, allocator: Allocator, project_dir: std.Io.Dir) !?usize {
     // EPH-I0670: never read build.zig through a planted symlink —
     // the splice would copy the victim's content into the repo tree. The
-    // installer refuses with a named error; the caller prints the manual
+    // installer refuses with a named error. The caller prints the manual
     // integration block and fails the install.
     if (buildZigIsSymlink(diag.io, project_dir)) {
         cliDiag(
@@ -47558,8 +47558,8 @@ fn printRecordedHash(io: std.Io, allocator: Allocator, ver: []const u8) void {
 }
 
 /// Run the upgrade command: updates ephor dependency in build.zig.zon.
-/// If install_version is provided, upgrades to that specific version;
-/// otherwise defaults to the binary's own version (EPHOR_VERSION).
+/// If install_version is provided, upgrades to that specific version.
+/// Otherwise defaults to the binary's own version (EPHOR_VERSION).
 /// Refuses to resolve below EPHOR_VERSION unless force is set (EPH-I0193).
 /// Manifest-write invariant (EPH-I0271): only the init, install, and
 /// upgrade commands write project manifest files. Init writes ephor.json
@@ -47690,7 +47690,7 @@ const UpgradeRun = struct {
     }
 
     /// Floor: a downgrade needs --force. Applies to an explicit --version
-    /// too (EPH-I0193). Refuse before any write; the implicit-version
+    /// too (EPH-I0193). Refuse before any write. The implicit-version
     /// fetch already ran — it must, to resolve the upgrade target the
     /// floor compares (B13-20).
     fn refuseDowngrade(self: *const UpgradeRun, ver: []const u8) !void {
@@ -47745,7 +47745,7 @@ const UpgradeRun = struct {
         updateConfigVersion(self.diag.io, self.allocator, ver);
 
         // Update build.zig integration to match current canonical block.
-        // Only the symlink refusal errors here (EPH-I0670); every
+        // Only the symlink refusal errors here (EPH-I0670). Every
         // other miss is best-effort by the function's guarantee.
         updateBuildZigIntegration(self.diag, self.allocator) catch {
             return refuseBuildZigSymlink(self.diag);
@@ -47780,7 +47780,7 @@ const release_pubkey: []const u8 = "";
 
 /// Temp base for the release-verification files (EPH-I0287): install.sh's
 /// mktemp -d "${TMPDIR:-/tmp}" choice. initToolPaths sets it from the
-/// environment; tests point it at their tmp dir.
+/// environment. Tests point it at their tmp dir.
 var verify_tmp_base: []const u8 = "/tmp";
 
 /// Minisign spawn path for the upgrade verification (EPH-I0287). A bare
@@ -47909,7 +47909,7 @@ fn createVerifyDir(allocator: Allocator, io: std.Io) ![]const u8 {
 
 /// Best-effort removal of the verification temp dir (EPH-I0287). The
 /// check already ran, so a removal failure warns instead of failing the
-/// upgrade; the error name keeps the report specific.
+/// upgrade. The error name keeps the report specific.
 fn removeVerifyDir(diag: *DiagCtx, verify_dir: []const u8) void {
     std.Io.Dir.cwd().deleteTree(diag.io, verify_dir) catch |err| {
         cliDiag(
@@ -47949,14 +47949,14 @@ fn missingMinisignFailure(diag: *DiagCtx) error{UpgradeFailed} {
 }
 
 /// Cap on the captured minisign output (EPH-I0287): the verdict is a
-/// one-line report; the cap bounds a hostile PATH minisign.
+/// one-line report. The cap bounds a hostile PATH minisign.
 const minisign_output_limit_bytes = 4096;
 
 /// Run `minisign -Vm <tarball> -p <pubkey>` and map the result to the
 /// upgrade outcome (EPH-I0287, EPH-I0235). The spawn captures its
 /// output instead of inheriting streams: under the zig build runner the
 /// test binary's stdout carries the runner protocol, and an inherited
-/// stream would corrupt it. Verified proceeds; a missing binary, a
+/// stream would corrupt it. Verified proceeds. A missing binary, a
 /// failed spawn, and a nonzero exit fail closed with the install.sh
 /// message pairs, minisign's own verdict line surfaced first.
 fn minisignVerdictOutcome(
@@ -48004,7 +48004,7 @@ fn reportSignatureFailure(diag: *DiagCtx, verdict: []const u8) error{UpgradeFail
 /// The flags mirror install.sh's -fsSL minus -S: -f turns an HTTP error
 /// status (404/500/403) into a nonzero exit, so the download-failure
 /// message pair fires instead of minisign misdiagnosing an error body
-/// as tampering (EPH-I1226); -s silences the progress meter; -L follows
+/// as tampering (EPH-I1226). -s silences the progress meter. -L follows
 /// redirects. The -S error display stays dropped because the spawn
 /// discards both streams (install.sh's 2>/dev/null shape). The release
 /// URLs are https, so the =https clamps apply (EPH-I0156).
@@ -48035,12 +48035,12 @@ const ThresholdsSpan = struct {
     brace_end: usize,
 };
 
-/// Locate the "thresholds" object's braces; null when absent or malformed
+/// Locate the "thresholds" object's braces. Null when absent or malformed
 /// (EPH-I0511). The key and both braces are located in code position: a
 /// comment or a string value mentioning "thresholds" cannot retarget the
 /// splice, and a `}` inside a string value of the object cannot close the
 /// span early. The value walk starts past the actual separator, so
-/// whitespace between the key and its colon stays valid; the first code
+/// whitespace between the key and its colon stays valid. The first code
 /// byte after it must be a `{` (EPH-I0065). In `{"thresholds": 5,
 /// "x": {...}}` the pre-fix scan bound the NEXT object's brace and
 /// migrateThresholds inserted keys into the wrong object, so a scalar or
@@ -48117,7 +48117,7 @@ const ThresholdKeyEntry = struct {
     text: []const u8,
 };
 
-/// Serialize missing keys as indented JSON entries, one per line; leading
+/// Serialize missing keys as indented JSON entries, one per line. Leading
 /// comma when the existing body does not end with one.
 fn buildMissingKeysJson(allocator: Allocator, mig: MissingThresholdKeys) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -48222,7 +48222,7 @@ fn buildVersionUpdatedConfig(
 
 /// Replace the value of an existing "version" key at the given offset.
 /// The canonical shape is `"version": "..."` with the colon and the
-/// value string in code position; any other shape returns null so the
+/// value string in code position. Any other shape returns null so the
 /// best-effort update no-ops instead of splicing into a comment, a later
 /// key, or a stray string (EPH-I0511). The closing quote is escape-aware:
 /// a `\"` inside the value stays value data.
@@ -48271,7 +48271,7 @@ fn insertVersionField(
 /// Write contents to sub_path atomically. Creates a uniquely named temp
 /// file in the same directory (exclusive create), writes it, then renames
 /// over the target. WHY: a fixed-path writeFile follows a symlink planted
-/// in a hostile clone and truncates the victim file; rename replaces the
+/// in a hostile clone and truncates the victim file. Rename replaces the
 /// link itself and never follows it (EPH-I0194). std's File.Atomic removes
 /// the temp file on failure.
 fn writeFileAtomic(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, contents: []const u8) !void {
@@ -48446,7 +48446,7 @@ var update_notification: ?[]const u8 = null;
 
 /// Free the pending update notification and clear the slot. runEphor
 /// registers this as a defer so the abort and error return paths free
-/// it too (EPH-I0545); the null reset keeps a second call a no-op.
+/// it too (EPH-I0545). The null reset keeps a second call a no-op.
 fn freeUpdateNotification(allocator: Allocator) void {
     if (update_notification) |msg| {
         allocator.free(msg);
@@ -48475,8 +48475,8 @@ const CachedCheck = struct {
 
 /// Check for new version (best effort, never blocks on failure).
 /// The latest version is cached for 24h at ~/.ephor_update_check (two lines:
-/// unix epoch, then version). A fresh cache skips the network fetch entirely;
-/// a stale, missing, or corrupt cache is refreshed after a successful fetch
+/// unix epoch, then version). A fresh cache skips the network fetch entirely.
+/// A stale, missing, or corrupt cache is refreshed after a successful fetch
 /// and left untouched when the fetch fails. Without HOME the cache is skipped
 /// and every check fetches live. Setting EPHOR_NO_UPDATE_CHECK (any value,
 /// including empty) skips the whole check: no fetch, no cache read, no warning.
@@ -48618,7 +48618,7 @@ fn writeUpdateCache(ctx: UpdateCacheCtx, path: []const u8, version: []const u8) 
     // The mode_t != u0 probe alone is not enough (EPH-I1068): Windows
     // forces the libc shim, where posix.mode_t is u32, so the branch
     // would compile and then fail on the missing member. Exclude the
-    // Windows target explicitly; the user-profile ACLs already scope the
+    // Windows target explicitly. The user-profile ACLs already scope the
     // cache file to the user there.
     if (comptime @import("builtin").os.tag != .windows and std.posix.mode_t != u0) {
         atomic.file.setPermissions(
@@ -48630,7 +48630,7 @@ fn writeUpdateCache(ctx: UpdateCacheCtx, path: []const u8, version: []const u8) 
 }
 
 /// Return the cached version (ownership transferred to the caller) when a
-/// fresh cache exists at path; null when missing, corrupt, or stale.
+/// fresh cache exists at path. Null when missing, corrupt, or stale.
 fn readFreshCachedVersion(ctx: UpdateCacheCtx, path: []const u8) ?[]const u8 {
     const cached = readUpdateCache(ctx.io, ctx.allocator, path) orelse return null;
     if (isCacheFresh(cached.epoch, ctx.now)) return cached.version;
@@ -48639,7 +48639,7 @@ fn readFreshCachedVersion(ctx: UpdateCacheCtx, path: []const u8) ?[]const u8 {
 }
 
 /// Resolve the latest ephor version. A fresh cache hit returns immediately
-/// without calling fetch_fn; otherwise fetch_fn is called once and a
+/// without calling fetch_fn. Otherwise fetch_fn is called once and a
 /// successful result rewrites the cache (stamped with `now`). A failed fetch
 /// returns null and leaves any existing cache file untouched.
 fn resolveLatestVersion(
@@ -48734,7 +48734,7 @@ fn extractTagName(json: []const u8, after_marker: usize) ?[]const u8 {
 /// every string value (EPH-I0281). JSON has no comment grammar, so the
 /// context scan only tracks string values, with backslash escapes. A
 /// "name" inside a free-text message field is string data and fails the
-/// gate; only key positions mint candidates. A future API shape whose
+/// gate. Only key positions mint candidates. A future API shape whose
 /// nested object carries its own "name" key stays an accepted residual:
 /// the value is still tag-shaped and the semver-max plus the I0193 floor
 /// bound it.
@@ -48808,7 +48808,7 @@ fn parseVersionFromTagsApi(allocator: Allocator, json: []const u8) ?[]const u8 {
         search_pos = after_marker;
         // Structure-aware gate (EPH-I0281): a "name": sequence inside a
         // string value (a tag message that mentions it) is text, not a
-        // key. Only key positions mint candidates; a spoofed version in
+        // key. Only key positions mint candidates. A spoofed version in
         // a message can no longer steer the semver-max.
         if (!isJsonKeyPosition(json, idx)) continue;
         const tag = extractTagName(json, after_marker) orelse continue;
@@ -48868,7 +48868,7 @@ fn isNewerVersion(local: []const u8, remote: []const u8) bool {
 }
 
 /// True when the upgrade path may resolve to target. A target older than
-/// current is a downgrade (EPH-I0193); the caller composes the --force
+/// current is a downgrade (EPH-I0193). The caller composes the --force
 /// bypass (ZA506 D2), so a forced run skips this floor entirely. WHY:
 /// tag order and explicit flags can resolve below the installed binary,
 /// and a silent downgrade re-introduces fixed bugs. An unparseable
@@ -49218,7 +49218,7 @@ fn containsEntry(entries: []const []const u8, entry: []const u8) bool {
 /// config's own entries. Left in place, a kept entry rebased onto the
 /// parent dir or dropped against the file path (reviewer r1 shapes).
 fn detectFileTargetEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
-    // The move gives `kept` the whole list buffer; cfg.entries starts
+    // The move gives `kept` the whole list buffer. Cfg.entries starts
     // empty, so the load owns every string it appends.
     var kept = cfg.entries;
     cfg.entries = .empty;
@@ -49278,7 +49278,7 @@ fn freeKeptEntries(kept: *std.ArrayListUnmanaged([]const u8), allocator: Allocat
 
 /// Extract entry points from build.zig by parsing common patterns.
 /// EPH-I0195 exempt: reads the working directory's own build.zig (the
-/// operator's tree); the target-tree extraction family carries the
+/// operator's tree). The target-tree extraction family carries the
 /// containment gate.
 fn extractBuildZigEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     // EPH-I0526: OOM is not "no build.zig in the cwd" — it propagates.
@@ -49345,7 +49345,7 @@ const PathTagPattern = struct {
 
 /// Scan the `.path = "..."` / `.root_src = "..."` /
 /// `.root_source_file = "..."` tag table of one build.zig line
-/// (extractPathFromLine). Each tag queries from the line start; the
+/// (extractPathFromLine). Each tag queries from the line start. The
 /// first match per tag adds its path.
 fn scanPathTagPatterns(ctx: EntryScanCtx, line: []const u8) !void {
     const path_patterns = [_]PathTagPattern{
@@ -49519,7 +49519,7 @@ fn addEntryIfValid(ctx: EntryScanCtx, path: []const u8) !void {
 /// target-path directory scans (standard-entry scans skip it).
 /// `gate_containment` turns on the EPH-I0195 realpath containment check for
 /// candidates derived from the scanned tree (attacker-controlled build.zig
-/// content); operator channels (cwd build.zig, cwd dir walk) leave it off.
+/// content). Operator channels (cwd build.zig, cwd dir walk) leave it off.
 const EntryScanCtx = struct {
     diag: *DiagCtx,
     allocator: Allocator,
@@ -49533,7 +49533,7 @@ const EntryScanCtx = struct {
 };
 
 /// EntryScanCtx with the four shared fields set (scanMultiEntryDirs,
-/// scanCwdMultiEntryDirs); the per-scan flags and path plumbing stay
+/// scanCwdMultiEntryDirs). The per-scan flags and path plumbing stay
 /// per-caller.
 fn entryScanCtx(
     diag: *DiagCtx,
@@ -49762,7 +49762,7 @@ fn addDirEntry(ctx: EntryScanCtx, dir_path: []const u8, name: []const u8) !void 
 fn scanDirForEntries(ctx: EntryScanCtx, dir_path: []const u8) !void {
     if (ctx.depth > 16) {
         // EPH-I0667 (trust-model F-5): entry discovery truncates. Disclose
-        // once per run; the cap names this walk's depth.
+        // once per run. The cap names this walk's depth.
         noteDepthCapTruncation(ctx.diag, 16);
         return;
     }
@@ -49783,7 +49783,7 @@ fn scanDirForEntries(ctx: EntryScanCtx, dir_path: []const u8) !void {
 
 /// One directory entry's disposition in the entry scan
 /// (scanDirForEntries): `skip` — the entry is a file and the walk
-/// continues; `descended` — a subdirectory was scanned recursively.
+/// continues. `descended` — a subdirectory was scanned recursively.
 const DirEntryDisposition = enum { skip, descended };
 
 /// One entry of the scanDirForEntries walk: an entry-point file joins
@@ -49827,7 +49827,7 @@ fn detectStandardEntries(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !vo
 
 /// Add the conventional entry points that exist in the cwd
 /// (detectStandardEntries): src/main.zig, src/lib.zig, src/root.zig,
-/// and build.zig. Missing candidates skip silently; the access probe is
+/// and build.zig. Missing candidates skip silently. The access probe is
 /// best-effort on the operator's own tree.
 fn addStandardEntries(
     diag: *DiagCtx,
@@ -49889,7 +49889,7 @@ fn addSrcTestFiles(
 }
 
 /// One src/ entry's disposition in the test-file discovery
-/// (addSrcTestFiles): `skip` — not a test file or already added;
+/// (addSrcTestFiles): `skip` — not a test file or already added.
 /// `added` — a new *_test.zig entry joined the list.
 const SrcTestDisposition = enum { skip, added };
 
@@ -50028,7 +50028,7 @@ const cli_threshold_flags = [_]CliThresholdFlag{
 
 // B14-14: reportInvalidThreshold strips the trailing '=' with
 // prefix[0 .. prefix.len - 1]. A table entry with an empty or '='-less
-// prefix would underflow at runtime; a table mistake is a compile
+// prefix would underflow at runtime. A table mistake is a compile
 // error, never a panic.
 comptime {
     for (cli_threshold_flags) |flag| {
@@ -50063,7 +50063,7 @@ fn parseThresholdArg(diag: *DiagCtx, arg: []const u8, cfg: *Config) !bool {
 
 /// Parse a single CLI argument
 /// Handle --entry= CLI argument. EPH-I0195 exempt: --entry is operator
-/// intent; only the untrusted channels (target config, target-tree
+/// intent. Only the untrusted channels (target config, target-tree
 /// build.zig extraction) are containment-gated. The caller validates the
 /// value (EPH-I0289) so the fn stays at 4 params (ZA303).
 fn handleEntryArg(
@@ -50282,8 +50282,8 @@ fn parseCliArg(ctx: CliParseCtx, arg: []const u8) !void {
 }
 
 /// CLI-default config: command=check, borrowed path "src", all lists empty.
-/// fail_on fields keep their struct defaults. Copied per parseArgs call;
-/// path_owned=false means deinit never frees the static "src" string.
+/// fail_on fields keep their struct defaults. Copied per parseArgs call.
+/// Path_owned=false means deinit never frees the static "src" string.
 const cli_default_config = Config{
     .command = .check,
     .path = "src",
@@ -50330,7 +50330,7 @@ fn autoDetectPath(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     };
     if (!needs_path or cfg.path_owned) return;
     const detected = detectPathDirFromBuildZig(diag, allocator);
-    // EPH-I1041: the re-dupe below can fail; `detected` is cfg-tracked
+    // EPH-I1041: the re-dupe below can fail. `detected` is cfg-tracked
     // only in the no-strip branch, so an OOM there must free it here.
     // The manual free after the dupe precedes the normal return, so the
     // errdefer does not double-free the success path.
@@ -50450,7 +50450,7 @@ fn skipWtf16ExeName(vector: []const u16) usize {
 }
 
 /// Find the end of the WTF-16 argv word that starts at `start`. A quote
-/// toggles the in-quotes state; a quote behind an odd backslash run is
+/// toggles the in-quotes state. A quote behind an odd backslash run is
 /// a literal quote (the Windows CRT rule), so it does not toggle. The
 /// word ends at the first space/tab outside quotes or at the vector
 /// end. Infallible: a bounded index walk over a caller-owned slice.
@@ -50473,7 +50473,7 @@ fn wtf16WordEnd(vector: []const u16, start: usize) usize {
 /// True when the code unit is a quote that toggles the in-quotes state:
 /// a `"` behind an even backslash run. A quote behind an odd run is a
 /// literal quote (the Windows CRT rule). `backslashes` is the count of
-/// consecutive backslashes directly before the unit; the caller resets
+/// consecutive backslashes directly before the unit. The caller resets
 /// it after every non-backslash unit. Infallible.
 fn isUnescapedWtf16Quote(c: u16, backslashes: usize) bool {
     return c == '"' and backslashes % 2 == 0;
@@ -51042,8 +51042,8 @@ fn loadKnownIssuesOnce(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void
     if (provenance == .auto) try noteKnownIssuesAutoload(diag, allocator, path, keys_added);
 }
 
-/// Resolve the known-issues path: the explicit --known-issues path wins;
-/// otherwise auto-detect the .ephor-ignore. Null means no file to load.
+/// Resolve the known-issues path: the explicit --known-issues path wins.
+/// Otherwise auto-detect the .ephor-ignore. Null means no file to load.
 fn resolveKnownIssuesPath(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !?[]const u8 {
     return cfg.known_issues_path orelse (try detectKnownIssuesPath(diag, allocator, cfg));
 }
@@ -51065,7 +51065,7 @@ fn loadKnownIssueKeys(
         if (trimmed.len == 0) continue;
         if (trimmed[0] == '#') continue; // Comment
         // Format: file:line or file:line:rule (EPH-I0158). The full line
-        // is stored; isKnownIssue parses the rule suffix at match time.
+        // is stored. IsKnownIssue parses the rule suffix at match time.
         const key = try allocator.dupe(u8, trimmed);
         errdefer allocator.free(key);
         try cfg.known_issues.append(allocator, key);
@@ -51147,9 +51147,9 @@ fn probeKnownIssuesDir(
 
 /// True when the issue's file:line matches a loaded known-issue key.
 /// Two key forms (EPH-I0158): "file:line" suppresses every rule at the
-/// line; "file:line:rule" suppresses only that rule. The line number is
+/// line. "file:line:rule" suppresses only that rule. The line number is
 /// the last colon-separated numeric field, so a file path containing
-/// ':' still parses (the line part must be a number); a non-numeric
+/// ':' still parses (the line part must be a number). A non-numeric
 /// last field is the rule suffix, and the line then sits one field
 /// earlier. Both sides strip one leading "./" prefix before the
 /// compare (EPH-I0738): findings render relative to the invocation cwd,
@@ -51158,7 +51158,7 @@ fn probeKnownIssuesDir(
 /// un-matched from another CWD. Beyond the prefix the compare stays
 /// byte-exact. No fixed-size key buffer: a file path longer than 512
 /// bytes used to fail bufPrint and silently never matched (B14-12).
-/// The linear scan is O(issues x keys); acceptable at current list
+/// The linear scan is O(issues x keys). Acceptable at current list
 /// sizes.
 /// Does the finding match one known-issues key? The 3-field form
 /// (file:line:rule, EPH-I0158) suppresses only that rule. The 2-field
@@ -51522,7 +51522,7 @@ fn classifySoftChannel(issue: Issue, out: ReportOutCtx) FilterDecision {
 
 /// True when a config orphan_exclude pattern hides this orphan finding
 /// (EPH-I0666, trust-model F-4). Only RULE_ORPHAN_FILE candidates the
-/// graph carried past the default filter reach this fact; the built-in
+/// graph carried past the default filter reach this fact. The built-in
 /// defaults are tool posture and never count.
 fn isOrphanHiddenIssue(issue: Issue, cfg: *const Config) bool {
     if (!mem.eql(u8, issue.rule, RULE_ORPHAN_FILE)) return false;
@@ -51604,7 +51604,7 @@ fn formatSuppressedJson(buf: []u8, stats: SuppressionStats) ![]const u8 {
 /// silently: a bare-text notice would break the machine stream
 /// (EPH-I0213, EPH-I0540). The writer seam (EPH-I1130, the EPH-I0687
 /// shape): tests pass a capture writer so the object never reaches the
-/// green-run stderr (the EPH-I0288 noise class); production passes null
+/// green-run stderr (the EPH-I0288 noise class). Production passes null
 /// for the raw stderr path, byte-identical with the pre-seam output.
 fn printSuppressedJsonObject(stats: SuppressionStats, writer: ?*std.Io.Writer) void {
     var buf: [256]u8 = undefined;
@@ -51637,7 +51637,7 @@ fn reportSuppression(
     const n = stats.total();
     if (n == 0) return;
     // JSON mode: the suppressed object/member already carries the
-    // accounting; the bare note would break the machine stream (EPH-I0213).
+    // accounting. The bare note would break the machine stream (EPH-I0213).
     if (diag.json_stream) return;
     diag.suppression_note_count += 1;
     var buf: [192]u8 = undefined;
@@ -51649,7 +51649,7 @@ fn reportSuppression(
 }
 
 /// Print issues and return count of actionable issues (warnings + errors only).
-/// `warnings` lumps errors in (historical semantics for footer/summary);
+/// `warnings` lumps errors in (historical semantics for footer/summary).
 /// `errors` is the error-severity subset, tracked for --fail-on=error.
 const PrintCounts = struct {
     warnings: usize = 0,
@@ -51711,8 +51711,8 @@ fn printStrictFailure(total: PrintCounts, fail_on: FailOn) void {
 
 /// Apply the strict CI gate to one command's findings: print the failure
 /// notice and flag the exit when the fail-on level is met. JSON mode
-/// suppresses the notice so the machine stream stays pure (EPH-I0213);
-/// the exit flag carries the gate in both modes.
+/// suppresses the notice so the machine stream stays pure (EPH-I0213).
+/// The exit flag carries the gate in both modes.
 fn applyStrictGate(total: PrintCounts, cfg: *const Config, findings_fail: *bool) void {
     if (computeExitCode(total, cfg.fail_on) == 0) return;
     if (cfg.format != .json) printStrictFailure(total, cfg.fail_on);
@@ -51762,7 +51762,7 @@ fn coverageGateAppliesToScan(ctx: *const RunCtx) bool {
 /// Read the runner-evidence JSON into the run context (EPH-I1091). A
 /// missing or broken file never reads as a clean gate state: text mode
 /// warns and leaves the runner legs unevaluated (the gate script fails
-/// on the warning); JSON mode carries the failure through the machine
+/// on the warning). JSON mode carries the failure through the machine
 /// guarantee — the run exits 1 with the abort object, no silent skip.
 /// The file is operator-supplied plumbing.
 fn loadRunCoverageEvidence(ctx: *RunCtx) void {
@@ -51785,10 +51785,10 @@ fn loadRunCoverageEvidence(ctx: *RunCtx) void {
 
 /// Apply the ephor.json coverage block to one check run (EPH-I1091).
 /// The ratio leg compares the ZT105 unreached-pub-fn percentage against
-/// `unreached_pub_fn_ratio_max`; the runner legs (min_tests,
+/// `unreached_pub_fn_ratio_max`. The runner legs (min_tests,
 /// require_all_passed) evaluate only when --coverage-evidence supplied
 /// the runner's counts. Text mode prints one informational ratio line and
-/// one failure line per tripped leg; JSON mode stays silent (the exit
+/// one failure line per tripped leg. JSON mode stays silent (the exit
 /// code carries the gate), the same guarantee as applyStrictGate.
 fn applyCoverageGate(ctx: *RunCtx, counts: UntestedFnCounts) void {
     if (!ctx.cfg.coverage.present) return;
@@ -51970,7 +51970,7 @@ fn printIssuesJson(a: AnalyzerJsonArgs, out: ReportOutCtx) void {
 /// printable tallies. This is the output guarantee's dispatcher: JSON
 /// mode buffers one object per analyzer and writes it once
 /// (buildIssuesJson), text mode prints each issue through printText.
-/// The tallies exclude suppressed findings; they feed the footer, the
+/// The tallies exclude suppressed findings. They feed the footer, the
 /// summary, and the strict gate.
 fn printIssues(issues: []const Issue, title: []const u8, out: ReportOutCtx) PrintCounts {
     const counts = tallyIssues(issues, out);
@@ -52067,7 +52067,7 @@ test "footer renders errors separately from warnings (EPH-I0740)" {
 /// so ephor's own stats scanner (getStats, raw-byte match) never counts
 /// the label when ephor scans its own source: a contiguous spelling in
 /// this file would self-inflate the dogfood stats. The rendered text is
-/// the marker word; rendering is pinned by test (EPH-I0538, B15 F5).
+/// the marker word. Rendering is pinned by test (EPH-I0538, B15 F5).
 const quality_todo_label = "TO" ++ "DO/FIX" ++ "ME";
 
 /// Print the project statistics block in the configured format. The
@@ -52169,7 +52169,7 @@ const IssueCounts = struct {
     tests: usize = 0,
     concurrency: usize = 0,
     /// Note-severity findings. The per-category buckets count warnings
-    /// only (errors ride inside warnings); notes get one explicit bucket
+    /// only (errors ride inside warnings). Notes get one explicit bucket
     /// so a notes-only run can never report total 0 with status ok
     /// (EPH-I0535, B15 F2).
     notes: usize = 0,
@@ -52195,11 +52195,11 @@ const summary_json_buf_bytes = 1536;
 /// a "suppressed" member of the summary object, so a clean "status" never
 /// hides suppressed findings from machine consumers (RED3-3). The AST-tier
 /// members (EPH-I0200) are additive: machine consumers keep every member
-/// they already read. The issues member gains an explicit "notes" count;
+/// they already read. The issues member gains an explicit "notes" count.
 /// "total" counts every printed finding (warnings plus errors plus notes),
 /// and "status" reflects that total, so a notes-only run never reports
 /// ok (EPH-I0535). The head shares its value run with the text summary
-/// (formatSummaryCore, EPH-I1232 C7); the tail keeps the JSON-only
+/// (formatSummaryCore, EPH-I1232 C7). The tail keeps the JSON-only
 /// todos/status/suppressed members.
 fn formatSummaryJson(
     buf: []u8,
@@ -52259,7 +52259,7 @@ fn formatSummaryJson(
 }
 
 /// Print the JSON summary. The buffer math (summary_json_buf_bytes)
-/// proves the format cannot overflow; on the impossible overflow the
+/// proves the format cannot overflow. On the impossible overflow the
 /// summary drops silently instead of emitting a bare-text notice: a
 /// notice would break the JSON machine guarantee (EPH-I0213), and the
 /// summary is a trailing optional document (EPH-I0540).
@@ -52277,7 +52277,7 @@ fn printSummaryJson(counts: IssueCounts, s: ProjectStats, suppression: Suppressi
 /// The Notes line and the TOTAL (which includes notes) keep the summary
 /// consistent with the footer and the exit code (EPH-I0535). The head
 /// shares its value run with the JSON summary (formatSummaryCore,
-/// EPH-I1232 C7); the tail keeps the text-only label/status shape.
+/// EPH-I1232 C7). The tail keeps the text-only label/status shape.
 fn formatSummaryText(buf: []u8, counts: IssueCounts, s: ProjectStats) ![]const u8 {
     const head = try formatSummaryCore(
         \\
@@ -52350,7 +52350,7 @@ fn formatSummaryCore(
 }
 
 /// Print the text summary. The buffer math (summary_text_buf_bytes)
-/// proves the format cannot overflow; on the impossible overflow a
+/// proves the format cannot overflow. On the impossible overflow a
 /// static all-literal notice replaces the silent drop, so a future
 /// member that breaks the math stays visible (EPH-I0540).
 fn printSummaryText(counts: IssueCounts, s: ProjectStats) void {
@@ -52420,7 +52420,7 @@ fn writeSkipPaths(w: *std.Io.Writer, log: SkipPathLog, skipped: usize) !void {
 /// signal. Fires whenever the tier skipped at least one file, and names
 /// the skipped paths (capped) so the skip is diagnosable without debug
 /// instrumentation (EPH-I1197). JSON mode skips the note so the machine
-/// stream stays pure (EPH-I0213); with --summary the ast_skipped member
+/// stream stays pure (EPH-I0213). With --summary the ast_skipped member
 /// carries the same fact.
 fn noteAstTierSkips(diag: *DiagCtx, stats: ast_tier.Stats, log: SkipPathLog) void {
     if (stats.skipped == 0 or diag.json_stream) return;
@@ -52524,7 +52524,7 @@ fn requireScannedFiles(ctx: *RunCtx, g: *const ImportGraph) void {
 // ============================================================================
 
 /// Per-run state shared by the command handlers. Handlers mutate the three
-/// flag fields through the ctx pointer; main reads them in the epilogue to
+/// flag fields through the ctx pointer. Main reads them in the epilogue to
 /// pick the exit path. The bundle keeps every handler at one parameter.
 const RunCtx = struct {
     alloc: Allocator,
@@ -52657,7 +52657,7 @@ fn handleUpgrade(ctx: *RunCtx) void {
 }
 
 /// Usage error shared by `orphans` and `check`: both need entry points.
-/// cliDiag keeps the lines off the JSON machine stream (EPH-I0213); the
+/// cliDiag keeps the lines off the JSON machine stream (EPH-I0213). The
 /// exit flag carries the failure in both modes.
 fn printNoEntriesError(diag: *DiagCtx) void {
     cliDiag(diag, "error: no entry points found\n", .{});
@@ -52756,7 +52756,7 @@ fn handleMemory(ctx: *RunCtx) !void {
     // the structure report (EPH-I0742).
     var ast_issues = try analyzeAstTier(ctx.alloc, &g, null, null);
     // Atomic move (EPH-I0690, F-2): the ZA111 payloads are owned, so an
-    // OOM mid-move keeps them with this list for the errdefer; after the
+    // OOM mid-move keeps them with this list for the errdefer. After the
     // move the list is empty and the explicit deinit frees only the
     // array. The reset disarms the errdefer for later fallible calls
     // (0.16 deinit leaves the list undefined).
@@ -52879,7 +52879,7 @@ fn printTestListing(
 
 /// Render the list-tests machine object: file, line, and name per block
 /// plus the count. File and name cross escapeJson (repo-derived fields,
-/// EPH-I0146); the line and the count are plain integers.
+/// EPH-I0146). The line and the count are plain integers.
 fn buildTestListingJson(
     obj: *types.OutBuf,
     allocator: Allocator,
@@ -52933,7 +52933,7 @@ fn runtimePromptText(
 /// any answer other than y/Y (EOF included). JSON mode owns the stream as
 /// a machine guarantee (EPH-I1099): no prompt text may print and no silent
 /// stdin read may hang a machine consumer, so the call declines without
-/// printing or reading; the caller routes the decline to the abort object.
+/// printing or reading. The caller routes the decline to the abort object.
 fn confirmRuntime(ctx: *const RunCtx) !bool {
     if (ctx.cfg.auto_approve) return true;
     if (ctx.cfg.format == .json) return false;
@@ -52952,7 +52952,7 @@ fn confirmRuntime(ctx: *const RunCtx) !bool {
 }
 
 /// `runtime` command: dynamic analysis under the project's own test run.
-/// A declined prompt skips the epilogue (no update notification); the run
+/// A declined prompt skips the epilogue (no update notification). The run
 /// still exits with the decline code (EPH-I0261).
 fn handleRuntime(ctx: *RunCtx) !void {
     if (!try confirmRuntime(ctx)) {
@@ -53065,7 +53065,7 @@ fn filterMemoryFamily(issues: *std.ArrayListUnmanaged(Issue), allocator: Allocat
 
 /// The cfg_mem_issues list split by rule family: ZA8 → null-safety, ZA9 →
 /// panic, everything else → memory. ZA2 drops out (analyzeErrors owns those
-/// findings; printing both would duplicate them). The buckets hold copies,
+/// findings. Printing both would duplicate them). The buckets hold copies,
 /// so deinit frees the bucket arrays only.
 const FilteredMemIssues = struct {
     mem_only: std.ArrayListUnmanaged(Issue),
@@ -53112,11 +53112,11 @@ const CheckCounts = struct {
 /// Emit the post-load trust disclosures (RED3-4/RED3-9, EPH-I0209/I0169)
 /// from the check handler, after the CLI path and the target-config load
 /// settle the final scan root. Target-dir configs print their own trust
-/// notes from the loader; this helper covers the cwd channel and the
+/// notes from the loader. This helper covers the cwd channel and the
 /// error-naming convention, whose source config path was recorded during
 /// the parse.
 fn notePostLoadTrust(diag: *DiagCtx, allocator: Allocator, cfg: *const Config) !void {
-    // The cwd config loads trusted and unconditionally; disclose the
+    // The cwd config loads trusted and unconditionally. Disclose the
     // decision whenever its directory covers the scan target.
     if (cfg.cwd_config_loaded and configDirCoversScanRoot(diag.io, ".", cfg.path))
         try noteTrustedConfig(diag, allocator, CONFIG_FILENAME);
@@ -53193,7 +53193,7 @@ fn buildCheckGraph(ctx: *const RunCtx, g: *ImportGraph) !void {
 /// The key is the entry's realpath when it resolves, the raw text
 /// otherwise: duplicate strings and alternate spellings of one file
 /// collapse to one scan, while unresolvable entries still dedupe by their
-/// text. The set owns its keys; buildCheckGraph frees them at teardown.
+/// text. The set owns its keys. BuildCheckGraph frees them at teardown.
 fn markEntryScanned(
     io: std.Io,
     allocator: Allocator,
@@ -53402,11 +53402,11 @@ const AstTierMergeSinks = struct {
 };
 
 /// AST tier: ZA111 findings merge into the memory list so they flow
-/// through the ZA1 → memory category filter and the export list; ZA503
+/// through the ZA1 → memory category filter and the export list. ZA503
 /// parse findings merge into the structure list (EPH-I0742) so they
 /// print beside the other file-level skips. Item ownership moves with
 /// the atomic moveIssues transfer (EPH-I0690, F-2), so the tier list
-/// frees only its array on the success path; an OOM keeps the owned
+/// frees only its array on the success path. An OOM keeps the owned
 /// payloads with the list for the errdefer. The parse findings append
 /// directly into `sinks.structure`, whose own errdefer covers them. The
 /// returned skip log records the skipped paths for the skip note
@@ -53442,12 +53442,12 @@ fn reportCheckFindings(ctx: *RunCtx, g: *ImportGraph, findings: *CheckFindings) 
     // Findings are informational unless --strict/--fail-on gates them.
     applyStrictGate(counts.total(), ctx.cfg, &ctx.strict_fail);
     // Coverage gate (EPH-I1091): the ratio leg runs on the scan's ZT105
-    // census; the runner legs run only when --coverage-evidence supplied
+    // census. The runner legs run only when --coverage-evidence supplied
     // the runner's counts. The block applies only to the operator's own
     // tree (the scan root inside the invocation cwd) — a coverage limit
     // is a self-measurement, never a verdict on a foreign scan target. In
     // text mode a broken evidence file warns (the gate script fails on
-    // the warning) and leaves the runner legs unevaluated; in JSON mode
+    // the warning) and leaves the runner legs unevaluated. In JSON mode
     // the run fails closed with the abort object.
     if (coverageGateAppliesToScan(ctx)) {
         loadRunCoverageEvidence(ctx);
@@ -53585,7 +53585,7 @@ fn printExportNotice(
 /// the export document. An export failure prints an error and fails the
 /// run (EPH-I0741): a CI step that lost its export artifact must not
 /// pass. The error line crosses cliDiag, whose json_stream latch keeps
-/// it off the JSON machine stream; the exit flag carries the failure
+/// it off the JSON machine stream. The exit flag carries the failure
 /// in both modes (the stashed diagnostic rides the JSON abort object).
 fn exportCheckIssues(
     ctx: *RunCtx,
@@ -53684,7 +53684,7 @@ fn printAbortJson(allocator: Allocator, err: anyerror, msg: []const u8) void {
 
 /// Render the JSON-mode abort object into `obj` (EPH-I1067): the error
 /// name and the diagnostic message. The message crosses escapeJson like
-/// every repo-derived field (EPH-I0146); the error name is a Zig
+/// every repo-derived field (EPH-I0146). The error name is a Zig
 /// identifier, so it never needs escaping.
 fn buildAbortJson(
     obj: *types.OutBuf,
@@ -53758,7 +53758,7 @@ fn declinedRuntimeExitCode() u8 {
 /// the stashed diagnostic (possibly empty) rides as the message,
 /// exactly like the parse abort. One branch covers the flag-first,
 /// no-entries, and strict-fail shapes. A clean run returns 0 and
-/// runEphor's defers hold; the entry wrapper applies the code after
+/// runEphor's defers hold. The entry wrapper applies the code after
 /// they run.
 fn failedRunExitCode(diag: *DiagCtx, allocator: Allocator, ctx: *const RunCtx) u8 {
     if (!(ctx.should_exit_error or ctx.strict_fail or ctx.coverage_fail)) return 0;
@@ -53784,7 +53784,7 @@ pub fn main(init: std.process.Init) !void {
 
 /// The run body (EPH-I0543): parse, dispatch, and the exit-code
 /// computation. Every exit disposition returns through this function so
-/// its defers run; the entry wrapper applies the code after they do.
+/// its defers run. The entry wrapper applies the code after they do.
 fn runEphor(init: std.process.Init) !u8 {
     var diag = DiagCtx{ .io = init.io };
     // Production keeps the safety-on DebugAllocator by decision
@@ -53819,7 +53819,7 @@ fn runEphor(init: std.process.Init) !u8 {
     }
     // The pending notification outlives every return path from here
     // (abort, handler error, clean epilogue), so a deferred free covers
-    // them all; the epilogue only prints (EPH-I0545).
+    // them all. The epilogue only prints (EPH-I0545).
     defer freeUpdateNotification(alloc);
 
     // EPH-I0172 (RED4-7): a failed root realpath aborts with an explicit
@@ -53830,7 +53830,7 @@ fn runEphor(init: std.process.Init) !u8 {
         return unresolvedScanRootExit(&diag, alloc, cfg.path, err);
 
     // Suppression-fact cache shared by every printIssues/exportIssues call in
-    // this run; built lazily per (file, rule), freed at exit.
+    // this run. Built lazily per (file, rule), freed at exit.
     var ignore_cache = IgnoreCache.init(alloc);
     defer ignore_cache.deinit();
 
@@ -53857,7 +53857,7 @@ fn runEphor(init: std.process.Init) !u8 {
     if (ctx.abort_epilogue) return declinedRuntimeExitCode();
 
     // Unknown-version fallback warning (EPH-I1054): compat recorded the
-    // flag during analysis; the epilogue routes the message through
+    // flag during analysis. The epilogue routes the message through
     // cliDiag, whose json_stream latch keeps it off the JSON machine
     // stream.
     reportUnknownVersionWarning(&diag);
@@ -54155,7 +54155,7 @@ test "stats: a trailing newline adds no phantom line or blank (EPH-I0724)" {
 
 test "zero-zig-files scan is a usage error (EPH-I0726)" {
     // A non-zig path argument resolves to zero Zig files. Silent exit 0
-    // would read as ran-clean; the run must fail with one diagnostic and
+    // would read as ran-clean. The run must fail with one diagnostic and
     // the usage-error exit. A scan that finds a Zig file stays silent.
     var diag = testDiagCtx();
     var capture = CaptureSink{};
@@ -54301,7 +54301,7 @@ test "markBuildPathReferences reads with the shared source cap (EPH-I0376)" {
     var diag = testDiagCtx();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // build.zig makes findBuildRoot resolve to the tmp root; the nested
+    // build.zig makes findBuildRoot resolve to the tmp root. The nested
     // build discovery then finds no subdirectories, so the only marking
     // path for target.zig is the b.path() ref scan itself.
     try tmp.dir.writeFile(std.testing.io, .{
@@ -54325,10 +54325,10 @@ test "markBuildPathReferences reads with the shared source cap (EPH-I0376)" {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
     // Production shape (EPH-I0172): every handler sets the containment
-    // root; the null-root fail-closed gate must not mask this fixture.
+    // root. The null-root fail-closed gate must not mask this fixture.
     graph.scan_root = root;
     const big_path = try std.fmt.allocPrint(allocator, "{s}/big.zig", .{root});
-    // The map takes ownership of the key (deinit frees it); the pin must
+    // The map takes ownership of the key (deinit frees it). The pin must
     // not free it again.
     try graph.reachable.put(big_path, {});
 
@@ -55065,8 +55065,8 @@ test "summary JSON carries the notes bucket and status reflects it (EPH-I0535)" 
     );
     defer parsed.deinit();
     const issues = parsed.value.object.get("summary").?.object.get("issues").?.object;
-    // The per-category buckets keep the warnings-only meaning; notes ride
-    // their own member; total counts every printed finding.
+    // The per-category buckets keep the warnings-only meaning. Notes ride
+    // their own member. Total counts every printed finding.
     try std.testing.expectEqual(@as(i64, 2), issues.get("memory").?.integer);
     try std.testing.expectEqual(@as(i64, 1), issues.get("notes").?.integer);
     try std.testing.expectEqual(@as(i64, 3), issues.get("total").?.integer);
@@ -55286,7 +55286,7 @@ test "check ZA2 ownership: every dropped CFG ZA2 has an errors twin (EPH-I0174)"
     // (ZA202 catch unreachable, ZA203 orelse unreachable, via
     // runCFGSafetyAnalyses → analyzeCFGErrors). filterMemIssues drops
     // CFG-list ZA2 items because analyzeErrors re-emits each one at the
-    // same (file, line); this test pins that twin assumption and the
+    // same (file, line). This test pins that twin assumption and the
     // drop mechanism on a live CFG-ZA2 input.
     const content =
         \\const std = @import("std");
@@ -55849,7 +55849,7 @@ test "alternate out-of-root entry spellings scan once (EPH-I0817)" {
     // Two spellings of one physical file outside the scan path collapse
     // to one scan. Pre-fix the second analyzeFile joined the file under
     // a second graph key (duplicate analysis, stale resolved_to_key
-    // value); the realpath-keyed dedupe pins the graph to one entry.
+    // value). The realpath-keyed dedupe pins the graph to one entry.
     var diag = testDiagCtx();
     diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
@@ -55895,7 +55895,7 @@ test "walk joins one graph entry per physical hardlink (EPH-I0823)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     // One physical file under two names: a hardlink pair. The walk sees
-    // two .file entries with one inode; the pair must join the graph
+    // two .file entries with one inode. The pair must join the graph
     // once. Duplicate analysis and duplicate findings are the bug.
     try tmp.dir.createDirPath(std.testing.io, "a/link");
     try tmp.dir.writeFile(std.testing.io, .{
@@ -56078,7 +56078,7 @@ test "markZigFilesRecursive stays inside the scan root (EPH-I0161)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // proj/ is the scan root; out.zig sits beside it. A walk rooted at
+    // proj/ is the scan root. Out.zig sits beside it. A walk rooted at
     // the tmp root (the module-dir parent-search shape) must mark the
     // in-root file and skip the sibling. Pre-fix markSingleZigFile
     // marked with no containment, so out.zig landed in reachable.
@@ -56111,7 +56111,7 @@ test "parent build.zig search is opt-in for a foreign parent (EPH-I0161)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     // parent/build.zig sits outside the scan root (parent/sub). The
-    // default run must not adopt it; --include-parent opts in.
+    // default run must not adopt it. --include-parent opts in.
     try tmp.dir.createDirPath(std.testing.io, "parent/sub");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "parent/build.zig", .data = "" });
 
@@ -56258,7 +56258,7 @@ test "extractBareImports still records a real bare @import (EPH-I0227)" {
 test "findImportPath accepts the continuation-line miss as documented (EPH-I0300)" {
     // The tag scan is line-bounded by design: a const whose @import
     // value opens on the NEXT line is not extracted. The miss is
-    // documented as accepted on findImportPath; this pin keeps it until
+    // documented as accepted on findImportPath. This pin keeps it until
     // a future scan covers the shape deliberately.
     const continuation =
         \\const x =
@@ -56390,7 +56390,7 @@ test "dead main still fires when the build graph is visible (EPH-I1060)" {
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
     const build_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{root});
-    // The map takes ownership of the key; the pin must not free it again.
+    // The map takes ownership of the key. The pin must not free it again.
     try graph.analyzeFile(entry);
     try graph.analyzeFile(dead);
     try graph.markReachable(entry);
@@ -56551,7 +56551,7 @@ test "pathTag extractor lands a .root_source_file entry (EPH-I1222)" {
 test "cwd pathTag scan lands a .root_source_file entry (EPH-I1222)" {
     // The same dead-arm fix on the cwd install-entry table.
     // addEntryIfValid resolves against the process cwd, so the test
-    // chdirs into the fixture; the defer restores before the test ends.
+    // chdirs into the fixture. The defer restores before the test ends.
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -56624,7 +56624,7 @@ test "build.zig entry extractors ignore refs in // comments (EPH-I0299)" {
 
     // The whole per-line band: the commented refs add nothing, the real
     // ref still lands (extractPathFromLine shares the same code-position
-    // gate; it resolves paths against the process cwd, so it is not
+    // gate. It resolves paths against the process cwd, so it is not
     // directly callable with a tmp-absolute entry).
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "build.zig",
@@ -56674,8 +56674,8 @@ test "entry directory scan propagates OOM (EPH-I0526)" {
 
 test "nested build module note sanitizes a hostile path (EPH-I1143)" {
     // The path derives from build.zig content. Control bytes and the
-    // log-forging newline must render as placeholders before the print;
-    // the quote is not terminal-hostile and stays.
+    // log-forging newline must render as placeholders before the print.
+    // The quote is not terminal-hostile and stays.
     const note = try renderNestedBuildModuleNote(std.testing.allocator, "a\x1b[31mred\nnext\"q");
     defer std.testing.allocator.free(note);
     try std.testing.expectEqualStrings(
@@ -56876,15 +56876,15 @@ const SlicesLessThan = struct {
 test "detectStandardEntries frees both duped entries on append failure (EPH-I1037)" {
     // The fixture reaches both leakable append sites and forces a growth
     // allocation at the walk site too. The standard entries loop appends
-    // src/main.zig, src/lib.zig, src/root.zig (3 appends; the first grows
+    // src/main.zig, src/lib.zig, src/root.zig (3 appends. The first grows
     // the list 0 -> 9). The src/ test-file walk appends seven _test.zig
-    // files; the 7th walk append is the 10th append overall and exceeds
+    // files. The 7th walk append is the 10th append overall and exceeds
     // the 9-slot first-growth capacity, so it triggers a growth
     // allocation the fail_index sweep covers — order-independent, because the
     // growth lands on the walk's last append in any readdir order.
     // std growCapacity(1) = 1 + cache_line / @sizeOf([]const u8): 9 on
     // both aarch64 and x86_64 (cache_line 128 for both in the pinned
-    // 0.16.0 stdlib; some pre-0.16 stdlibs map x86_64 to 64 — the count
+    // 0.16.0 stdlib. Some pre-0.16 stdlibs map x86_64 to 64 — the count
     // is sized so the walk exceeds the capacity either way). No
     // build.zig means extractBuildZigEntries no-ops and the
     // multi-entry dir walk finds nothing, so the allocation sequence
@@ -57032,7 +57032,7 @@ test "extractQuotedPath accepts stdlib-named project files (EPH-I0529)" {
     // stdlib names (verified against the 0.16.0 compiler: @import("std")
     // and @import("builtin") are the only package forms, and the .zig
     // suffix gate rejects both). Pre-fix, startsWith("std")/"builtin"
-    // refused these entries; zls carries a real @import("std.zig").
+    // refused these entries. Zls carries a real @import("std.zig").
     try std.testing.expectEqualStrings(
         "stdfoo.zig",
         extractQuotedPath("@import(\"stdfoo.zig\")", 9).?,
@@ -57297,7 +57297,7 @@ test "joinPathSegments guards the empty slice and propagates OOM (EPH-I0528)" {
 }
 
 test "parseCommand maps the bare version word (EPH-I0544)" {
-    // The bare word is the most common version-query spelling; pre-fix it
+    // The bare word is the most common version-query spelling. Pre-fix it
     // fell through to the path latch and died with FileNotFound plus a
     // misleading outside-root note.
     try std.testing.expectEqual(
@@ -57353,14 +57353,14 @@ test "parseCommandIntoArgv unclosed quote consumes the tail; tabs split (EPH-I02
     var buf: [64][]const u8 = undefined;
     var scratch: [1024]u8 = undefined;
     // An unterminated quote consumes the rest of the command as one
-    // token; the quote byte itself is stripped (the d383904 guarantee,
+    // token. The quote byte itself is stripped (the d383904 guarantee,
     // EPH-I0244). The pre-fix tokenizer kept the quote bytes and lumped
     // the remainder into the last token silently.
     const parsed = parseCommandIntoArgv("\"echo", &buf, &scratch);
     try std.testing.expectEqual(@as(usize, 1), parsed.argc);
     try std.testing.expect(!parsed.truncated);
     try std.testing.expectEqualStrings("echo", buf[0]);
-    // A tab splits unquoted tokens exactly like a space; inside quotes a
+    // A tab splits unquoted tokens exactly like a space. Inside quotes a
     // tab is a literal byte.
     const parsed2 = parseCommandIntoArgv("a\tb\t\"c\td\"", &buf, &scratch);
     try std.testing.expectEqual(@as(usize, 3), parsed2.argc);
@@ -57661,7 +57661,7 @@ test "parseTestOutput emits one classification for a FAIL panic line (EPH-I0508 
     defer deinitIssues(&issues, allocator);
     // One classification per line: the panic is the failure cause, so a
     // line matching both markers emits the panic finding only. The
-    // duplicate ZR104 stays silent (band-B12 F23; the EPH-I0230 double
+    // duplicate ZR104 stays silent (band-B12 F23. The EPH-I0230 double
     // classification is superseded).
     try parseTestOutput(.{
         .issues = &issues,
@@ -57844,7 +57844,7 @@ test "declined runtime prompt carries a nonzero exit code (EPH-I0261)" {
 }
 
 test "printVerboseRuntimeLine sanitizes child bytes before the render (EPH-I0171, EPH-I0288)" {
-    // The verbose band prints raw child lines; this seam must strip
+    // The verbose band prints raw child lines. This seam must strip
     // control bytes. The writer seam routes the output to a capture
     // buffer (EPH-I0288): zig 0.16's build_runner frames any supervised
     // stderr on a GREEN run, so the hostile fixture bytes must never
@@ -57864,7 +57864,7 @@ test "printVerboseRuntimeLine sanitizes child bytes before the render (EPH-I0171
         try std.testing.expectEqualStrings("GPA: boom ?[2J leaked\n", w.buffered());
     }
     {
-        // The sanitize path borrows clean input without allocation; the
+        // The sanitize path borrows clean input without allocation. The
         // hostile path owns a copy. Both must stay byte-balanced.
         var buf: [64]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
@@ -58226,7 +58226,7 @@ test "parseGPADiagnostics keeps unknown:0 when the header names a zig step" {
     // EPH-I0769: the runner header quotes the test step name. A step
     // name holding a ".zig" substring minted file:0 through the header
     // anchor pre-fix. The header anchors only when it parses to a real
-    // path:line form; otherwise the finding keeps unknown:0.
+    // path:line form. Otherwise the finding keeps unknown:0.
     const allocator = std.testing.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, allocator);
@@ -58426,8 +58426,8 @@ test "buildRuntimeArgv builds default and custom argv" {
 }
 
 test "buildRuntimeArgv truncation is detected with and without JSON mode" {
-    // The truncated marker still surfaces the 64-token cap in both modes;
-    // the warning print itself stays off the machine stream (EPH-I0213).
+    // The truncated marker still surfaces the 64-token cap in both modes.
+    // The warning print itself stays off the machine stream (EPH-I0213).
     const allocator = std.testing.allocator;
     var cmd: std.ArrayListUnmanaged(u8) = .empty;
     defer cmd.deinit(allocator);
@@ -58508,7 +58508,7 @@ test "reportRunFailure distinguishes spawn failure from output overflow" {
 }
 
 test "runtime spawn failure reports the analysis as not-run (EPH-I0734)" {
-    // A spawn failure means the analysis never ran; the run must not
+    // A spawn failure means the analysis never ran. The run must not
     // read as a pass. The exit arm keys on analysis_ran, which
     // runRuntimeAnalysis reports false by default and true only after
     // the child spawn succeeds. The target is a deleted tmpdir's
@@ -58660,14 +58660,14 @@ test "runFmtCheck JSON mode keeps the spawn-failure line off the stream (EPH-I02
     var diag = testDiagCtx();
     diag.json_stream = true;
     const allocator = std.testing.allocator;
-    // Force the spawn failure with a nonexistent tool path; restore the
+    // Force the spawn failure with a nonexistent tool path. Restore the
     // global so the rest of the suite sees the real zig.
     const saved_zig_path = tool_zig_path;
     defer tool_zig_path = saved_zig_path;
     tool_zig_path = "/nonexistent/ephor-jq-fmt";
     var issues = try runFmtCheck(&diag, allocator, "src");
     defer deinitIssues(&issues, allocator);
-    // The machine stream carries the failure as a ZR104 finding; the
+    // The machine stream carries the failure as a ZR104 finding. The
     // bare "cannot run zig fmt" line is gated off (cliDiag).
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_TEST_FAILURE, issues.items[0].rule);
@@ -58679,7 +58679,7 @@ test "runFmtCheck spawn failure unarms the printed-error latch (EPH-I1161)" {
     var capture = CaptureSink{};
     diag.diag_sink = capture.sink();
     const allocator = std.testing.allocator;
-    // Force the spawn failure with a nonexistent tool path; restore the
+    // Force the spawn failure with a nonexistent tool path. Restore the
     // global so the rest of the suite sees the real zig.
     const saved_zig_path = tool_zig_path;
     defer tool_zig_path = saved_zig_path;
@@ -58702,7 +58702,7 @@ test "runFmtCheck accepts a dash-leading scan path (EPH-I1023)" {
     // The dash-leading relative path must reach zig fmt as the
     // positional "./-dashdir2". Pre-fix the child died on
     // "unrecognized parameter: '-dashdir2'" (zig fmt 0.16 has no `--`
-    // separator; its parser treats any dash-leading argument as a
+    // separator. Its parser treats any dash-leading argument as a
     // flag) and every run on a dash-leading path was a spurious ZR104.
     for (issues.items) |issue|
         try std.testing.expect(mem.indexOf(u8, issue.message, "unrecognized parameter") == null);
@@ -59036,7 +59036,7 @@ test "runFmtCheck stays silent when zig fmt crashes on a hostile line (EPH-I0979
     defer tmp.cleanup();
 
     // zig fmt's own parser stack-overflows (signal 11) on a single
-    // line with 20K `or` keywords (~140 KB); the pinned 0.16.0
+    // line with 20K `or` keywords (~140 KB). The pinned 0.16.0
     // toolchain crashes deterministically and prints nothing before
     // the crash (probe 2026-08-14). The signal-killed child is not an
     // ephor analysis result, so the fmt band reports no ZR104 — the
@@ -59155,7 +59155,7 @@ test "runRuntimeAnalysis JSON mode keeps the spawn-failure line off the stream (
         },
     );
     defer deinitIssues(&issues, allocator);
-    // The machine stream carries the failure as a ZR104 finding; the
+    // The machine stream carries the failure as a ZR104 finding. The
     // bare "cannot run" line is gated off.
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings("ZR104", issues.items[0].rule);
@@ -59368,7 +59368,7 @@ test "runRuntimeAnalysis reports a located ZR101 for child GPA leak text (band-T
     defer deinitIssues(&issues, allocator);
 
     // The leak header plus its location line yield exactly one leak
-    // finding; the nonzero exit must not add a bare ZR104. EPH-I0171
+    // finding. The nonzero exit must not add a bare ZR104. EPH-I0171
     // (re-derived pin, B86): the forged location fails the containment
     // gate, so the finding keeps the generic message instead of
     // embedding the forged path.
@@ -59554,7 +59554,7 @@ fn runCFGMemoryTest(
 
 /// One failing-allocator sweep iteration over the CFG memory pipeline:
 /// build the one-file graph and run analyzeCFGMemory. An induced
-/// OutOfMemory surfaces as an error; the caller asserts byte balance
+/// OutOfMemory surfaces as an error. The caller asserts byte balance
 /// after the run. The graph deinit happens inside, so the caller only
 /// checks the allocator ledger (EPH-I0895).
 fn sweepCFGMemoryOnce(
@@ -59718,7 +59718,7 @@ test "safety lists carry no owned payloads (EPH-I0483)" {
     // band-B11 F13: runCFGSafetyAnalyses transfers r1/r2/r3 into out
     // with a bare appendSlice — an owned message in those lists would
     // leak on an OOM at the transfer (the array defer frees only the
-    // backing; the B45-1 guards exist exactly for that class). The
+    // backing. The B45-1 guards exist exactly for that class). The
     // null-safety, panic-pattern, and error families emit static message
     // strings only, so no guard is needed. This pin fails when a future
     // emission allocates a message into one of the safety lists without
@@ -59762,11 +59762,11 @@ test "ZA1xx: no-free collectors stay byte-balanced on put failure (EPH-I1007)" {
     // The fixture drives >= 2 puts into each no-free collector map: the
     // arena-typed struct fields (collectNoFreeFieldNames, file-level scan),
     // the type-init and alias chain (collectNoFreeAllocatorNames — two
-    // stdlib inits; the arena0-named params no longer drive the signature
+    // stdlib inits. The arena0-named params no longer drive the signature
     // arm since the arena name matches exactly, ADR-0007/EPH-I0387), and
     // the init + Allocator-param chain (collectAllAllocatorNames).
     // A map whose put fails after earlier puts held storage dropped that
-    // storage pre-fix; byte balance at every fail index is the leak proof
+    // storage pre-fix. Byte balance at every fail index is the leak proof
     // (EPH-I1007).
     const content =
         \\const S = struct {
@@ -60616,7 +60616,7 @@ test "ZA101: exit-free inner loop between alloc and free stays silent (EPH-I0116
 
     // The F6a loop deadlock read an exit-free inner loop as uncovered:
     // the alloc always reaches the post-loop free, so the ZA101 was an
-    // FP. Pre-fix nested_no_break fired; post-fix only the exit
+    // FP. Pre-fix nested_no_break fired. Post-fix only the exit
     // shapes fire (break/return/try can bypass the free, so their
     // verdict stays FP-lean).
     const content =
@@ -60659,7 +60659,7 @@ test "ZA101: exit-free inner loop between alloc and free stays silent (EPH-I0116
     var run = try runCFGMemoryTest(&diag, allocator, "test_exit_free_loop.zig", content);
     defer run.deinit(allocator);
 
-    // nested_break, nested_return, nested_try fire; nested_no_break stays
+    // nested_break, nested_return, nested_try fire. Nested_no_break stays
     // silent.
     try std.testing.expectEqual(
         @as(usize, 3),
@@ -60677,7 +60677,7 @@ test "ZA101: end-of-line try and bare return inside the loop stay loud (EPH-I117
     // shapes — a `try` at end of line (the operand wrapped onto the
     // next line) and a bare `return;` in a multi-statement arm — so
     // the exit-free relaxation suppressed a genuine ZA101. The
-    // word-bounded scan restores both; the clean control stays silent.
+    // word-bounded scan restores both. The clean control stays silent.
     const content =
         \\fn eol_try(allocator: std.mem.Allocator, c: bool) !void {
         \\    const buf = try allocator.alloc(u8, 10);
@@ -60711,7 +60711,7 @@ test "ZA101: end-of-line try and bare return inside the loop stay loud (EPH-I117
     var run = try runCFGMemoryTest(&diag, allocator, "test_eol_exits_101.zig", content);
     defer run.deinit(allocator);
 
-    // eol_try and mid_return fire; clean_control stays silent.
+    // eol_try and mid_return fire. Clean_control stays silent.
     try std.testing.expectEqual(
         @as(usize, 2),
         countRuleIssues(run.issues.items, "test_eol_exits_101.zig", RULE_ALLOC_NO_DEFER),
@@ -60753,7 +60753,7 @@ test "ZA101: errdefer-only cleanup warns on the success path (EPH-I0349)" {
     const allocator = gpa.allocator();
 
     // An errdefer frees only on error exits. The success path keeps the
-    // alloc with nothing freeing it, so ZA101 fires; the errdefer still
+    // alloc with nothing freeing it, so ZA101 fires. The errdefer still
     // covers the error exits, so ZA103 stays silent (band-B02 F10).
     const content =
         \\fn errdefer_only(allocator: std.mem.Allocator, s: []const u8) !void {
@@ -60956,7 +60956,7 @@ test "ZA101: multi-line enum param does not truncate body" {
     const allocator = gpa.allocator();
 
     // EPH-I0012 issue shape: the `},` closing the enum container returns
-    // brace_depth to 0 mid-signature; the body below must still be analyzed.
+    // brace_depth to 0 mid-signature. The body below must still be analyzed.
     const content =
         \\fn leaky(
         \\    alloc: std.mem.Allocator,
@@ -61042,7 +61042,7 @@ test "ZA101: default-param container on own line does not truncate body" {
     const allocator = gpa.allocator();
 
     // EPH-I0012 shape: the `.{}` default value closes on its own signature
-    // line, returning brace_depth to 0 mid-signature; the body below must
+    // line, returning brace_depth to 0 mid-signature. The body below must
     // still be analyzed (RED-verified at HEAD 762e462 via .tmp/probe5.zig).
     const content =
         \\const Foo = struct { x: u8 = 0 };
@@ -61070,7 +61070,7 @@ test "ZA101: single-line container signature detection unchanged" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Parity lock: end-of-line evaluation already saved this shape; the
+    // Parity lock: end-of-line evaluation already saved this shape. The
     // signature/body boundary rework must not regress it.
     const content =
         \\fn leaky(alloc: std.mem.Allocator, kind: enum { a, b }) !void {
@@ -61094,8 +61094,8 @@ test "ZA101: nested fn-type param does not break body extraction" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Parity lock: the `fn () void` param contributes parens but no braces;
-    // neither the old nor the new scanner may truncate on it.
+    // Parity lock: the `fn () void` param contributes parens but no braces.
+    // Neither the old nor the new scanner may truncate on it.
     const content =
         \\fn leaky(
         \\    alloc: std.mem.Allocator,
@@ -61132,7 +61132,7 @@ test "ZA103: multi-line signature with error return on own line is checked" {
 
     // EPH-I0072 issue shape: `) !void` on its own line — invisible to the
     // fn-keyword-line scan, so ZA103 never fired (probe P1 at HEAD 1a3593f:
-    // ZA101 fired, ZA103 silent; the single-line twin fired both).
+    // ZA101 fired, ZA103 silent. The single-line twin fired both).
     const content =
         \\fn leaky(
         \\    allocator: std.mem.Allocator,
@@ -61158,7 +61158,7 @@ test "ZA103: single-line error-return signature check unchanged" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Parity lock: the detect-line check already enabled ZA103 here; the
+    // Parity lock: the detect-line check already enabled ZA103 here. The
     // signature-line scan must not regress it.
     const content =
         \\fn leaky(allocator: std.mem.Allocator, x: u8) !void {
@@ -61351,7 +61351,7 @@ test "ZA101: a noreturn-named param line does not exempt the fn (EPH-I1180)" {
     // follower, so `noreturn: bool,` on a continuation line read as a
     // noreturn return and skipped ZA101/ZA103 for a need-free fn. The
     // follower gate (the body brace) keeps the param decl inside the
-    // param list; the fn stays need-free and its leak fires.
+    // param list. The fn stays need-free and its leak fires.
     const content =
         \\fn takes_param(
         \\    allocator: std.mem.Allocator,
@@ -61407,7 +61407,7 @@ test "ZA103: catch |e| return e; propagation is an error-exit trigger (EPH-I0069
 
     // The canonical propagation form was in neither try_lines nor
     // error_returns, so the alloc before it leaked silently. Pre-fix
-    // this shape fired no ZA103; post-fix the trigger fires once. The
+    // this shape fired no ZA103. Post-fix the trigger fires once. The
     // errdefer control stays silent, and a success-path bare return
     // never fakes a trigger. The block form stays a documented
     // residual (see hasErrorPropagationCatch).
@@ -61458,7 +61458,7 @@ test "ZA103: try inside the alloc's own argument list never triggers the outer a
     // EPH-I0675 statement-span machinery — this test pins it against
     // regression): the outer alloc's only next-try sits inside its own
     // argument list, so no error path can leak the outer result. The
-    // multi-line and single-line forms must stay silent; the
+    // multi-line and single-line forms must stay silent. The
     // later-try control fires (the machinery stays live).
     const content =
         \\fn read_shape(gpa: std.mem.Allocator, sh: *Shell, c: bool) !void {
@@ -61849,7 +61849,7 @@ test "ZA105: element alloc stored in a slice is unattributed (EPH-I0361 doc-arm)
     defer run.deinit(allocator);
 
     const file = "test_elem_stored.zig";
-    // stored(): silent (accepted FN); plain(): fires.
+    // stored(): silent (accepted FN). Plain(): fires.
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_USE_AFTER_FREE) == 1);
     var fired_on_plain = false;
     for (run.issues.items) |issue| {
@@ -62019,7 +62019,7 @@ test "ZA106: inline catch-arm free then post-join free grades conditional (EPH-I
     const allocator = gpa.allocator();
 
     // The second free double-frees on the error path only (the arm freed
-    // there); the success path runs it once. Conditional grade, mirror of
+    // there). The success path runs it once. Conditional grade, mirror of
     // the EPH-I0356 switch-arm double-free.
     const content =
         \\fn inline_catch_df(allocator: std.mem.Allocator, opt: error{X}!void) !void {
@@ -62132,7 +62132,7 @@ test "ZA106: definite free then braced if-arm free grades conditional, join stay
     // condition's path only — the same-semantics catch-arm and brace-less
     // twins grade warning via the current-free op (EPH-I1011). The
     // block-on-every-continuing-path gate now grades the arm free
-    // conditional; the post-join free, reached on every path that
+    // conditional. The post-join free, reached on every path that
     // continues, keeps the definite grade.
     const content =
         \\fn use(d: []u8) void {
@@ -62253,7 +62253,7 @@ test "ZA106: cross-block both-arms free grades err, single-arm twin grades warni
     // free, so the pair stays conditional (warning). The two functions
     // differ in one line — the discriminating pin. Pre-fix both graded
     // warning (the B48a conditional grade read the skip path as per-arm
-    // conditional); the err assertion fails pre-fix.
+    // conditional). The err assertion fails pre-fix.
     const content =
         \\fn use(d: []u8) void {
         \\    _ = d;
@@ -62370,7 +62370,7 @@ test "ZA106: all-arms chain intermediate grades err, skip paths stay conditional
     // arm's other path skips the whole chain), a chain whose prefix arm
     // does not free (the prefix path runs no second free), and a chain
     // inside a loop (the zero-trip false exit skips it). Pre-fix the
-    // guard capped every intermediate at warning; the err assertion
+    // guard capped every intermediate at warning. The err assertion
     // fails on the pre-fix binary.
     const content =
         \\fn use(d: []u8) void {
@@ -62481,7 +62481,7 @@ test "ZA106: 3-link all-arms chain grades the shallower intermediate err (EPH-I1
     // body. The EPH-I1145 continuation walk proves the pair definite
     // when every arm of the continuation chain frees — the graded
     // arm's skip path then runs a second free of its own. Pre-fix the
-    // shallower intermediate of chain3_own graded warning; post-fix
+    // shallower intermediate of chain3_own graded warning. Post-fix
     // it grades err like the last intermediate. The chain HEAD arm
     // stays warning by the EPH-I1142 lock — the walk applies to
     // intermediates only, and the head-arm upgrade is the named
@@ -62553,11 +62553,11 @@ test "ZA106: loop-else both-arms free grades err, plain loop twin stays conditio
 
     // The word-bounded-else discriminator on the sibling's first line: a
     // loop with an else arm whose body also frees reads as both-arms
-    // (err — every path runs a second free; for a loop the false exit IS
+    // (err — every path runs a second free. For a loop the false exit IS
     // the else body). The plain loop's sibling is the post-loop block,
     // which carries no else token, so the pair stays conditional
     // (warning). The two functions differ in the else arm only — the
-    // discriminating pin. Pre-fix both graded warning; the err assertion
+    // discriminating pin. Pre-fix both graded warning. The err assertion
     // fails pre-fix.
     const content =
         \\fn use(d: []u8) void {
@@ -62612,7 +62612,7 @@ test "ZA106: merge siblings with unrelated else tokens stay conditional, genuine
     // close, so its first line's unrelated else token (an if-expression,
     // a single-line if-else, a switch else prong) no longer upgrades the
     // pair to err (EPH-I1031). The three FP fns carry a free on the
-    // merge's first line and another free in the merge's span; each pair
+    // merge's first line and another free in the merge's span. Each pair
     // grades conditional (warning) — pre-fix all three graded err. The
     // discriminating controls: the multi-line if/else and while-else
     // both-arms pairs (genuine `} else {` siblings) stay err, and the
@@ -62910,7 +62910,7 @@ test "ZA106: else-if chain corner grades — inline arm and final else stay cond
 
     const file = "test_chain_corner_grades.zig";
     // One ZA106 per chain fn: the first-arm free of the inline and
-    // final-else chains grades conditional; the all-arms chain's line
+    // final-else chains grades conditional. The all-arms chain's line
     // grades err.
     try std.testing.expect(countRuleIssues(run.issues.items, file, RULE_DOUBLE_FREE) == 3);
     var inline_warning = false;
@@ -63024,7 +63024,7 @@ test "ZA106: mid-line marker suppression keeps the else-arm pair silent (EPH-I10
     // EPH-I0806 marker-suppression class) while the own-line twin
     // grades err through the branch_false sibling gate (EPH-I1086).
     // The then-arm pair keeps its err grade. Count: one ZA106 err
-    // (the then-arm free); no issue fires on the else-arm line.
+    // (the then-arm free). No issue fires on the else-arm line.
     const content =
         \\fn mid_line(allocator: std.mem.Allocator, c: bool) !void {
         \\    const buf = try allocator.alloc(u8, 64);
@@ -63171,10 +63171,10 @@ test "ZA901/ZA903: closed same-line else-if arm does not cover a separate bare b
     // inside the arm, which closes on the same line: the closed arm's
     // bound must not cover the bare block below (pre-fix silent on both
     // rules — the I1036 FN). The discriminating controls: the plain
-    // closed if and the closed while twins fire the same way; a
+    // closed if and the closed while twins fire the same way. A
     // multi-line chain arm's in-arm candidate stays silent (its body is
-    // the guard's span); an Allman if header keeps covering its body
-    // below; and an amount past the credited bound fires.
+    // the guard's span). An Allman if header keeps covering its body
+    // below. And an amount past the credited bound fires.
     const content =
         \\fn use(v: usize) usize {
         \\    _ = v;
@@ -63714,7 +63714,7 @@ test "ZA105: same-block UAF after rebind cites the reaching refree (EPH-I0344 r1
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // P7: the free on 3 released the dead pre-rebind binding; the rebind on
+    // P7: the free on 3 released the dead pre-rebind binding. The rebind on
     // 4 re-arms buf, and the free on 6 is what the use on 7 runs after. The
     // message must cite 6 — the detection record (3) would read as an FP
     // about an allocation that no longer exists at the use.
@@ -63911,9 +63911,9 @@ test "ZA105: root rebind after the free does not resurrect the alias (EPH-I0835)
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `buf = other` hands the ROOT to live memory; the alias `a` still
+    // `buf = other` hands the ROOT to live memory. The alias `a` still
     // points at the freed allocation, so the use on 6 stays a definite UAF.
-    // The root lattice would reset on the rebind; the alias verdict must
+    // The root lattice would reset on the rebind. The alias verdict must
     // not follow it (EPH-I0835 root-rebind guard).
     const content =
         \\fn alias_after_root_rebind(allocator: std.mem.Allocator, other: []u8) !void {
@@ -63949,7 +63949,7 @@ test "ZA105: conditional root free plus root rebind grades warning (EPH-I0838)" 
     // The free on 5 reaches the use on 8 on the c-true path only, and the
     // root rebind on 7 does not resurrect the alias's target. The path
     // truth is a conditional UAF: the grade must be warning. The lattice
-    // resets at the rebind, so the use block cannot grade it; the grade
+    // resets at the rebind, so the use block cannot grade it. The grade
     // anchors at the rebind block's entry state (EPH-I0838).
     const content =
         \\fn alias_root_rebind_cond_free(allocator: std.mem.Allocator, c: bool, other: []u8) !void {
@@ -64032,7 +64032,7 @@ test "ZA105: conditional alias rebind after the free stays silent (EPH-I0836)" {
     // p5c probe shape. hasReassignmentBetween is arm-blind (band-B02 F25
     // class): the rebind on 6 suppresses like an unconditional one, though
     // the c-false path still reads the freed allocation. Accepted FN, the
-    // FP-to-FN trade EPH-I0347 prescribed; pinned as current behavior.
+    // FP-to-FN trade EPH-I0347 prescribed. Pinned as current behavior.
     const content =
         \\fn alias_cond_rebind(allocator: std.mem.Allocator, other: []u8, c: bool) !void {
         \\    const buf = try allocator.alloc(u8, 64);
@@ -64124,7 +64124,7 @@ test "ZA105: alias use after a switch that frees on one arm still fires" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The free runs on the .a path only; the alias use sits AFTER the switch
+    // The free runs on the .a path only. The alias use sits AFTER the switch
     // join, not in a sibling arm — genuine UAF on the .a path (EPH-I0010 F2).
     const content =
         \\fn alias_post_switch(allocator: std.mem.Allocator, kind: enum { a, b }) !void {
@@ -64410,7 +64410,7 @@ test "ZA106: Allman while-continue loop body free fires the loop-carried vote (E
     // finds the `{` on the next line, and bounds the body — the
     // loop-carried double-free fires. Firing is CORRECT (adjudicated
     // B86j+B87 r2 F2): the Allman body is a well-defined braced extent
-    // and the defect is real; silence would be a false negative.
+    // and the defect is real. Silence would be a false negative.
     const content =
         \\fn loop_allman(allocator: std.mem.Allocator) !void {
         \\    const buf = try allocator.alloc(u8, 64);
@@ -64523,7 +64523,7 @@ test "ZA106: while-continue capture payload free stays masked (EPH-I0749 shadow 
     var run = try runCFGMemoryTest(&diag, allocator, "test_loop_capture.zig", content);
     defer run.deinit(allocator);
 
-    // The masked capture shape draws nothing; the control's definite
+    // The masked capture shape draws nothing. The control's definite
     // double-free is the one issue.
     try std.testing.expect(
         countRuleIssues(run.issues.items, "test_loop_capture.zig", RULE_DOUBLE_FREE) == 1,
@@ -65451,7 +65451,7 @@ test "ZA105: inline-switch arm free then nested post-join use fires (EPH-I0356)"
 
     // The post-join use sits inside a following if at the ARM indent. The
     // next arm's header used to suppress it (band-B02 F3 residual: the arm
-    // header between free and use at the free's indent); the containment
+    // header between free and use at the free's indent). The containment
     // rule (armHeaderSeparates) proves the use runs after the switch join
     // and the warning fires. Pre-fix this shape was silent.
     const content =
@@ -65981,7 +65981,7 @@ test "ZA105: arm header of a switch whose join precedes the use does not separat
     // is reachable on the free's arm and must fire at the conditional
     // grade. Pre-fix this shape was the pinned accepted FN of the
     // EPH-I0062 residual test (band-B02 F3: "the textual layer cannot
-    // tell"); the join-before-use geometry is now the mechanism's answer
+    // tell"). The join-before-use geometry is now the mechanism's answer
     // to the audit's F3 done-when.
     const content =
         \\fn handle(allocator: std.mem.Allocator, k: enum { a, b }, c: bool) !void {
@@ -66343,7 +66343,7 @@ test "ZA106: free of a var the loop never references stays silent (EPH-I0676)" {
     const allocator = gpa.allocator();
 
     // Reviewer F1 fp5: the loop iterates a different slice and never names
-    // buf; the single free after the loop is correct cleanup.
+    // buf. The single free after the loop is correct cleanup.
     const content =
         \\fn spin3(allocator: std.mem.Allocator, items: []u8) !void {
         \\    const buf = try allocator.alloc(u8, 64);
@@ -66448,7 +66448,7 @@ test "ZA106: defer free with reassignment after direct free stays silent" {
     const allocator = gpa.allocator();
 
     // defer evaluates buf at scope exit — after reassignment it frees the NEW
-    // allocation; the direct free released the old one. Correct pattern.
+    // allocation. The direct free released the old one. Correct pattern.
     const content =
         \\fn defer_reassigned(allocator: std.mem.Allocator) !void {
         \\    var buf = try allocator.alloc(u8, 64);
@@ -66916,7 +66916,7 @@ test "ZA106: errdefer free plus direct free with a later try is a warning (EPH-I
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The direct free runs on the success path; the later `try` can error,
+    // The direct free runs on the success path. The later `try` can error,
     // so the errdefer fires and frees the same buffer again — a real
     // double-free on the error path, not detected before EPH-I0006.
     const content =
@@ -67027,7 +67027,7 @@ test "ZA106: test-block else-arm fallible stays silent (EPH-I1211)" {
     // fired, and the else-arm `try` was credited as a post-free error
     // exit — the pairing fired on a shape with no double-free path (the
     // direct free runs only on the c-true path, which has no error exit
-    // after it; the else arm never runs the free). The untrimmed feed
+    // after it. The else arm never runs the free). The untrimmed feed
     // restores the stop, and the fn-side twin of this shape was always
     // silent (EPH-I1211).
     const content =
@@ -67211,7 +67211,7 @@ test "ZA103: struct field storage with colliding name transfers ownership" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // self.buf = buf — the first "buf" occurrence is the LHS field; the
+    // self.buf = buf — the first "buf" occurrence is the LHS field. The
     // transfer is only visible by searching the RHS (bun linear_fifo shape).
     const content =
         \\const Holder = struct {
@@ -67385,7 +67385,7 @@ test "ZA103: shadowed alloc name returned in a later scope stays covered (EPH-I0
     // scan). The shadow's own decl carries no `try`, so no uncovered
     // exit stops the walk first, and a bare `{` block is not a control
     // brace (EPH-I0368), so the shadow's return dominates at the same
-    // depth. Disclosed residual: the verdict stays silent; a
+    // depth. Disclosed residual: the verdict stays silent. A
     // scope-tracked rewrite must update this pin and the isReturnTransfer
     // doc.
     const content =
@@ -67414,7 +67414,7 @@ test "ZA103: return of a call result does not transfer (TP lock)" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `return wrap(buf);` — ownership passed through a call is unclear; the
+    // `return wrap(buf);` — ownership passed through a call is unclear. The
     // return-transfer suppression must NOT apply.
     const content =
         \\fn call_return(allocator: std.mem.Allocator, use_buf: bool) ![]u8 {
@@ -67473,7 +67473,7 @@ test "ZA103: field access on another object inside tuple does not transfer (TP l
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `return .{ x.buf, 0 };` — `x.buf` is a field of another object; the
+    // `return .{ x.buf, 0 };` — `x.buf` is a field of another object. The
     // leading dot is NOT a word boundary for the local buf, which is never
     // transferred and must still be reported.
     const content =
@@ -67504,8 +67504,8 @@ test "ZA103: enum literal inside tuple does not transfer (TP lock)" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `return .{ .buf, 0 };` — `.buf` is an enum literal, not the local buf;
-    // the local is never transferred and must still be reported.
+    // `return .{ .buf, 0 };` — `.buf` is an enum literal, not the local buf.
+    // The local is never transferred and must still be reported.
     const content =
         \\const Kind = enum { buf, other };
         \\fn enum_mention(allocator: std.mem.Allocator, use_buf: bool) !struct { Kind, usize } {
@@ -67535,7 +67535,7 @@ test "ZA103: string mention inside tuple does not transfer (TP lock)" {
     const allocator = gpa.allocator();
 
     // `return .{ "buf", 0 };` — the alloc name appears only inside a string
-    // literal in the tuple; the real buf is never transferred.
+    // literal in the tuple. The real buf is never transferred.
     const content =
         \\fn str_mention(allocator: std.mem.Allocator, use_buf: bool) !struct { []const u8, usize } {
         \\    if (use_buf) {
@@ -67564,7 +67564,7 @@ test "ZA101/ZA103: orelse-return try-alloc escapes to caller (EPH-I0009)" {
     const allocator = gpa.allocator();
 
     // zls analysis.zig trimCommonIndentation shape: the dupe result is
-    // RETURNED in the orelse branch; the var only ever holds the unwrapped
+    // RETURNED in the orelse branch. The var only ever holds the unwrapped
     // value. Ownership went to the caller — no defer/errdefer is due.
     const content =
         \\fn trim(allocator: std.mem.Allocator, str: []const u8, preserved: usize) ![]u8 {
@@ -67688,7 +67688,7 @@ test "ZA101/ZA103: orelse-return inside string literal does not skip" {
     const allocator = gpa.allocator();
 
     // The `orelse return` text appears only inside a string literal BEFORE
-    // the alloc — the orelse scan must be string-aware; y still fires.
+    // the alloc — the orelse scan must be string-aware. y still fires.
     const content =
         \\fn str_shape(allocator: std.mem.Allocator, s: []const u8) !void {
         \\    var x = "a orelse return b"; var y = try allocator.dupe(u8, s);
@@ -67847,8 +67847,8 @@ test "ZA103: errdefer covers regardless of exit-transfer order (EPH-I0005 lock)"
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // A real errdefer between the alloc and the try covers the error path;
-    // the later field store is irrelevant.
+    // A real errdefer between the alloc and the try covers the error path.
+    // The later field store is irrelevant.
     const content =
         \\fn covered(allocator: std.mem.Allocator, state: *State, s: []const u8) !void {
         \\    const buf = try allocator.dupe(u8, s);
@@ -67933,9 +67933,9 @@ test "ZA103: conditional return of another name stays a gap (EPH-I0063 lock)" {
 test "isUncoveredErrorExit ignores mid-line comment exits (EPH-I0070)" {
     // A mid-line comment mentioning an exit is prose, not an exit: the
     // scan must pass the line. The `// return err;` pin failed pre-fix
-    // (hasBareIdentReturn matched the comment text); the `// try this`
+    // (hasBareIdentReturn matched the comment text). The `// try this`
     // pin is a guard (hasRealKeyword was already comment-aware). The
-    // conditional alloc-return pin failed pre-fix (EPH-I0063); the
+    // conditional alloc-return pin failed pre-fix (EPH-I0063). The
     // conditional other-name and real-try pins are locks.
     try std.testing.expect(!isUncoveredErrorExit("work(); // return err;", "buf"));
     try std.testing.expect(!isUncoveredErrorExit("work(); // try this", "buf"));
@@ -68111,7 +68111,7 @@ test "ZA103: bare error return without a trigger stays silent (EPH-I0005 lock)" 
     // the ownership scan, but emission still requires a real trigger (try or
     // `return error.`) — a bare-err return is not itself a trigger. The
     // EPH-I0069 expansion landed the single-line canonical form
-    // (`catch |X| return X;`); the catch-BLOCK bare return here stays
+    // (`catch |X| return X;`). The catch-BLOCK bare return here stays
     // outside it. The exit-stop only un-suppresses.
     const content =
         \\fn bareErrLock(allocator: std.mem.Allocator, state: *State, s: []const u8) !void {
@@ -68159,7 +68159,7 @@ test "scanErrdeferLines releases partial state on every allocation failure (EPH-
     // any index must return without leaking the collections built so far
     // (errdefer state.deinit, band-B03 F15 / EPH-I0375). Pre-errdefer a
     // mid-scan failure leaked every list populated before the failing
-    // call; std.testing.allocator detects any such leak on the error
+    // call. std.testing.allocator detects any such leak on the error
     // path.
     const allocator = std.testing.allocator;
     const lines = [_][]const u8{
@@ -68299,7 +68299,7 @@ test "ZA103: split-RHS own try is not a self-trigger (EPH-I0675)" {
 
     // The alloc's own try lives on the continuation line inside the
     // statement span: it must not fire the alloc itself (the stmt_end
-    // exclusion). Pre-fix the alloc was invisible; a join without the
+    // exclusion). Pre-fix the alloc was invisible. A join without the
     // span exclusion fires it falsely.
     const content =
         \\fn splitRhsOnly(allocator: std.mem.Allocator) !void {
@@ -68491,7 +68491,7 @@ test "ZA103: lone `{` in a string keeps a multi-line errdefer block open (EPH-I0
     var run = try runCFGMemoryTest(&diag, allocator, "test_block_open_brace.zig", content);
     defer run.deinit(allocator);
 
-    // `more` is a real alloc outside the block; its line must not be
+    // `more` is a real alloc outside the block. Its line must not be
     // swallowed, so the later try fires the gap.
     try std.testing.expect(countRuleIssues(
         run.issues.items,
@@ -68811,7 +68811,7 @@ test "ZA103/ZA101: issue col stays inside the physical line on split-RHS and wra
     const allocator = gpa.allocator();
 
     // The alloc col is computed on the JOINED line, which exceeds the
-    // short decl line on a split RHS; the emitted col must clamp into the
+    // short decl line on a split RHS. The emitted col must clamp into the
     // physical line so Issue.col stays displayable.
     const split_content =
         \\fn splitCol(allocator: std.mem.Allocator) !void {
@@ -69011,7 +69011,7 @@ test "ZA103: braced field store in a non-dominating branch is a gap (EPH-I0368)"
     const allocator = gpa.allocator();
 
     // The multi-line field store inside the if covers only its branch
-    // path; the fall-through try still leaks.
+    // path. The fall-through try still leaks.
     const content =
         \\const State = struct { f: []u8 = &.{} };
         \\fn braced_store(allocator: std.mem.Allocator, state: *State, c: bool) !void {
@@ -69123,7 +69123,7 @@ test "ZA103: comment field-store does not transfer (EPH-I0369)" {
     const allocator = gpa.allocator();
 
     // band-B03 F5: prose in a comment faked coverage for the field-store
-    // detector; the try after it is a real gap.
+    // detector. The try after it is a real gap.
     const content =
         \\const State = struct { f: []u8 = &.{} };
         \\fn comment_store(allocator: std.mem.Allocator, state: *State) !void {
@@ -69229,7 +69229,7 @@ test "ZA103: comment mentioning .ptr does not transfer (EPH-I0389)" {
     const allocator = gpa.allocator();
 
     // band-B04 F3: `.ptr` inside comment prose faked an ownership
-    // transfer for the raw scan; the try after it is a real gap, so the
+    // transfer for the raw scan. The try after it is a real gap, so the
     // warning must fire.
     const content =
         \\fn comment_ptr(allocator: std.mem.Allocator) !void {
@@ -69573,7 +69573,7 @@ test "ZA103: realloc with errdefer stays silent (EPH-I0366 lock)" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The realloc line itself stays a try-exit for ZA103; a same-scope
+    // The realloc line itself stays a try-exit for ZA103. A same-scope
     // errdefer between the alloc and the realloc covers it.
     const content =
         \\fn grow(allocator: std.mem.Allocator, n: usize) !void {
@@ -69920,7 +69920,7 @@ test "ZA103: trigger after the alloc's own block close is not a gap (EPH-I0830 l
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The alloc is scoped to the if-block with its errdefer; a later
+    // The alloc is scoped to the if-block with its errdefer. A later
     // function-level try cannot leak it (the block close ended the
     // alloc's lifetime). The alloc's own scope span bounds the triggers.
     const content =
@@ -70041,7 +70041,7 @@ test "ZA103: StackFallbackAllocator .get() chains stay no-free (EPH-I0831)" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The deleted bail silenced every stackFallback shape; the per-call
+    // The deleted bail silenced every stackFallback shape. The per-call
     // site machinery must now cover all three: the aliased form
     // (`const a = sfa.get(); a.alloc(`), the named accessor form
     // (`sfa.get().alloc(`), and the fully inline form
@@ -70268,7 +70268,7 @@ test "ZA103: multi-decl line records the first name, so the free of the second m
     var run = try runCFGMemoryTest(&diag, allocator, "test_multi_decl.zig", content);
     defer run.deinit(allocator);
 
-    // The gap fires for the mis-named record; the properly named `more`
+    // The gap fires for the mis-named record. The properly named `more`
     // record stays silent.
     try std.testing.expectEqual(@as(usize, 1), countRuleIssues(
         run.issues.items,
@@ -70471,7 +70471,7 @@ test "analyzeCFGMemory no false positive for catch-free-return pattern (ZA105)" 
     // Should NOT detect use-after-free - data is still valid after catch
     // block. Single-file run: assert rule-absence across all issues so an
     // FP with an empty or mangled file field cannot slip the filter
-    // (band-T02 F-02 shape, EPH-I1102; swept at B64:55450).
+    // (band-T02 F-02 shape, EPH-I1102. Swept at B64:55450).
     for (issues.items) |issue| {
         try std.testing.expect(!mem.eql(u8, issue.rule, RULE_USE_AFTER_FREE));
     }
@@ -70719,7 +70719,7 @@ test "analyzeCFGMemory ZA802 fires on nullable pointer param deref (EPH-I0219)" 
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Param annotations live on the fn line; `p` carries no name prefix.
+    // Param annotations live on the fn line. `p` carries no name prefix.
     const content =
         \\fn deref_param(p: ?*u8) void {
         \\    const v = p.*;
@@ -70769,7 +70769,7 @@ test "analyzeCFGMemory ZA802 silent past the two-line null-guard shape (EPH-I048
 
     // `if (p == null) { return; }` exits before the deref, so `p.*` on the
     // following line is safe. The exit sits on its own line, so the
-    // same-line exit gate misses it; classifyNullCheck's braced
+    // same-line exit gate misses it. classifyNullCheck's braced
     // following-block exit acceptance covers it (EPH-I0488).
     const content =
         \\fn deref_null_guard(p: ?*u8) ?*u8 {
@@ -70862,7 +70862,7 @@ test "analyzeCFGMemory ZA802 fires past a nested conditional exit in the guard b
 
     // `if (q) return null;` inside the guard block is a conditional exit:
     // when p == null and q is false, the block falls through and the deref
-    // runs on null. Substring exit matching accepted it; the unconditional
+    // runs on null. Substring exit matching accepted it. The unconditional
     // line gate rejects it (EPH-I0488).
     const content =
         \\fn cond_exit(p: ?*u8, q: bool) ?*u8 {
@@ -70892,7 +70892,7 @@ test "analyzeCFGMemory ZA802 fires past a same-line nested conditional exit in a
     // `if (p == null) { if (q) return null; }` on one line: the same-line
     // exit sits inside a nested conditional, so the guard block falls
     // through when q is false and the deref runs on null. The substring
-    // same-line exit gate accepted it; the depth-aware same-line judgment
+    // same-line exit gate accepted it. The depth-aware same-line judgment
     // rejects it, and the guard block closing on the guard line keeps the
     // following-block walk from reading the function's own return as a
     // guard exit (EPH-I0859).
@@ -71006,7 +71006,7 @@ test "analyzeCFGMemory ZA802 silent past a same-line braced-with-else guard (EPH
     // `if (p == null) { return null; } else { sink(); }` + deref: the
     // then arm exits and the else arm runs on the non-null path, so the
     // deref after the chain is safe. The fall-through fact lands on the
-    // else body; the empty inline then-arm must not wipe it at the merge
+    // else body. The empty inline then-arm must not wipe it at the merge
     // (EPH-I0863).
     const content =
         \\fn v2(p: ?*u8) ?*u8 {
@@ -71127,7 +71127,7 @@ test "analyzeCFGMemory ZA802 silent on the deref-in-else contrast shapes (EPH-I0
     const allocator = gpa.allocator();
 
     // The contrast probes: a deref inside the else arm (v5/v6) runs on
-    // the non-null path and stays silent; the multi-line twin of the
+    // the non-null path and stays silent. The multi-line twin of the
     // one-line with-else guard (v7) stays silent through the same
     // else-merge fact flow (EPH-I0863).
     const content =
@@ -71349,7 +71349,7 @@ test "analyzeCFGMemory ZA802 silent past a same-line unbraced-then both-arms gua
     // else { return null; }` on one line. Both arms exit, so the guard
     // block cannot fall through on null and the deref below stays
     // silent. The else keyword terminates the unbraced arm (no
-    // semicolon at the arm end); the semicolon spelling is a Zig parse
+    // semicolon at the arm end). The semicolon spelling is a Zig parse
     // error and is judged through the else-fragment join (EPH-I0861).
     const content =
         \\fn same_line_unbraced_both(p: ?*u8, q: bool) ?*u8 {
@@ -71378,7 +71378,7 @@ test "analyzeCFGMemory ZA802 fires past the multi-line twin of an unbraced-then 
     // unbraced-then shape. The walk cannot see an exit line inside a
     // conditional header (`if (q) return null` opens a conditional, it
     // is not an exit line), so the guard does not qualify and the deref
-    // fires. The same-line judge accepts the shape; the walk cannot
+    // fires. The same-line judge accepts the shape. The walk cannot
     // (EPH-I0861).
     const content =
         \\fn multi_line_unbraced_both(p: ?*u8, q: bool) ?*u8 {
@@ -71744,7 +71744,7 @@ test "analyzeCFGMemory ZA801 same-line exits judged at the guard's depth (EPH-I0
     // The hasEarlyReturnNullGuard same-line exit is judged at the
     // guard's own depth: a nested same-line conditional exit
     // (`{ if (q) return 0; }`) does not dominate the fall-through, so
-    // the unwrap after it fires; the direct and braced exits keep their
+    // the unwrap after it fires. The direct and braced exits keep their
     // suppression (EPH-I0865).
     const content =
         \\fn unwrap_nested(p: ?u32, q: bool) u32 {
@@ -71832,7 +71832,7 @@ test "analyzeCFGMemory ZA801 fires on a second unwrap site after a bare first (E
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // A bare `opt.?;` statement suppresses only its own site; the second
+    // A bare `opt.?;` statement suppresses only its own site. The second
     // unwrap on the line is a real usage and must still fire (band-B12 F24).
     const content =
         \\fn f(opt: ?u32, other: ?u32) void {
@@ -71856,7 +71856,7 @@ test "analyzeCFGMemory ZA802 fires on a second deref site after a checked first 
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The checked set suppresses p's deref; the second deref of q on the
+    // The checked set suppresses p's deref. The second deref of q on the
     // same line must still fire (band-B12 F24).
     const content =
         \\fn f(p: ?*u32, q: ?*u32) void {
@@ -72439,7 +72439,7 @@ test "analyzeCFGMemory ZA801 silent on the nested else-guard shape (EPH-I0747)" 
     // The issue's shape: every real path to the unwrap guarded x, so the
     // verdict must stay silent. The braced inner guard generates no CFG
     // fact (EPH-I0488), so the textual early-return backstop carries this
-    // verdict; the ZA802 companion pins the meet fix itself.
+    // verdict. The ZA802 companion pins the meet fix itself.
     const content =
         \\fn nested_else_guard_unwrap(x: ?u32, a: bool) void {
         \\    if (a) {
@@ -73756,7 +73756,7 @@ test "ZA205 type-aware: multiple user types in same file resolved independently"
 
 /// Count ZA205 findings the way the check command reports them: the
 /// analyzeErrors list plus the analyzeIgnoredErrors list. Each run
-/// builds its own one-file graph; both analyzers read the graph, so
+/// builds its own one-file graph. Both analyzers read the graph, so
 /// the merged count is identical to the shared-graph form.
 fn countCheckMergeZA205(
     diag: *DiagCtx,
@@ -74540,7 +74540,7 @@ test "same-line directive token after prose does not suppress (EPH-I0051)" {
 }
 
 test "rule id after prose word in directive does not suppress (EPH-I0051)" {
-    // The rule list ends at the first non-rule token; a rule id buried in
+    // The rule list ends at the first non-rule token. A rule id buried in
     // trailing prose does not count.
     const content =
         \\// ephor:ignore because ZA201 is noisy
@@ -74740,10 +74740,10 @@ const ignore_cache_string_mention =
     \\const has = mem.indexOf(u8, line, "ephor:ignore") != null;
     \\const a = foo() catch {};
 ;
-// CRLF line endings (explicit escapes; raw literals cannot hold \r)
+// CRLF line endings (explicit escapes. Raw literals cannot hold \r)
 const ignore_cache_crlf =
     "// ephor:ignore ZA201\r\nfn f() void {\r\n    foo() catch {};\r\n}\r\nconst z = bar() catch {};\r\n";
-// multi-rule list with trailing prose; rule id buried in prose is inert
+// multi-rule list with trailing prose. Rule id buried in prose is inert
 const ignore_cache_multi_rule =
     \\// ephor:ignore ZA201 ZA305 because pre-checked
     \\const x = foo() catch {};
@@ -74813,11 +74813,11 @@ test "IgnoreCache matches isInlineDisabled on every (line, rule) pair" {
 
 test "IgnoreCache allocation-failure paths fall back without leaking" {
     // WHY two fixtures: a file-level rule makes buildRuleFacts early-return
-    // with zero allocations (covers grow/dupe/put failure points); a
+    // with zero allocations (covers grow/dupe/put failure points). A
     // line-level rule allocates in facts.lines.put — the only sweep that
     // reaches the build-failure unwind. Alloc sequence per iteration (zig
     // 0.16.0, build-then-commit key dupe — EPH-I0365): file dupe, outer
-    // grow, rule dupe, inner put (query A); file dupe, outer grow, rule
+    // grow, rule dupe, inner put (query A). File dupe, outer grow, rule
     // dupe, lines.put (query B). The failing sweep covers every index up
     // to the measured total, so the sequence comment is descriptive, not
     // load-bearing.
@@ -74863,7 +74863,7 @@ test "IgnoreCache second same-(file, rule) query performs zero allocations" {
     // allocator proves the second identical query allocates NOTHING — it
     // answers from the read-only fast path — so a rebuild-per-query
     // regression allocates and trips the pin. FailingAllocator with the
-    // default fail_index never fails; .allocations counts every success.
+    // default fail_index never fails. .allocations counts every success.
     var counter = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var cache = IgnoreCache.init(counter.allocator());
     defer cache.deinit();
@@ -75225,9 +75225,9 @@ test "definite-assignment worklist drains beyond the 2B+1 cap (EPH-I1058)" {
     // abort): a long chain of payload-ifs and nested-return ifs with the
     // var's assignment if/else near the start. The CFG builder
     // pre-creates each if's false-continuation block, so the inner
-    // merges flow back to lower block ids; the flip wave then
+    // merges flow back to lower block ids. The flip wave then
     // re-enqueues nearly every downstream block. This shape has
-    // B = 64 blocks and E = 94 included edges; the worklist enqueues
+    // B = 64 blocks and E = 94 included edges. The worklist enqueues
     // 130 entries — one past the former 2B+1 cap, which asserted and
     // aborted the whole scan (exit 134). The queue bound is
     // B + 2E + 1: each block's entry and exit flip false->true at most
@@ -75349,7 +75349,7 @@ test "definite-assignment worklist drains within the B+2E+1 bound (EPH-I0335, EP
     // each block at most twice (initial plus one re-visit per state
     // flip): the sweep form it replaced made up to 2B+1 full passes
     // over every edge. Pre-fix, a chain-shaped CFG of B blocks paid
-    // O(B^2) visits; the drain is the hermetic pin.
+    // O(B^2) visits. The drain is the hermetic pin.
     //
     // The loop condition caps visits at B + 2E + 1 (blocks plus twice
     // the included edges), so a <= assertion can never fail
@@ -75406,7 +75406,7 @@ test "definite-assignment converges on a 10k-line adversarial function (EPH-I033
     // 1000 undefined vars, each read inside four nested same-condition
     // ifs — the guard-walk and correlated-guard scans' worst shape.
     // Pre-fix, the 11k-line input hung the analyzer past five minutes
-    // (the O(n^3) per-var scans and the O(B^2 * E) worklist); the
+    // (the O(n^3) per-var scans and the O(B^2 * E) worklist). The
     // bounded scans and the queue worklist finish the 11k shape in
     // 10.7 s (A/B measured at dispatch on the ReleaseSafe binary). The
     // verdicts stay exact: every uncovered read still reports.
@@ -75624,7 +75624,7 @@ test "buildCFG: switch arm block close does not pop switch entry" {
     var cfg = try buildCFG(allocator, "f", 1, &lines);
     defer cfg.deinit();
 
-    // Both arms must branch from the switch header block; the first arm's
+    // Both arms must branch from the switch header block. The first arm's
     // `},` close must not pop the switch entry before arm .b is wired up.
     const header = findBlockForLine(&cfg, 2) orelse return error.TestUnexpectedResult;
     const arm_a = findBlockForLine(&cfg, 4) orelse return error.TestUnexpectedResult;
@@ -75904,7 +75904,7 @@ test "LineWalk.nextClosure paren scan stops at a multiline opener (EPH-I0751)" {
 }
 
 test "LineWalk.nextChar yields code chars and cuts at openers (EPH-I1232 C3)" {
-    // Code chars yield in order; string content is skipped, and the quote
+    // Code chars yield in order. String content is skipped, and the quote
     // state survives between steps through the caller's mode.
     var mode: QuoteMode = .none;
     var walk = LineWalk.initLine("x = \"a b\";", 0);
@@ -76243,7 +76243,7 @@ test "nextCallSite and quotedCallSite accept whitespace before the paren (EPH-I0
 
 test "char-literal contents are not references or try-calls (EPH-I0432)" {
     // A 1-char candidate inside a char literal is literal data, not a
-    // value reference; a `(` inside a char literal is not a call opener.
+    // value reference. A `(` inside a char literal is not a call opener.
     try std.testing.expect(!hasIdentRef("const c = 'f';", "f"));
     try std.testing.expect(hasIdentRef("const f = 1;", "f"));
     try std.testing.expect(!hasCallBeforeSemicolon(" x == '(';"));
@@ -76286,7 +76286,7 @@ test "isErrorSetOpen accepts whitespace before the brace (EPH-I0470)" {
     try std.testing.expect(!isErrorSetOpen("fn f() {", 7));
     // `!error{...}` keeps working: `!` is not an identifier byte.
     try std.testing.expect(isErrorSetOpen("!error{", 6));
-    // A spaced error set in a signature keeps working; the body brace
+    // A spaced error set in a signature keeps working. The body brace
     // opens later (EPH-I0470).
     try std.testing.expect(isErrorSetOpen("fn f() error {", 13));
     // `myerror {` is a return type: the brace opens the body, not an
@@ -76298,7 +76298,7 @@ test "isErrorSetOpen accepts whitespace before the brace (EPH-I0470)" {
 
 test "scanCFGSignatureLine: spaced error set is not the body brace (EPH-I0470)" {
     // The `{` of `error { OutOfMemory }` must count as a signature
-    // container; the body opens only at the real `{` after the return type.
+    // container. The body opens only at the real `{` after the return type.
     var state = CFGState{};
     const pos = scanCFGSignatureLine("fn f() error { OutOfMemory } void {", &state);
     try std.testing.expect(state.body_started);
@@ -76346,7 +76346,7 @@ test "scanCFGSignatureLine carries a continued string default (EPH-I0887)" {
 
 test "detectCFGFuncStart: a closed string before fn does not hide it (EPH-I0471)" {
     var state = CFGState{};
-    // The return value reports a NESTED fn; the detection itself shows in
+    // The return value reports a NESTED fn. The detection itself shows in
     // the state.
     const was_in_func = detectCFGFuncStart("const s = \"x\"; fn real() void {", &state, 1);
     try std.testing.expect(!was_in_func);
@@ -76522,7 +76522,7 @@ test "buildCFG: nested int prongs branch from the inner switch header (EPH-I0318
     // innermost-first stack scan in handleSwitchArm is the mechanism the
     // ZA607 nested-prong pin observes only through its downstream verdict
     // (EPH-I0318, band-B01a F3). The outer arm block's range covers line
-    // 6 too, so findBlockForLine cannot name the arm; identify it by
+    // 6 too, so findBlockForLine cannot name the arm. Identify it by
     // start_line, the idiom the nested-switch test above uses.
     const outer_header = findBlockForLine(&cfg, 3) orelse return error.TestUnexpectedResult;
     const inner_header = findBlockForLine(&cfg, 5) orelse return error.TestUnexpectedResult;
@@ -76649,7 +76649,7 @@ test "buildCFG: nested same-line if — literal close pops only the inner if" {
     var cfg = try buildCFG(allocator, "f", 1, &lines);
     defer cfg.deinit();
 
-    // Line 3 sits in the outer if's true block; the inner if branches from
+    // Line 3 sits in the outer if's true block. The inner if branches from
     // it, and line 4 must be the inner merge — not the inner true block
     // (leaked pop) and not the outer merge (a misclassified literal close
     // popping the outer entry).
@@ -76982,7 +76982,7 @@ test "buildCFG: text between two same-line closes keeps the inner fall-through (
     // EPH-I0091 finish-before-overwrite guard in handleBlockEndOrDefer,
     // which wires the inner body into the inner merge before it claims
     // the slot. This line has no else keyword, so finishDeferredBeforeElse
-    // never runs here; the pin guards the interleaved-text variant the
+    // never runs here. The pin guards the interleaved-text variant the
     // two-closes-one-line EPH-I0091 test lacks.
     const entry = cfg.entry_block;
     const outer_true = cfgSucc(&cfg, entry, .branch_true) orelse
@@ -77271,8 +77271,8 @@ test "buildCFG: bare else-identifier line wires as a virtual else body" {
     var cfg = try buildCFG(allocator, "f", 1, &lines);
     defer cfg.deinit();
 
-    // `else ifx;` is NOT else-if (the word-delimited patterns reject it);
-    // it is a virtual else whose body is the statement `ifx;`.
+    // `else ifx;` is NOT else-if (the word-delimited patterns reject it).
+    // It is a virtual else whose body is the statement `ifx;`.
     try std.testing.expectEqual(@as(usize, 4), cfg.blocks.items.len);
     const entry = cfg.entry_block;
     const else_block = cfgSucc(&cfg, entry, .branch_false) orelse
@@ -77291,7 +77291,7 @@ test "buildCFG: braced if-break edges to the loop merge and ends the block" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // EPH-I0094: break exits to the nearest loop's merge; the break block
+    // EPH-I0094: break exits to the nearest loop's merge. The break block
     // is terminal — no sequential fall-through into the if's merge.
     const lines = [_][]const u8{
         "fn f(c: bool, d: bool) void {", // 1
@@ -77468,7 +77468,7 @@ test "buildCFG: braced continue edges to the loop header" {
     const allocator = gpa.allocator();
 
     // EPH-I0094: continue jumps to the loop header (a loop_back edge, so
-    // definite-assignment keeps its zero-trip discipline); block terminal.
+    // definite-assignment keeps its zero-trip discipline). Block terminal.
     const lines = [_][]const u8{
         "fn f(c: bool, d: bool) void {", // 1
         "    while (c) {", // 2
@@ -77612,7 +77612,7 @@ test "buildCFG: Allman while-else break wires to the post-else merge" {
     const allocator = gpa.allocator();
 
     // EPH-I0094: the deferred-close else claims the loop entry through
-    // pending_else; the break rewire must land the same way.
+    // pending_else. The break rewire must land the same way.
     const lines = [_][]const u8{
         "fn f(c: bool, d: bool) void {", // 1
         "    while (c) {", // 2
@@ -77653,7 +77653,7 @@ test "buildCFG: break in a switch prong inside a loop targets the loop merge" {
     const allocator = gpa.allocator();
 
     // EPH-I0094: a switch is not a loop — the prong body's break binds to
-    // the enclosing loop; the arm no longer falls into the switch merge.
+    // the enclosing loop. The arm no longer falls into the switch merge.
     const lines = [_][]const u8{
         "fn f(c: bool, x: u8) void {", // 1
         "    while (c) {", // 2
@@ -77898,7 +77898,7 @@ test "ZA607: no-space while header keeps the body fill conditional (EPH-I0320)" 
     // isLoopOpenerLine must see the no-space `while(` form, or the fill-before-
     // use filter treats the loop as a plain statement and the body fill as
     // unconditional, so the zero-trip read stays silent (band-B01a F5).
-    // detectCFPattern already accepts the no-space form; the fill scan
+    // detectCFPattern already accepts the no-space form. The fill scan
     // must stay in step.
     const content =
         \\fn use(v: u32) void {
@@ -78258,7 +78258,7 @@ test "ZA607: one-line while body fill does not cover the zero-trip path (EPH-I01
 
     // EPH-I0129 e7: the one-line loop body's fill is conditional (the
     // loop may run zero times). The former loop-header carve-out scored
-    // it unconditionally and the read stayed silent; the narrowed
+    // it unconditionally and the read stayed silent. The narrowed
     // position split defers the body fill to the CFG, which fires.
     const content =
         \\fn use(v: u32) void {
@@ -78412,7 +78412,7 @@ test "ZA607: braceless for call fill keeps the pre-B2 attribution (EPH-I1178, do
     // brace-less for loops (no virtual body), so both the call fill and
     // the direct fill stay silent — the fill lands on the header block
     // and covers the false exit. The direct twin shows the same 0, so
-    // the deferral is uniform; the CFG-model gap is the documented
+    // the deferral is uniform. The CFG-model gap is the documented
     // residual (EPH-I1178).
     const content =
         \\fn init(p: *u32) void {
@@ -79554,7 +79554,7 @@ test "ZA101: string close brace in a real defer block does not drop the depth ea
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The F6a loop shape reaches the linear fallback; the string `}`
+    // The F6a loop shape reaches the linear fallback. The string `}`
     // on the log line must not close the defer block before the free.
     // Pre-fix the raw counter dropped the depth, so the defer block
     // lost its free and the warning fired (FP).
@@ -79623,7 +79623,7 @@ test "ZA101: errdefer handoff survives a string brace in a return literal (EPH-I
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The errdefer covers the error paths; the return literal mentions
+    // The errdefer covers the error paths. The return literal mentions
     // buf on the success path (the handoff). Pre-fix the raw ret_brace
     // walk closed the return construct at the string `}` line, blocked
     // the blk body, and the handoff never counted — the errdefer then
@@ -80156,7 +80156,7 @@ test "buildCFG: nested same-line if is one plain virtual body" {
     const allocator = gpa.allocator();
 
     // Documented approximation (B2.4): the outer body is the whole line
-    // `if (b) x = 1;`; the inner if is not modeled (one opener per line).
+    // `if (b) x = 1;`. The inner if is not modeled (one opener per line).
     const lines = [_][]const u8{
         "fn f(a: bool, b: bool) void {", // 1
         "    if (a) if (b) x = 1;", // 2
@@ -80371,7 +80371,7 @@ test "buildCFG: two returns in one block append one exit id (EPH-I0325)" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Both return lines sit in the same if body; the exit list must hold
+    // Both return lines sit in the same if body. The exit list must hold
     // the block id once (band-B01a F9). Consumers scan for membership,
     // so the duplicate was tolerated — the dedup keeps the list honest
     // for length-based consumers.
@@ -80393,7 +80393,7 @@ test "buildCFG: two returns in one block append one exit id (EPH-I0325)" {
         if (exit_bid == cfg.blocks.items.len - 2) count += 1;
     }
     // The if body is the second-to-last block: the last block is the
-    // if's false-block merge, which handleBranch creates at open time;
+    // if's false-block merge, which handleBranch creates at open time.
     // buildCFG adds no block at fn close. Both returns live there.
     try std.testing.expectEqual(@as(usize, 1), count);
 }
@@ -80589,7 +80589,7 @@ test "ZA607: if-arm fill with empty else is detected" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The else path never assigns x; an empty else arm must not silence
+    // The else path never assigns x. An empty else arm must not silence
     // the maybe-undefined read (EPH-I0087 guard).
     const content =
         \\fn ifFillEmptyElse(cond: bool) u32 {
@@ -80644,7 +80644,7 @@ test "ZA607: else-if-arm-only assignment is detected" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The fill sits in the else-if branch; the c-true path and the
+    // The fill sits in the else-if branch. The c-true path and the
     // neither-c-nor-d path never assign x (EPH-I0108).
     const content =
         \\fn elseIfFill(c: bool, d: bool) u32 {
@@ -80820,7 +80820,7 @@ test "ZA607: braceless else-arm assignment is detected" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // A single-statement else body is still a conditional arm; its fill
+    // A single-statement else body is still a conditional arm. Its fill
     // does not cover the cond-true path (EPH-I0087).
     const content =
         \\fn bracelessElseFill(cond: bool) u32 {
@@ -80875,8 +80875,8 @@ test "ZA607: braceless else-if statement body is detected" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // A single-statement else-if body assigns only on the d-true path;
-    // the c-true and neither paths still read x undefined (EPH-I0087 guard).
+    // A single-statement else-if body assigns only on the d-true path.
+    // The c-true and neither paths still read x undefined (EPH-I0087 guard).
     const content =
         \\fn bracelessElseIf(c: bool, d: bool) u32 {
         \\    var x: u32 = undefined;
@@ -80964,7 +80964,7 @@ test "ZA607: braced payload-else-if condition fill covers the arm (EPH-I0120)" {
     // pattern match treated the line as a plain else and the condition
     // fill never genned the arm block — the arm read fired though the
     // extract call covers it on exactly the paths that enter the arm.
-    // The payload-aware chain model (elseChainsIntoIf skips the capture;
+    // The payload-aware chain model (elseChainsIntoIf skips the capture.
     // peekElseBody keeps the braced if on the chain path) must make the
     // arm read silent. The p12 plain twin keeps its pin at
     // "ZA607: fill-call in else-if condition covers the arm body".
@@ -81252,7 +81252,7 @@ test "ZA607: loop-carried counter guard over-warns (EPH-I0826, documented residu
     const allocator = gpa.allocator();
 
     // The RhyOS net/dns_recursive.zig:2034 shape (RG-1 first capture):
-    // the digit loop writes tmp[tmp_len] and bumps tmp_len; the reverse
+    // the digit loop writes tmp[tmp_len] and bumps tmp_len. The reverse
     // loop reads tmp[tmp_len - 1 - ri] under `ri < tmp_len`. No
     // unassigned read exists at runtime — tmp_len counts the writes, so
     // the read loop's counter bounds the read to written elements. The
@@ -81302,7 +81302,7 @@ test "ZA607: loop guard-continue before same-scope assignment is silent" {
     const allocator = gpa.allocator();
 
     // Every path reaching the reads passed the unconditional `x = create(...)`
-    // in the same iteration; the brace-less guard `continue` skips both.
+    // in the same iteration. The brace-less guard `continue` skips both.
     const content =
         \\const Cfg = struct { a: u32 };
         \\fn create(c: Cfg) u32 {
@@ -81340,7 +81340,7 @@ test "ZA607: same-line return guard before dominating assignment is silent" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The brace-less `if (a) return 1;` guard block is return-terminal; the
+    // The brace-less `if (a) return 1;` guard block is return-terminal. The
     // definite-assignment meet drops its phantom fall-through predecessor,
     // and the unconditional `x = 5` covers the read (EPH-I0681, F7 shape:
     // the CFG alone decides — no textual dominance suppressor).
@@ -81423,7 +81423,7 @@ test "ZA607: braceless if with next-line body is detected" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The next-line virtual body assigns only on the cond-true path; the
+    // The next-line virtual body assigns only on the cond-true path. The
     // pos-0 shortcut must not claim it dominates the read (EPH-I0095).
     const content =
         \\fn bracelessNextLine(cond: bool) u32 {
@@ -81445,7 +81445,7 @@ test "ZA607: multi-line condition with next-line body is detected" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The header stays open across lines; the body after the closing paren
+    // The header stays open across lines. The body after the closing paren
     // is still guarded (EPH-I0095).
     const content =
         \\fn multiLineCond(a: bool, b: bool) u32 {
@@ -81471,7 +81471,7 @@ test "ZA607: nested braceless if bodies are detected" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The inner header is the outer header's body; x assigns only on the
+    // The inner header is the outer header's body. x assigns only on the
     // a-and-b path (EPH-I0095).
     const content =
         \\fn nestedBraceless(a: bool, b: bool) u32 {
@@ -81497,8 +81497,8 @@ test "ZA607: brace text in a header comment does not disarm the guard" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // A `{` inside the trailing comment must not read as a braced body;
-    // the next-line body stays guarded (EPH-I0095).
+    // A `{` inside the trailing comment must not read as a braced body.
+    // The next-line body stays guarded (EPH-I0095).
     const content =
         \\fn headerComment(cond: bool) u32 {
         \\    var x: u32 = undefined;
@@ -81546,7 +81546,7 @@ test "ZA607: braceless else-if with next-line body is detected" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The else-if arm assigns only on the d-true path; the CFG wires the
+    // The else-if arm assigns only on the d-true path. The CFG wires the
     // chain correctly, so the shortcut must not suppress (EPH-I0114 shape,
     // same pos-0 mechanism as EPH-I0095).
     const content =
@@ -81599,7 +81599,7 @@ test "ZA607: both braceless arms assigning is silent" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Both virtual bodies assign; the CFG merge covers the read without
+    // Both virtual bodies assign. The CFG merge covers the read without
     // the shortcut.
     const content =
         \\fn bothArmsVirtual(cond: bool) u32 {
@@ -81629,7 +81629,7 @@ test "ZA607: same-line braced if does not cover the later read (EPH-I0849)" {
     // The one-line braced if's fill runs on the guarded path only, so a
     // later-line read on the unguarded path sees uninitialized x — the
     // cond == false path reads it in silence before the fix (EPH-I0849).
-    // The pin records the fixed verdict; the earlier locked-verdict pin
+    // The pin records the fixed verdict. The earlier locked-verdict pin
     // (EPH-I0111, I0859 era) recorded the false negative.
     const content =
         \\fn sameLineBraced(cond: bool) u32 {
@@ -81709,7 +81709,7 @@ test "ZA607: one-line-else return arm keeps the later read silent (EPH-I0846/49)
 
     // The c == false path returns inside the else arm, so the later read
     // only runs on the assigned path. The early-return chain must see the
-    // one-line else arm's mid-line exit; the arm fill attribution moved
+    // one-line else arm's mid-line exit. The arm fill attribution moved
     // off the entry block without this (EPH-I0846/49).
     const content =
         \\fn elseReturnArm(c: bool) u32 {
@@ -81823,9 +81823,9 @@ test "ZA607: read after fill inside a same-line braced arm is covered (EPH-I0873
     // The read `_ = x` runs only on the c=true path, after `x = 1`: it is
     // genuinely covered. The one-line arm attribution must give the fill
     // its real statement-end effect so the same-arm read after the fill
-    // is covered; the maxInt effect of the pre-fix code never covered any
+    // is covered. The maxInt effect of the pre-fix code never covered any
     // same-line read (EPH-I0873). The multi-line form (u2.zig) was
-    // already silent; the read after the construct on the same line stays
+    // already silent. The read after the construct on the same line stays
     // uncovered (EPH-I0849 pins that direction).
     const content =
         \\fn armReadAfterFill(c: bool) u32 {
@@ -81909,7 +81909,7 @@ test "ZA607: no-nest editor shape control stays silent (EPH-I0121)" {
 
     // The p14_editor_no_nest.zig control: the guarded read at the fn
     // tail without the outer same-line nested-if wrapper. Already silent
-    // before the fix; the pin locks the semantic.
+    // before the fix. The pin locks the semantic.
     const content =
         \\fn extract(p: *[]const u8) void {
         \\    p.* = "x";
@@ -82040,11 +82040,11 @@ test "ZA607: second same-line control arm stays silent (EPH-I0871, documented re
 
     // q1.zig: `if (a) { x = 1; } if (b) { x = 2; } return x;` stays
     // silent though the A=false,B=false path reads uninitialized x. Only
-    // the first same-line control brace claims the opener; the second
+    // the first same-line control brace claims the opener. The second
     // arm's braces are expression braces, its fill gets whole-line
     // (entry-block) attribution, and the trailing read is covered. The
-    // residual is documented at the ArmSpan and recordGenEffect docs;
-    // this pin locks the current verdict (EPH-I0871, adjudicated
+    // residual is documented at the ArmSpan and recordGenEffect docs.
+    // This pin locks the current verdict (EPH-I0871, adjudicated
     // documentation-arm per the plan).
     const content =
         \\fn f(a: bool, b: bool) u32 {
@@ -82074,7 +82074,7 @@ test "ZA607: one-line else-if chain unassigned path stays silent (EPH-I0872, doc
     // excluded from span recording), so the if-arm's fill gens the entry
     // block and covers every downstream path. The chain parsers collect
     // branches only past a depth-zero close, so the same-line else-if
-    // arm never joins the list; the residual is documented at
+    // arm never joins the list. The residual is documented at
     // buildEarlyReturnMemo and pinned here (EPH-I0872, adjudicated
     // documentation-arm per the plan).
     const content =
@@ -82385,7 +82385,7 @@ test "ZA607: longer-name prefix assignment does not count" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `xyz = 1;` is not an assignment to x; locks the boundary behavior.
+    // `xyz = 1;` is not an assignment to x. Locks the boundary behavior.
     const content =
         \\fn prefixName() u32 {
         \\    var x: u32 = undefined;
@@ -82527,7 +82527,7 @@ test "isArrayIndexAssignment requires a plain assignment (EPH-I0327)" {
         "if (buf[i] == 0) { buf[i] = 1; }",
         "buf",
     ));
-    // Unbalanced brackets skip the occurrence; word boundaries hold.
+    // Unbalanced brackets skip the occurrence. Word boundaries hold.
     try std.testing.expect(!isArrayIndexAssignment("buffer[i] = 1;", "buf"));
     try std.testing.expect(!isArrayIndexAssignment("buf[s[..];", "buf"));
 }
@@ -83460,7 +83460,7 @@ test "ZA607: nested in-span read before the fill stays silent (EPH-I1230, docume
     // nested start-bound read `x[0]` stays silent though it genuinely
     // may observe pre-fill state (the langref does not pin the bounds'
     // evaluation order). Accepted residual of the EPH-I1230 effect-point
-    // design; this pin locks the current verdict.
+    // design. This pin locks the current verdict.
     const content =
         \\fn fill(p: *[4]u8) usize {
         \\    p.* = .{ 1, 2, 3, 4 };
@@ -83643,8 +83643,8 @@ test "isAssignmentOp rejects switch prong arrow and comparisons" {
 }
 
 test "hasModifyingMethodCall scans every occurrence" {
-    // EPH-I0082: the first occurrence may be a different variable (box);
-    // checking only it missed the genuine receiver later on the line.
+    // EPH-I0082: the first occurrence may be a different variable (box).
+    // Checking only it missed the genuine receiver later on the line.
     try std.testing.expect(hasModifyingMethodCall("box.append(1); x.append(2);", "x"));
     try std.testing.expect(!hasModifyingMethodCall("box.append(1);", "x"));
     try std.testing.expect(!hasModifyingMethodCall("foo.x.append(1);", "x"));
@@ -83752,7 +83752,7 @@ test "isDirectFreeOfVar skips whitespace-spaced dot receivers (EPH-I0796)" {
 }
 
 test "isDirectFreeOfVar keeps sibling and paren-nested ranges element accesses (EPH-I1010)" {
-    // The chained shape `buf[a..][b]` reads one element of a view; the
+    // The chained shape `buf[a..][b]` reads one element of a view. The
     // paren-nested shape `buf[f(a..b)]` cannot parse in Zig but must not
     // fabricate a view either. The endpoint-paren view and the plain view
     // still count as frees of the tracked var.
@@ -83858,8 +83858,8 @@ test "hasAmpBeforeChain discriminates by the byte right of the amp (EPH-I0815)" 
 
 test "hasDirectFill takes the right-side amp verdict (EPH-I0815)" {
     // The same discrimination through the consumer: deref, unwrap, and
-    // char-literal operands keep the ZA607 read-before-undefined report;
-    // an if-else value and a labeled break value still fill (EPH-I0815).
+    // char-literal operands keep the ZA607 read-before-undefined report.
+    // An if-else value and a labeled break value still fill (EPH-I0815).
     try std.testing.expect(!hasDirectFill("const m = p.* & opts.buf;", "buf"));
     try std.testing.expect(!hasDirectFill("const m = p.? & opts.buf;", "buf"));
     try std.testing.expect(!hasDirectFill("const m = 'a' & opts.buf;", "buf"));
@@ -83918,7 +83918,7 @@ test "nextFillCallOccurrence bridges the amp-paren bare name (EPH-I0822)" {
     // The walk-level fill-call arm needs '&' immediately left of the
     // name, so `use(&(x))` evaded the statement-precise credit. The
     // grouping paren bridges through the same walk as the line-level
-    // Pattern 1 arm; the non-call forms stay unmatched (EPH-I0822).
+    // Pattern 1 arm. The non-call forms stay unmatched (EPH-I0822).
     var s: usize = 0;
     try std.testing.expect(nextFillCallOccurrence("use(&(x));", "x", &s) != null);
     s = 0;
@@ -84372,7 +84372,7 @@ test "guardNullAtOrIf tracks the null state across assignments (EPH-I0330)" {
 }
 
 test "isNullGuardDecl classifies the guard's own initializer (EPH-I0852)" {
-    // The guard's own initializer decides; another variable's null on
+    // The guard's own initializer decides. Another variable's null on
     // the line never counts.
     try std.testing.expect(!isNullGuardDecl("var g: ?u32 = 5; var o: ?u32 = null;", "g"));
     try std.testing.expect(isNullGuardDecl("var g: ?u32 = null; var o: ?u32 = 5;", "g"));
@@ -84558,7 +84558,7 @@ test "guardDominatesRead requires shared enclosures (EPH-I0329)" {
 test "guardDominatesRead reaches a divergent opener beyond the window (EPH-I0847)" {
     // The guard-if sits 45 lines above the read, past the 40-line
     // lookback. The old walk saw no enclosures and presumed dominance
-    // vacuously; the walk to the function top finds if (a), which the
+    // vacuously. The walk to the function top finds if (a), which the
     // read does not share — the guard-if does not dominate.
     var far: [57][]const u8 = undefined;
     far[0] = "fn f(a: bool, c: bool) u32 {";
@@ -84622,7 +84622,7 @@ test "ZA607: far divergent guard-if fires past the 40-line window (EPH-I0847)" {
 
     // The guard-if is nested in if (c), the read is not, and 42 padding
     // lines separate them. The vacuous dominance beyond the 40-line
-    // lookback suppressed the read before the fix (EPH-I0847); the
+    // lookback suppressed the read before the fix (EPH-I0847). The
     // c == false, cond == true path reads uninitialized x.
     var content = std.ArrayListUnmanaged(u8).empty;
     defer content.deinit(allocator);
@@ -84834,7 +84834,7 @@ test "ZA607: one-line else arm guard does not suppress the correlated read (EPH-
     // uninitialized, so the read must fire. The one-line else arm's `{`
     // previously sat in the raw-line prefix slice the trimmed-column
     // scan skipped, and the correlation read the sibling as the same
-    // block (EPH-I0842); the raw-line sibling variant of this shape is
+    // block (EPH-I0842). The raw-line sibling variant of this shape is
     // masked by the pre-existing one-line-if effect attribution and
     // stays silent by design (verified at c127739 and here). The
     // multi-line sibling keeps the read visible, so the correlation
@@ -84937,7 +84937,7 @@ test "ZA607: same-condition sibling ifs report the correlated read (EPH-I0848)" 
     // not connect sibling ifs, even when both share the condition
     // textually — `if (c) { guard = 1; }` and `if (c) { x = 2; }` run
     // together, so the read is safe, yet the analyzer reports it. The
-    // approximation is documented at allGuardAssignsCorrelate; this pin
+    // approximation is documented at allGuardAssignsCorrelate. This pin
     // records the chosen direction (EPH-I0848).
     const content =
         \\fn sameCondSiblings(c: bool) u32 {
@@ -84970,7 +84970,7 @@ test "ZA607: comparison operators in or-condition are reads on every path" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `!=`, `<=`, `>=` in the condition all read x; a body assigning only
+    // `!=`, `<=`, `>=` in the condition all read x. A body assigning only
     // box must not suppress any of them (== is covered by the repro test).
     const content =
         \\fn cmpNe(c: bool) void {
@@ -85256,7 +85256,7 @@ test "ZA607: or-guard fires when the guard declaration line carries another var'
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `g` is declared non-null on the first line; the line-level `= null`
+    // `g` is declared non-null on the first line. The line-level `= null`
     // substring of `o`'s declaration must not classify g as null. The
     // first iteration evaluates `x == 1` against uninitialized x, so the
     // read fires.
@@ -85317,7 +85317,7 @@ test "ZA607: or-guard ignores a string-position or token (EPH-I0298)" {
 
     // The string "x == null or y" fakes a first " or " at a raw-substring
     // scan. Pre-fix the fake or stole the or-guard position and the read
-    // was wrongly suppressed; the real `or` after the string must decide.
+    // was wrongly suppressed. The real `or` after the string must decide.
     // The read fires because the first `y` occurrence (inside the string)
     // precedes the real `or`: the vpos <= or_pos gate rejects the
     // narrative before orGuardVariable runs, so no LHS null-equality
@@ -85348,7 +85348,7 @@ test "ZA607: or-guard ignores a trailing-comment or token (EPH-I0298)" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The comment "z == null or y" holds the only " or " on the line; the
+    // The comment "z == null or y" holds the only " or " on the line. The
     // read of y is not short-circuited by anything real, so it fires.
     // Comment prose cannot fake the short-circuit even at a raw-substring
     // scan: the first genuine read always precedes a trailing comment, so
@@ -85523,8 +85523,8 @@ test "ZA607: loop-carried guard under a shared loop stays silent (EPH-I0329)" {
     const allocator = gpa.allocator();
 
     // The sig cmd.zig shape: the guard-if and the read share the while
-    // enclosure, so the read cannot run without the guard block running;
-    // the loop-carried assignment covers it. The shared enclosure and the
+    // enclosure, so the read cannot run without the guard block running.
+    // The loop-carried assignment covers it. The shared enclosure and the
     // loop-carried arm keep the suppression (documented approximations).
     const content =
         \\fn sharedLoopGuard(exit: *bool, i: *usize) u32 {
@@ -85620,8 +85620,8 @@ test "ZA607: switch prong read of assigned var stays silent" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // With x genuinely assigned before the switch, the prong read is safe;
-    // the `=>` fix must not introduce a false positive here.
+    // With x genuinely assigned before the switch, the prong read is safe.
+    // The `=>` fix must not introduce a false positive here.
     const content =
         \\fn negSwitchAssigned(c: u32) u32 {
         \\    var x: u32 = undefined;
@@ -86244,8 +86244,8 @@ test "ZA607: same-block read before assignment is detected" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The `y = x;` read precedes the `x = 1;` assignment in the same block;
-    // block-granular gen masked it (EPH-I0080).
+    // The `y = x;` read precedes the `x = 1;` assignment in the same block.
+    // Block-granular gen masked it (EPH-I0080).
     const content =
         \\fn readThenAssignSameBlock(c: bool) u32 {
         \\    var x: u32 = undefined;
@@ -86752,7 +86752,7 @@ test "ZA607: read in an earlier argument than the fill destination is detected (
     // The issue's p22 repro: `foo(use(x), &x)` reads x in the first
     // argument while the fill destination sits in the second. The read
     // precedes the call's closing `)` and observes the undefined value.
-    // Same open-paren comparison class as p17; pinned separately because
+    // Same open-paren comparison class as p17. Pinned separately because
     // the first occurrence is the read, not the destination.
     const content =
         \\fn use(v: u32) u32 {
@@ -86785,7 +86785,7 @@ test "ZA607: init-call fill is statement-precise (EPH-I1173)" {
     // EPH-I1173 narrowed the init-call drop: a method call the
     // fill-verdict layer already models as a fill (`x.init()`) keeps the
     // statement-precise fill treatment instead of the whole-function
-    // drop. The read before the call fires; the read after it observes
+    // drop. The read before the call fires. The read after it observes
     // the filled value and stays silent. The former pin (EPH-I0102) held
     // both silent — the use-then-init FN this test now recovers.
     const content =
@@ -86852,7 +86852,7 @@ test "ZA607: modifying method call keeps the whole-function drop (EPH-I1173, doc
     // whole-function drop: narrowing them fired a corpus FP (ghostty
     // uucode grapheme.zig table.set(...) inside comptime loops read as
     // trip-conditional and the return over-warned). The drop keeps the
-    // corpus-clean boundary; the use-then-set FN stays the accepted
+    // corpus-clean boundary. The use-then-set FN stays the accepted
     // residual (EPH-I1173).
     const content =
         \\const Table = struct {
@@ -87302,7 +87302,7 @@ test "ZA607: return-terminal deferred close wires no merge edge (EPH-I1176/EPH-I
     const allocator = gpa.allocator();
 
     // finishPendingElse now carries the is_return check its sibling
-    // handleBlockEnd always had (fixed under the I1188 kick-back; the
+    // handleBlockEnd always had (fixed under the I1188 kick-back. The
     // I1176 record carried the gap as a documented residual): a
     // return-terminal deferred body wires no fall-through edge, so the
     // merge's only pred is the false branch and the read fires on the
@@ -87584,7 +87584,7 @@ test "ZA607: later same-name payload binding fires toward warning (EPH-I1192, do
     // binding's body sits outside the span, so its payload read fires
     // toward warning — the accepted residual for shadow text, which is a
     // 0.15+ compile error (a payload capture shadowing an outer local,
-    // EPH-I1188; zero corpus instances). The first arm's own read stays
+    // EPH-I1188. Zero corpus instances). The first arm's own read stays
     // suppressed. The EPH-I0826 documented-residual arm, EPH-I1192.
     const content =
         \\fn rebind(opt: ?u32, opt2: ?u32) void {
@@ -88075,7 +88075,7 @@ test "ZA607: top-level while-else fill stays silent at the read" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Guard (EPH-I0086): the top-level shape was already silent; the fixed
+    // Guard (EPH-I0086): the top-level shape was already silent. The fixed
     // CFG keeps it silent (else body feeds the post-loop merge directly).
     const content =
         \\fn use(v: u32) void {
@@ -88413,7 +88413,7 @@ test "ZA607: comptime block skips its body and closes at its own brace (EPH-I032
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The decl inside the block is comptime code (skipped); the decl
+    // The decl inside the block is comptime code (skipped). The decl
     // after the block's close is normal code and must be flagged.
     const content =
         \\fn use(v: u32) void {
@@ -88443,7 +88443,7 @@ test "ZA607: @field read in rvalue position does not clear the var (EPH-I0333)" 
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `total += @field(x, f.name)` reads x; the read of x on the return
+    // `total += @field(x, f.name)` reads x. The read of x on the return
     // line must stay flagged.
     const content =
         \\const S = struct { a: u32, b: u32 };
@@ -88517,7 +88517,7 @@ test "ZA607: multi-line @field assignment with switch argument clears (EPH-I0333
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The second argument spans lines; the close paren and `=` sit on a
+    // The second argument spans lines. The close paren and `=` sit on a
     // later line. The pending scan must still see the assignment.
     const content =
         \\const S = struct { a: u32, b: u32 };
@@ -88608,7 +88608,7 @@ test "ZA607: one-line arm-list fill is a documented FN (EPH-I0334)" {
     // Documented FN (accepted, fail-unsafe): a switch whose first arm
     // shares the header line never splits arm blocks at the CFG level,
     // so the fill counts as unconditional and the potential undefined
-    // read stays silent. The multi-line shape above warns; zig fmt
+    // read stays silent. The multi-line shape above warns. zig fmt
     // expands this shape to multi-line, which warns. The pin names the
     // shape (EPH-I0334) and asserts the accepted no-warning verdict.
     const content =
@@ -88749,7 +88749,7 @@ test "parseVersionFromZon rejects a dot-segment payload (EPH-I0668)" {
         \\    .version = "x/../../../../org/repo/archive/v9.9.9",
         \\}
     ;
-    // The pre-fix parser dupes the payload; the free keeps the RED probe
+    // The pre-fix parser dupes the payload. The free keeps the RED probe
     // (gate removed) a clean assertion failure, not a leak panic.
     const ver = parseVersionFromZon(allocator, dot_segment);
     if (ver) |v| allocator.free(v);
@@ -88883,7 +88883,7 @@ test "readUpdateCache fails closed on a valid epoch with a bad version (band-T04
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // The epoch parses; the version line is not semver. The whole entry
+    // The epoch parses. The version line is not semver. The whole entry
     // must be rejected, not just the version field.
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "cache",
@@ -88937,7 +88937,7 @@ test "readUpdateCache fails closed on an oversized cache file (band-T04 F-6)" {
     // fixture in lockstep and the pin would stay green through the very
     // regression it exists to catch. A cap raise or a dropped limit makes
     // this expect flip (and the returned version would also trip the
-    // leak-checking allocator); the round-trip test above pins sub-cap
+    // leak-checking allocator). The round-trip test above pins sub-cap
     // acceptance.
     const header = "1800000000\n1.0.0\n";
     const big = try allocator.alloc(u8, 4097);
@@ -89240,7 +89240,7 @@ test "parseVersionFromTagsApi ignores a \"name\" mention inside a message field 
     const allocator = std.testing.allocator;
     // A release note that quotes "name": "v9.9.9" is message text, not a
     // tag key. The valid-JSON wire form escapes the embedded quotes
-    // (\"name\"); the string-context gate rejects the raw match and the
+    // (\"name\"). The string-context gate rejects the raw match and the
     // semver-max comes from the real element keys only.
     const json =
         \\[{"name": "v0.14.2", "message": "see \"name\": \"v9.9.9\" for the pin"},
@@ -89684,7 +89684,7 @@ test "updateBuildFnScanBraces: only code braces move the depth (EPH-I0055)" {
     try std.testing.expectEqual(@as(i32, 1), scan.brace_depth);
     try std.testing.expect(scan.build_fn_end == null);
     try std.testing.expect(scan.in_build_fn);
-    // A real code brace opens; its matching close returns to depth 1.
+    // A real code brace opens. Its matching close returns to depth 1.
     updateBuildFnScanBraces(&scan, "if (x) {", 3);
     try std.testing.expectEqual(@as(i32, 2), scan.brace_depth);
     updateBuildFnScanBraces(&scan, "}", 4);
@@ -89724,7 +89724,7 @@ test "zigContentParses gates the replacement on a clean parse (EPH-I0168)" {
     // The spawn routes through tool_zig_path: a zig binary reachable via
     // PATH (or the EPHOR_ZIG_PATH override) is a test-host requirement
     // here, exactly as it is for runFmtCheck (band-T04 F-1). The bare
-    // "zig" default resolves through PATH; an absolute-path toolchain
+    // "zig" default resolves through PATH. An absolute-path toolchain
     // host sets EPHOR_ZIG_PATH for the test run.
     try std.testing.expect(
         zigContentParses(std.testing.io, allocator, tmp.dir, "pub fn build() void {}\n"),
@@ -89765,8 +89765,8 @@ test "resolveToolFromEnv accepts an absolute override that resolves (EPH-I0154)"
 test "resolveToolFromEnv resolves the bare name through PATH absolutely (EPH-I0163)" {
     // RED5-9 arm: the spawn path resolves to an absolute path at
     // startup, so the executed binary is fixed before any scan input is
-    // read. The first PATH entry naming an existing non-directory wins;
-    // a PATH that names no tool falls back to the bare name.
+    // read. The first PATH entry naming an existing non-directory wins.
+    // A PATH that names no tool falls back to the bare name.
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -89831,7 +89831,7 @@ test "resolveToolFromEnv warns and falls back on a directory override (EPH-I0312
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     diag.cli_diagnostics_enabled = false;
     // A directory passes the pre-fix existence-only access() check and
-    // fails confusingly at the late spawn; the not-dir gate catches it here.
+    // fails confusingly at the late spawn. The not-dir gate catches it here.
     try std.testing.expectEqualStrings(
         "zig",
         resolveToolFromEnv(&diag, .zig, "/bin", null),
@@ -89879,7 +89879,7 @@ const analysis_write_guard_config =
 /// cfg.path (EPH-I0271). Mirrors the .check arm in main: the known-issues
 /// probe, the scan, the orphan pass, then every file-touching analyzer.
 /// Excludes runFmtCheck: it spawns `zig fmt --check`, a read-only
-/// subprocess. The battery stays subprocess-free; the one spawn in this
+/// subprocess. The battery stays subprocess-free. The one spawn in this
 /// family lives in the dedicated zigContentParses test, which needs
 /// the same zig binary through tool_zig_path (PATH, or the
 /// EPHOR_ZIG_PATH override) (band-T04 F-1).
@@ -89890,7 +89890,7 @@ fn runCheckAnalysisBattery(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !
     g.scan_root = cfg.path;
     try scanPath(&g, cfg.path);
     // The fixture entry sits under the scan root, so .check's extra
-    // single-file entry scan no-ops; markReachable still needs the entry.
+    // single-file entry scan no-ops. markReachable still needs the entry.
     for (cfg.entries.items) |e| try g.markReachable(e);
     try g.markBuildPathReferences(cfg);
 
@@ -90151,7 +90151,7 @@ const migrate_insert_cases = [_]MigrateInsertCase{
     ,
         // Inserted entry lands at close_indent(8)+2=10 spaces, NOT aligned
         // with the sibling key at 12 — the algorithm derives indent from the
-        // closing brace only. Valid JSON; cosmetic misalignment is the pin.
+        // closing brace only. Valid JSON. Cosmetic misalignment is the pin.
         \\{
         \\    "outer": {
         \\        "thresholds": {
@@ -90183,7 +90183,7 @@ const migrate_insert_cases = [_]MigrateInsertCase{
     ),
     migrateCase(
         // EPH-I0511: a string VALUE mentioning "thresholds" must not
-        // anchor the splice; the real key after it must. Pre-fix the
+        // anchor the splice. The real key after it must. Pre-fix the
         // value's quote was the first raw match and the "x" object
         // received the migration (corruption).
         "value mention before the real key does not retarget the splice",
@@ -90314,7 +90314,7 @@ const migrate_null_cases = [_]MigrateNullCase{
         // EPH-I0511: a string VALUE mentioning "thresholds" with no real
         // thresholds key must not anchor the splice into the next object.
         // Pre-fix the migration inserted threshold keys into the
-        // "something" object (corruption); now it no-ops.
+        // "something" object (corruption). Now it no-ops.
         .name = "value mention with no thresholds object is not an anchor",
         .input =
         \\{
@@ -90413,7 +90413,7 @@ test "buildMissingKeysJson serializes missing entries in order" {
 const VersionRewriteCase = struct {
     name: []const u8,
     input: []const u8,
-    /// Expected rewrite output; null expects a no-op (null return).
+    /// Expected rewrite output. null expects a no-op (null return).
     expected: ?[]const u8,
 };
 
@@ -90604,7 +90604,7 @@ test "checkVarNaming: non-snake_case var is flagged" {
 
 test "isConstTypeModifier: pointer and slice const forms are modifiers (EPH-I0886)" {
     // Every real `const` type-modifier form has `*`, `]`, or `)` (modulo
-    // whitespace) directly before it; declaration-position consts never do.
+    // whitespace) directly before it. Declaration-position consts never do.
     const modifier_lines = [_][]const u8{
         "arg_p: [*c]const Some_Type,",
         "fn_ptr: *const Some_Type,",
@@ -90631,7 +90631,7 @@ test "isConstTypeModifier: pointer and slice const forms are modifiers (EPH-I088
 
 test "isConstTypeModifier: qualifier-before-const forms are modifiers (EPH-I0889)" {
     // `*volatile const T` and `*allowzero const T` place the qualifier
-    // between the pointer marker and `const`; the word walk must still
+    // between the pointer marker and `const`. The word walk must still
     // recognize the const as a modifier. The pre-existing forms
     // (`*const volatile`, plain `*const`) keep working.
     const modifier_lines = [_][]const u8{
@@ -90674,7 +90674,7 @@ test "isConstTypeModifier: const-to-const qualifier adjacency is a modifier (EPH
 }
 
 test "findDeclEnd: stops at the top-level semicolon (EPH-I0896)" {
-    // The first `;` outside braces closes the declaration; the later
+    // The first `;` outside braces closes the declaration. The later
     // declaration's `=` and RHS stay out of the segment.
     const line = "= struct {}; const y = 2;";
     try std.testing.expectEqual(
@@ -90684,7 +90684,7 @@ test "findDeclEnd: stops at the top-level semicolon (EPH-I0896)" {
 }
 
 test "findDeclEnd: semicolon inside braces does not close the declaration (EPH-I0896)" {
-    // The struct body's inner `;` sits at brace depth 1; only the closing
+    // The struct body's inner `;` sits at brace depth 1. Only the closing
     // `;` at depth 0 terminates the declaration.
     const line = "= struct { const z = 1; }; const y = 2;";
     try std.testing.expectEqual(
@@ -90694,7 +90694,7 @@ test "findDeclEnd: semicolon inside braces does not close the declaration (EPH-I
 }
 
 test "findDeclEnd: semicolon inside a string does not close the declaration (EPH-I0896)" {
-    // The `;` inside the string literal is data; the real `;` after the
+    // The `;` inside the string literal is data. The real `;` after the
     // closing quote terminates the declaration.
     const line = "= \"a;b\"; const y = 2;";
     try std.testing.expectEqual(
@@ -90705,7 +90705,7 @@ test "findDeclEnd: semicolon inside a string does not close the declaration (EPH
 
 test "findDeclEnd: unterminated declaration ends at end of line (EPH-I0896)" {
     // A multi-line declaration (an open struct body) has no top-level `;`
-    // on the line; the segment then ends at end of line.
+    // on the line. The segment then ends at end of line.
     const line = "= struct {";
     try std.testing.expectEqual(line.len, findDeclEnd(line, 0));
 }
@@ -90722,7 +90722,7 @@ test "analyzeNaming: bindgen const type modifiers stay silent (EPH-I0886)" {
     // Bindgen output shape: `[*c]const` / `*const` modifiers inside fn
     // params and struct fields. The widened whole-line gate (EPH-I0466/
     // 68/69) matched the modifier and read the machine-cased TYPE NAME as
-    // a declaration name; only the real `const badName` declaration fires.
+    // a declaration name. Only the real `const badName` declaration fires.
     const code =
         \\pub fn bindgenPtrAdd(arg_p: [*c]const Some_Type, x: u8) void {
         \\    _ = arg_p;
@@ -90757,7 +90757,7 @@ test "analyzeNaming: second same-line const decl is checked (EPH-I0888)" {
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // Only the first `const` used to be checked; the second declaration's
+    // Only the first `const` used to be checked. The second declaration's
     // name must be reported too, at its own column.
     const code =
         \\const a = 1; const badName = 2;
@@ -90872,7 +90872,7 @@ test "analyzeNaming: extern const line still checks a trailing const decl (EPH-I
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // The extern declaration's own name stays exempt (ABI-fixed); the
+    // The extern declaration's own name stays exempt (ABI-fixed). The
     // trailing const is a project-chosen identifier and must fire
     // (EPH-I0901).
     const code =
@@ -91101,7 +91101,7 @@ test "analyzeNaming: const decl after a type-modifier const is checked (EPH-I089
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // The line's first `const` is a `*const` type modifier; the later
+    // The line's first `const` is a `*const` type modifier. The later
     // declaration must still be checked instead of aborting the line scan.
     const code =
         \\pub fn bindgenFn(a: *const Some_Type) void { const badName = 2; }
@@ -91130,8 +91130,8 @@ test "analyzeNaming: qualifier-before-const bindgen types stay silent (EPH-I0889
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // Bindgen emits `*volatile const` / `*allowzero const` modifier orders;
-    // only the real declaration may fire (it must, so the test is not a
+    // Bindgen emits `*volatile const` / `*allowzero const` modifier orders.
+    // Only the real declaration may fire (it must, so the test is not a
     // lie: the modifier lines alone would produce zero issues).
     const code =
         \\pub fn bindgenVol(a: *volatile const Some_Type, b: *allowzero const Other_Type) void {
@@ -91217,7 +91217,7 @@ test "analyzeNaming: type-def const before a snake const stays silent (EPH-I0896
     // conforming constant. Whole-line classification used to fire a false
     // "type 'good_name' should be TitleCase" from decl #1's `struct {}`.
     // decl #1 (`x`) is itself a lowercase type-def const, so its own
-    // true positive stays; the pin asserts the FP is gone, not that the
+    // true positive stays. The pin asserts the FP is gone, not that the
     // line is silent.
     const code =
         \\const x = struct {}; const good_name = 2;
@@ -91591,7 +91591,7 @@ test "analyzeNaming: quoted identifiers are checked as their inner name (EPH-I04
     defer deinitIssues(&issues, allocator);
 
     // The quoted form is a legal spelling of the same identifier, so the
-    // convention checks the inner text; conforming inner names stay silent.
+    // convention checks the inner text. Conforming inner names stay silent.
     // Quoted names with no unquoted spelling (`@"*i32"`, `@"active-surface"`,
     // `@"error"`) have no convention to enforce, and extern consts are
     // ABI-fixed — the documented exemptions (EPH-I0467).
@@ -91896,7 +91896,7 @@ test "registerFnSignature falls through on fn-pointer-typed decls (EPH-I0395)" {
     defer ctx.deinit(std.testing.allocator);
     const sctx = FnSigCtx{ .a = std.testing.allocator, .lines = &.{}, .idx = 0 };
     // band-B04 F10: the fn-paren guard matches a fn-pointer TYPE
-    // annotation too; such lines are var declarations and must not be
+    // annotation too. Such lines are var declarations and must not be
     // consumed as signatures (registerVarDecl then registers the var).
     try std.testing.expect(!try registerFnSignature(
         sctx,
@@ -92000,7 +92000,7 @@ test "parseFileTypeContext skips signatures embedded in string literals (EPH-I03
 
     // band-B04 F11: a string literal carrying a full `fn name(...) T`
     // signature on a CODE line must not register a bogus entry. The
-    // EPH-I0975 code-position masking covers the fn-paren guard; this
+    // EPH-I0975 code-position masking covers the fn-paren guard. This
     // pin locks the full-signature shape end-to-end through the context
     // builder (top-level and struct-field strings alike).
     const content =
@@ -92164,7 +92164,7 @@ test "extractVarTypeName skips pointer qualifiers in annotations" {
 }
 
 test "extractVarTypeName skips allowzero qualifier (EPH-I0071)" {
-    // `*allowzero u8` used to yield the garbage key "allowzero"; the
+    // `*allowzero u8` used to yield the garbage key "allowzero". The
     // qualifier must be skipped like `volatile ` (I0057 precedent).
     try std.testing.expectEqualStrings(
         "u8",
@@ -92661,7 +92661,7 @@ test "checkErrorNaming: member scan stops at the error-union boundary (EPH-I0274
         .line_num = 4,
         .error_naming = .snake_case,
     }, .inside);
-    // Exactly the four real members fire; payload and return types never do.
+    // Exactly the four real members fire. Payload and return types never do.
     try std.testing.expectEqual(@as(usize, 4), issues.items.len);
     const expected = [_][]const u8{
         "error set member 'BadMember' should be snake_case",
@@ -92757,7 +92757,7 @@ test "analyzeNaming: TitleCase default flags snake_case member declarations only
     var issues = try analyzeNaming(allocator, &graph, .title_case);
     defer deinitIssues(&issues, allocator);
 
-    // Only the declaration fires; both use sites stay silent (EPH-I1075).
+    // Only the declaration fires. Both use sites stay silent (EPH-I1075).
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
         "error set member 'bad_member' should be TitleCase",
@@ -92957,7 +92957,7 @@ test "checkFnNaming: every same-line fn decl is checked (EPH-I0888)" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
-    // Only the first `fn` used to be checked; the second declaration's
+    // Only the first `fn` used to be checked. The second declaration's
     // name must be reported too, at its own column.
     const line = "fn a() void {} fn BadName() void {}";
     try checkFnNaming(.{
@@ -92986,7 +92986,7 @@ test "checkFnNaming: string-first fn cannot suppress a real decl (EPH-I0888)" {
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, a);
 
-    // The first `fn ` occurrence sits inside a string literal (data); the
+    // The first `fn ` occurrence sits inside a string literal (data). The
     // real declaration after it must still be checked.
     const line = "const s = \"fn x\"; fn bad_name() void {}";
     try checkFnNaming(.{
@@ -93466,7 +93466,7 @@ test "buildNoFreeParamFunctions skips function definitions" {
 
 test "isArenaName is exact-match only (EPH-I0387, ADR-0007)" {
     // The substring form matched arena_count/arenas/notarena and hid real
-    // leaks; ADR-0007 documents the exact-match scope and its FN budget.
+    // leaks. ADR-0007 documents the exact-match scope and its FN budget.
     try std.testing.expect(isArenaName("arena"));
     try std.testing.expect(!isArenaName("arena_count"));
     try std.testing.expect(!isArenaName("arenas"));
@@ -93958,7 +93958,7 @@ test "analyzeCFGErrdeferCoverage flags dupe-then-try-append without errdefer (EP
     defer graph.deinit();
 
     // The I0150-B1 pattern: the try-wrapped append takes the dupe only on
-    // its success path; on append failure the copy leaks with no errdefer.
+    // its success path. On append failure the copy leaks with no errdefer.
     const test_content =
         \\fn bad_dupe_append(alloc: std.mem.Allocator, list: *std.ArrayList([]const u8)) !void {
         \\    const copy = try alloc.dupe(u8, "hello");
@@ -94062,7 +94062,7 @@ test "analyzeCFGErrdeferCoverage detects missing errdefer for allocPrint (ZA103)
 // buildCFG versus graph-level analyzeCFGMemory) are distinct mechanisms —
 // a single table would mix harnesses — and the per-case comments
 // (arena, transfer, const+return) document which exemption each pin
-// covers. The ~45-line setup repeats; accepted maintenance cost.
+// covers. The ~45-line setup repeats. Accepted maintenance cost.
 
 test "analyzeCFGDeferCoverage detects mem.concat with no defer (ZA101)" {
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -94641,7 +94641,7 @@ test "analyzeCFGMemory detects use-after-free through alias (ZA105)" {
 
 // Arena-heuristic family note (band-T05 F10, EPH-I0578): the per-case
 // bodies stay boilerplate on purpose. Each test keeps its fixture and its
-// regression comment self-contained; a table-drive would move both into
+// regression comment self-contained. A table-drive would move both into
 // rows and bury the per-case reasoning. A new case copies the nearest
 // sibling. This choice is documented, not pending.
 test "analyzeCFGMemory no FP for arena field chain (ZA101)" {
@@ -95378,8 +95378,8 @@ test "no FP for multiline custom-receiver dupe with arena first arg (ZA101)" {
 
 test "no FP for replaceOwned with arena-named second arg (ZA101)" {
     var diag = testDiagCtx();
-    // std.mem.replaceOwned(comptime T, allocator, ...) is type-param-first;
-    // the allocator is the second argument (verified against 0.15/0.16 stdlib).
+    // std.mem.replaceOwned(comptime T, allocator, ...) is type-param-first.
+    // The allocator is the second argument (verified against 0.15/0.16 stdlib).
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
@@ -95934,7 +95934,7 @@ test "ZA204 fires when a partially filled buffer escapes by return (EPH-I0729)" 
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // `buf[0] = 1;` fills one byte; `return buf;` escapes the whole
+    // `buf[0] = 1;` fills one byte. `return buf;` escapes the whole
     // array with 31 undefined bytes. The pre-I0729 rule stayed silent
     // (the element write dropped the var from the pending set).
     const test_content =
@@ -96035,7 +96035,7 @@ test "ZA204 stays silent when a partially filled buffer never escapes (EPH-I0729
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // The partial fill feeds local use only; nothing escapes, so the
+    // The partial fill feeds local use only. Nothing escapes, so the
     // scope end must not fire (dead data is not a leak).
     const test_content =
         \\const std = @import("std");
@@ -96137,7 +96137,7 @@ test "ZA204 no FP when modifying method call follows other-var receiver" {
     defer graph.deinit();
 
     // EPH-I0082: hasModifyingMethodCall checked only the first occurrence
-    // of the name; with box first, the genuine x.append fill was missed
+    // of the name. With box first, the genuine x.append fill was missed
     // and x stayed in the pending-undefined set.
     const test_content =
         \\const std = @import("std");
@@ -96208,7 +96208,7 @@ test "ZA202 second catch site fires after a @TypeOf-suppressed first (EPH-I0508 
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // The @TypeOf suppression clears only the first catch site; the second
+    // The @TypeOf suppression clears only the first catch site. The second
     // real catch unreachable on the same line must still fire (band-B12 F24).
     const test_content =
         \\fn f() void {
@@ -96243,7 +96243,7 @@ test "ZA202 second catch site fires after a bufPrint-suppressed first (EPH-I0945
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // The bufPrint suppression clears only the bufPrint catch site; the
+    // The bufPrint suppression clears only the bufPrint catch site. The
     // second real catch unreachable on the same line must still fire.
     // Pre-fix the whole-line predicate suppressed both sites (EPH-I0945).
     const test_content =
@@ -96279,7 +96279,7 @@ test "ZA202 second catch site fires after a safe-stdlib-suppressed first (EPH-I0
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // The parseIp-with-literal suppression clears only its own site; the
+    // The parseIp-with-literal suppression clears only its own site. The
     // second real catch unreachable on the same line must still fire.
     // Pre-fix the whole-line predicate suppressed both sites (EPH-I0945).
     const test_content =
@@ -96316,8 +96316,8 @@ test "ZA202 second catch site fires on a multi-line bufPrint closing line (EPH-I
     defer graph.deinit();
 
     // The bufPrint call opens on a preceding line and closes on the
-    // second site's line. The first catch (bufPrint's own) is suppressed;
-    // the closing line's net prefix balance nets to 0 when the group's
+    // second site's line. The first catch (bufPrint's own) is suppressed.
+    // The closing line's net prefix balance nets to 0 when the group's
     // own `)` precedes the second site, so the fallback must match the
     // site's `(` per-site, not by balance (EPH-I0969).
     const test_content =
@@ -96395,7 +96395,7 @@ test "ZA202 second catch site fires on a multi-line safe-stdlib closing line (EP
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // The parseIp call opens on a preceding line; the closing line's
+    // The parseIp call opens on a preceding line. The closing line's
     // second catch (foo) must fire even though the parseIp fallback
     // would otherwise swallow the whole line (EPH-I0969).
     const test_content =
@@ -96549,7 +96549,7 @@ test "ZA203 silent on a trailing-comment mention via the CFG tier (EPH-I0491)" {
     // F8: the CFG emitter (checkOrelseUnreachable) checked only
     // isInsideString, so a trailing `// orelse unreachable` mention filed
     // ZA203. The comment-start gate — the line-based twin's discipline —
-    // keeps the mention silent; the real code shape still fires (control).
+    // keeps the mention silent. The real code shape still fires (control).
     const mention_content =
         \\fn f(p: ?*u8) u8 {
         \\    const x = p; // orelse unreachable
@@ -97462,7 +97462,7 @@ test "ZA202 silent when a split payload carries real handling (EPH-I0308 pin)" {
 }
 
 test "ZA207 fires through a split payload (EPH-I0308 shared probe)" {
-    // The probe is shared with ZA207; the payload-strip must hold for
+    // The probe is shared with ZA207. The payload-strip must hold for
     // the undefined verdict too.
     const next = [_][]const u8{"    |err| undefined;"};
     const issue = checkCatchUndefined(.{
@@ -97850,7 +97850,7 @@ test "isInsideWhileCondition ignores string parens and keywords (EPH-I0424)" {
 
 test "isInsideWhileCondition ignores comment keywords (EPH-I0424)" {
     // Grouping parens around the catch plus an `if (` in comment prose
-    // used to arm the condition check; the keyword must be real code.
+    // used to arm the condition check. The keyword must be real code.
     try std.testing.expect(!isInsideWhileCondition("(foo() catch {}) // if (", 7));
 }
 
@@ -98880,8 +98880,8 @@ test "while continuation adds no nesting depth (EPH-I0275)" {
     defer graph.deinit();
 
     // fh-explorer pool.zig acquire: the 2026-07-25 log reported depth 4
-    // where actual is 3. The continuation `: (retry += 1)` adds no brace;
-    // the phantom rode the anonymous-struct literal on the catch line
+    // where actual is 3. The continuation `: (retry += 1)` adds no brace.
+    // The phantom rode the anonymous-struct literal on the catch line
     // (the `.{}` open counted as a real block before EPH-I0811). Both
     // twins carry the same braced if, so a cap of 2 fires both at exactly
     // depth 3 — identical messages pin the invariant.
@@ -99010,7 +99010,7 @@ test "flat switch dispatcher receives the flat-chain allowance (EPH-I0276)" {
             nested_findings += 1;
         }
     }
-    // The flat router passes the whole ZA3xx family; the nested one does not.
+    // The flat router passes the whole ZA3xx family. The nested one does not.
     try std.testing.expectEqual(@as(usize, 0), flat_findings);
     try std.testing.expect(nested_findings > 0);
 }
@@ -99088,7 +99088,7 @@ test "data-table pattern grants the multiplier, logic in an arm disqualifies (EP
             logic_findings += 1;
         }
     }
-    // The pure table passes the whole ZA3xx family; the call in the last
+    // The pure table passes the whole ZA3xx family. The call in the last
     // arm makes classifyLogic logic, so it still fires.
     try std.testing.expectEqual(@as(usize, 0), table_findings);
     try std.testing.expect(logic_findings > 0);
@@ -99286,7 +99286,7 @@ test "ZA303 exempts extern and callconv(.c) declarations (EPH-I1059)" {
     for (issues.items) |issue| {
         if (mem.eql(u8, issue.rule, RULE_TOO_MANY_PARAMS)) za303_count += 1;
     }
-    // The three C-ABI shapes are exempt; plainFive and decoy still fire
+    // The three C-ABI shapes are exempt. plainFive and decoy still fire
     // (the EntryPoint callconv on a later declaration exempts neither).
     try std.testing.expectEqual(@as(usize, 2), za303_count);
 }
@@ -99337,7 +99337,7 @@ test "ZA303 exempts callconv(.Stdcall) and export declarations (EPH-I1093, EPH-I
     for (issues.items) |issue| {
         if (mem.eql(u8, issue.rule, RULE_TOO_MANY_PARAMS)) za303_count += 1;
     }
-    // The four pinned shapes are exempt; sysvFive and plainFive still fire.
+    // The four pinned shapes are exempt. sysvFive and plainFive still fire.
     try std.testing.expectEqual(@as(usize, 2), za303_count);
 }
 
@@ -99346,7 +99346,7 @@ test "ZA303 exempts callconv(.Stdcall) and export declarations (EPH-I1093, EPH-I
 // ============================================================================
 
 test "stringContentStats splits code from string content (EPH-I0272)" {
-    // 4 spaces + quote + 113 x's + quote + comma = 120 visible; code 5,
+    // 4 spaces + quote + 113 x's + quote + comma = 120 visible. Code 5,
     // content 113.
     const long_literal = "    \"" ++ "x" ** 113 ++ "\",";
     try std.testing.expectEqual(@as(usize, 120), calculateVisibleLength(long_literal));
@@ -99410,7 +99410,7 @@ test "generated-file banner silences ZA701 and ZA703 (EPH-I1062)" {
     // Real corpus shape (sig v2/lib/crypto/ed25519/wycheproof.zig): a
     // `//! DO NOT EDIT` head banner over generated content. The camelCase
     // const (should be snake_case) and the over-long line both fire on
-    // hand-written code; the banner marks the file generated and silences
+    // hand-written code. The banner marks the file generated and silences
     // both. The twin without a banner is the control.
     const generated =
         "//! DO NOT EDIT! File generated by `gen_tool.zig`.\n" ++
@@ -99518,7 +99518,7 @@ test "ZA701 exempts lines over-length solely due to string literals (EPH-I0267)"
     for (issues.items) |issue| {
         if (mem.eql(u8, issue.rule, RULE_LINE_TOO_LONG)) {
             // Lines 1 (unbreakable literal) and 5 (literal + char literal) are
-            // exempt; lines 2, 3, and 4 (char literal masking) are not.
+            // exempt. Lines 2, 3, and 4 (char literal masking) are not.
             try std.testing.expect(issue.line != 1 and issue.line != 5);
             flagged_lines += 1;
         }
@@ -99538,7 +99538,7 @@ test "ZA701 flags a long line with a short embedded string (EPH-I0272)" {
     // The exact messenger line (peer_discovery_find_node_tests.zig:162):
     // 104 physical columns, 93 of them code, an 11-column "127.0.0.1"
     // string. The pre-fix walker stripped the 9 content columns and hid
-    // the line; the tail exemption must cover only string tokens that
+    // the line. The tail exemption must cover only string tokens that
     // dominate their line.
     const messenger_line =
         "    const end = writeNode(&buf, 52, .{ .node_id = [_]u8{0xA1} ** 32, .port = 4001, .ip = \"127.0.0.1\" });";
@@ -99567,7 +99567,7 @@ test "ZA701 flags a long line with a short embedded string (EPH-I0272)" {
 }
 
 test "ZA701: multi-byte lines count codepoints, not bytes (EPH-I0248)" {
-    // 60 CJK chars = 180 bytes; the byte model reported 182 columns.
+    // 60 CJK chars = 180 bytes. The byte model reported 182 columns.
     // The codepoint model counts 63 (the "// " prefix included).
     const cjk = "// " ++ "界" ** 60;
     try std.testing.expectEqual(@as(usize, 63), calculateVisibleLength(cjk));
@@ -99712,7 +99712,7 @@ test "isInsideTypeOf: trailing comment on a boundary cannot force a match (EPH-I
     // force a match. A catch line at deeper paren depth (inside a call
     // argument list) needs the same strip. The sibling test below pins
     // that shape. Comment parens corrupted parenBalance itself until
-    // EPH-I0794 masked the primitive; the EPH-I0794 pins cover that class.
+    // EPH-I0794 masked the primitive. The EPH-I0794 pins cover that class.
     const prev = [_][]const u8{
         "const T = @TypeOf(",
         "    foo,",
@@ -100132,7 +100132,7 @@ test "firstVarReadPos exempts .len occurrences (EPH-I0338 doc)" {
 
 test "branchAssignsVar and branchHasExit accept an empty body (EPH-I0341)" {
     // The `lines.len - 1` end cap underflowed on an empty slice (panic
-    // in ReleaseSafe, UB in ReleaseFast); the guard returns the
+    // in ReleaseSafe, UB in ReleaseFast). The guard returns the
     // documented empty-body verdict instead (band-B01b F-15).
     const empty: []const []const u8 = &.{};
     try std.testing.expect(!branchAssignsVar(empty, 0, 0, "x"));
@@ -100211,8 +100211,8 @@ test "hasLowerBoundGuardForVar rejects or-roots that prove nothing (EPH-I0942)" 
     // `y > 0 or x > 0` ran the guarded body at x == 0 when only y
     // held, so the subtraction stayed silent. The `!=` arm's raw
     // `" or"` check also missed the whitespace variant `x != 0  or y`.
-    // Both arms now reject any or-root that proves nothing for the var;
-    // an `and`-tail and a same-var or-root keep the guard.
+    // Both arms now reject any or-root that proves nothing for the var.
+    // An `and`-tail and a same-var or-root keep the guard.
     const limit: usize = 1000;
     try std.testing.expect(
         !hasLowerBoundGuardForVar("while (y > 0 or x > 0) a[x - 1];", "x", limit),
@@ -100267,7 +100267,7 @@ test "countLineCyclomatic counts all decision points" {
     // Control flow keywords
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("if (x) {"));
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("} else if (y) {"));
-    // else adds no decision point (McCabe; the README decision list names
+    // else adds no decision point (McCabe. The README decision list names
     // no else) — EPH-I0455.
     try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("} else {"));
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("for (items) |item| {"));
@@ -100300,7 +100300,7 @@ test "countLineCognitive weights by nesting and counts else/orelse" {
     try std.testing.expectEqual(@as(usize, 1), countLineCognitive("while (true) {", 0, 0));
     try std.testing.expectEqual(@as(usize, 1), countLineCognitive("for (items) |item| {", 0, 0));
     try std.testing.expectEqual(@as(usize, 1), countLineCognitive("switch (x) {", 0, 0));
-    // try has no structural increment (Sonar; the README rule lists no try)
+    // try has no structural increment (Sonar. The README rule lists no try)
     // — EPH-I0458.
     try std.testing.expectEqual(@as(usize, 0), countLineCognitive("try foo();", 0, 0));
     try std.testing.expectEqual(@as(usize, 1), countLineCognitive("x catch |e| {", 0, 0));
@@ -100355,7 +100355,7 @@ test "countLineCyclomatic ignores keywords in strings and comments (EPH-I0226)" 
 }
 
 test "countSwitchArms ignores arrows in trailing comments (EPH-I0017)" {
-    // hasToken is comment-masked since B2; countSwitchArms was the
+    // hasToken is comment-masked since B2. CountSwitchArms was the
     // leftover: `foo(); // a => b` counted a phantom arm in ZA304/305/306.
     try std.testing.expectEqual(@as(usize, 0), countSwitchArms("foo(); // a => b"));
     try std.testing.expectEqual(@as(usize, 0), countSwitchArms("// =>"));
@@ -100733,7 +100733,7 @@ test "hasSameLineGuardExit applies the depth-2 then+else rule (EPH-I0861)" {
     // the Zig grammar's AssignExpr KEYWORD_else form, EPH-I0861).
     try std.testing.expect(hasSameLineGuardExit("{ if (q) return null else { return null; } }"));
     // The semicolon spelling (`if (q) return null; else { return null; }`)
-    // is a Zig parse error; the judge accepts it anyway through the
+    // is a Zig parse error. The judge accepts it anyway through the
     // else-fragment join, so a broken file's guard still suppresses the
     // same way (EPH-I0861).
     try std.testing.expect(hasSameLineGuardExit("{ if (q) return null; else { return null; } }"));
@@ -100754,7 +100754,7 @@ test "analyzeCFGMemory ZA203 fires past a same-line nested conditional exit in a
     // `if (p == null) { if (q) return 0; }` on one line: the exit sits
     // inside a nested conditional, so the block falls through when q is
     // false and `p orelse unreachable` panics on null. The substring
-    // same-line exit gate suppressed it; the depth judgment lets ZA203
+    // same-line exit gate suppressed it. The depth judgment lets ZA203
     // fire (EPH-I0861).
     const content =
         \\fn za203_same_line_nested(p: ?*u8, q: bool) u8 {
@@ -100904,8 +100904,8 @@ test "operandFormStart peels a 1M-suffix deref chain without recursion (EPH-I091
     // the 8 MB stack on both entry paths: nullPredicateBinds (guard
     // side) and extractOrelseVar (orelse side). The qa-gate probes
     // (.tmp/probe-qagate-b14/deref_guard.zig, deref_orelse.zig) crashed
-    // with exit 134; the bisect crashed at n=40000. The peel is
-    // iterative now; this pin asserts the verdict on the 1M-suffix
+    // with exit 134. The bisect crashed at n=40000. The peel is
+    // iterative now. This pin asserts the verdict on the 1M-suffix
     // crash shape. The chain is `p` plus N `.*` pairs (the probe shape
     // `p.*.*.*...`), which peels to the bare `p` at offset 0, so the
     // form start is 0 — the verdict the recursion also produced on
@@ -101007,7 +101007,7 @@ test "guard scans stay bounded on a pathological deep function (EPH-I0225)" {
     // yet reachable by that helper's unbounded walk. Each assertion expects
     // the target MISSED, so a window-removal regression walks to index 0,
     // finds its target, and fails. Pre-fix the fixture planted only the
-    // null guard; the other five assertions passed even with an unbounded
+    // null guard. The other five assertions passed even with an unbounded
     // scan because nothing on the fixture matched them (band-T05 F6,
     // EPH-I0574). The comment-only filler carries none of the queried
     // shapes and breaks no walk: the `;`-ending "work();" filler stopped
@@ -101394,7 +101394,7 @@ test "ZA305/ZA306: switch arms count as decision points" {
     try graph.reachable.put(try allocator.dupe(u8, "switch.zig"), {});
 
     // 16 arms (1 each) + 16 tries (1 each) + 1 switch = 33 decision
-    // points; threshold 10 fires ZA305, and the arm+try cognitive cost
+    // points. Threshold 10 fires ZA305, and the arm+try cognitive cost
     // fires ZA306.
     var issues = try analyzeComplexity(allocator, &graph, .{});
     defer deinitIssues(&issues, allocator);
@@ -101578,7 +101578,7 @@ test "ZA901: zero-check same-line exits judged at the guard's depth (EPH-I0865)"
     // depth: a nested same-line conditional exit (`{ if (q) return 0; }`)
     // does not dominate the fall-through, so the decrement below fires
     // (the sink padding pushes the function's own return past the walk
-    // window, so no later line rescues the guard); the direct zero-check
+    // window, so no later line rescues the guard). The direct zero-check
     // exit keeps its suppression (EPH-I0865).
     const content =
         \\fn dec_nested(n: usize, q: bool) usize {
@@ -101675,7 +101675,7 @@ test "ZA901: boolean-assignment guard shape does not suppress (EPH-I0486)" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `const b = m > 0;` computes a value; it guards nothing, so it must
+    // `const b = m > 0;` computes a value. It guards nothing, so it must
     // not put m in the guard set. Pre-fix the decrement stayed silent
     // (collection scope FN).
     const content =
@@ -101897,7 +101897,7 @@ test "opensConditionalBody recognizes labeled and inline loop openers (EPH-I0950
 }
 
 test "isFuncBoundary ignores fn ( inside a string literal (EPH-I0949)" {
-    // The backward walks stop at function boundaries; a string like
+    // The backward walks stop at function boundaries. A string like
     // `const pat = "fn (";` between the loop header and the candidate
     // must not read as a nested signature. Pre-fix the raw byte match
     // returned true and findEnclosingLoop/hasInitWitness stopped short
@@ -101942,7 +101942,7 @@ test "findEnclosingLoop ignores fn ( and } inside string literals (EPH-I0949)" {
 }
 
 test "hasBreakGuardOnPriorLines skips a closed loop body (EPH-I0936)" {
-    // A break guard inside a loop body exits the loop; it does not
+    // A break guard inside a loop body exits the loop. It does not
     // dominate an access after the loop — the loop can exit via its
     // condition with the var still zero. Pre-fix the walk crossed the
     // closing `}` and found the depth-1 guard.
@@ -101964,7 +101964,7 @@ test "hasBreakGuardOnPriorLines skips an Allman closed loop body (EPH-I0951)" {
     // The Allman open is the bare `{` line under the `while` header, so
     // crossClosedBlock does not see a loop opener at the depth-returning
     // line. Pre-fix the body was judged and the in-body break guard
-    // suppressed the after-loop decrement; the header check passes the
+    // suppressed the after-loop decrement. The header check passes the
     // body like the K&R shape.
     const lines = [_][]const u8{
         "fn f(x: usize, y: usize) usize {",
@@ -102085,7 +102085,7 @@ test "ZA901: pre-loop break guard does not suppress the loop-body decrement (EPH
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The guard breaks the enclosing y-loop; the inner loop's
+    // The guard breaks the enclosing y-loop. The inner loop's
     // iterations reach `m -= 1` without re-passing it. Pre-fix the
     // stale guard silenced the decrement (F18).
     const content =
@@ -102121,7 +102121,7 @@ test "ZA901: in-loop break guard does not suppress the after-loop decrement (EPH
     const allocator = gpa.allocator();
 
     // The loop can exit via its condition with m == 0, so the after-loop
-    // decrement can underflow; the in-body break guard exits the loop,
+    // decrement can underflow. The in-body break guard exits the loop,
     // not the path to the decrement. Pre-fix the guard silenced it.
     const content =
         \\fn dec_after(x: usize, y: usize) usize {
@@ -102196,7 +102196,7 @@ test "ZA901: Allman loop-condition guard covers the bare-brace body (EPH-I0952)"
     // line, exactly like the K&R shape. Pre-fix hasEnclosingGuardForVar
     // saw the header at depth 0 (the `{` line paid the depth first), so
     // the in-body `y -= 1` fired alongside the after-loop issue (count 2
-    // in the batch-29 r2 probe; the K&R twin reported count 1). The
+    // in the batch-29 r2 probe. The K&R twin reported count 1). The
     // after-loop `m -= 1` keeps firing: the loop can exit with m == 0.
     const content =
         \\fn dec_allman_iso(x: usize, y: usize) usize {
@@ -102858,7 +102858,7 @@ test "ZA903 message and help name subtraction underflow (EPH-I1169)" {
         if (!mem.eql(u8, issue.rule, RULE_INDEX_ARITHMETIC)) continue;
         // The matcher is subtraction-only, so the message must not
         // promise overflow coverage. The ZA903 producer always sets the
-        // help field; a null here is a test-fixture failure, not a shape
+        // help field. A null here is a test-fixture failure, not a shape
         // the pin models.
         const help = issue.help orelse return error.TestUnexpectedResult;
         try std.testing.expect(mem.indexOf(u8, issue.message, "overflow") == null);
@@ -102918,10 +102918,10 @@ test "ZA903 matcher: unspaced bracket subtraction forms" {
     try std.testing.expect(hasArrayIndexSubtraction("const y = a[0 .. i - 1];") != null);
     // A leading minus is a negative literal, not a subtraction.
     try std.testing.expect(hasArrayIndexSubtraction("const y = a[-1];") == null);
-    // A char literal '-' is data; char arithmetic is a real subtraction.
+    // A char literal '-' is data. Char arithmetic is a real subtraction.
     try std.testing.expect(hasArrayIndexSubtraction("const y = a['-'];") == null);
     try std.testing.expect(hasArrayIndexSubtraction("const y = a['x' - '0'];") != null);
-    // A dereferenced index is a real operand; a bare `* -` is multiplication.
+    // A dereferenced index is a real operand. A bare `* -` is multiplication.
     try std.testing.expect(hasArrayIndexSubtraction("const y = a[ptr.* - 1];") != null);
     try std.testing.expect(hasArrayIndexSubtraction("const y = a[x * -1];") == null);
 }
@@ -102944,7 +102944,7 @@ test "hasRangeEndInitGuard requires a literal init witness (EPH-I0499)" {
         "}",
     };
     // The slice end `n - 1` underflows when n < 1. A literal init of
-    // the end var proves the safe boundary; a parameter init proves
+    // the end var proves the safe boundary. A parameter init proves
     // nothing.
     try std.testing.expect(!hasRangeEndInitGuard(&lines, 3, lines[3]));
 
@@ -103031,8 +103031,8 @@ test "ZA903: range-end witness does not cover an earlier unwitnessed index (batc
 
     // `arr[b - 1][0 .. x - 1][0]` with `const x = 5` and b a parameter:
     // the range-end witness proves x >= 1, not b >= 1. The candidate
-    // finder selects the FIRST subtraction-bearing bracket (`[b - 1]`);
-    // pre-fix the witness guard scanned every bracket, so the later
+    // finder selects the FIRST subtraction-bearing bracket (`[b - 1]`).
+    // Pre-fix the witness guard scanned every bracket, so the later
     // range witness silenced the unwitnessed `b - 1` candidate (FN).
     const content =
         \\fn range_mixed(b: usize, arr: []usize) usize {
@@ -103089,7 +103089,7 @@ test "ZA903: range-start subtraction honors the init witness (batch 24 review F2
 test "hasInitWitness stops at a nested fn at the window edge (batch 24 review F-A)" {
     // The nested fn signature sits at the window edge (current_idx - 20
     // == check_start for current_idx 23). The window's first line is
-    // the outer signature only when the window starts at index 0; at a
+    // the outer signature only when the window starts at index 0. At a
     // deeper window the edge line is an arbitrary mid-function line, so
     // a signature there is a scope boundary. The `const x = 5` inside
     // the nested fn must not witness the outer `x` (batch 24 review
@@ -103184,7 +103184,7 @@ test "EPH-I0931: early-return length guard 3 lines below the signature engages (
 test "EPH-I0931: loop-init witness 3 lines below the signature engages (dead-zone)" {
     // The `var i = 5` init sits 3 lines below the signature, the
     // candidate 5 lines below it. Batch 24's index-0 exemption already
-    // skips the signature; this pin locks the done-when shape.
+    // skips the signature. This pin locks the done-when shape.
     const lines = [_][]const u8{
         "fn f(arr: []usize, n: usize) usize {",
         "    _ = n;",
@@ -103268,7 +103268,7 @@ test "EPH-I0934: loop-body write after the candidate breaks the init witness" {
 
 test "EPH-I0934: switch range prong 0...i => does not count as a reassignment" {
     // A range prong ending in the index var reads `i =>` after the
-    // boundary match; the `=` check must exclude the `=>` prong shape.
+    // boundary match. The `=` check must exclude the `=>` prong shape.
     const lines = [_][]const u8{
         "fn f(arr: []usize, n: usize) usize {",
         "    _ = n;",
@@ -103466,7 +103466,7 @@ test "rangeEndSubOf binds the call-head argument var (EPH-I0938)" {
     const call = rangeEndSubOf("0 .. f(n - 1)").?;
     try std.testing.expect(mem.eql(u8, call.idx_var, "n"));
     try std.testing.expect(call.subtrahend == 1);
-    // A paren group binds the same way; the plain and dotted ends keep
+    // A paren group binds the same way. The plain and dotted ends keep
     // their binding.
     const group = rangeEndSubOf("0 .. (n - 1)").?;
     try std.testing.expect(mem.eql(u8, group.idx_var, "n"));
@@ -103769,7 +103769,7 @@ test "ZA903: Allman loop-condition bound covers the bare-brace body (EPH-I0952)"
     // The ZA903 twin of the Allman guard pin: the `while (n > 2)` bound
     // covers the body opened on the bare `{` line. Pre-fix the bound
     // walk saw the header at depth 0 (the `{` line paid the depth first)
-    // and `buf[n - 1]` fired despite n >= 3 (FP); the K&R twin stayed
+    // and `buf[n - 1]` fired despite n >= 3 (FP). The K&R twin stayed
     // silent.
     const content =
         \\fn dec_allman_bound(n: usize) usize {
@@ -104177,7 +104177,7 @@ test "ZA903: compound range end binds the summed subtrahends (EPH-I0958)" {
     ) == 1);
 
     // `const n = 4` proves n >= 3 (4 - 3 = 1), so the twin stays
-    // silent; a non-literal operand (`n - 1 - k`) makes the summed
+    // silent. A non-literal operand (`n - 1 - k`) makes the summed
     // amount unknowable and the shape fires even with `const n = 4`.
     const silent =
         \\fn comp_ok(arr: []usize, m: usize) usize {
@@ -104215,10 +104215,10 @@ test "ZA903: non-decimal range-end subtrahends parse by base (EPH-I0977)" {
     // The base-0 std parse owns the
     // prefix and underline semantics (EPH-I0977). The fire twins
     // pin the parse: the fire-twin amounts exceed their witnesses
-    // (hex/bin/oct/mix by one; `1_0` = 10 exceeds n = 4 by six).
+    // (hex/bin/oct/mix by one. `1_0` = 10 exceeds n = 4 by six).
     // `n - 0x2` with n = 2 is SILENT — 0x2 is 2 and 2 - 2 does not
     // underflow (the issue text's fire expectation was an arithmetic
-    // slip; the n = 1 twin fires).
+    // slip. The n = 1 twin fires).
     const content =
         \\fn hex_ok(arr: []usize) usize {
         \\    const n = 4;
@@ -104424,7 +104424,7 @@ test "ZA903: non-decimal init literals witness the loop-init bound (EPH-I0994)" 
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `var i = 0x10` inits i to 16, which covers `arr[i - 1]`; the
+    // `var i = 0x10` inits i to 16, which covers `arr[i - 1]`. The
     // decimal-only init parse read the hex literal as unparseable and
     // the loop-init witness failed (FP). The fire twin's init 0x1 is 1,
     // which does not cover `arr[i - 2]` (EPH-I0994).
@@ -105088,7 +105088,7 @@ test "ZA903: guard-to-candidate reassignment defeats the enclosing bound (EPH-I0
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `n = 1` restores n below the subtrahend before the read; the
+    // `n = 1` restores n below the subtrahend before the read. The
     // opener's bound no longer covers the body path.
     const fire =
         \\fn reassigned(arr: []usize, n: usize) usize {
@@ -105279,7 +105279,7 @@ test "ZA901: else-open skip does not over-apply below closed arms (EPH-I0963 r4)
     const allocator = gpa.allocator();
 
     // The legacy walk mirrors the ZA903 judgment: the decrement below
-    // a closed else-if arm runs at x == 0 (pin p6); the decrement
+    // a closed else-if arm runs at x == 0 (pin p6). The decrement
     // after a closed inner if/else inside an outer guarded block is
     // covered by x > 0 (pin p8).
     const dec =
@@ -105348,7 +105348,7 @@ test "ZA903: mid-line else-open escapes the antecedent credit (EPH-I0965)" {
 
     // The then-branch twin of the SPLIT shape stays silent (the arm
     // closes on the else-open line — same-line class, fires pre-fix and
-    // post-fix; covered by the f2b test below). A mid-line else-if
+    // post-fix. Covered by the f2b test below). A mid-line else-if
     // credits only the chain arm's OWN condition, and a self-contained
     // if/else whose arms close on the line stays transparent (the outer
     // opener still guards the candidate below it).
@@ -105426,7 +105426,7 @@ test "ZA903: mid-line else-if with a foreign condition fires (EPH-I0965)" {
 
     // The mid-line else-if arm's own condition guards only its own var:
     // `m > 0` proves nothing about n, so `arr[0 .. n - 2]` in the arm
-    // fires; the antecedent `n > 1` on the same line is negated.
+    // fires. The antecedent `n > 1` on the same line is negated.
     const content =
         \\fn else_if_foreign(arr: []usize, n: usize, m: usize) usize {
         \\    if (n > 1) { return arr[0]; } else if (m > 0) {
@@ -105538,7 +105538,7 @@ test "ZA903: else-open line edges — string, comment, and ident-adjacent else (
     // still open the arm at the line's real `else`. Pre-fix a string
     // or comment carrying `} else {` after the real keyword made the
     // backward scan re-query the line classifier at an earlier
-    // position and PANICKED (ReleaseSafe assert); the arm candidate
+    // position and PANICKED (ReleaseSafe assert). The arm candidate
     // then never ran. All four arms run at n <= 1 and fire
     // (EPH-I0980 probe, 2026-08-14).
     const content =
@@ -105627,7 +105627,7 @@ test "ZA901: decrement in a mid-line else arm fires (EPH-I0980)" {
     // The mid-line else arm runs at m <= 1, so `m -= 1` underflows at
     // m == 0. Pre-fix the CFG guard scan recorded the antecedent's
     // guard (`m > 1`) as a LOCAL guard of the else-arm block and the
-    // decrement stayed silent (FN); the scan now reads only the arm's
+    // decrement stayed silent (FN). The scan now reads only the arm's
     // own region after the `else`. The foreign-var twin and the
     // classic-else twin fire the same way (controls).
     const content =
@@ -105674,10 +105674,10 @@ test "ZA901: chain-arm own condition guards a decrement past the opener walk (EP
     // The else-if arm's own condition (`m > 3`) must guard the
     // decrement below it. Pre-fix the arm region kept the whitespace
     // after the `else` keyword, so the guard scan never recorded the
-    // chain arm's own condition and the decrement fired (FP); the
+    // chain arm's own condition and the decrement fired (FP). The
     // region is now trimmed (EPH-I0993). The decrement sits 46 lines
     // below the chain line — past the 40-line opener walk — so only
-    // the CFG guard meet can silence it; the filler makes the pin
+    // the CFG guard meet can silence it. The filler makes the pin
     // discriminating.
     const content =
         \\fn chain_arm(x: usize, q: usize) usize {
@@ -106037,7 +106037,7 @@ test "ZA903: unrelated-var same-line guard does not suppress (EPH-I0506)" {
     const allocator = gpa.allocator();
 
     // band-B12 F17: `if (j > 0) return a[i - 1];` — the guard relates
-    // to j, the index to i; the comparison must bind the index var.
+    // to j, the index to i. The comparison must bind the index var.
     const content =
         \\fn unrelated(a: []u8, i: usize, j: usize) u8 {
         \\    if (j > 0) return a[i - 1];
@@ -106275,12 +106275,12 @@ test "Site-3 probe: the guard keyword scan completes on the while-left-of-if sha
 
 test "nextGuardKeywordPos walks per-loop classifiers on both keyword orders (EPH-I1218)" {
     // The while keyword left of the if keyword used to query the shared
-    // classifier backward; each loop now walks its own classifier, and
+    // classifier backward. Each loop now walks its own classifier, and
     // the earlier of the two keywords still wins.
     try std.testing.expect(nextGuardKeywordPos("while (a) if (b) {", 0) == 0);
     try std.testing.expect(nextGuardKeywordPos("if (b) while (a) {", 0) == 0);
-    // "x = 1; " is 7 bytes, so the `if` sits at 7 and the `while` at 14;
-    // the earlier keyword wins (verified live: harness run returns 7).
+    // "x = 1; " is 7 bytes, so the `if` sits at 7 and the `while` at 14.
+    // The earlier keyword wins (verified live: harness run returns 7).
     try std.testing.expect(nextGuardKeywordPos("x = 1; if (b) while (a) {", 0) == 7);
 }
 
@@ -106291,7 +106291,7 @@ test "ZA903: or-tails do not suppress on the > arm or whitespace variants (EPH-I
     const allocator = gpa.allocator();
 
     // band-B12 F17 residual (EPH-I0942): `y > 0 or x > 0` ran the body
-    // at x == 0 when only y held, so the subtraction stayed silent; the
+    // at x == 0 when only y held, so the subtraction stayed silent. The
     // `!=` arm's raw `" or"` check missed `x != 0  or y`. Both arms now
     // reject an or-root that proves nothing for the var. An `and`-tail
     // keeps the exclusion. Exactly two findings pin both sides.
@@ -106719,7 +106719,7 @@ test "ZA901: identifier-RHS guard keeps the documented shape-only verdict (EPH-I
     // var-value analysis is beyond the line-granular model. The class
     // keeps the shape-only verdict (covered for any amount) to avoid
     // FP noise on genuinely-guarded corpus code (verified: 8 corpus
-    // sites; EPH-I1000 residual, documented at guardSpanCoversAmount).
+    // sites. EPH-I1000 residual, documented at guardSpanCoversAmount).
     // The end-to-end twin stays silent (probe .tmp/b46probes/p2_var_rhs).
     try std.testing.expect(guardLineCoversAmount("if (m > limit) {", "m", 5));
     try std.testing.expect(guardSpanCoversAmount(
@@ -106731,7 +106731,7 @@ test "ZA901: identifier-RHS guard keeps the documented shape-only verdict (EPH-I
 }
 
 test "joinGuardCondition joins clean multi-line conditions and bails on poison (EPH-I1000)" {
-    // The or-tail's two lines join into one condition text; the span
+    // The or-tail's two lines join into one condition text. The span
     // and bound judges then parse it like a single-line condition. The
     // region-offset join starts at the arm's own `if`, never at the
     // negated antecedent. A comment, an unterminated string, or a
@@ -106900,7 +106900,7 @@ test "ZA901: chain-arm own condition still covers a same-line candidate (EPH-I10
 
 test "hasGuardOnLine splits the same-line chain's else-arm region (EPH-I1001)" {
     // The same-line judge reads the arm's own region after the else
-    // keyword that opens the candidate's arm; a then-arm candidate
+    // keyword that opens the candidate's arm. A then-arm candidate
     // keeps the whole-line judge. The zero-exit branch keeps the full
     // line: the `== 0` exit's negation proves the arm runs at m >= 1
     // (EPH-I1001).
@@ -106937,9 +106937,9 @@ test "elseKeywordBeforePos bounds the else scan at the candidate (EPH-I1001)" {
     // candidate's column: a then-arm candidate before any else sees no
     // arm, an else-arm candidate sees the last else before it.
     const chain = "} else { const s = \"else\"; m -= 1; }";
-    // The qualifying else follows the leading `}` at position 2; the
+    // The qualifying else follows the leading `}` at position 2. The
     // word inside the string is not code. A candidate at column 2 sees
-    // no arm; a candidate at column 3 sits inside the arm.
+    // no arm. A candidate at column 3 sits inside the arm.
     try std.testing.expect(elseKeywordBeforePos(chain, 2) == null);
     try std.testing.expect(elseKeywordBeforePos(chain, 3) == 2);
     const chain2 = "if (m > 1) { return 0; } else if (m > 3) { m -= 2; } else { m -= 1; }";
@@ -107393,7 +107393,7 @@ test "ZA903: Allman chain-arm header covers its bare-brace body (EPH-I1019)" {
         "}",
     };
     // The `}`-leading chain header defeats isConditionalStart's
-    // line-start requirement; the chain-arm gate judges the arm's own
+    // line-start requirement. The chain-arm gate judges the arm's own
     // joined condition instead, which proves m >= 4 — the
     // 2-subtrahend stays silent and the 5-subtrahend fires (EPH-I1019).
     const bctx: EnclosingBoundCtx = .{
@@ -107511,7 +107511,7 @@ test "ZA903: Allman chain-arm header end-to-end, plain-else arm keeps firing (EP
     var run = try runCFGMemoryTest(&diag, allocator, "test_za903_allman_chain.zig", content);
     defer run.deinit(allocator);
     // The covered chain arms (classic multi-line, classic single-line,
-    // and the mid-line twin) stay silent; the amount past the bound
+    // and the mid-line twin) stay silent. The amount past the bound
     // (classic and mid-line) and the plain else arm fire.
     try std.testing.expectEqual(
         @as(usize, 3),
@@ -107527,7 +107527,7 @@ test "guardOnLineAt judges each arm's decrement against its own region (EPH-I102
     const chain = "if (m > 1) { return 0; } else if (m > 3) { m -= 2; } else { m -= 1; }";
     const mid_col = findDecrementOpAt(chain, 0).?;
     const final_col = findDecrementOpAt(chain, mid_col + 2).?;
-    // The middle arm's own condition proves m >= 4, which covers 2; an
+    // The middle arm's own condition proves m >= 4, which covers 2. An
     // amount past the arm's bound still fires. The final else arm's
     // region is the naked body — the negated antecedents never cover
     // the arm below, so its candidate fires. A foreign var never
@@ -107545,7 +107545,7 @@ test "ZA901: one-line multi-arm chain reports the unguarded later-arm decrement 
     const allocator = gpa.allocator();
 
     // The middle arm's `m -= 2` is covered by its own arm's bound and
-    // stays silent; the final else arm runs at m <= 3, so its `m -= 1`
+    // stays silent. The final else arm runs at m <= 3, so its `m -= 1`
     // underflows at m == 0 and fires. Pre-fix only the first decrement
     // was judged, the covered middle arm silenced the whole line, and
     // the final arm's decrement was never reported (FN, EPH-I1022).
@@ -107588,7 +107588,7 @@ test "ZA901: joined multi-line == conjuncts stay conservative (EPH-I1015)" {
     // The doc-arm pin for the conservative-fire class at
     // guardSpanCoversAmount: an or-tail with an unparseable conjunct
     // (`m == 1`) proves no bound, so the joined multi-line or-tail
-    // fires even for `m -= 1`; the and-tail keeps the parseable arm's
+    // fires even for `m -= 1`. The and-tail keeps the parseable arm's
     // bound (m >= 2 covers 1 but not 5). The single-line twins fire
     // the same way — the join is a consistent extension of the model
     // limitation (reviewer probes r5/r8).
@@ -107633,7 +107633,7 @@ test "ZA903: mismatched-array .len guard does not suppress the candidate (EPH-I0
 
     // F14: `if (a.len == 0) return;` silenced `b[i - 1]` — the .len
     // guard was never tied to the indexed array. The candidate base is
-    // bound first; a guard on `a` cannot cover `b`, so ZA903 fires. The
+    // bound first. A guard on `a` cannot cover `b`, so ZA903 fires. The
     // 30-line walk only engages past its window start (the
     // function-boundary stop — pre-existing window shape), so the guard
     // sits 30 lines above the candidate.
@@ -108114,7 +108114,7 @@ test "countLineCyclomatic counts unspaced control flow" {
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("if(x) {"));
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("while(x) {"));
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("for(xs) |x| {"));
-    // else adds no decision point (McCabe; EPH-I0455)
+    // else adds no decision point (McCabe. EPH-I0455)
     try std.testing.expectEqual(@as(usize, 0), countLineCyclomatic("}else{"));
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("}else if(x) {"));
     try std.testing.expectEqual(@as(usize, 1), countLineCyclomatic("}catch{"));
@@ -108185,7 +108185,7 @@ test "ZA305: unspaced if-chain trips cyclomatic threshold" {
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // 20 unspaced decision points -> CCN 21; previously undercounted to 1.
+    // 20 unspaced decision points -> CCN 21. Previously undercounted to 1.
     const code =
         \\fn unspaced_chain(x: u32) u32 {
         \\    if(x == 0) return 0;
@@ -108375,7 +108375,7 @@ test "extractVarDeclNameBefore skips type-qualifier const" {
 
 test "isStructFieldFilled keeps fill verdicts after param rename (EPH-I0420)" {
     // The four struct-field helpers take (struct_name, field_name) since
-    // the sn/fn_ rename; the verdicts are the pins (band B06 F15).
+    // the sn/fn_ rename. The verdicts are the pins (band B06 F15).
     try std.testing.expect(isStructFieldFilled("s.x = 1;", "s", "x"));
     try std.testing.expect(isStructFieldFilled("&s.x", "s", "x"));
     try std.testing.expect(!isStructFieldFilled("s.x = 1;", "s", "y"));
@@ -108404,7 +108404,7 @@ test "trackTestBlock zero-depth close keeps state consistent (EPH-I1217)" {
     // base behavior in_test=false, depth=1 after the trailing `{` — so
     // in_test and depth disagreed. The shared tracker checks depth > 0
     // before it closes, so the state now stays consistent. The input is
-    // invalid Zig; the pin records the contract.
+    // invalid Zig. The pin records the contract.
     const r = trackTestBlock("test \"x\" } {", false, 0);
     try std.testing.expect(r.in_test);
     try std.testing.expectEqual(@as(usize, 1), r.depth);
@@ -108465,7 +108465,7 @@ test "trackDeferBlockDepthLine uses one code-position brace notion (EPH-I0883)" 
 }
 
 test "skipBlanks skips spaces and tabs (EPH-I0421)" {
-    // The space-only skipSpaces merged into skipBlanks; tabs advance too.
+    // The space-only skipSpaces merged into skipBlanks. Tabs advance too.
     try std.testing.expectEqual(@as(usize, 5), skipBlanks("ab \t c", 2));
     try std.testing.expectEqual(@as(usize, 2), skipBlanks("  x", 0));
     try std.testing.expectEqual(@as(usize, 3), skipBlanks("ab c", 2));
@@ -108473,8 +108473,8 @@ test "skipBlanks skips spaces and tabs (EPH-I0421)" {
 }
 
 test "isScopeEnd unifies the depth and return/fn predicates (EPH-I0421)" {
-    // Depth 0 ends the scope on any line; return starts and fn-with-paren
-    // openers end it at depth > 0; ordinary lines do not.
+    // Depth 0 ends the scope on any line. Return starts and fn-with-paren
+    // openers end it at depth > 0. Ordinary lines do not.
     try std.testing.expect(isScopeEnd("x = 1;", 0));
     try std.testing.expect(isScopeEnd("return x;", 3));
     try std.testing.expect(isScopeEnd("return;", 2));
@@ -108772,7 +108772,7 @@ test "ZA204: brace in a trailing comment does not end the pending field scope (E
 test "isTestFilePath: one classifier for dir segments on either separator (EPH-I0422)" {
     // Documented test-file semantics: `_test.zig` names and `test`/`tests`
     // directory segments. The old loose `/test` matched `/testbed/` and
-    // `/testing/`; the segment classifier keeps them out (band B06 F16).
+    // `/testing/`. The segment classifier keeps them out (band B06 F16).
     // Windows `\` separators classify too.
     try std.testing.expect(isTestFilePath("src/main_test.zig"));
     try std.testing.expect(isTestFilePath("test/foo.zig"));
@@ -108828,7 +108828,7 @@ test "ZA201 fires inside a catch block body (EPH-I0414)" {
 
 test "analyzer drivers free their issue lists on the happy path (EPH-I0459)" {
     // The four return-by-value drivers carry errdefer deinitIssues on the
-    // OOM path; a wrong defer (or a double fire) trips the testing
+    // OOM path. A wrong defer (or a double fire) trips the testing
     // allocator when the caller frees the returned lists.
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -109020,8 +109020,8 @@ test "ZA204: single-line struct literal undefined field is reported (EPH-I0413)"
 
     // F7 (band-B06): the decl line's fields were never collected, so the
     // single-line literal's undefined field never reported. The decl
-    // line now collects its fields and closes the literal (EPH-I0413);
-    // the unfilled field reports at the fn close like the multi-line
+    // line now collects its fields and closes the literal (EPH-I0413).
+    // The unfilled field reports at the fn close like the multi-line
     // form (EPH-I0421).
     const content =
         \\fn build() void {
@@ -109095,7 +109095,7 @@ test "ZA204: later anonymous literal field is not misattributed (EPH-I0413)" {
             found_line = issue.line;
         }
     }
-    // Only the decl line's `.a = undefined` reports; the `.b` on line 3
+    // Only the decl line's `.a = undefined` reports. The `.b` on line 3
     // never joins the pending set.
     try std.testing.expectEqual(@as(usize, 2), found_line);
 }
@@ -109194,12 +109194,12 @@ test "trackBraceNesting ignores braces inside char literals" {
 
 test "trackBraceNesting handles escaped-quote char literals" {
     // `'\''` — the escaped quote is content (odd backslash run), only the
-    // last quote is the delimiter; the `{` after the literal must count.
+    // last quote is the delimiter. The `{` after the literal must count.
     var state = ComplexityState{ .in_fn = true, .nest = 1 };
     try std.testing.expect(!trackBraceNesting("if (c == '\\'') {", &state));
     try std.testing.expectEqual(@as(usize, 2), state.nest);
-    // `'\\'` — backslash literal (even backslash run before the delimiter);
-    // the `{` after the literal must count.
+    // `'\\'` — backslash literal (even backslash run before the delimiter).
+    // The `{` after the literal must count.
     try std.testing.expect(!trackBraceNesting("if (c == '\\\\') {", &state));
     try std.testing.expectEqual(@as(usize, 3), state.nest);
     try std.testing.expect(!trackBraceNesting("}", &state));
@@ -109216,7 +109216,7 @@ test "trackBraceNesting treats quote after even backslash run as delimiter" {
 
 test "trackBraceNesting keeps escaped quote as string data" {
     // `"\""` — the middle quote has an odd backslash run before it, so it is
-    // escaped data; the string ends at the last quote and the trailing `}`
+    // escaped data. The string ends at the last quote and the trailing `}`
     // still closes the scope.
     var state = ComplexityState{ .in_fn = true, .nest = 1 };
     try std.testing.expect(trackBraceNesting("const s = \"\\\"\"; }", &state));
@@ -109272,7 +109272,7 @@ test "trackBraceNesting nets zero on a same-line empty prong (EPH-I0133)" {
 }
 
 test "trackBraceNesting nets zero on a same-line struct-literal prong (EPH-I0451)" {
-    // The first `{` is the struct literal's open; its close pairs with the
+    // The first `{` is the struct literal's open. Its close pairs with the
     // skip, leaving the enclosing switch depth untouched.
     var state = ComplexityState{ .in_fn = true, .nest = 2 };
     try std.testing.expect(!trackBraceNesting("1 => .{ .x = 1 },", &state));
@@ -109300,7 +109300,7 @@ test "trackBraceNesting counts a second open brace on a prong line (EPH-I0451)" 
     // Only the line's first `{` is the prong's. A second open is an inner
     // brace and counts, so its close balances and the prong close still
     // pairs with the skip. The pre-I0451 skip swallowed every brace on the
-    // arrow line; the pin uses a real control brace (a literal second open
+    // arrow line. The pin uses a real control brace (a literal second open
     // skips as data since EPH-I0811, pinned separately).
     var state = ComplexityState{ .in_fn = true, .nest = 2 };
     try std.testing.expect(!trackBraceNesting("1 => { if (x) {", &state));
@@ -109311,7 +109311,7 @@ test "trackBraceNesting counts a second open brace on a prong line (EPH-I0451)" 
 
 test "trackBraceNesting skips a literal second open on a prong line (EPH-I0811)" {
     // `1 => { x = .{` — the prong's brace skips, the literal's braces skip
-    // as data; neither counts. Pre-fix the literal counted (nest peaked 3).
+    // as data. Neither counts. Pre-fix the literal counted (nest peaked 3).
     var state = ComplexityState{ .in_fn = true, .nest = 2, .max_nest = 2 };
     try std.testing.expect(!trackBraceNesting("1 => { x = .{", &state));
     try std.testing.expectEqual(@as(usize, 2), state.nest);
@@ -109323,7 +109323,7 @@ test "trackBraceNesting skips a literal second open on a prong line (EPH-I0811)"
 test "trackBraceNesting pairs nested skipped prongs at one depth (EPH-I0451)" {
     // A one-line switch expression inside a block prong leaves two skipped
     // opens pending at the same depth. The per-depth count pairs each close
-    // with its own skip; a single-bit marker would lose the outer one and
+    // with its own skip. A single-bit marker would lose the outer one and
     // end the fn at the switch close.
     var state = ComplexityState{ .in_fn = true, .nest = 2 };
     try std.testing.expect(!trackBraceNesting("1 => {", &state));
@@ -109340,7 +109340,7 @@ test "trackBraceNesting pairs 300 nested switch-expression prongs (EPH-I0451)" {
     // current depth, which never advances across the nested opens, so 300
     // nested `N => switch (v) {` lines drive the per-depth count to 300.
     // The u8 counter overflowed at 256 (review fixture
-    // .tmp/review-i0451/overflow.zig); the usize count pairs every close.
+    // .tmp/review-i0451/overflow.zig). The usize count pairs every close.
     var state = ComplexityState{ .in_fn = true, .nest = 2 };
     var buf: [32]u8 = undefined;
     var i: usize = 0;
@@ -109418,7 +109418,7 @@ test "trackBraceNesting keeps a prong-block literal at the prong depth (EPH-I081
 
 test "trackBraceNesting attributes an arrow-line literal to the literal mask (EPH-I0811)" {
     // d4 shape: the literal's `{` is the first brace on the arrow line.
-    // Pre-fix the prong skip swallowed it (recorded as a prong open); the
+    // Pre-fix the prong skip swallowed it (recorded as a prong open). The
     // literal mask claims it, so the prong counter never moves and the
     // literal pairs its own close.
     var state = ComplexityState{ .in_fn = true, .nest = 2 };
@@ -109630,7 +109630,7 @@ test "ZA301: block-prong switch with code after it measures to the fn end (EPH-I
     const allocator = gpa.allocator();
 
     // handleBlockEnd-shaped: four block prongs, then work after the
-    // switch. True body 52 lines; pre-fix the second prong close ended
+    // switch. True body 52 lines. Pre-fix the second prong close ended
     // the measurement at fn line 10.
     const code =
         \\fn handle_block_end_shaped(v: u8) void {
@@ -109719,7 +109719,7 @@ test "ZA302: char-literal braces do not inflate nesting depth" {
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // Real nesting is 3 (fn > if > for); the `'{'` char literal on a
+    // Real nesting is 3 (fn > if > for). The `'{'` char literal on a
     // brace-free line must not add a phantom fourth level.
     const code =
         \\fn char_lit(c: u8) void {
@@ -109759,7 +109759,7 @@ test "ZA306: else-prong second same-line brace adds no cognitive nest (EPH-I0884
     // The else-prong line `else => { {` opens an anonymous block as a
     // SECOND code brace. opensCognitiveScope lists the else token without
     // a hasElseArrow exclusion, so that second brace marks +1 cog_nest for
-    // its interior lines; the identical shape under a numeric prong
+    // its interior lines. The identical shape under a numeric prong
     // (`0 => { {`) measures at the base level. Sonar assigns plain blocks
     // no nesting, so the else-arm interior overcounts (EPH-I0884).
     // True cognitive: switch(1) + arm(1+1) + inner if(1+1) + arm(1+1) +
@@ -109811,7 +109811,7 @@ test "ZA302: same-line struct literals do not inflate nesting depth (EPH-I0811)"
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // Real nesting is 3 (fn > if > if); the same-line `.{ ... }` literal
+    // Real nesting is 3 (fn > if > if). The same-line `.{ ... }` literal
     // must not add a phantom fourth level (probe_d3 shape).
     const code =
         \\const Spec = struct { a: u32, b: u32 };
@@ -110114,7 +110114,7 @@ test "detectFnStart reports the line-absolute column for indented methods (EPH-I
     };
     detectFnStart(view, &state, 1);
     try std.testing.expect(state.in_fn);
-    // Pre-fix the col was pos+1 = 1 (trim-relative); the indent now counts.
+    // Pre-fix the col was pos+1 = 1 (trim-relative). The indent now counts.
     try std.testing.expectEqual(@as(usize, 5), state.fn_col);
 }
 
@@ -110127,7 +110127,7 @@ test "ZA306: catch after a labeled block closes costs 1+0 and leaks nothing (EPH
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    // True cognitive: if(c)(1) + catch(2) + trailing if(v)(2) = 5; the
+    // True cognitive: if(c)(1) + catch(2) + trailing if(v)(2) = 5. The
     // `try` on the break line costs nothing (EPH-I0458). Pre-fix the
     // catch's marker landed one level deeper than the block that opened
     // (the unmarked `blk` close), so the trailing if cost 3 and the
@@ -110226,7 +110226,7 @@ test "ZA301: wrapped type-factory signature keeps the [tf] multiplier (EPH-I0457
 
     // 60 raw lines. Pre-fix the factory check saw only the keyword line,
     // so the wrapped `) type {` factory measured at the 50 limit and
-    // fired; the [tf] 3x limit (150) keeps it silent.
+    // fired. The [tf] 3x limit (150) keeps it silent.
     // EPH-I0277: the discard rows alone are the data-table shape (the
     // [dt] 20x line allowance would silence both twins), so one logic
     // line keeps them outside the pattern — the row count stays 60 and
@@ -110280,7 +110280,7 @@ test "ZA301: wrapped type-factory signature keeps the [tf] multiplier (EPH-I0457
 }
 
 test "isTypeFactory: inner fn-pointer close cannot grant [tf] (EPH-I0457)" {
-    // `fn (x: u8) type` closes to depth 1; the guard rejects the grant.
+    // `fn (x: u8) type` closes to depth 1. The guard rejects the grant.
     try std.testing.expect(!isTypeFactory("fn foo(a: fn (x: u8) type) void {"));
     // Wrapped form: the walk crosses the newline, same verdict.
     try std.testing.expect(!isTypeFactory(
@@ -110291,7 +110291,7 @@ test "isTypeFactory: inner fn-pointer close cannot grant [tf] (EPH-I0457)" {
 }
 
 test "isTypeFactory: real factory with fn-pointer param still detected (EPH-I0457)" {
-    // The inner close is skipped; the outer `) type` still grants.
+    // The inner close is skipped. The outer `) type` still grants.
     try std.testing.expect(isTypeFactory("fn foo(a: fn (x: u8) type) type {"));
 }
 
@@ -110409,7 +110409,7 @@ test "findRealFnDef: quoted fn name is a real def (EPH-I0442)" {
     // spelling callSiteName records for a quoted call.
     try std.testing.expect(findRealFnDef("fn @\"weird-name\"() void {}") != null);
     try std.testing.expect(findRealFnDef("pub fn @\"a-b\"() void {}") != null);
-    // A malformed quote is not a def; a fn-pointer type is not a def.
+    // A malformed quote is not a def. A fn-pointer type is not a def.
     try std.testing.expect(findRealFnDef("fn @\"unterminated() void {}") == null);
     try std.testing.expect(findRealFnDef("cb: *const fn () void,") == null);
     const quoted_def = extractFnDef("fn @\"weird-name\"() void {}") orelse
@@ -110633,7 +110633,7 @@ test "ZA301: extern decl followed by a real fn reports no phantom (EPH-I0454)" {
     const aa = arena.allocator();
 
     // The extern decl never ends, so the 8 lines after it accumulate into
-    // its state; the real fn's arrival reports the phantom's verdict.
+    // its state. The real fn's arrival reports the phantom's verdict.
     var content: []u8 = try aa.dupe(u8, "pub extern fn c_thing(x: c_int) void;\n");
     for (0..8) |i| {
         const line = try std.fmt.allocPrint(aa, "const v{d}: u32 = {d};\n", .{ i, i });
@@ -110660,7 +110660,7 @@ test "analyzeFileComplexity skips cimport files (EPH-I0454)" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The @cImport marker makes isCImportFile true for any filename; the
+    // The @cImport marker makes isCImportFile true for any filename. The
     // real fn would exceed the line cap if the file were analyzed.
     const code =
         \\const c = @cImport(@cInclude("x.h"));
@@ -110683,7 +110683,7 @@ test "analyzeFileComplexity skips cimport files (EPH-I0454)" {
 
     const th = Thresholds{ .max_function_lines = 5 };
     // The run reaches analyzeFileComplexity through analyzeAllFiles'
-    // comptime analyzer parameter — invisible to ZT101's call graph; the
+    // comptime analyzer parameter — invisible to ZT101's call graph. The
     // value reference documents the covered fn (EPH-I0029 workaround).
     _ = analyzeFileComplexity;
     var issues = try analyzeComplexity(allocator, &graph, th);
@@ -110735,7 +110735,7 @@ test "analyzeFileComplexity runs on a string-only marker file (EPH-I0758)" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The markers live only in string data; the over-cap fn must be measured.
+    // The markers live only in string data. The over-cap fn must be measured.
     // EPH-I0277: six discard rows alone are the data-table shape (the [dt]
     // line allowance would silence the verdict), so one logic line keeps
     // the fixture outside the pattern (test evolution, not weakening: the
@@ -110760,7 +110760,7 @@ test "analyzeFileComplexity runs on a string-only marker file (EPH-I0758)" {
 
     const th = Thresholds{ .max_function_lines = 5 };
     // The run reaches analyzeFileComplexity through analyzeAllFiles'
-    // comptime analyzer parameter — invisible to ZT101's call graph; the
+    // comptime analyzer parameter — invisible to ZT101's call graph. The
     // value reference documents the covered fn (EPH-I0029 workaround).
     _ = analyzeFileComplexity;
     var issues = try analyzeComplexity(allocator, &graph, th);
@@ -110993,7 +110993,7 @@ test "ZT102: Allman test with a real assertion stays silent (EPH-I0435 guard)" {
     const allocator = gpa.allocator();
 
     // Guard: the pending opener must not leak — an Allman test whose body
-    // asserts is fully silent (this also holds pre-fix; it pins the open
+    // asserts is fully silent (this also holds pre-fix. It pins the open
     // not misfiring on the assertion line).
     const content =
         \\test "allman asserting"
@@ -111091,7 +111091,7 @@ test "ZT102: try expectEqual counts as an assertion" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // ZT103 fires on the identical args here (covered in ZT103 tests);
+    // ZT103 fires on the identical args here (covered in ZT103 tests).
     // ZT102 must stay silent because an assertion call is present.
     const content =
         \\test "x" { try expectEqual(1, 1); }
@@ -111725,7 +111725,7 @@ test "ZT102: lowercase cross-file name collisions do not suppress" {
     const allocator = gpa.allocator();
 
     // RhyOS bzip2 shape: the block calls BitReader.init + a non-asserting
-    // helper; an UNRELATED asserting `init` elsewhere in the project must
+    // helper. An UNRELATED asserting `init` elsewhere in the project must
     // not cover the block — ubiquitous lowercase names collide project-wide.
     // The helper is named `readStreamHeader` deliberately: a validate* verb
     // would count as an assertion under the EPH-I0047 try-gate and break
@@ -112420,7 +112420,7 @@ test "ZT101: comptime fn-value delegation reaches the candidate (EPH-I1235)" {
     // The C1a pipeline shape: the test calls a pipeline fn whose body
     // passes parseHeader by value into a comptime-dispatched helper.
     // Pre-fix the call graph saw only runVisits -> visit (a parameter
-    // name — dead) and reported a lie; the delegation edge makes the
+    // name — dead) and reported a lie. The delegation edge makes the
     // coverage real.
     const content =
         \\fn parseHeader(raw: []const u8) !void {
@@ -112868,7 +112868,7 @@ test "ZT104: test-file path is test context" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // ZA2xx is suppressed across whole *_test.zig files; ZT104 inverts the
+    // ZA2xx is suppressed across whole *_test.zig files. ZT104 inverts the
     // suppression over exactly the same domain, helpers included.
     const content =
         \\fn foo() !void {}
@@ -113204,7 +113204,7 @@ test "ZT104: catch unreachable in a defer still notes" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The cleanup exemption covers only the empty-catch form; converting
+    // The cleanup exemption covers only the empty-catch form. Converting
     // an error to a panic is never a cleanup idiom, defer or not.
     const content =
         \\fn reset() !void {}
@@ -113354,7 +113354,7 @@ test "ZT105: comptime fn-value delegation reaches a cross-file pub fn (EPH-I1235
     // The C1a chain shape, cross-file: the test calls pipeline, whose
     // body passes lastHop by value into a comptime-dispatched helper,
     // and only lastHop's body calls the pub fn. Pre-fix the chain broke
-    // at the comptime hop and the note fired; the delegation edge
+    // at the comptime hop and the note fired. The delegation edge
     // completes it. orphan_api is the control — the flag path ran.
     const files = [_]TestQualityFile{
         .{
@@ -113403,7 +113403,7 @@ test "ZT105: generic pub fns are not candidates" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Tests call instantiations, never the generic itself; the wrapped
+    // Tests call instantiations, never the generic itself. The wrapped
     // signature proves the multi-line signature window works (a single-line
     // scan would miss the comptime param and flag maxValWrapped).
     const content =
@@ -113509,7 +113509,7 @@ test "ZT105: pub fn main is not a candidate" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The entry point is exercised by running the binary; flagging it
+    // The entry point is exercised by running the binary. Flagging it
     // would be noise on every executable. other_api is the control.
     const content =
         \\pub fn main() void {}
@@ -113712,7 +113712,7 @@ test "ZT105 EPH-I0429: pub fn defer-called from hosted tests in other files stay
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // RhyOS resetForTest shape: the pub fn lives in scheduler.zig; hosted
+    // RhyOS resetForTest shape: the pub fn lives in scheduler.zig. Hosted
     // test blocks in signal.zig and process_ops.zig defer-call it through
     // the Sched namespace. The dotted defer call is test evidence in both
     // files. orphan_sched is the control.
@@ -113948,7 +113948,7 @@ test "ZT105 EPH-I0031: pub fn with callconv(.C) is a candidate" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The `pub fn ` prefix already matched a callconv(.C) signature; the
+    // The `pub fn ` prefix already matched a callconv(.C) signature. The
     // pin guards the class against future prefix-list drift. plain_api is
     // the control.
     const content =
@@ -113980,7 +113980,7 @@ test "ZT105 EPH-I0031: quoted fn name is a candidate and a test call is evidence
 
     // Pre-fix a `pub fn @"..."` decl was skipped (the name scan only
     // accepted identifier starts), so quoted-name fns were never
-    // candidates — tested or not. The test calls the hyphenated one; the
+    // candidates — tested or not. The test calls the hyphenated one. The
     // underline one stays unreferenced. plain_api is the control.
     const content =
         \\pub fn @"quoted-name"() void {}
@@ -114072,7 +114072,7 @@ test "ZT105 EPH-I0907: type-factory-nested pub fns keep the name-union bound pin
     const allocator = gpa.allocator();
 
     // tigerbeetle tree_fuzz apply shape: the pub fns sit inside a type
-    // factory, so neither name becomes a call-graph key; the test seeds
+    // factory, so neither name becomes a call-graph key. The test seeds
     // `run`, whose merged callees include `apply` — the documented
     // name-union over-approximation (EPH-I0907). open_then_apply is the
     // invariant: it must STAY flagged on both binaries. The apply=0
@@ -114178,7 +114178,7 @@ test "ZT105 EPH-I0910: pub fn build in build.zig is not a candidate" {
     const allocator = gpa.allocator();
 
     // `zig build` exercises build.zig's build entry point exactly as the
-    // binary exercises main; flagging it would be noise on every project.
+    // binary exercises main. Flagging it would be noise on every project.
     // Pre-fix the name-based value suppression happened to hide it — the
     // exemption makes it deterministic. build_stray is the control.
     const content =
@@ -114349,9 +114349,9 @@ test "ZT105 EPH-I0912: nested and build.zig-suffixed files are candidates" {
     const allocator = gpa.allocator();
 
     // The root "build.zig" (bare path, the root of its own scan) keeps
-    // the EPH-I0910 exemption; "sub/build.zig" and "my-build.zig" are
+    // the EPH-I0910 exemption. "sub/build.zig" and "my-build.zig" are
     // ordinary candidates. Pre-fix the endsWith exemption hid all three
-    // (note count 0); post-fix exactly the two non-root decls are
+    // (note count 0). Post-fix exactly the two non-root decls are
     // flagged.
     const files = [_]TestQualityFile{
         .{ .path = "build.zig", .content = "pub fn build(b: *std.Build) void {}\n" },
@@ -114369,7 +114369,7 @@ test "ZT105 EPH-I0912: nested and build.zig-suffixed files are candidates" {
 
 test "ZT105 EPH-I0912: root build.zig classification across scan forms" {
     // Production path shapes for isBuildEntryPoint: the scan root's own
-    // build.zig is exempt in every scan form; a strict descendant or a
+    // build.zig is exempt in every scan form. A strict descendant or a
     // build.zig-suffixed name is a candidate.
     try std.testing.expect(isBuildEntryPoint("/proj/build.zig", "/proj"));
     try std.testing.expect(isBuildEntryPoint("build.zig", null));
@@ -114627,7 +114627,7 @@ fn expectZC101Counts(
 
 // ZC101 family note (band-T05 F10, EPH-I0578): the per-case bodies stay
 // boilerplate on purpose. Each test keeps its fixture and its regression
-// comment self-contained; a table-drive would move both into rows and bury
+// comment self-contained. A table-drive would move both into rows and bury
 // the per-case reasoning. A new case copies the nearest sibling. This
 // choice is documented, not pending.
 test "ZC101: lock with plain unlock is a note, not a warning" {
@@ -114695,7 +114695,7 @@ test "ZC101: conditional and block-form defers count as coverage" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `defer if (c) mu.unlock();` is the zls InternPool should_lock idiom;
+    // `defer if (c) mu.unlock();` is the zls InternPool should_lock idiom.
     // `defer { mu.unlock(); }` is the multi-statement cleanup form.
     const content =
         \\fn doWork() void {}
@@ -114754,7 +114754,7 @@ test "ZC101: multi-line } defer { body releases at the defer depth (EPH-I0926)" 
     var run = try runConcurrencyCheck(&diag, allocator, "zc101_deferclose.zig", content);
     defer run.deinit(allocator);
 
-    // f is silent (deferred coverage); g still warns. ZC102 has nothing
+    // f is silent (deferred coverage). g still warns. ZC102 has nothing
     // to flag: f holds no re-acquire, and the deferred release fires at
     // the fn's close, after the last event.
     try expectZC101Counts(run.issues.items, 1, 0);
@@ -114791,7 +114791,7 @@ test "ZC101: nested defer block keeps the outer defer context armed (EPH-I0928)"
     var run = try runConcurrencyCheck(&diag, allocator, "zc101_nested_defer.zig", content);
     defer run.deinit(allocator);
 
-    // f is silent (the acquire sits in the outer defer block); g still
+    // f is silent (the acquire sits in the outer defer block). g still
     // warns — the control proves the flag path ran.
     try expectZC101Counts(run.issues.items, 1, 0);
     try expectZC102Counts(run.issues.items, 0, 0);
@@ -114877,7 +114877,7 @@ test "ZC101: defer block holding an if keeps the post-close acquire loud (EPH-I0
 
     // The walk-base discriminator: a non-defer if inside an open defer
     // block, then a `} defer {` continuation on the if's close line. The
-    // carried depth mixes the defer brace with the if brace (2); the
+    // carried depth mixes the defer brace with the if brace (2). The
     // whole-line walk counts the if's close first, so the outer defer
     // close later disarms and the acquire after the block fires. A
     // keyword-start walk (B86j) or the min(stmt_depth, carried)
@@ -114906,7 +114906,7 @@ test "ZC101: defer block holding an if keeps the post-close acquire loud (EPH-I0
     var run = try runConcurrencyCheck(&diag, allocator, "zc101_defer_if_cont.zig", content);
     defer run.deinit(allocator);
 
-    // mu is deferred inside the block (dropped); mutex after the close
+    // mu is deferred inside the block (dropped). Mutex after the close
     // and g's mutex2 both fire — two warnings.
     try expectZC101Counts(run.issues.items, 2, 0);
     try expectZC102Counts(run.issues.items, 0, 0);
@@ -115005,8 +115005,8 @@ test "ZC101: acquire inside a } defer { continuation body records deferred (EPH-
     var run = try runConcurrencyCheck(&diag, allocator, "zc101_acq_in_cont.zig", content);
     defer run.deinit(allocator);
 
-    // f's acquire sits inside the continuation's defer block (dropped);
-    // only g's control warns.
+    // f's acquire sits inside the continuation's defer block (dropped).
+    // Only g's control warns.
     try expectZC101Counts(run.issues.items, 1, 0);
     try expectZC102Counts(run.issues.items, 0, 0);
 }
@@ -115168,7 +115168,7 @@ test "ZC101: a release in ANOTHER file does not satisfy the acquire (EPH-I0443 d
     // The documented file-local bound: hasCrossFnRelease sees only this
     // file's fn records, so file A's acquire still warns although file B
     // releases the same receiver. A project-wide receiver index would be
-    // the fix arm; the disclosure names this bound (over-warn direction).
+    // the fix arm. The disclosure names this bound (over-warn direction).
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
     const content_a =
@@ -115193,7 +115193,7 @@ test "ZC101: a release in ANOTHER file does not satisfy the acquire (EPH-I0443 d
     var issues = try analyzeConcurrency(allocator, &graph);
     defer deinitIssues(&issues, allocator);
 
-    // A's acquire draws the warning; B holds no acquire to judge.
+    // A's acquire draws the warning. B holds no acquire to judge.
     const na = countRuleIssues(issues.items, "zc101_cross_a.zig", RULE_LOCK_NO_DEFER_UNLOCK);
     try std.testing.expectEqual(@as(usize, 1), na);
     const nb = countRuleIssues(issues.items, "zc101_cross_b.zig", RULE_LOCK_NO_DEFER_UNLOCK);
@@ -115303,7 +115303,7 @@ test "ZC101: lockShared pairs with unlockShared, not plain unlock" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // f is correctly paired (silent); g releases a shared lock with the
+    // f is correctly paired (silent). g releases a shared lock with the
     // exclusive unlock — a mis-paired release is not coverage. Distinct
     // receivers: a same-receiver unlockShared elsewhere in the file would
     // legitimately suppress g via the cross-fn rule (textual matching
@@ -115384,7 +115384,7 @@ test "ZC101: identifier-underscore binding is a tracked acquire, bare _ discard 
     // `x_ = mu.tryLock()` binds the result to a variable — an acquire,
     // not the hold-till-close discard (which is the bare `_`). Pre-fix
     // the loose matcher dropped `x_ =` and the unspaced `x_=` from
-    // tracking (both silent); post-fix both warn. The bare `_` forms
+    // tracking (both silent). Post-fix both warn. The bare `_` forms
     // (spaced and unspaced — EPH-I0446's widened acceptance) stay
     // discarded. The `work()` calls keep stmt_count above the tiny
     // acquire-wrapper exemption.
@@ -115416,7 +115416,7 @@ test "ZC101: strings and comments are neither acquires nor releases" {
     const allocator = gpa.allocator();
 
     // The comment `// defer mu.unlock();` and the string "mu.unlock()"
-    // must NOT cover the real acquire; comment/string `mu.lock()` text
+    // must NOT cover the real acquire. Comment/string `mu.lock()` text
     // must NOT fire. One real unpaired acquire => exactly one warning.
     const content =
         \\fn doWork() void {}
@@ -115445,7 +115445,7 @@ test "ZC101: comment braces never count toward the defer depth (EPH-I0925)" {
     // ruling): the `/* } */` span before the keyword must not decrement
     // the attributed depth. Pre-fix the defer reads as depth 2 and
     // covers the depth-2 acquire (silent, suppressing a genuine leak
-    // note); the true depth 3 does not cover it, so the warning fires.
+    // note). The true depth 3 does not cover it, so the warning fires.
     const content =
         \\fn work() void {}
         \\fn f(c: bool) void {
@@ -115571,7 +115571,7 @@ test "ZC101: each acquire is judged independently" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // a is defer-covered; b is never released => exactly one warning.
+    // a is defer-covered. b is never released => exactly one warning.
     const content =
         \\fn doWork() void {}
         \\fn f() void {
@@ -115661,7 +115661,7 @@ test "ZC101: failure-branch release with sibling unlock API is silent" {
     const allocator = gpa.allocator();
 
     // zls DocumentStore.tryLockConfig/unlockConfig: the in-fn unlock
-    // covers only the failure branch; the success path returns locked and
+    // covers only the failure branch. The success path returns locked and
     // the caller releases via unlockConfig. A branch-scoped release plus
     // a cross-fn release is the acquire/release idiom, not a defect.
     const content =
@@ -115688,7 +115688,7 @@ test "ZC101: lone branch-scoped release is a note (some paths leak)" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The unlock covers only the c==true path; c==false leaks. No defer,
+    // The unlock covers only the c==true path. c==false leaks. No defer,
     // no cross-fn release — the note flags the non-deferred partial pair.
     const content =
         \\fn f(c: bool) void {
@@ -115899,7 +115899,7 @@ test "ZC101: mis-paired release beside a correct pair is masked (EPH-I0033)" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // Strict pairing only governs coverage; a mis-paired release is never
+    // Strict pairing only governs coverage. A mis-paired release is never
     // reported itself. Beside a correctly-paired same-receiver release it
     // is fully masked — no ZC101 warning, and ZC103 stays silent because
     // the receiver HAS acquire evidence (EPH-I0033 item 4).
@@ -116002,7 +116002,7 @@ test "ZC101: one-line guard-block defer is branch-scoped (EPH-I0439)" {
     // only on the entered path, so an outer-depth acquire is not
     // covered — matching the multi-line `if (x) {` + `defer` form pinned
     // above. Pre-fix the release read as a plain branch release and the
-    // verdict was a note; the deferred classification warns (band B08
+    // verdict was a note. The deferred classification warns (band B08
     // F3).
     const content =
         \\fn doWork() void {}
@@ -116091,7 +116091,7 @@ test "ZC101: unspaced discard is not an acquire (EPH-I0446)" {
 }
 
 // ZC101 domain-method suppression (EPH-I1228): a lock-family call on a
-// bare receiver binds to a fn parameter; when that parameter's type is
+// bare receiver binds to a fn parameter. When that parameter's type is
 // a struct declared in the same file with NO tracked lock-primitive
 // field, the call is a domain method (`Vault.lock()` auto-lock) and
 // never fires. Chain receivers, std-typed params, and unresolved names
@@ -116582,7 +116582,7 @@ test "ZC102: tryLock guard-block defer covers the acquired paths" {
     const allocator = gpa.allocator();
 
     // On the success path the guard-block defer releases at the block's
-    // exit; on the failure path nothing was held. The later lock is free
+    // exit. On the failure path nothing was held. The later lock is free
     // on both.
     const content =
         \\fn doWork() void {}
@@ -116606,7 +116606,7 @@ test "ZC102: branch-scoped defer leaves the non-branch path held" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The defer fires at the if-block's exit on the c path only; on the
+    // The defer fires at the if-block's exit on the c path only. On the
     // !c path the lock is still held when the second lock executes.
     const content =
         \\fn f(c: bool) void {
@@ -116743,7 +116743,7 @@ test "ZC102: branch-scoped plain release leaves the non-branch path held (F4)" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The unlock runs on the c path only; on the !c path the second lock
+    // The unlock runs on the c path only. On the !c path the second lock
     // executes while still held. The release downgrades the hold to
     // path-conditional instead of clearing it.
     const content =
@@ -116807,7 +116807,7 @@ test "ZC102: tryLock as second acquire cannot block — silent" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // A tryLock while held just returns false; only a BLOCKING second
+    // A tryLock while held just returns false. Only a BLOCKING second
     // acquire deadlocks.
     const content =
         \\fn doWork() void {}
@@ -116855,7 +116855,7 @@ test "ZC102: lock() text in strings and comments is not an acquire" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // One real acquire; the string and comment carry two more lock()
+    // One real acquire. The string and comment carry two more lock()
     // texts — if they leaked into the event stream, a double-lock warning
     // would fire.
     const content =
@@ -116940,7 +116940,7 @@ test "ZC102: bare-block release reads as branch-scoped — the FP-unsafe class (
     // hold — but the walk reads it as branch-scoped (depth 2 vs the
     // acquire's depth 1), downgrades the hold to path-conditional, and
     // the second acquire warns. The one FP-unsafe accepted class
-    // (EPH-I0036 item 4); the ZC101 notes document the downgrade.
+    // (EPH-I0036 item 4). The ZC101 notes document the downgrade.
     const content =
         \\fn doWork() void {}
         \\fn f(m: *Mu) void {
@@ -116964,7 +116964,7 @@ test "ZC102: multiline else ends the arm chain — arms read as sequential (EPH-
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // The arm chain needs `} else {` on one line (the zig fmt form); an
+    // The arm chain needs `} else {` on one line (the zig fmt form). An
     // unformatted multiline else closes at a plain close, so the else-arm
     // acquire re-locks on the if-arm's path and warns (EPH-I0036 item 5).
     // The same-line control ("acquires in sibling if/else arms are
@@ -117283,8 +117283,8 @@ test "ZC103: discarded tryLock satisfies the deferred unlock" {
 // Concurrency Analysis Tests (ZC104 spawn without join/detach)
 // ============================================================================
 
-/// Assert the exact ZC104 warning count (notes are unused by the rule;
-/// every silent test has firing siblings in this section).
+/// Assert the exact ZC104 warning count (notes are unused by the rule.
+/// Every silent test has firing siblings in this section).
 fn expectZC104Counts(
     issues: []const Issue,
     warnings: usize,
@@ -117492,7 +117492,7 @@ test "ZC104: a join in ANOTHER file does not resolve the spawn (EPH-I0443 doc ar
 
     // The documented file-local bound: findSpawnResolution searches the
     // spawn's own file only, so file A's handle still warns although
-    // file B joins the same name. Over-warn, the safe direction; the
+    // file B joins the same name. Over-warn, the safe direction. The
     // disclosure names this bound.
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
@@ -117518,7 +117518,7 @@ test "ZC104: a join in ANOTHER file does not resolve the spawn (EPH-I0443 doc ar
     var issues = try analyzeConcurrency(allocator, &graph);
     defer deinitIssues(&issues, allocator);
 
-    // A's spawn draws the warning; B holds no spawn to judge.
+    // A's spawn draws the warning. B holds no spawn to judge.
     const na = countRuleIssues(issues.items, "zc104_cross_a.zig", RULE_THREAD_NO_JOIN);
     try std.testing.expectEqual(@as(usize, 1), na);
     const nb = countRuleIssues(issues.items, "zc104_cross_b.zig", RULE_THREAD_NO_JOIN);
@@ -117532,8 +117532,8 @@ test "ZC104: join text after a mid-line multiline opener is not evidence (EPH-I0
     const allocator = gpa.allocator();
 
     // `const s = \\ t.join();` — the tail is string data, so the phantom
-    // join must not resolve the handle; the warning must fire.
-    // Pre-EPH-I0671 the tail was evidence and this run was silent; the
+    // join must not resolve the handle. The warning must fire.
+    // Pre-EPH-I0671 the tail was evidence and this run was silent. The
     // blankLiteralContents mid-line opener masking is the fix. Guard:
     // pins the ZC104 band's exposure.
     const content =
@@ -117753,7 +117753,7 @@ test "ZC104: test-name/fixture/trailing braces keep block bounds (EPH-I0437)" {
     const allocator = gpa.allocator();
 
     // Guard pins: the EPH-I0883 literal-aware trackTestBlock already
-    // masks the three shapes; the ZC104 site now feeds it the
+    // masks the three shapes. The ZC104 site now feeds it the
     // comment-stripped, literal-blanked neutral line (the sibling-band
     // rule). A `{` inside the test NAME must not arm a phantom block,
     // and a `}` in a fixture string or trailing comment must not close
@@ -117859,7 +117859,7 @@ test "ZC104: comment between the Allman opener and its brace keeps the block a t
     // BEFORE resolveTestOpener). Pre-fix the mirror ran resolveTestOpener
     // on the comment first: the non-`{` line dropped the pending, the
     // `{` line never opened a test block, and the spawn fired. Post-fix
-    // the block opens as a test and the spawn stays silent; the spawn
+    // the block opens as a test and the spawn stays silent. The spawn
     // inside the non-test block is the control and still fires.
     const content =
         \\fn work() void {}
@@ -117931,7 +117931,7 @@ test "transfer predicate: expression keywords are not call evidence (EPH-I1100)"
     // keyword before the '(' as a call name and the parenthesized
     // expression counted as ownership-transfer evidence (the I0402
     // residual). A keyword-guarded operand keeps ownership with the
-    // current function; a fn-pointer parameter list never names a call.
+    // current function. A fn-pointer parameter list never names a call.
     try std.testing.expect(!isFunctionArgTransfer("if (a and (name)) return;", "name"));
     try std.testing.expect(!isFunctionArgTransfer("if (a or (name)) return;", "name"));
     try std.testing.expect(
@@ -117978,7 +117978,7 @@ test "ZC101: fn-pointer field never opens a phantom fn span (EPH-I0447)" {
     const allocator = gpa.allocator();
 
     // Guard pin: findRealFnDef requires an identifier after "fn ", so a
-    // fn-pointer field (`fn (`) never arms pending state; the sig_parens
+    // fn-pointer field (`fn (`) never arms pending state. The sig_parens
     // bound (EPH-I0447) keeps a `.{}` default on the next line from
     // opening a phantom record either way. The real fn's lock note is
     // the only issue.
@@ -118057,7 +118057,7 @@ test "ZA202: error-scan test tracking survives brace shapes (EPH-I0921, guard)" 
     var run = try runErrorsCheck(&diag, allocator, "za202_shapes.zig", content);
     defer run.deinit(allocator);
 
-    // Only the two non-test catches fire; the test-block catch is
+    // Only the two non-test catches fire. The test-block catch is
     // suppressed. A corrupted boundary would flip one of these counts.
     try std.testing.expectEqual(
         @as(usize, 2),
@@ -118098,7 +118098,7 @@ test "ZA103: CFG test tracking survives brace shapes (EPH-I0921, guard)" {
     var run = try runCFGMemoryTest(&diag, allocator, "za103_shapes.zig", content);
     defer run.deinit(allocator);
 
-    // Only the outside twin fires; the inside fn is test-context.
+    // Only the outside twin fires. The inside fn is test-context.
     try std.testing.expectEqual(
         @as(usize, 1),
         countRuleIssues(run.issues.items, "za103_shapes.zig", RULE_ALLOC_NO_ERRDEFER),
@@ -118384,7 +118384,7 @@ test "ZA110 v2: self field return without a reset fires (EPH-I0038)" {
 
     // v2: `return self.list;` copies the header while the receiver stays
     // alive in the caller — two live owners. v1 stayed silent because the
-    // take() idiom needs the visible reset to adjudicate; v2 fires when
+    // take() idiom needs the visible reset to adjudicate. v2 fires when
     // no reset of the exact path is visible before the return.
     const content =
         \\const std = @import("std");
@@ -118416,7 +118416,7 @@ test "ZA110 v2: a visible field reset silences the dual-owner return (EPH-I0038)
     // self.list = .empty; return x;`) is v2-invisible — its returned path
     // is the local x. A defer-form reset also reads (it runs after the
     // copy, which is exactly the ownership transfer). All three stay
-    // silent; the fourth fn has no reset and fires.
+    // silent. The fourth fn has no reset and fires.
     const content =
         \\const std = @import("std");
         \\const Store = struct {
@@ -118489,7 +118489,7 @@ test "ZA110: self field return with exact-path armed defer fires (EPH-I0482)" {
     // not silence the certain-dangle subset — an armed defer on the
     // EXACT returned field path frees the backing the by-value copy
     // hands out, with no take()-reset adjudication needed (EPH-I0038
-    // covers the no-defer dual-owner form; za110_selffield pins that
+    // covers the no-defer dual-owner form. za110_selffield pins that
     // silence).
     const content =
         \\const std = @import("std");
@@ -118855,7 +118855,7 @@ test "ZA110: string-literal defer text never arms a phantom defer (EPH-I0475)" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `"defer missing"` is a string; `old.deinit()` is an inline call, not
+    // `"defer missing"` is a string. `old.deinit()` is an inline call, not
     // a defer. The old raw substring search armed `old` and fired on this
     // safe code (the worst-class FP — F1).
     const content =
@@ -118881,7 +118881,7 @@ test "ZA110: pre-keyword deinit does not arm the return (EPH-I0476)" {
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // `old.deinit()` runs inline before the unrelated defer; `old` is not
+    // `old.deinit()` runs inline before the unrelated defer. `old` is not
     // armed, so the return is the safe ownership-transfer idiom.
     const content =
         \\const std = @import("std");
@@ -119152,7 +119152,7 @@ test "ZA110: RHS-rebound copy alias never fires (EPH-I1048)" {
     // `list = other;` rebinds the alias RHS after the declaration: the
     // armed defer on `list` frees `other`'s backing at scope exit, not
     // the original backing `out` still holds — firing here is an FP. The
-    // rebind sweep drops the alias; a conditional rebind also drops,
+    // rebind sweep drops the alias. A conditional rebind also drops,
     // FN-only (EPH-I0836 precedent).
     const content =
         \\const std = @import("std");
@@ -119179,7 +119179,7 @@ test "ZA110: RHS-rebound copy alias never fires (EPH-I1048)" {
 // ============================================================================
 // Family note (band-T05 F10, EPH-I0578): the per-case bodies stay
 // boilerplate on purpose. Each test keeps its fixture and its regression
-// comment self-contained; a table-drive would move both into rows and bury
+// comment self-contained. A table-drive would move both into rows and bury
 // the per-case reasoning. A new case copies the nearest sibling. This
 // choice is documented, not pending.
 
@@ -120042,7 +120042,7 @@ test "ZA209: labeled-block error path is not scanned — the note fires (EPH-I00
     // break :blk error.Fail is a real error path, but the scan does not
     // follow labeled-block returns, so the fn still fires the never-fails
     // note — the documented rule-level false positive (EPH-I0040 item 2).
-    // The verdict is locked as-is; a future scan of block-carried errors
+    // The verdict is locked as-is. A future scan of block-carried errors
     // would flip this pin.
     const content =
         \\fn work() void {}
@@ -120284,7 +120284,7 @@ test "ZA210: off by default; explicit enable turns it on" {
     };
     defer cfg.deinit(allocator);
 
-    // Default config: ZA210 silent; the new ON-by-default rules are not.
+    // Default config: ZA210 silent. The new ON-by-default rules are not.
     try std.testing.expect(cfg.isRuleDisabled(RULE_NO_CATCH_RETURN));
     try std.testing.expect(cfg.isRuleEnabled(RULE_MUST_RETURN_REF));
     try std.testing.expect(cfg.isRuleEnabled(RULE_USELESS_ERROR_RETURN));
@@ -121009,7 +121009,7 @@ test "ZA904: broken ) } continuations in invalid regions stay masked (EPH-I0974)
 
 // computeExitCode family note (band-T05 F10, EPH-I0578): the eight
 // one-liner cases stay separate on purpose. Each test names its level and
-// count shape; a table-drive would move both into rows and hide the
+// count shape. A table-drive would move both into rows and hide the
 // level-by-level reasoning in a loop. This choice is documented, not
 // pending.
 test "collectTestBlocks discovers named, unnamed, and Allman openers (EPH-I1088)" {
@@ -121771,7 +121771,7 @@ test "same source resolves last-wins" {
 
 test "duplicate list keys accumulate, duplicate scalars last-win (B13-12)" {
     // Documented semantics (printHelp and README, EPH-I1050): a repeated
-    // list key appends every value; a repeated scalar key resolves
+    // list key appends every value. A repeated scalar key resolves
     // last-wins.
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -121974,7 +121974,7 @@ test "isWithinScanRoot fails closed on a null root with one warning (EPH-I0172)"
     var g = ImportGraph.init(std.testing.allocator, &diag);
     defer g.deinit();
     // RED4-7: the pre-fix null root read as contained. Fail closed and
-    // say so once; the second miss stays silent (once-guard).
+    // say so once. The second miss stays silent (once-guard).
     try std.testing.expect(!g.isWithinScanRoot("/tmp/repo/x.zig"));
     try std.testing.expect(mem.indexOf(u8, capture.slice(), "scan root not set") != null);
     const after_first = capture.len;
@@ -122185,7 +122185,7 @@ test "findPathDirInContent masks trailing comments and string bodies (EPH-I0144)
     try std.testing.expectEqualStrings("src", findPathDirInContent(url_same_line).?);
 
     // A payload on a line-initial `\\` multiline-string body line stays
-    // skipped. The existing skip already covers this shape; this pins it.
+    // skipped. The existing skip already covers this shape. This pins it.
     const string_body =
         \\pub fn build(b: *std.Build) void {
         \\    const note =
@@ -122199,7 +122199,7 @@ test "findPathDirInContent masks trailing comments and string bodies (EPH-I0144)
     // A multiline string that opens MID-LINE swallows the rest of its
     // line as string data (EPH-I0283): the quoted path inside the tail
     // must not win over a later real match. stripLineComment cuts at the
-    // opener (EPH-I0671); this pins the exact shape the I0283 probe
+    // opener (EPH-I0671). This pins the exact shape the I0283 probe
     // used to steer.
     const mid_line_tail =
         \\pub fn build(b: *std.Build) void {
@@ -122265,7 +122265,7 @@ test "detectPathDirFromBuildZig fallback unarms the printed-error latch (EPH-I11
 
 test "autoDetectPath normalizes a ./-spelled root_source_file (EPH-I1041)" {
     // A ./-spelled root_source_file yields a ./-spelled dir from the
-    // build.zig extraction; autoDetectPath must strip it like the config
+    // build.zig extraction. autoDetectPath must strip it like the config
     // and CLI channels do (EPH-I1038), so every channel spells cfg.path
     // the same way.
     var diag = testDiagCtx();
@@ -122423,8 +122423,8 @@ test "missing target config stays silent (EPH-I0517)" {
 
 test "orphan_exclude config list replaces the built-in defaults (B13-15)" {
     // Documented semantics: a non-empty config orphan_exclude REPLACES
-    // the built-in defaults (build.zig, _test.zig, directory patterns);
-    // it does not extend them. A custom pattern alone re-enables the
+    // the built-in defaults (build.zig, _test.zig, directory patterns).
+    // It does not extend them. A custom pattern alone re-enables the
     // built-in classes' reports.
     const allocator = std.testing.allocator;
     var cfg = testConfig();
@@ -122617,7 +122617,7 @@ test "--trust-target-config honors a target config in full" {
 
 test "untrusted config entries outside the scan root are dropped (EPH-I0195)" {
     var diag = testDiagCtx();
-    // Layout: <tmp>/root is the scan root (ephor.json + inside.zig);
+    // Layout: <tmp>/root is the scan root (ephor.json + inside.zig).
     // <tmp>/outside.zig is the traversal target one level up. The config
     // carries one entry per attack shape: inside (survives), absolute
     // outside, ".." traversal outside, and nonexistent (fail closed).
@@ -122690,7 +122690,7 @@ test "trusted config keeps outside-root entries (EPH-I0195 exemption)" {
     try std.testing.expectEqualStrings("/etc/passwd", cfg.entries.items[1]);
     try std.testing.expectEqual(@as(usize, 0), diag.entries_reject_count);
     try std.testing.expectEqual(@as(usize, 0), diag.entries_reject_note_count);
-    // Trusted configs print no entries-hint note; the trust note fires.
+    // Trusted configs print no entries-hint note. The trust note fires.
     try std.testing.expectEqual(@as(usize, 0), diag.untrusted_entries_hint_note_count);
     try std.testing.expectEqual(@as(usize, 1), diag.trusted_config_note_count);
 }
@@ -123285,7 +123285,7 @@ test "makeEntriesAbsoluteTrusted absolutizes without gating (EPH-I0195)" {
     // The trusted channel (RED4-3): operator channels may point outside
     // the root for orphan completeness, so the trusted pass absolutizes
     // and gates nothing. The split moved the trusted flag out of the
-    // makeEntriesAbsolute signature (ZA506 D2); this pin holds the
+    // makeEntriesAbsolute signature (ZA506 D2). This pin holds the
     // trusted semantic directly.
     const allocator = std.testing.allocator;
     var cfg = try buildEntriesSweepConfig(allocator, "/trusted/root");
@@ -123305,7 +123305,7 @@ test "makeEntriesAbsoluteTrusted absolutizes without gating (EPH-I0195)" {
 /// fail_at-th allocation AFTER setOwnedPath (the arm must never eat the
 /// setup allocations). The diag counters reset so every iteration
 /// measures its own rejects and notes. Shared by the EPH-I0689 and
-/// EPH-I0763 sweep helpers; the repeated prologue was one ZA504 clone.
+/// EPH-I0763 sweep helpers. The repeated prologue was one ZA504 clone.
 const SweepProbe = struct {
     failing: std.testing.FailingAllocator,
     cfg: Config,
@@ -123447,7 +123447,7 @@ test "loadConfigFromTargetPath parent fallback never reads freed target_path (EP
     // frees the cfg.path buffer that target_path aliases) and then fails
     // non-fatally under an induced OOM at the entries key. Pre-fix the
     // parent fallback read std.fs.path.dirname(target_path) on the freed
-    // buffer; the poisoned bytes hold no '/', so dirname returned null and
+    // buffer. The poisoned bytes hold no '/', so dirname returned null and
     // the fallback was skipped, leaving cfg.path at "sub". The sweep
     // asserts every clean return commits back to the target dir.
     const parent = std.testing.allocator;
@@ -123510,7 +123510,7 @@ test "loadConfigFromTargetPath without a config frees saved_path once (EPH-I0689
 /// (std.testing.allocator), whose leak detector is the ownership proof.
 /// The vtable entries take the allocator as their leading `self`
 /// receiver (the Allocator interface mandates the 5-parameter entry
-/// signatures; ZA303 excludes the receiver like it does for methods).
+/// signatures. ZA303 excludes the receiver like it does for methods).
 const SingleFailureAllocator = struct {
     parent: Allocator,
     fail_at: usize = std.math.maxInt(usize),
@@ -123581,7 +123581,7 @@ test "partial target-config parse rolls back its entries before the parent fallb
     var diag = testDiagCtx();
     diag.cli_diagnostics_enabled = false;
     // Layout: <tmp>/root carries the target config whose parse the sweep
-    // fails AFTER appending entries; <tmp> carries a valid parent config.
+    // fails AFTER appending entries. <tmp> carries a valid parent config.
     // The parent load absolutizes whatever survives against the PARENT
     // base and, with --trust-target-config, lets it through ungated — a
     // partial target parse would steer the analysis from leaked entries.
@@ -123646,7 +123646,7 @@ test "partial target-config parse rolls back its entries before the parent fallb
                 is_parent_state or is_target_state or cfg.entries.items.len == 0,
             );
         } else |err| {
-            // A mid-load OOM may leave partial content; the parent
+            // A mid-load OOM may leave partial content. The parent
             // allocator's leak detector is the ownership proof.
             try std.testing.expectEqual(error.OutOfMemory, err);
         }
@@ -123737,7 +123737,7 @@ test "config path_dir outside the config directory is rejected (RED4-1)" {
     // directory is a tmpDir, not the cwd. Pre-fix the test assumed the cwd
     // was the repo root (".." outside, "src" inside), so a test run from
     // any other cwd failed spuriously. parseConfigJsonSource is the
-    // production path; parseConfigJson just pins dir=".".
+    // production path. parseConfigJson just pins dir=".".
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir_path = try tmpDirPath(allocator, &tmp);
@@ -123788,7 +123788,7 @@ test "config path_dir outside the config directory is rejected (RED4-1)" {
 }
 
 test "config path_dir aliases code, src, root all route to the same key (B13-10)" {
-    // The aliases are documented in printHelp and README; each one must
+    // The aliases are documented in printHelp and README. Each one must
     // behave exactly like "path_dir" (containment-checked, stored).
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -123906,7 +123906,7 @@ test "target-dir config parse never aliases cfg.path (UAF regression)" {
     // A two-alias config ({"path_dir": "sub", "src": "sub"}) freed that
     // buffer in key 1 (setOwnedPath) and read it in key 2 — a use-after-free.
     // Under the test allocator the freed bytes are poisoned, so key 2 warned
-    // spuriously; the discriminating signal is zero rejections here.
+    // spuriously. The discriminating signal is zero rejections here.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -124700,7 +124700,7 @@ test "unknown-version warning routes through the sink and off the JSON stream (E
     compat.markUnknownVersionFallback();
     reportUnknownVersionWarning(&diag);
     // Supported builds carry an empty warning text (the fallback never
-    // engages there), so the capture is empty; the sink route itself is
+    // engages there), so the capture is empty. The sink route itself is
     // pinned by the flag consumption and the JSON gate on every build.
     if (compat.unknown_version_warning_text.len > 0) {
         try std.testing.expect(std.mem.indexOf(u8, capture.slice(), "WARNING: ephor") != null);
@@ -124732,7 +124732,7 @@ test "export notice sanitizes the path and stays off the JSON stream (EPH-I0542)
     printExportNotice(&diag, std.testing.allocator, 7, "ev\x1b[2Jil.md");
     try std.testing.expect(std.mem.indexOf(u8, capture.slice(), "\x1b") == null);
     try std.testing.expect(std.mem.indexOf(u8, capture.slice(), "exported 7 issues to") != null);
-    // JSON mode: the machine stream stays pure; the export file is the
+    // JSON mode: the machine stream stays pure. The export file is the
     // result signal.
     capture = .{};
     diag.diag_sink = capture.sink();
@@ -125164,7 +125164,7 @@ test "CLI zero threshold value is a hard usage error (EPH-I0522)" {
     var diag = testDiagCtx();
     // Regression: --max-lines=0 parsed, CLI-locked the field, and flagged
     // every function, while the error text promised "a positive integer".
-    // Only the max clamp existed; nothing rejected zero.
+    // Only the max clamp existed. Nothing rejected zero.
     diag.cli_diagnostics_enabled = false;
     const allocator = std.testing.allocator;
     const zero_flags = [_][]const u8{
@@ -125959,7 +125959,7 @@ test "upgrade release verification fails closed on a failed tarball download (EP
 
 /// A test pubkey whose content is only shape-checked by the fake
 /// minisign (EPH-I0287). No real key material: the fake script matches
-/// the base64 line; the real minisign never runs in a unit test.
+/// the base64 line. The real minisign never runs in a unit test.
 const test_release_pubkey =
     "untrusted comment: minisign public key TESTKEY\n" ++
     "RWTESTKEYBASE64PLACEHOLDER\n";
@@ -125995,7 +125995,7 @@ const FakeVerifyMode = enum {
 };
 
 /// Installed fake tool paths for one EPH-I0287 verification test. The
-/// struct owns the allocated paths and the pre-install tool-path values;
+/// struct owns the allocated paths and the pre-install tool-path values.
 /// deinit restores the globals and frees, so one test cannot leak a
 /// tmp-dir path into the next test's spawns.
 const VerifyFakes = struct {
@@ -126093,7 +126093,7 @@ fn fakeCurlBody(allocator: Allocator, marker: []const u8, base: []const u8) ![]c
 /// the real tool, checks the files the real minisign requires, and
 /// prints the verdict to the stream the real tool uses, then exits 0
 /// or 1 per the scenario. The scenario mode replaces the former fail
-/// flag (ZA506 D7, EPH-I1081); only .bad_signature selects the failure
+/// flag (ZA506 D7, EPH-I1081). Only .bad_signature selects the failure
 /// arm.
 fn fakeMinisignBody(allocator: Allocator, marker: []const u8, mode: FakeVerifyMode) ![]const u8 {
     return std.fmt.allocPrint(
@@ -126404,7 +126404,7 @@ test "runInstallFetch repairs a 0x0 fingerprint and refetches (EPH-I0718)" {
     const url_z = try allocator.dupeZ(u8, "https://example.invalid/ephor.tar.gz");
     defer allocator.free(url_z);
 
-    // The first fetch fails with the fingerprint hint; the repair
+    // The first fetch fails with the fingerprint hint. The repair
     // patches the zon and the second fetch succeeds.
     try runInstallFetch(&diag, allocator, tmp.dir, .{
         .url_z = url_z,
@@ -126453,7 +126453,7 @@ test "setOptionalPath OOM keeps the old value freeable exactly once" {
 // Test-reference idiom: pull the AST tier's tests into `zig build test`.
 // ast_tier is only referenced from inside function bodies, which does not
 // force analysis of its test declarations. The suite-join shim calls
-// nothing by design (EPH-I0601); the block is an include, not a test.
+// nothing by design (EPH-I0601). The block is an include, not a test.
 // ephor:ignore ZT106
 test {
     _ = ast_tier;
@@ -126982,7 +126982,7 @@ test "suppression: JSON mode carries the accounting without the bare note (EPH-I
     try std.testing.expectEqual(@as(usize, 0), counts.warnings);
     try std.testing.expect(h.stats.total() > 0);
     // The suppressed object (or summary member) carries the accounting in
-    // JSON mode; the bare note must not reach the machine stream. The
+    // JSON mode. The bare note must not reach the machine stream. The
     // object renders through the capture writer (EPH-I1130): the green-run
     // log stays clean (EPH-I0288), and the pin asserts the exact bytes.
     var capture_buf: [384]u8 = undefined;
@@ -127843,7 +127843,7 @@ test "Fs.readFileAllocNoFollow reads regular files and refuses symlinks (EPH-I02
 
 test "scan reads refuse a symlink swapped in for a recorded file (EPH-I0210)" {
     // The discriminating RED: an entry that IS a symlink. The pre-fix
-    // read followed the link and analyzed its target; the no-follow read
+    // read followed the link and analyzed its target. The no-follow read
     // skips it, so the graph stays empty.
     var diag = testDiagCtx();
     diag.cli_diagnostics_enabled = false;
@@ -127966,7 +127966,7 @@ test "analyzeFileAstTier emits one ZA503 for a parse-broken file (EPH-I0742)" {
         .issues = &issues,
         .parse_issues = &parse_issues,
     }, "broken.zig", "fn broken( {");
-    // The rule list stays empty (the tier skipped the broken file); the
+    // The rule list stays empty (the tier skipped the broken file). The
     // parse sink carries one warning naming the host parser's verdict.
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
     try std.testing.expectEqual(@as(usize, 1), parse_issues.items.len);
@@ -128456,7 +128456,7 @@ test "ZA504 same-file and cross-file duplication both report" {
         \\const epsilon = 5;
         \\const zeta = 6;
     ;
-    // one.zig carries two separated copies (same-file pair); two.zig and
+    // one.zig carries two separated copies (same-file pair). two.zig and
     // three.zig carry one each (cross-file pair).
     const doubled = six ++ "\nconst separator = true;\n" ++ six;
     var run = try runCloneTest(&diag, allocator, &.{
@@ -129510,7 +129510,7 @@ test "ZA406 skips a var field inside a container body" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     // `var count` is a static field (always mutable), never a binding
-    // judgement; `total` is a real binding and must fire.
+    // judgement. `total` is a real binding and must fire.
     var run = try runFnIfaceTest(&diag, allocator,
         \\fn stateless() u8 {
         \\    const Registry = struct {
@@ -129849,7 +129849,7 @@ test "ZA507 stays silent on a paren-wrapped statement (the discarded-value FN)" 
     // The accepted FN direction (EPH-I1248): a paren-wrapped if-statement
     // whose value is discarded reads as expression position too. The
     // suggested transform would drop a discarded value, so the silence is
-    // safe; the unwrapped statement form keeps firing (the controls).
+    // safe. The unwrapped statement form keeps firing (the controls).
     var run = try runFnIfaceTest(&diag, allocator,
         \\fn pick(s: u8, n: u8) u8 {
         \\    (if (n > 0) return 1 else 2);
@@ -130063,7 +130063,7 @@ test "ZA404 fires when a private fn has no reference anywhere" {
     }};
     var run = try runUnusedFnTest(&diag, allocator, &files);
     defer run.deinit(allocator);
-    // The pub fn is not a candidate; exactly one warning names the dead
+    // The pub fn is not a candidate. Exactly one warning names the dead
     // helper and points at its declaration line.
     try std.testing.expectEqual(
         @as(usize, 1),

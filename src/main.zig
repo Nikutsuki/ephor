@@ -24107,15 +24107,12 @@ fn trackTestDeferBlock(neutral: []const u8, state: *TestFileScanState) void {
     }
 }
 
-/// Mark ZT101 candidates referenced as values on this line. On the block's
-/// start line only text after the opening `{` counts — the test's own name
-/// precedes the brace and is not a body reference.
-fn markLineLieReferences(
-    code: []const u8,
-    starts_test: bool,
-    state: *TestFileScanState,
-) void {
-    if (!starts_test) return markLieReferences(code, &state.lie);
+/// Mark ZT101 candidates referenced as values on the test block's START
+/// line (ZA506 D6, EPH-I1081): only text after the opening `{` counts —
+/// the test's own name precedes the brace and is not a body reference.
+/// Non-start lines call markLieReferences directly; the caller holds the
+/// starts_test state and dispatches.
+fn markTestStartLieReferences(code: []const u8, state: *TestFileScanState) void {
     const blanked = blankLiteralContents(code, &state.blank_buf);
     const open = mem.indexOfScalar(u8, blanked, '{') orelse code.len;
     markLieReferences(code[open..], &state.lie);
@@ -24280,7 +24277,11 @@ fn scanTestLine(
     state.counters.try_calls += countTryCalls(code);
     try checkLineTrivialAsserts(sink, line_num, code);
     try collectLineCalls(code, &state.body_calls, sink.allocator);
-    markLineLieReferences(code, opener.starts_test, state);
+    if (opener.starts_test) {
+        markTestStartLieReferences(code, state);
+    } else {
+        markLieReferences(code, &state.lie);
+    }
     if (!state.in_test) {
         try reportTestBlock(ctx, state);
         try reportLieTest(ctx, state);
@@ -24498,23 +24499,36 @@ const UntestedFnEvidence = struct {
         }
     }
 
-    /// Record one non-test identifier run. Leading segments of a dotted run
-    /// are always value references (namespace/object); the last segment is
-    /// a value reference only when the run is not a call target.
-    fn addNonTestRun(
+    /// Record the head segments of one non-test dotted run as value
+    /// references: leading segments are always value references
+    /// (namespace/object). A dot-less run carries no head — its sole
+    /// segment is the run's last, recorded by addAliasedLastSegment in
+    /// value position (ZA506 D6: the former is_call flag splits into the
+    /// head/last pair).
+    fn addAliasedHeadSegments(
         self: *UntestedFnEvidence,
         allocator: Allocator,
         run: []const u8,
-        is_call: bool,
     ) !void {
-        const dot = mem.lastIndexOfScalar(u8, run, '.');
-        const last = if (dot) |d| run[d + 1 ..] else run;
-        if (!is_call and last.len > 0) try self.aliased.put(allocator, last, {});
-        const head = if (dot) |d| run[0..d] else return;
-        var it = mem.splitScalar(u8, head, '.');
+        const dot = mem.lastIndexOfScalar(u8, run, '.') orelse return;
+        var it = mem.splitScalar(u8, run[0..dot], '.');
         while (it.next()) |seg| {
             if (seg.len > 0) try self.aliased.put(allocator, seg, {});
         }
+    }
+
+    /// Record the last segment of one non-test run as a value reference.
+    /// Value position only: a call target's last segment names the
+    /// callee, not a value reference, so the caller skips this method
+    /// for calls.
+    fn addAliasedLastSegment(
+        self: *UntestedFnEvidence,
+        allocator: Allocator,
+        run: []const u8,
+    ) !void {
+        const dot = mem.lastIndexOfScalar(u8, run, '.');
+        const last = if (dot) |d| run[d + 1 ..] else run;
+        if (last.len > 0) try self.aliased.put(allocator, last, {});
     }
 };
 
@@ -24612,12 +24626,15 @@ fn extractPubFnCandidate(t: []const u8, window: []const u8) ?[]const u8 {
 /// open a well-formed quoted identifier (EPH-I0031). A quoted field name
 /// in a struct literal (`.{ .@"cwd" = ... }`) still aliases — the plain
 /// `.field` form is excluded by the run tokenizer (EPH-I0909); the quoted
-/// literal shape is rare enough to leave conservative.
+/// literal shape is rare enough to leave conservative. The per-run flags
+/// bundle (ZA506 D6) carries the test-context state the same way
+/// collectIdentRunEvidence receives it; only `in_test_context` selects
+/// the destination set here.
 fn collectQuotedIdentEvidence(
     ctx: *const UntestedFnScanCtx,
     code: []const u8,
     i: usize,
-    in_test_context: bool,
+    flags: UntestedRunFlags,
 ) !?usize {
     if (i + 1 >= code.len or code[i + 1] != '"') return null;
     const after_quote = skipQuotedIdent(code, i + 2);
@@ -24625,7 +24642,7 @@ fn collectQuotedIdentEvidence(
     const quoted = code[i + 2 .. after_quote - 1];
     const paren = skipWhitespace(code, after_quote);
     const is_call = paren < code.len and code[paren] == '(';
-    if (in_test_context) {
+    if (flags.in_test_context) {
         try ctx.evidence.tested.put(ctx.allocator, quoted, {});
     } else if (!is_call) {
         try ctx.evidence.aliased.put(ctx.allocator, quoted, {});
@@ -24767,8 +24784,10 @@ fn collectUntestedFnIdents(
     while (i < code.len) {
         if (skipLiteral(code, &i)) continue;
         if (code[i] == '@') {
-            const next = try collectQuotedIdentEvidence(ctx, code, i, in_test_context) orelse
-                (i + 1);
+            const next = try collectQuotedIdentEvidence(ctx, code, i, .{
+                .in_test_context = in_test_context,
+                .prev_tail = prev_tail,
+            }) orelse (i + 1);
             i = next;
             continue;
         }
@@ -24813,7 +24832,10 @@ fn collectIdentRunEvidence(
     if (flags.in_test_context) {
         try ctx.evidence.addTestedRun(ctx.allocator, code[start..end]);
     } else if (!is_bare_field) {
-        try ctx.evidence.addNonTestRun(ctx.allocator, code[start..end], is_call);
+        try ctx.evidence.addAliasedHeadSegments(ctx.allocator, code[start..end]);
+        if (!is_call) {
+            try ctx.evidence.addAliasedLastSegment(ctx.allocator, code[start..end]);
+        }
     }
     i.* = end;
 }
@@ -27075,6 +27097,13 @@ fn classifySpawnBinding(prefix_raw: []const u8) ?[]const u8 {
     return name;
 }
 
+/// The left boundary a join/detach token search admits (ZA506 D6,
+/// EPH-I1081): `strict` rejects a preceding `.` — it names a different
+/// handle, so `event.t.join(` never satisfies a local `t` — and `dotted`
+/// admits it (the last-segment fallback's `receiver.field.join(` shape,
+/// EPH-I0904).
+const JoinBoundary = enum { strict, dotted };
+
 /// True when a needle hit at `pos` satisfies the search boundary
 /// (ZC104): a clean word start, or a preceding `.` when `allow_dotted`
 /// (the last-segment fallback's `receiver.field.join(` admission,
@@ -27092,11 +27121,12 @@ fn joinBoundaryOk(code: []const u8, pos: usize, allow_dotted: bool) bool {
 /// (messenger: `worker.thread.?.join()` on a `?std.Thread` field).
 /// `it.join(` and `event.t.join(` name a DIFFERENT handle and must not
 /// satisfy the search — a preceding `.` fails the boundary. The
-/// last-segment fallback (EPH-I0904) sets `allow_dotted`, admitting
-/// `receiver.field.join(`: a field-bound handle (`witness.thread`) may
-/// be joined through ANY receiver that carries the same field name
-/// (`self.thread.join()`), the skytale witness-deinit shape.
-fn hasJoinOrDetach(code: []const u8, name: []const u8, buf: []u8, allow_dotted: bool) bool {
+/// last-segment fallback (EPH-I0904) passes `boundary = .dotted`,
+/// admitting `receiver.field.join(`: a field-bound handle
+/// (`witness.thread`) may be joined through ANY receiver that carries
+/// the same field name (`self.thread.join()`), the skytale
+/// witness-deinit shape.
+fn hasJoinOrDetach(code: []const u8, name: []const u8, buf: []u8, boundary: JoinBoundary) bool {
     const suffixes = [_][]const u8{ ".join(", ".detach(", ".?.join(", ".?.detach(" };
     for (suffixes) |suffix| {
         if (name.len + suffix.len > buf.len) continue;
@@ -27106,7 +27136,7 @@ fn hasJoinOrDetach(code: []const u8, name: []const u8, buf: []u8, allow_dotted: 
         var from: usize = 0;
         while (mem.indexOfPos(u8, code, from, needle)) |pos| {
             from = pos + 1;
-            if (joinBoundaryOk(code, pos, allow_dotted)) return true;
+            if (joinBoundaryOk(code, pos, boundary == .dotted)) return true;
         }
     }
     return false;
@@ -27132,8 +27162,8 @@ fn hasReturnOf(code: []const u8, name: []const u8) bool {
 /// a return to the caller, a store into a struct field, or a hand-off as
 /// a call argument (container puts included). String literals and
 /// comments are never evidence — a "t.join()" in a format string joins
-/// nothing. `allow_dotted` admits a preceding `.` on the join search
-/// (the last-segment fallback's `receiver.field.join(` admission,
+/// nothing. The `.dotted` boundary admits a preceding `.` on the join
+/// search (the last-segment fallback's `receiver.field.join(` admission,
 /// EPH-I0904); the exact-name search keeps the strict boundary so
 /// `event.t.join(` never satisfies a local `t`.
 /// File-local bound (EPH-I0443): the search covers the spawn's own file
@@ -27144,14 +27174,14 @@ fn hasReturnOf(code: []const u8, name: []const u8) bool {
 fn findSpawnResolution(
     ctx: SpawnScanCtx,
     name: []const u8,
-    allow_dotted: bool,
+    boundary: JoinBoundary,
 ) bool {
     for (ctx.lines) |line| {
         const t = mem.trim(u8, line, " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         const code_end = findCommentStart(line) orelse line.len;
         const blanked = blankLiteralContents(line[0..code_end], ctx.blank_buf);
-        if (hasJoinOrDetach(blanked, name, ctx.needle_buf, allow_dotted)) return true;
+        if (hasJoinOrDetach(blanked, name, ctx.needle_buf, boundary)) return true;
         if (hasReturnOf(blanked, name)) return true;
         if (structFieldStorePos(blanked, name) != null) return true;
         if (isFunctionArgTransfer(blanked, name)) return true;
@@ -27215,13 +27245,13 @@ fn checkLineSpawns(
 /// ever suppresses — the safe direction — and skips short segments
 /// whose genericity would mask real leaks.
 fn spawnResolved(ctx: SpawnScanCtx, name: []const u8) bool {
-    if (findSpawnResolution(ctx, name, false)) {
+    if (findSpawnResolution(ctx, name, .strict)) {
         return true;
     }
     const dot = mem.lastIndexOfScalar(u8, name, '.') orelse return false;
     const segment = name[dot + 1 ..];
     if (segment.len < 3) return false;
-    return findSpawnResolution(ctx, segment, true);
+    return findSpawnResolution(ctx, segment, .dotted);
 }
 
 /// Analyze a single file for spawned-thread handle leaks (ZC104). Test
@@ -27558,14 +27588,15 @@ fn recordRun(
     try gop.value_ptr.append(alloc, line_num);
 }
 
-/// Extract variable name for unused detection (filters out _ prefix and short names)
-fn extractUnusedDeclName(t: []const u8, is_const: bool) ?[]const u8 {
-    const prefix_len: usize = if (is_const) 6 else 4;
-    if (t.len <= prefix_len) return null;
-    var end = prefix_len;
+/// Extract the declared name after its keyword prefix (ZA506 D6,
+/// EPH-I1081): the former is_const flag chose between two literal
+/// prefixes — the caller passes the prefix it already matched.
+fn extractUnusedDeclName(t: []const u8, prefix: []const u8) ?[]const u8 {
+    if (t.len <= prefix.len) return null;
+    var end = prefix.len;
     while (end < t.len and isIdent(t[end])) end += 1;
-    if (end <= prefix_len) return null;
-    const name = t[prefix_len..end];
+    if (end <= prefix.len) return null;
+    const name = t[prefix.len..end];
     // Skip names that are intentionally unused (_ prefix) or too short to be meaningful
     if (name.len < 2 or name[0] == '_') return null;
     return name;
@@ -27614,7 +27645,8 @@ fn checkUnusedDecl(ctx: UnusedFileCtx, t: []const u8, line_num: usize) !void {
     const is_const = mem.startsWith(u8, t, "const ");
     const is_var = mem.startsWith(u8, t, "var ");
     if (!is_const and !is_var) return;
-    const name = extractUnusedDeclName(t, is_const) orelse return;
+    const prefix: []const u8 = if (is_const) "const " else "var ";
+    const name = extractUnusedDeclName(t, prefix) orelse return;
     if (ctx.index.countUses(name, line_num) > 0) return;
     const rule = if (is_const) RULE_UNUSED_CONST else RULE_UNUSED_VAR;
     const kind = if (is_const) "const" else "var";
@@ -29207,9 +29239,11 @@ fn opensCognitiveScope(t: []const u8) bool {
         hasToken(t, "catch");
 }
 
-/// Calculate limit with type factory multiplier
-fn calcLimit(base: usize, is_factory: bool, mult: usize) usize {
-    return if (is_factory) base * mult else base;
+/// Calculate limit with type factory multiplier (ZA506 D6, EPH-I1081):
+/// the former is_factory flag derives from the complexity state, its
+/// only source.
+fn calcLimit(base: usize, state: *const ComplexityState, mult: usize) usize {
+    return if (state.is_type_factory) base * mult else base;
 }
 
 /// Calculate cognitive complexity limit with data dispatch (8x), flat-chain
@@ -29465,9 +29499,9 @@ const ComplexityCheck = struct {
 /// ZA301 line limit: a data table relaxes to data rows (EPH-I0277), else
 /// the type-factory 3x applies. Hoisted so buildComplexityChecks stays
 /// within its line budget.
-fn lineLimit(th: Thresholds, state: *const ComplexityState, is_tf: bool) usize {
+fn lineLimit(th: Thresholds, state: *const ComplexityState) usize {
     if (state.is_data_table) return th.max_function_lines * data_table_multiplier;
-    return calcLimit(th.max_function_lines, is_tf, 3);
+    return calcLimit(th.max_function_lines, state, 3);
 }
 
 /// Build complexity checks array for a function
@@ -29475,19 +29509,18 @@ fn buildComplexityChecks(
     state: *const ComplexityState,
     th: Thresholds,
 ) [6]ComplexityCheck {
-    const is_tf = state.is_type_factory;
     return .{
         .{
             .rule = RULE_FUNC_TOO_LONG,
             .actual = state.fn_lines,
-            .limit = lineLimit(th, state, is_tf),
+            .limit = lineLimit(th, state),
             .metric = "lines",
             .help = "split into smaller functions",
         },
         .{
             .rule = RULE_NESTING_TOO_DEEP,
             .actual = state.max_nest,
-            .limit = calcLimit(th.max_nesting_depth, is_tf, 2),
+            .limit = calcLimit(th.max_nesting_depth, state, 2),
             .metric = "nesting depth",
             .help = "use early returns",
         },

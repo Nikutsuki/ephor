@@ -37415,10 +37415,9 @@ fn indexSubOf(inside: []const u8) ?IdxSub {
 }
 
 /// One subtraction-bearing bracket span (EPH-I1232): the bracket's
-/// open/close positions and its inside slice.
+/// open position and its inside slice.
 const SubBracket = struct {
     open: usize,
-    close: usize,
     inside: []const u8,
 };
 
@@ -37436,7 +37435,7 @@ fn nextSubBracket(t: []const u8, i: *usize) ?SubBracket {
             i.* = end;
             continue;
         }
-        const b = SubBracket{ .open = i.*, .close = end, .inside = inside };
+        const b = SubBracket{ .open = i.*, .inside = inside };
         i.* = end;
         return b;
     }

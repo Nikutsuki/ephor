@@ -11,7 +11,7 @@
 | **orphans** | Files not imported from entry points |
 | **memory** | Allocation without `defer free/destroy`, missing `errdefer`, use-after-free, double-free |
 | **errors** | Silent `catch {}`, `catch unreachable`, `orelse unreachable`, `catch undefined`, `exit()` bypassing defers, `@panic()`, discarded errors |
-| **unused** | Unused imports, const, and var declarations |
+| **unused** | Unused imports, params, and declarations |
 | **complexity** | Long functions, deep nesting, too many params/branches |
 | **style** (check-only) | Lines too long, files too large, naming conventions |
 | **fmt-check** | Files that need `zig fmt` |
@@ -501,6 +501,13 @@ ZA305 and ZA306 are off by default. To enable them, remove `"ZA305"` and `"ZA306
 | **ZA401** | warning | ON | Unused import |
 | **ZA402** | warning | ON | Unused const declaration |
 | **ZA403** | warning | ON | Unused var declaration |
+| **ZA405** | warning | ON | Unused parameter: a private fn declares a parameter its body never references. Exempt: pub fns (interface and vtable impls are public by construction), the `self` receiver, `_`-prefixed names (the deliberate-unused convention), generic fns (`comptime`/`anytype` params and the bare `T: type` spelling), and C-ABI decls (EPH-I1080) |
+
+**ZA405 and interface signatures:** the carve-out for pub fns is
+structural: a fn that implements an interface or fills a vtable slot must
+be callable from the impl site, so its signature is fixed by the
+contract, not by the body. A private fn keeps its parameter list by
+choice, so an unused parameter there is speculative generality.
 
 ### Structure (ZA5xx)
 
@@ -510,6 +517,19 @@ ZA305 and ZA306 are off by default. To enable them, remove `"ZA305"` and `"ZA306
 | **ZA502** | warning | ON | File reaches or exceeds the 10 MiB source read cap and is skipped from analysis (split the file into smaller units) |
 | **ZA503** | warning | ON | File does not parse (the AST tier's host-parser check rejected it): one finding per file, located at the first parse error, naming the error. The line tier still scans the file, but `zig build` cannot compile it (EPH-I0742) |
 | **ZA504** | warning | ON | Duplicated block: a run of 6 or more normalized lines that repeats within one file or across files (copy-paste duplication, EPH-I1076) |
+| **ZA505** | warning | ON | Passthrough wrapper: the fn body is a single call statement (`return`/`try` prefixes allowed) whose argument list is exactly the parameter list in order (a shallow module that adds interface without hiding implementation, EPH-I1077) |
+| **ZA506** | warning | OFF | Boolean flag parameter: a `bool`-typed parameter whose name appears inside an `if`/`switch` condition in the body — the flag selects between two code paths (two functions in one signature, EPH-I1081). Off until clean (planner run 52): ephor's own src carries 41 genuine flag-param sites; the D-wave burn zeroes them and the flip commit turns the rule ON (the B133/EPH-I1232 precedent) |
+
+**ZA505 and interface implementations:** a forward to a method of the
+same name (`fn write(...) { return self.backend.write(...); }`) is an
+interface impl by structure — the wrapper IS the job — and never fires.
+A forward to a different name (a rename-only lifecycle wrapper like
+`deinit` → `destroy`) is the finding class. Generic fns and C-ABI decls
+are exempt: their signatures are compile-time or external contracts.
+**ZA506 and flag conventions:** the rule fires on the selector shape
+(the flag sits in a condition), never on a flag that is only passed
+along or returned. `?bool` counts as a flag type; the receiver and
+generic fns are exempt.
 
 **ZA504 and normalization:** the normalized form of a line strips `//`
 comments (quote-aware), trims surrounding whitespace, and drops blank
@@ -820,7 +840,7 @@ Commands:
   orphans     Files not imported from entry points
   memory      Stdlib allocation without defer patterns (21 patterns: 18 method + 3 qualified)
   errors      Error handling patterns (ZA201-ZA210)
-  unused      Unused imports/const/var declarations
+  unused      Unused imports/params/declarations
   complexity  Function complexity metrics
   fmt-check   Files needing zig fmt
   stats       Project statistics

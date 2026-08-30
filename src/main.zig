@@ -620,9 +620,12 @@ const RULE_COGNITIVE = types.RULE_COGNITIVE;
 const RULE_UNUSED_IMPORT = types.RULE_UNUSED_IMPORT;
 const RULE_UNUSED_CONST = types.RULE_UNUSED_CONST;
 const RULE_UNUSED_VAR = types.RULE_UNUSED_VAR;
+const RULE_UNUSED_PARAM = types.RULE_UNUSED_PARAM;
 const RULE_ORPHAN_FILE = types.RULE_ORPHAN_FILE;
 const RULE_FILE_TOO_LARGE = types.RULE_FILE_TOO_LARGE;
 const RULE_DUPLICATED_BLOCK = types.RULE_DUPLICATED_BLOCK;
+const RULE_PASSTHROUGH_WRAPPER = types.RULE_PASSTHROUGH_WRAPPER;
+const RULE_BOOL_FLAG_PARAM = types.RULE_BOOL_FLAG_PARAM;
 const RULE_NEEDS_FORMAT = types.RULE_NEEDS_FORMAT;
 const RULE_DEFINITE_ASSIGNMENT = types.RULE_DEFINITE_ASSIGNMENT;
 const RULE_LINE_TOO_LONG = types.RULE_LINE_TOO_LONG;
@@ -3199,12 +3202,6 @@ fn buildCFG(
     return cfg;
 }
 
-/// Check if a pattern at position is inside a string literal
-/// Uses centralized implementation from types.zig that handles escape sequences correctly
-fn isPatternInString(t: []const u8, pattern_pos: usize) bool {
-    return types.isInsideString(t, pattern_pos);
-}
-
 /// Check if line is a comment or multiline string (should be skipped in analysis)
 fn isCommentOrMultilineString(t: []const u8) bool {
     return mem.startsWith(u8, t, "//") or mem.startsWith(u8, t, "\\\\");
@@ -3227,7 +3224,7 @@ fn hasRealFreePattern(t: []const u8) bool {
         // Only check .free( and .destroy( — not .deinit( (bulk cleanup, not per-alloc)
         if (mem.eql(u8, pat, ".deinit(")) continue;
         const pos = mem.indexOf(u8, t, pat) orelse continue;
-        if (!isPatternInString(t, pos)) return true;
+        if (!types.isInsideString(t, pos)) return true;
     }
     return false;
 }
@@ -3236,7 +3233,7 @@ fn hasRealFreePattern(t: []const u8) bool {
 fn hasRealCleanupPattern(t: []const u8) bool {
     for (compat.getCleanupPatterns()) |pat| {
         const pos = mem.indexOf(u8, t, pat) orelse continue;
-        if (!isPatternInString(t, pos)) return true;
+        if (!types.isInsideString(t, pos)) return true;
     }
     return false;
 }
@@ -4057,7 +4054,7 @@ fn opensConditionalBody(check_line: []const u8) bool {
         const after_else = mem.trimStart(u8, rest["else".len..], " \t");
         return !mem.startsWith(u8, after_else, "=>");
     }
-    return isConditionalStart(rest) or isLoopStart(rest);
+    return isConditionalStart(rest) or isLoopOpenerLine(rest);
 }
 
 /// Column just past the declaration `=` on a `var`/`const` line, or null
@@ -4098,14 +4095,6 @@ fn isRealUseOfVar(check_line: []const u8, name: []const u8) bool {
     if (isFillPattern(check_line, name)) return false;
     if (isAssignmentTarget(check_line, name, pos)) return false;
     return true;
-}
-
-/// True when the line opens a loop body, including labeled (`label:
-/// while ...`) and inline (`inline while ...`) openers. The delegation
-/// keeps the guard collection (opensConditionalBody) and the fill scan
-/// in step with the loop-boundary family (EPH-I0950).
-fn isLoopStart(check_line: []const u8) bool {
-    return isLoopOpenerLine(check_line);
 }
 
 /// What a candidate fill line means for fill-before-use: a direct
@@ -4200,11 +4189,11 @@ const FillScan = struct {
         nesting_depth: usize,
         fill_col: ?usize,
     ) ?bool {
-        if (nesting_depth != 0 and !isLoopStart(check_line)) return null;
+        if (nesting_depth != 0 and !isLoopOpenerLine(check_line)) return null;
         const verdict = classifyFillLine(check_line, name);
         if (verdict == .not_fill) return null;
         if (verdict == .self_read_use) return if (nesting_depth == 0) false else null;
-        if (isLoopStart(check_line)) {
+        if (isLoopOpenerLine(check_line)) {
             if (loopBodyFillAt(check_line, name, fill_col)) return null;
             return true;
         }
@@ -4308,7 +4297,7 @@ const ColumnSpan = struct {
 };
 
 fn loopContinuationSpan(t: []const u8) ?ColumnSpan {
-    if (!isLoopStart(t)) return null;
+    if (!isLoopOpenerLine(t)) return null;
     const cond_close = loopCondCloseCol(t) orelse return null;
     const body_start = loopBodyStartCol(t) orelse return null;
     if (body_start <= cond_close + 1) return null;
@@ -17669,7 +17658,7 @@ fn trackNoFreeTypeInit(
     var matched = false;
     for (ctx.no_free_inits) |init_pat| {
         const pos = mem.indexOf(u8, t, init_pat) orelse continue;
-        if (isPatternInString(t, pos)) continue;
+        if (types.isInsideString(t, pos)) continue;
         matched = true;
         break;
     }
@@ -26997,10 +26986,6 @@ fn checkTryLockDefer(sink: *const ConcurrencyIssueSink, rec: *const FnLockRecord
 /// separates those from a real 0.16 `mu.unlock(io)`, so the note class
 /// was unsound. The warning path needs no change: a conditional try
 /// acquire is in-file evidence by construction.
-fn evaluateUnlockWithoutLock(sink: *const ConcurrencyIssueSink, rec: *const FnLockRecord) !void {
-    try checkTryLockDefer(sink, rec);
-}
-
 /// Evaluate every fn record once the file scan is complete — cross-fn
 /// evidence needs the whole file first. ZC101 judges each acquire's
 /// coverage; ZC102 walks the ordered lock flow for re-acquires; ZC103
@@ -27014,7 +26999,7 @@ fn evaluateLockRecords(
             try evaluateAcquire(sink, records, rec_idx, acq);
         }
         try evaluateDoubleLock(sink, rec);
-        try evaluateUnlockWithoutLock(sink, rec);
+        try checkTryLockDefer(sink, rec);
     }
 }
 
@@ -27426,6 +27411,11 @@ fn isIndexableName(name: []const u8) bool {
 }
 
 /// Key order for the occurrence-line binary search in IdentUseIndex.
+/// This is an instantiation adapter, not a forwarding wrapper: std.math.order
+/// is generic, so a fn-typed parameter needs this monomorphized binding.
+/// The ZA505 finding is the generic-adapter limitation (EPH-I1238); D8
+/// replaces this suppression with the value-reference carve-out.
+// ephor:ignore ZA505
 fn orderLine(key: usize, item: usize) std.math.Order {
     return std.math.order(key, item);
 }
@@ -28050,6 +28040,779 @@ fn hasCompatComponent(path: []const u8) bool {
         if (mem.eql(u8, comp, "compat")) return true;
     }
     return false;
+}
+// ============================================================================
+// Function Interface Analysis (ZA405, ZA505, ZA506) — EPH-I1077/I1080/I1081
+// ============================================================================
+// Serves REL-ZERO-1 (closing EPH-I1077, EPH-I1080, and EPH-I1081),
+// REL-GATE-2 (the dogfood ratchet holds at 0 on ephor's own src), and
+// REL-AB-5 (the corpus A/B stays byte-identical-or-explained).
+//
+// One per-file pass collects every fn's signature text and body span, then
+// runs three interface-shape detectors when the span closes:
+//   ZA405 unused parameter — a private fn declares a parameter its body
+//     never references. Pub fns stay exempt (the fixed-signature carve-out:
+//     interface and vtable impls are public by construction), and so do
+//     `_`-prefixed names, the self receiver, generic fns, and C-ABI decls.
+//   ZA505 passthrough wrapper — the body is a single call statement (a
+//     `return` or `try` prefix allowed) whose argument list is exactly the
+//     parameter list in order (the shallow-module class). A same-name
+//     forward is an interface impl by structure and never fires (the
+//     carve-out).
+//   ZA506 boolean flag parameter — a bool-typed parameter whose name
+//     appears inside an if/switch condition in the body (the
+//     two-functions-in-one-signature class).
+// The carve-outs are comptime-decided predicates, never runtime config
+// (the C-wave carve-out pattern).
+
+/// One open fn during the pass: the signature byte range plus the body
+/// span, and the def facts the findings anchor on.
+const FnIfaceOpen = struct {
+    name: []const u8,
+    /// Offset just past the fn name, relative to the signature start.
+    name_rel_end: usize,
+    /// Byte offset of the `fn` keyword (the signature start).
+    sig_start: usize,
+    /// Byte offset of the body's opening `{`; set when the body opens.
+    body_brace: usize,
+    /// Byte offset of the body's closing `}`; set when the span closes.
+    body_end: usize,
+    is_pub: bool,
+    /// extern/export/callconv prefix seen before the `fn` keyword.
+    is_c_abi: bool,
+    start_line: usize,
+    col: usize,
+};
+
+/// One parsed parameter: the name, the type text, and the self flag.
+const FnParam = struct {
+    name: []const u8,
+    type_text: []const u8,
+    is_self: bool,
+};
+
+/// Result of parsing one signature's parameter list. The output array caps
+/// at 64 slots: a fn past the cap truncates, and the caller skips it (a
+/// 65-parameter fn is pathological beyond the documented bound).
+const ParamParse = struct {
+    count: usize,
+    truncated: bool,
+};
+
+/// Per-file scan state for the fn-interface pass. Pending holds a def whose
+/// signature has not reached its body brace; active holds the open fn whose
+/// body is being walked. The depth invariant: while active, `depth` counts
+/// the braces still open inside the body and is never 0 (the body's own
+/// brace is the innermost open).
+const FnIfaceScan = struct {
+    pending: ?FnIfaceOpen = null,
+    active: ?FnIfaceOpen = null,
+    depth: usize = 0,
+    sig_parens: usize = 0,
+};
+
+/// One source line in the forms the pass needs: the literal-blanked code
+/// (brace tracking), the trimmed line (def detection), and the byte
+/// offsets that map trimmed positions back to content.
+const FnIfaceLine = struct {
+    blanked: []const u8,
+    t: []const u8,
+    lead: usize,
+    line_offset: usize,
+    line_num: usize,
+    content: []const u8,
+};
+
+/// Sink pair for the pass: ZA405 findings join the unused list, ZA505 and
+/// ZA506 join the structure list (the ZA504 pattern).
+const FnIfaceSinks = struct {
+    unused: *std.ArrayListUnmanaged(Issue),
+    structure: *std.ArrayListUnmanaged(Issue),
+};
+
+/// Per-file context: the sinks plus the allocator and the file path.
+const FnIfaceCtx = struct {
+    allocator: Allocator,
+    path: []const u8,
+    sinks: FnIfaceSinks,
+};
+
+/// One ready finding for reportFnIfaceIssue: the rule, the owned message,
+/// and the help line.
+const FnIfaceFinding = struct {
+    rule: []const u8,
+    message: []const u8,
+    help: []const u8,
+};
+
+/// A comma-split region: the segments (borrowed slices) and the truncation
+/// flag (more segments than the cap).
+const SegmentList = struct {
+    segs: [64][]const u8 = undefined,
+    count: usize = 0,
+    truncated: bool = false,
+};
+
+/// Carried grouping depth for one comma-split walk: parens, braces, and
+/// brackets each track so a comma inside any group is not a boundary.
+const ListDepth = struct {
+    paren: usize = 0,
+    brace: usize = 0,
+    bracket: usize = 0,
+
+    /// Apply one code byte to the depth trackers.
+    fn update(self: *ListDepth, ch: u8) void {
+        if (ch == '(') self.paren += 1;
+        if (ch == ')' and self.paren > 0) self.paren -= 1;
+        if (ch == '{') self.brace += 1;
+        if (ch == '}' and self.brace > 0) self.brace -= 1;
+        if (ch == '[') self.bracket += 1;
+        if (ch == ']' and self.bracket > 0) self.bracket -= 1;
+    }
+
+    /// True when no group is open: a comma here is a segment boundary.
+    fn atTop(self: ListDepth) bool {
+        return self.paren == 0 and self.brace == 0 and self.bracket == 0;
+    }
+};
+
+/// Split `text[from..to]` by top-level commas, literals masked. Shared by
+/// the param-list and the argument-list splitters (the ZA504 dedupe,
+/// EPH-I1077).
+fn splitTopLevelCommas(text: []const u8, from: usize, to: usize) SegmentList {
+    var list: SegmentList = .{};
+    var depth = ListDepth{};
+    var lit = types.LiteralState.forLine(text) orelse return list;
+    var start: usize = from;
+    var i: usize = from;
+    while (i < to) : (i += 1) {
+        if (text[i] == '\n') lit.in_comment = false;
+        const pos = lit.updateForChar(text, i) orelse continue;
+        const ch = text[pos];
+        depth.update(ch);
+        if (ch == ',' and depth.atTop()) {
+            list = appendSegment(list, text[start..pos]);
+            start = pos + 1;
+        }
+    }
+    return appendSegment(list, text[start..to]);
+}
+
+/// Append one segment, setting the truncation flag past the cap.
+fn appendSegment(list: SegmentList, seg: []const u8) SegmentList {
+    var result = list;
+    if (result.count >= result.segs.len) {
+        result.truncated = true;
+        return result;
+    }
+    result.segs[result.count] = seg;
+    result.count += 1;
+    return result;
+}
+
+/// One file's fn-interface pass: walk the lines, track fn spans, and run
+/// the three detectors when each span closes. C import files skip (the
+/// analyzeUnused precedent — their extern decls carry no bodies).
+fn visitFnInterfaceFile(c: FnIfaceCtx, content: []const u8) !void {
+    if (isCImportFile(c.path, content)) return;
+    var scan = FnIfaceScan{};
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var lines = mem.splitScalar(u8, content, '\n');
+    var line_num: usize = 0;
+    var offset: usize = 0;
+    while (lines.next()) |raw| : (line_num += 1) {
+        defer offset += raw.len + 1;
+        const t = mem.trim(u8, raw, " \t\r");
+        if (t.len == 0 or isCommentOrMultilineString(t)) continue;
+        const code_end = findCommentStart(raw) orelse raw.len;
+        const code = raw[0..code_end];
+        try processFnIfaceLine(c, &scan, .{
+            .blanked = blankLiteralContents(code, &blank_buf),
+            .t = t,
+            .lead = skipLeadingWhitespace(raw),
+            .line_offset = offset,
+            .line_num = line_num + 1,
+            .content = content,
+        });
+    }
+}
+
+/// One line of the per-file pass, dispatched by span mode.
+fn processFnIfaceLine(
+    c: FnIfaceCtx,
+    scan: *FnIfaceScan,
+    line: FnIfaceLine,
+) !void {
+    if (scan.active) |active| return walkActiveFnLine(c, scan, line, active);
+    if (scan.pending) |pending| return walkPendingFnLine(c, scan, line, pending);
+    try detectFnIfaceDef(c, scan, line);
+}
+
+/// Result of walking one blanked body line: the depth after the line and
+/// the close offset when the span ended on it.
+const BodyWalk = struct {
+    depth: usize,
+    close: ?usize,
+};
+
+/// Advance the body brace walk over one blanked line from `from`: braces
+/// update the depth, and the offset of the closing `}` (depth reaching 0)
+/// is recorded. Shared by walkActiveFnLine and openFnIfaceSpan (the ZA504
+/// dedupe, EPH-I1077).
+fn walkBodyBraces(blanked: []const u8, from: usize, depth: usize) BodyWalk {
+    var d = depth;
+    var i: usize = from;
+    while (i < blanked.len) : (i += 1) {
+        const b = blanked[i];
+        if (b == '{') {
+            d += 1;
+            continue;
+        }
+        if (b != '}' or d == 0) continue;
+        d -= 1;
+        if (d == 0) return .{ .depth = 0, .close = i };
+    }
+    return .{ .depth = d, .close = null };
+}
+
+/// One body line of an open fn: count braces and close the span when the
+/// depth returns to 0 (the body's own brace was the innermost open).
+fn walkActiveFnLine(
+    c: FnIfaceCtx,
+    scan: *FnIfaceScan,
+    line: FnIfaceLine,
+    active: FnIfaceOpen,
+) !void {
+    const walk = walkBodyBraces(line.blanked, 0, scan.depth);
+    scan.depth = walk.depth;
+    if (walk.close) |close_rel| {
+        var open = active;
+        open.body_end = line.line_offset + close_rel;
+        try analyzeClosedFn(c, line.content, open);
+        scan.active = null;
+        scan.depth = 0;
+    }
+}
+
+/// One signature-continuation line of a pending def: the body opens at the
+/// first brace outside the signature's parens that is not a signature
+/// container, and a `;` first drops the pending decl.
+fn walkPendingFnLine(
+    c: FnIfaceCtx,
+    scan: *FnIfaceScan,
+    line: FnIfaceLine,
+    pending: FnIfaceOpen,
+) !void {
+    var sig_parens = scan.sig_parens;
+    const open_rel = fnIfaceBodyBraceAt(line.blanked, 0, &sig_parens);
+    scan.sig_parens = sig_parens;
+    if (open_rel) |brace_rel| {
+        scan.pending = null;
+        var open = pending;
+        open.body_brace = line.line_offset + brace_rel;
+        try openFnIfaceSpan(c, scan, line, open);
+    } else if (endsWithCodeSemicolon(line.t)) {
+        // A wrapped bodiless decl (`fn f(\n a: u8\n);`) drops here.
+        scan.pending = null;
+    }
+}
+
+/// A non-span line: a new def line opens a pending signature. The
+/// word-boundary check mirrors extractFnDef: `has_fn and ...` invents no
+/// fn, and a bodiless extern decl never opens.
+fn detectFnIfaceDef(c: FnIfaceCtx, scan: *FnIfaceScan, line: FnIfaceLine) !void {
+    const pos = findRealFnDef(line.t) orelse return;
+    if (pos > 0 and types.isIdent(line.t[pos - 1])) return;
+    if (isBodilessFnDecl(line.t)) return;
+    const fn_name = pubFnNameAt(line.t, pos + 3) orelse return;
+    var sig_parens: usize = 0;
+    const open_rel = fnIfaceBodyBraceAt(line.blanked, line.lead + pos, &sig_parens);
+    const pending = makeFnIfacePending(line, pos, fn_name);
+    if (open_rel) |brace_rel| {
+        var open = pending;
+        open.body_brace = line.line_offset + brace_rel;
+        try openFnIfaceSpan(c, scan, line, open);
+        return;
+    }
+    scan.sig_parens = sig_parens;
+    scan.pending = pending;
+}
+
+/// Scan one blanked line from `from` for the body `{`: the first brace at
+/// paren depth 0 that is not a signature container (`error{...}`,
+/// `struct{...}` return types). The paren depth is written back on every
+/// path. Distinct from the 2-arg sigBodyBraceAt (the ZA209 shim scanner):
+/// this one adds the container exclusion and the start offset.
+fn fnIfaceBodyBraceAt(blanked: []const u8, from: usize, sig_parens: *usize) ?usize {
+    var i: usize = from;
+    while (i < blanked.len) : (i += 1) {
+        const ch = blanked[i];
+        if (ch == '(') sig_parens.* += 1;
+        if (ch == ')' and sig_parens.* > 0) sig_parens.* -= 1;
+        if (ch == '{' and sig_parens.* == 0 and !sigContainerOpen(blanked, i)) return i;
+    }
+    return null;
+}
+
+/// Open a span at a body brace already recorded on `open`, then walk the
+/// rest of the line for a same-line close (a one-line body). The depth
+/// starts at 1: the body's own brace is the innermost open, so its closing
+/// `}` returns the depth to 0 exactly.
+fn openFnIfaceSpan(
+    c: FnIfaceCtx,
+    scan: *FnIfaceScan,
+    line: FnIfaceLine,
+    open: FnIfaceOpen,
+) !void {
+    const from = open.body_brace - line.line_offset + 1;
+    const walk = walkBodyBraces(line.blanked, from, 1);
+    if (walk.close) |close_rel| {
+        var closed = open;
+        closed.body_end = line.line_offset + close_rel;
+        try analyzeClosedFn(c, line.content, closed);
+        return;
+    }
+    scan.active = open;
+    scan.depth = walk.depth;
+}
+
+/// Build the pending def from a keyword line: the identity, the offsets,
+/// and the pub/C-ABI facts.
+fn makeFnIfacePending(line: FnIfaceLine, pos: usize, fn_name: PubFnName) FnIfaceOpen {
+    const pre = mem.trimStart(u8, line.t[0..pos], " \t");
+    const is_c_abi = mem.startsWith(u8, pre, "extern ") or
+        mem.startsWith(u8, pre, "pub extern ") or
+        mem.startsWith(u8, pre, "export ") or
+        mem.startsWith(u8, pre, "pub export ") or
+        hasAbiPinnedCallconv(pre);
+    var is_pub = false;
+    for (pub_fn_prefixes) |prefix| {
+        if (mem.startsWith(u8, line.t, prefix)) is_pub = true;
+    }
+    return .{
+        .name = fn_name.name,
+        .name_rel_end = fn_name.end - pos,
+        .sig_start = line.line_offset + line.lead + pos,
+        .body_brace = 0,
+        .body_end = 0,
+        .is_pub = is_pub,
+        .is_c_abi = is_c_abi,
+        .start_line = line.line_num,
+        .col = line.lead + pos + 1,
+    };
+}
+
+/// Run the three detectors on a closed span. Generic params, type
+/// factories, and C-ABI-pinned signatures never fire: their shape is
+/// compile-time machinery or an external contract.
+fn analyzeClosedFn(c: FnIfaceCtx, content: []const u8, open: FnIfaceOpen) !void {
+    const sig = content[open.sig_start..open.body_brace];
+    if (fnReturnsType(sig, open.name_rel_end) or
+        hasGenericParams(sig, open.name_rel_end) or
+        isTypeFactory(sig) or
+        open.is_c_abi or
+        sigSuffixIsCAbi(sig)) return;
+    var params: [64]FnParam = undefined;
+    const parsed = parseFnParams(sig, &params);
+    if (parsed.truncated) return;
+    const ps = params[0..parsed.count];
+    // A bare `T: type` param is implicitly comptime (hasGenericParams only
+    // sees the comptime/anytype spellings) — compile-time machinery.
+    if (hasTypeParam(ps)) return;
+    const body = content[open.body_brace + 1 .. open.body_end];
+    try checkPassthroughWrapper(c, open, body, ps);
+    try checkBoolFlagParams(c, open, body, ps);
+    if (!open.is_pub) try checkUnusedParams(c, open, body, ps);
+}
+
+/// True when a parameter's type is literally `type`: the implicitly-
+/// comptime bare spelling (`T: type`) that the comptime/anytype keyword
+/// probe misses.
+fn hasTypeParam(params: []const FnParam) bool {
+    for (params) |p| {
+        if (mem.eql(u8, p.type_text, "type") or mem.eql(u8, p.type_text, "?type")) return true;
+    }
+    return false;
+}
+
+/// Parse the parameter list of `sig` (a fn signature slice that may span
+/// lines) into `out`. The list splits on top-level commas, with depth
+/// tracked and literals masked.
+fn parseFnParams(sig: []const u8, out: []FnParam) ParamParse {
+    const close = paramListEnd(sig) orelse return .{ .count = 0, .truncated = false };
+    const open = mem.indexOf(u8, sig, "(") orelse return .{ .count = 0, .truncated = false };
+    const segs = splitTopLevelCommas(sig, open + 1, close);
+    var result: ParamParse = .{ .count = 0, .truncated = segs.truncated };
+    var i: usize = 0;
+    while (i < segs.count and i < out.len) : (i += 1) {
+        out[i] = parseFnParam(segs.segs[i]);
+    }
+    result.count = i;
+    return result;
+}
+
+/// One parameter: the name (the identifier before the colon, after any
+/// comptime/noalias qualifier), the type text, and the self flag. The
+/// name and type borrow the original text — never a stack copy — so the
+/// returned slices outlive this fn. Doc comments (`///`) and plain
+/// comments inside a wrapped signature are prose: the name lives on the
+/// last code-bearing line of the name region (the sig corpus class).
+fn parseFnParam(text: []const u8) FnParam {
+    const colon = firstCodeColon(text) orelse
+        return .{ .name = "", .type_text = "", .is_self = false };
+    var name = lastCodeLine(text[0..colon]);
+    if (mem.startsWith(u8, name, "comptime ") or mem.startsWith(u8, name, "noalias ")) {
+        const space = mem.indexOfScalar(u8, name, ' ') orelse
+            return .{ .name = "", .type_text = "", .is_self = false };
+        name = mem.trimStart(u8, name[space + 1 ..], " \t\r\n");
+    }
+    const type_text = mem.trim(u8, text[colon + 1 ..], " \t\r\n");
+    return .{ .name = name, .type_text = type_text, .is_self = mem.eql(u8, name, "self") };
+}
+
+/// The first code-position colon at grouping depth 0 in one parameter's
+/// text: the name separator. Comment and string positions are masked, and
+/// a colon inside a group (a sentinel `[N:0]`, a struct field) is type
+/// material, not the separator.
+fn firstCodeColon(text: []const u8) ?usize {
+    var lit = types.LiteralState.forLine(text) orelse return null;
+    var depth = ListDepth{};
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '\n') lit.in_comment = false;
+        const pos = lit.updateForChar(text, i) orelse continue;
+        depth.update(text[pos]);
+        if (text[pos] == ':' and depth.atTop()) return pos;
+    }
+    return null;
+}
+
+/// The last non-empty code line of `text` (comments cut at their start),
+/// trimmed: the name material when doc comments precede it. Empty text
+/// yields an empty slice.
+fn lastCodeLine(text: []const u8) []const u8 {
+    var result: []const u8 = "";
+    var lines = mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const code_end = findCommentStart(line) orelse line.len;
+        const code = mem.trim(u8, line[0..code_end], " \t\r\n");
+        if (code.len > 0) result = code;
+    }
+    return result;
+}
+
+/// ZA505: the body is exactly one call statement — `return <callee>(<args>);`,
+/// `try <callee>(<args>);`, or a bare `<callee>(<args>);` (the rename-wrapper
+/// shape) — where <args> is the fn's parameter list in order. The self
+/// receiver may be passed as the first argument (delegation to a free fn).
+/// A same-name forward is an interface impl by structure and never fires
+/// (the record's carve-out).
+fn checkPassthroughWrapper(
+    c: FnIfaceCtx,
+    open: FnIfaceOpen,
+    body: []const u8,
+    params: []const FnParam,
+) !void {
+    const callee = forwardCallee(body) orelse return;
+    if (mem.eql(u8, calleeBaseName(callee.callee), open.name)) return;
+    if (!argsForwardParams(callee.args, params)) return;
+    const msg = try std.fmt.allocPrint(
+        c.allocator,
+        "function '{s}' only forwards its arguments to '{s}'",
+        .{ open.name, callee.callee },
+    );
+    errdefer c.allocator.free(msg);
+    try reportFnIfaceIssue(c, open, .{
+        .rule = RULE_PASSTHROUGH_WRAPPER,
+        .message = msg,
+        .help = "inline the callee or delete the wrapper",
+    });
+}
+
+/// The callee expression and argument region of a passthrough-shaped body,
+/// else null. The body must be one statement: `return EXPR;`, `try EXPR;`,
+/// or a bare `EXPR;` call statement (the rename-wrapper shape), where EXPR
+/// is one direct call — an identifier or dotted chain whose argument list
+/// ends the expression. A callee with parens of its own (a call result, a
+/// builtin) is not a plain forward.
+const ForwardCall = struct {
+    callee: []const u8,
+    args: []const u8,
+};
+
+/// Extract the forward shape of a body (checkPassthroughWrapper's probe).
+fn forwardCallee(body: []const u8) ?ForwardCall {
+    var rest = mem.trim(u8, body, " \t\r\n");
+    if (mem.startsWith(u8, rest, "return ")) {
+        rest = mem.trimStart(u8, rest["return ".len..], " \t\r\n");
+    }
+    if (mem.startsWith(u8, rest, "try ")) {
+        rest = mem.trimStart(u8, rest["try ".len..], " \t\r\n");
+    }
+    if (rest.len < 2 or rest[rest.len - 1] != ';') return null;
+    const expr = mem.trim(u8, rest[0 .. rest.len - 1], " \t\r\n");
+    const open_paren = mem.indexOfScalar(u8, expr, '(') orelse return null;
+    const callee = mem.trim(u8, expr[0..open_paren], " \t\r\n");
+    // A leading dot is the anonymous-struct literal shorthand (`.init(x)`
+    // means `.{ .init = x }`), not a call; a leading @ is a builtin.
+    if (callee.len == 0 or callee[0] == '@' or callee[0] == '.') return null;
+    for (callee) |ch| {
+        if (ch != '.' and !types.isIdent(ch)) return null;
+    }
+    var depth: usize = 0;
+    const close_paren = matchingParenCol(expr, open_paren, &depth) orelse return null;
+    if (mem.trim(u8, expr[close_paren + 1 ..], " \t\r\n").len != 0) return null;
+    return .{ .callee = callee, .args = expr[open_paren + 1 .. close_paren] };
+}
+
+/// The last dotted segment of a callee expression (`self.backend.write` →
+/// "write"), used by the same-name interface carve-out.
+fn calleeBaseName(callee: []const u8) []const u8 {
+    const dot = mem.lastIndexOfScalar(u8, callee, '.') orelse return callee;
+    return callee[dot + 1 ..];
+}
+
+/// True when the argument region forwards the parameter list in order:
+/// each argument is exactly the corresponding non-self parameter name,
+/// with an optional leading `self` argument. An empty argument region
+/// (zero arguments) matches a parameter list of only self, the rename
+/// wrapper shape (`fn deinit(self) { self.back.release(); }`).
+fn argsForwardParams(args: []const u8, params: []const FnParam) bool {
+    const arg_list = splitTopLevelCommas(args, 0, args.len);
+    if (arg_list.truncated) return false;
+    const names = collectForwardNames(params) orelse return false;
+    var arg_count = arg_list.count;
+    if (arg_count == 1 and mem.trim(u8, arg_list.segs[0], " \t\r\n").len == 0)
+        arg_count = 0;
+    const arg_idx = leadingSelfIndex(arg_list, arg_count, names);
+    if (arg_count - arg_idx != names.count) return false;
+    return forwardArgsMatch(arg_list, arg_idx, names);
+}
+
+/// The expected argument sequence: the non-self parameter names.
+const ForwardNames = struct {
+    names: [64][]const u8 = undefined,
+    count: usize = 0,
+    has_self: bool = false,
+};
+
+/// Collect the non-self parameter names; null when a malformed name or
+/// the cap would break the comparison.
+fn collectForwardNames(params: []const FnParam) ?ForwardNames {
+    var result: ForwardNames = .{};
+    for (params) |p| {
+        if (p.is_self) {
+            result.has_self = true;
+            continue;
+        }
+        if (p.name.len == 0 or result.count >= result.names.len) return null;
+        result.names[result.count] = p.name;
+        result.count += 1;
+    }
+    return result;
+}
+
+/// The first argument index to compare: 1 when the fn has a self receiver
+/// and the first argument is exactly `self` (delegation to a free fn).
+/// A fn with no self receiver can never name-match a `self` argument, so
+/// the receiver state alone decides the skip.
+fn leadingSelfIndex(list: SegmentList, arg_count: usize, names: ForwardNames) usize {
+    if (arg_count == 0 or !names.has_self) return 0;
+    const first = mem.trim(u8, list.segs[0], " \t\r\n");
+    return if (mem.eql(u8, first, "self")) 1 else 0;
+}
+
+/// Compare each expected name to its argument segment in order.
+fn forwardArgsMatch(list: SegmentList, arg_idx: usize, names: ForwardNames) bool {
+    for (names.names[0..names.count], 0..) |name, k| {
+        const seg = mem.trim(u8, list.segs[arg_idx + k], " \t\r\n");
+        if (!mem.eql(u8, seg, name)) return false;
+    }
+    return true;
+}
+
+/// ZA506: a `bool`-typed parameter whose name appears inside an if/switch
+/// condition in the body — the flag selects between code paths. The
+/// condition scan is line-scoped: a wrapped condition stays silent, the
+/// conservative direction.
+fn checkBoolFlagParams(
+    c: FnIfaceCtx,
+    open: FnIfaceOpen,
+    body: []const u8,
+    params: []const FnParam,
+) !void {
+    for (params) |p| {
+        if (p.is_self or p.name.len == 0) continue;
+        if (!mem.eql(u8, p.type_text, "bool") and !mem.eql(u8, p.type_text, "?bool")) continue;
+        if (!boolParamInCondition(body, p.name)) continue;
+        const msg = try std.fmt.allocPrint(
+            c.allocator,
+            "boolean parameter '{s}' of function '{s}' selects between code paths",
+            .{ p.name, open.name },
+        );
+        errdefer c.allocator.free(msg);
+        try reportFnIfaceIssue(c, open, .{
+            .rule = RULE_BOOL_FLAG_PARAM,
+            .message = msg,
+            .help = "split the function in two, or replace the flag with an enum",
+        });
+    }
+}
+
+/// True when `name` appears as a whole identifier inside an if/switch
+/// condition on some body line (string and comment positions masked).
+fn boolParamInCondition(body: []const u8, name: []const u8) bool {
+    var lines = mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        const code_end = findCommentStart(line) orelse line.len;
+        const code = line[0..code_end];
+        if (paramInKwCondition(code, "if", name)) return true;
+        if (paramInKwCondition(code, "switch", name)) return true;
+    }
+    return false;
+}
+
+/// True when `name` sits inside the condition of one `kw` occurrence on
+/// the line (real-token-masked keyword search).
+fn paramInKwCondition(code: []const u8, kw: []const u8, name: []const u8) bool {
+    var s: usize = 0;
+    while (realTokenPosFrom(code, kw, s)) |pos| {
+        s = pos + kw.len;
+        const cond = conditionParens(code, pos + kw.len) orelse continue;
+        if (containsIdentWord(cond, name)) return true;
+    }
+    return false;
+}
+
+/// The parenthesized condition directly after a control keyword, else
+/// null. `after_kw` points just past the keyword.
+fn conditionParens(code: []const u8, after_kw: usize) ?[]const u8 {
+    var j = after_kw;
+    while (j < code.len and (code[j] == ' ' or code[j] == '\t')) j += 1;
+    if (j >= code.len or code[j] != '(') return null;
+    var depth: usize = 0;
+    const close = matchingParenCol(code, j, &depth) orelse return null;
+    return code[j + 1 .. close];
+}
+
+/// ZA405: a private fn's parameter that the body never references. The
+/// receiver is exempt (an unused receiver is the interface-signature
+/// shape) and so is a `_`-prefixed name (the deliberate-unused
+/// convention). The search body is comment-stripped and literal-blanked,
+/// so a name that appears only in a string or comment stays unused.
+fn checkUnusedParams(
+    c: FnIfaceCtx,
+    open: FnIfaceOpen,
+    body: []const u8,
+    params: []const FnParam,
+) !void {
+    var masked: std.ArrayListUnmanaged(u8) = .empty;
+    defer masked.deinit(c.allocator);
+    try appendMaskedBody(c.allocator, &masked, body);
+    for (params) |p| {
+        if (p.is_self or p.name.len == 0) continue;
+        if (p.name[0] == '_') continue;
+        if (containsIdentWord(masked.items, p.name)) continue;
+        const msg = try std.fmt.allocPrint(
+            c.allocator,
+            "function '{s}' never uses parameter '{s}'",
+            .{ open.name, p.name },
+        );
+        errdefer c.allocator.free(msg);
+        try reportFnIfaceIssue(c, open, .{
+            .rule = RULE_UNUSED_PARAM,
+            .message = msg,
+            .help = "remove the unused parameter or reference it",
+        });
+    }
+}
+
+/// Append the comment-stripped, literal-blanked body to `masked` (the
+/// ZA405 search surface).
+fn appendMaskedBody(
+    allocator: Allocator,
+    masked: *std.ArrayListUnmanaged(u8),
+    body: []const u8,
+) !void {
+    var blank_buf: [16 * 1024]u8 = undefined;
+    var lines = mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        const code_end = findCommentStart(line) orelse line.len;
+        try masked.appendSlice(allocator, blankLiteralContents(line[0..code_end], &blank_buf));
+        try masked.append(allocator, '\n');
+    }
+}
+
+/// Report one fn-interface finding into the rule's sink. ZA405 findings
+/// join the unused list; ZA505/ZA506 join the structure list.
+fn reportFnIfaceIssue(c: FnIfaceCtx, open: FnIfaceOpen, f: FnIfaceFinding) !void {
+    const is_unused = mem.eql(u8, f.rule, RULE_UNUSED_PARAM);
+    const target = if (is_unused) c.sinks.unused else c.sinks.structure;
+    try target.append(c.allocator, .{
+        .file = c.path,
+        .line = open.start_line,
+        .col = open.col,
+        .severity = .warning,
+        .rule = f.rule,
+        .message = f.message,
+        .message_owned = true,
+        .help = f.help,
+    });
+}
+
+/// Run the fn-interface pass over the graph and merge its findings: ZA405
+/// into the unused sink, ZA505/ZA506 into the structure sink. Each moved
+/// list transfers atomically, so an OOM mid-merge leaves every owned
+/// message with exactly one errdefer (the EPH-I0690 pattern).
+fn mergeFnIfaceIssues(
+    allocator: Allocator,
+    g: *ImportGraph,
+    sinks: FnIfaceSinks,
+) !void {
+    var unused: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&unused, allocator);
+    var structure: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&structure, allocator);
+    var iter = g.files.iterator();
+    while (iter.next()) |entry| {
+        const fa = entry.value_ptr.*;
+        try visitFnInterfaceFile(.{
+            .allocator = allocator,
+            .path = fa.path,
+            .sinks = .{ .unused = &unused, .structure = &structure },
+        }, fa.content);
+    }
+    try moveIssues(allocator, sinks.unused, &unused);
+    try moveIssues(allocator, sinks.structure, &structure);
+    unused.deinit(allocator);
+    structure.deinit(allocator);
+}
+
+/// The `unused` command covers the whole ZA4xx band: merge the pass's
+/// unused-parameter findings and drop the structure half.
+fn mergeFnIfaceUnusedParams(
+    allocator: Allocator,
+    g: *ImportGraph,
+    into: *std.ArrayListUnmanaged(Issue),
+) !void {
+    var dropped: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&dropped, allocator);
+    try mergeFnIfaceIssues(allocator, g, .{ .unused = into, .structure = &dropped });
+}
+
+/// Build the check pipeline's unused list: analyzeUnused's findings plus
+/// the fn-interface pass's ZA405 findings. The ZA505/ZA506 half merges
+/// into `structure` directly. Returns the owned list (the caller's
+/// errdefer covers it after the transfer).
+fn mergeUnusedAndIface(
+    allocator: Allocator,
+    g: *ImportGraph,
+    structure: *std.ArrayListUnmanaged(Issue),
+) !std.ArrayListUnmanaged(Issue) {
+    var unused_issues = try analyzeUnused(allocator, g);
+    errdefer deinitIssues(&unused_issues, allocator);
+    try mergeFnIfaceIssues(allocator, g, .{ .unused = &unused_issues, .structure = structure });
+    return unused_issues;
 }
 
 // ============================================================================
@@ -32810,7 +33573,7 @@ fn patternColInCode(
     comment_start: *?usize,
 ) ?usize {
     const col = mem.indexOf(u8, t, pattern) orelse return null;
-    if (isPatternInString(t, col)) return null;
+    if (types.isInsideString(t, col)) return null;
     if (comment_start.* == null) comment_start.* = findCommentStart(t);
     if (comment_start.*) |cs| {
         if (col >= cs) return null;
@@ -33084,7 +33847,7 @@ fn isCallWithIdentAt(code: []const u8, from: usize) bool {
 fn hasTestingCall(code: []const u8) bool {
     var start: usize = 0;
     while (mem.indexOfPos(u8, code, start, "testing.")) |pos| {
-        if (!isPatternInString(code, pos) and
+        if (!types.isInsideString(code, pos) and
             isStdTestingReceiver(code, pos) and
             isCallWithIdentAt(code, pos + "testing.".len)) return true;
         start = pos + 1;
@@ -33117,7 +33880,7 @@ fn isStdTestingReceiver(code: []const u8, pos: usize) bool {
 fn hasOrelseOperator(code: []const u8) bool {
     var start: usize = 0;
     while (mem.indexOfPos(u8, code, start, " orelse ")) |pos| {
-        if (!isPatternInString(code, pos)) return true;
+        if (!types.isInsideString(code, pos)) return true;
         start = pos + 1;
     }
     return false;
@@ -37816,7 +38579,7 @@ fn isChainArmHeader(t: []const u8) bool {
 /// antecedent never covers.
 fn allmanWalkJudgesLine(t: []const u8) bool {
     if (isChainArmHeader(t)) return true;
-    return (isConditionalStart(t) or isLoopStart(t)) and
+    return (isConditionalStart(t) or isLoopOpenerLine(t)) and
         !lineCarriesOpenBrace(t) and !lineCarriesStatementEnd(t);
 }
 
@@ -42327,6 +43090,11 @@ const Config = struct {
         if (mem.eql(u8, rule, RULE_FILE_TOO_LONG)) return true;
         if (mem.eql(u8, rule, RULE_CYCLOMATIC)) return true;
         if (mem.eql(u8, rule, RULE_COGNITIVE)) return true;
+        // ZA506 ships OFF-until-clean (planner run 52, the B133/EPH-I1232
+        // precedent): ephor's own src carries 41 genuine flag-param sites.
+        // The D-wave burn zeroes them and the flip commit removes this
+        // line, closing EPH-I1081 (EPH-I1232's pattern for I1076).
+        if (mem.eql(u8, rule, RULE_BOOL_FLAG_PARAM)) return true;
         for (off_by_default_prefixes) |prefix| {
             if (mem.startsWith(u8, rule, prefix)) return true;
         }
@@ -48419,7 +49187,7 @@ fn printHelp() void {
         \\  orphans     Files not imported from entry points
         \\  memory      Alloc without defer patterns
         \\  errors      Error handling patterns (ZA201-ZA210)
-        \\  unused      Unused imports/declarations
+        \\  unused      Unused imports/params/declarations
         \\  complexity  Function complexity metrics
         \\  fmt-check   Files needing zig fmt (runs zig fmt --check)
         \\  stats       Project statistics
@@ -48648,9 +49416,11 @@ fn printHelp() void {
         \\                     ZA303: too-many-params, ZA304: too-many-branches,
         \\                     ZA305: cyclomatic (off by default), ZA306: cognitive (off by default))
         \\  ZA4xx  Unused     (ZA401: unused-import, ZA402: unused-const,
-        \\                     ZA403: unused-var)
+        \\                     ZA403: unused-var, ZA405: unused-parameter)
         \\  ZA5xx  Structure  (ZA501: orphan-file, ZA502: file-too-large,
-        \\                     ZA503: parse-error, ZA504: duplicated-block)
+        \\                     ZA503: parse-error, ZA504: duplicated-block,
+        \\                     ZA505: passthrough-wrapper,
+        \\                     ZA506: bool-flag-parameter (off by default))
         \\  ZA6xx  Format     (ZA601: needs-format,
         \\                     ZA607: read-before-assign, semantic check)
         \\  ZA7xx  Style      (ZA701: line-too-long,
@@ -50546,6 +51316,8 @@ fn handleUnused(ctx: *RunCtx) !void {
     defer g.deinit();
     var issues = try analyzeUnused(ctx.alloc, &g);
     defer deinitIssues(&issues, ctx.alloc);
+    // The ZA4xx band includes the fn-interface pass's ZA405 findings.
+    try mergeFnIfaceUnusedParams(ctx.alloc, &g, &issues);
     const c = printIssues(issues.items, "unused", ctx.reportOut(&g));
     reportSuppression(ctx.diag, &ctx.suppression, ctx.cfg, null);
     applyStrictGate(c, ctx.cfg, &ctx.strict_fail);
@@ -51065,7 +51837,7 @@ fn collectCheckFindings(ctx: *const RunCtx, g: *ImportGraph) !CheckFindings {
     try mergeCloneIssues(alloc, g, &orphan_issues);
     var err_issues = try analyzeErrors(alloc, g);
     errdefer deinitIssues(&err_issues, alloc);
-    var unused_issues = try analyzeUnused(alloc, g);
+    var unused_issues = try mergeUnusedAndIface(alloc, g, &orphan_issues);
     errdefer deinitIssues(&unused_issues, alloc);
     var cx_issues = try analyzeComplexity(alloc, g, ctx.cfg.thresholds);
     errdefer deinitIssues(&cx_issues, alloc);
@@ -75585,7 +76357,7 @@ test "ZA607: no-space while header keeps the body fill conditional (EPH-I0320)" 
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    // isLoopStart must see the no-space `while(` form, or the fill-before-
+    // isLoopOpenerLine must see the no-space `while(` form, or the fill-before-
     // use filter treats the loop as a plain statement and the body fill as
     // unconditional, so the zero-trip read stays silent (band-B01a F5).
     // detectCFPattern already accepts the no-space form; the fill scan
@@ -99542,7 +100314,7 @@ test "findEnclosingLoop recognizes labeled and inline openers (EPH-I0937)" {
 
 test "opensConditionalBody recognizes labeled and inline loop openers (EPH-I0950)" {
     // The CFG guard collection gates on isGuardEstablishingLine ->
-    // opensConditionalBody. Pre-fix isLoopStart matched only plain
+    // opensConditionalBody. Pre-fix isLoopOpenerLine matched only plain
     // `while `/`for ` prefixes, so a `label: while (x > 0)` or
     // `inline while (x > 0)` header never established a guard and the
     // body decrement fired. A labeled block (`label: {`) and a labeled
@@ -126135,4 +126907,426 @@ test "ZA504 run merge: a ten-line copy reports once with the full span" {
     for (run.issues.items) |issue| {
         try std.testing.expect(mem.indexOf(u8, issue.message, "10 lines") != null);
     }
+}
+
+// ============================================================================
+// ZA405/ZA505/ZA506 Tests — fn-interface analysis (EPH-I1077/I1080/I1081)
+// ============================================================================
+
+/// One fn-interface test run: the graph (which owns the borrowed paths)
+/// plus the two finding lists. The test consumes the issues before the
+/// graph frees.
+const FnIfaceTestRun = struct {
+    graph: ImportGraph,
+    unused: std.ArrayListUnmanaged(Issue),
+    structure: std.ArrayListUnmanaged(Issue),
+
+    fn deinit(self: *FnIfaceTestRun, allocator: Allocator) void {
+        self.graph.deinit();
+        deinitIssues(&self.unused, allocator);
+        deinitIssues(&self.structure, allocator);
+    }
+};
+
+/// Test helper: run the fn-interface pass over one in-memory file.
+fn runFnIfaceTest(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    content: []const u8,
+) !FnIfaceTestRun {
+    var graph = ImportGraph.init(allocator, diag);
+    errdefer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, "iface.zig", content);
+    try graph.files.put(analysis.path, analysis);
+    var unused: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&unused, allocator);
+    var structure: std.ArrayListUnmanaged(Issue) = .empty;
+    errdefer deinitIssues(&structure, allocator);
+    try mergeFnIfaceIssues(allocator, &graph, .{
+        .unused = &unused,
+        .structure = &structure,
+    });
+    return .{ .graph = graph, .unused = unused, .structure = structure };
+}
+
+/// True when `run` holds exactly one finding with the given rule.
+fn expectSingleFinding(run: *const FnIfaceTestRun, rule: []const u8) !void {
+    const total = run.unused.items.len + run.structure.items.len;
+    try std.testing.expectEqual(@as(usize, 1), total);
+    const issue = if (run.unused.items.len == 1) run.unused.items[0] else run.structure.items[0];
+    try std.testing.expectEqualStrings(rule, issue.rule);
+}
+
+/// True when `run` holds no findings.
+fn expectNoFindings(run: *const FnIfaceTestRun) !void {
+    try std.testing.expectEqual(@as(usize, 0), run.unused.items.len);
+    try std.testing.expectEqual(@as(usize, 0), run.structure.items.len);
+}
+
+// --- ZA405: unused parameters ------------------------------------------------
+
+test "ZA405 fires when a private fn never uses a parameter" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn compute(a: u8) u8 {
+        \\    return 42;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_UNUSED_PARAM);
+    const issue = run.unused.items[0];
+    try std.testing.expect(mem.indexOf(u8, issue.message, "compute") != null);
+    try std.testing.expect(mem.indexOf(u8, issue.message, "a") != null);
+}
+
+test "ZA405 stays silent when every parameter is referenced" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn compute(a: u8, b: u8) u8 {
+        \\    if (a > 3) return b;
+        \\    return a + b;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA405 exempts pub fns (the fixed-signature carve-out)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\pub fn api(handler: u8) u8 {
+        \\    return 7;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA405 exempts underscore-prefixed and self parameters" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\const Cursor = struct {
+        \\    fn seek(self: *Cursor, _allocator: u8) u8 {
+        \\        return self.pos;
+        \\    }
+        \\};
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA405 counts a discard statement as a reference" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn keep(a: u8) u8 {
+        \\    _ = a;
+        \\    return 1;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA405 ignores a name that appears only in a string or comment" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn compute(alpha: u8) u8 {
+        \\    const note = "alpha";
+        \\    // alpha appears only as prose here
+        \\    return note.len;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_UNUSED_PARAM);
+}
+
+test "ZA405 exempts generic and C-ABI fns" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn make(comptime T: type, seed: u8) T {
+        \\    return T{ .value = seed };
+        \\}
+        \\extern fn c_api(ignored: u8) void;
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA405 handles a multi-line signature" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn wrapper(
+        \\    diag: u8,
+        \\    allocator: u8,
+        \\) !u8 {
+        \\    return compute(diag, allocator);
+        \\}
+        \\
+        \\fn compute(a: u8, b: u8) !u8 {
+        \\    return a + b;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA405 skips a fn nested inside another fn body (the roll-up)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn outer(a: u8) u8 {
+        \\    const S = struct {
+        \\        fn inner(self: *const @This(), v: u8) u8 {
+        \\            return self.x + v;
+        \\        }
+        \\    };
+        \\    return helper(a, 2);
+        \\}
+        \\
+        \\fn helper(x: u8, y: u8) u8 {
+        \\    return x + y;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+// --- ZA505: passthrough wrappers ---------------------------------------------
+
+test "ZA505 fires on a single-return forward of all parameters" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn wrap(a: u8, b: u8) u8 {
+        \\    return inner(a, b);
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_PASSTHROUGH_WRAPPER);
+    try std.testing.expect(mem.indexOf(u8, run.structure.items[0].message, "inner") != null);
+}
+
+test "ZA505 fires on a method forwarding self to a free fn" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\const T = struct {
+        \\    fn m(self: *T, x: u8) u8 {
+        \\        return util(self, x);
+        \\    }
+        \\};
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_PASSTHROUGH_WRAPPER);
+}
+
+test "ZA505 fires on a rename-only lifecycle wrapper (try form)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\const C = struct {
+        \\    fn close(self: *C) !void {
+        \\        try self.inner.release();
+        \\    }
+        \\};
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_PASSTHROUGH_WRAPPER);
+}
+
+test "ZA505 stays silent for a same-name forward (the interface carve-out)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\const T = struct {
+        \\    fn write(self: *T, b: []const u8) !usize {
+        \\        return self.back.write(b);
+        \\    }
+        \\};
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA505 stays silent when the body does more than forward" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn wrap(a: u8) u8 {
+        \\    return inner(a) + 1;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA505 stays silent when the call drops or reorders arguments" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn drop(a: u8, b: u8) u8 {
+        \\    return inner(a) + b;
+        \\}
+        \\
+        \\fn swap(a: u8, b: u8) u8 {
+        \\    return inner(b, a);
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA505 stays silent for a non-call return and a multi-statement body" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn sum(a: u8, b: u8) u8 {
+        \\    return a + b;
+        \\}
+        \\
+        \\fn multi(a: u8) u8 {
+        \\    const x = inner(a);
+        \\    return x;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA505 exempts generic fns (the compile-time-input exclusion)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn wrap(comptime T: type, v: u8) T {
+        \\    return inner(T, v);
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+// --- ZA506: boolean flag parameters ------------------------------------------
+
+test "ZA506 fires when a bool parameter sits in an if condition" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn render(protected: bool) void {
+        \\    if (protected) {
+        \\        drawShield();
+        \\    }
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_BOOL_FLAG_PARAM);
+    const issue = run.structure.items[0];
+    try std.testing.expect(mem.indexOf(u8, issue.message, "protected") != null);
+}
+
+test "ZA506 fires for a switch condition and an optional bool" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn mode(flag: ?bool) u8 {
+        \\    switch (flag) {
+        \\        null => return 0,
+        \\        else => return 1,
+        \\    }
+        \\}
+    );
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), run.structure.items.len);
+    try std.testing.expectEqualStrings(RULE_BOOL_FLAG_PARAM, run.structure.items[0].rule);
+}
+
+test "ZA506 stays silent when the bool param never selects a branch" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn report(verbose: bool) u8 {
+        \\    return @intFromBool(verbose);
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA506 stays silent for a non-bool parameter in a condition" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn count(items: u8) void {
+        \\    if (items > 3) {
+        \\        trim();
+        \\    }
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA506 exempts generic fns and the self receiver" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn generic(comptime T: type, flag: bool) void {
+        \\    if (flag) return;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA505 stays silent for an anonymous-struct literal return" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // `.init(self)` is the anonymous-struct literal shorthand (the 0.16
+    // `.{ .init = self }`), not a call — the ghostty vtHandler class.
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn vtHandler(self: *u8) u8 {
+        \\    return .init(self);
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA405 parses a signature whose params carry doc comments" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The sig corpus class: a wrapped signature with `///` prose inside
+    // the parameter list must never feed the comment as a param name.
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn startGossip(
+        \\    /// Extra sockets to publish in gossip, other than the gossip socket?
+        \\    extra_sockets: []const usize,
+        \\) void {
+        \\    _ = extra_sockets.len;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA405 exempts a bare T: type parameter (the implicit-comptime spelling)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The corpus class: `T: type` without the comptime keyword is still a
+    // compile-time parameter, never a speculative runtime one. T stays
+    // unreferenced so a broken exclusion would fire.
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn fizz(T: type) u8 {
+        \\    return 7;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
 }

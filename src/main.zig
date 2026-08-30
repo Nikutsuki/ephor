@@ -6733,6 +6733,7 @@ fn loopIncrementSpan(
     // is [loop_idx + 1, body_end) and the outside-write check starts at
     // body_end).
     const body_start = loopBodyStartCol(t) orelse return null;
+    const is_braced = body_start < t.len and t[body_start] == '{';
     var found_inc = lineHasIncrement(t, counter);
     const ctx: LoopWalkCtx = .{
         .lines = lines,
@@ -6741,27 +6742,24 @@ fn loopIncrementSpan(
         .t = t,
         .body_start = body_start,
     };
-    if (body_start < t.len and t[body_start] == '{') {
-        // One-line braced body: the loop completes on the opener line.
-        // The former walk ran past it to the next standalone `}` — an
-        // enclosing block's close — and swallowed the post-loop lines
-        // into the span (EPH-I1177). hasOnelineLoopClose carries the
-        // quote-masked whole-line close walk (EPH-I0789). A tail write
-        // after the same-line body sits on this line too and breaks the
-        // correlation (EPH-I1187).
-        if (hasOnelineLoopClose(t)) {
-            if (lineHasOtherCounterWrite(t, counter)) return null;
-            return endOrNull(found_inc, loop_idx + 1);
-        }
-        return bracedLoopBodyEnd(ctx, loop_idx, &found_inc);
-    }
-    return bracelessLoopBodyEnd(ctx, loop_idx, &found_inc);
-}
-
-/// The span-end verdict: the line when the increment was seen, else the
-/// fail-closed null (EPH-I1177).
-fn endOrNull(found: bool, line: usize) ?usize {
-    return if (found) line else null;
+    // One-line braced body: the loop completes on the opener line.
+    // The former walk ran past it to the next standalone `}` — an
+    // enclosing block's close — and swallowed the post-loop lines
+    // into the span (EPH-I1177). hasOnelineLoopClose carries the
+    // quote-masked whole-line close walk (EPH-I0789). A tail write
+    // after the same-line body sits on this line too and breaks the
+    // correlation (EPH-I1187). The walks return the raw end; the
+    // increment-seen gate below applies to every verdict.
+    const end: ?usize = if (is_braced)
+        if (hasOnelineLoopClose(t)) blk: {
+            if (lineHasOtherCounterWrite(t, counter)) break :blk null;
+            break :blk loop_idx + 1;
+        } else bracedLoopBodyEnd(ctx, loop_idx, &found_inc)
+    else
+        bracelessLoopBodyEnd(ctx, loop_idx, &found_inc);
+    // The span-end verdict (ZA506 D7, EPH-I1081): the end line when the
+    // increment was seen, else the fail-closed null.
+    return if (found_inc) end else null;
 }
 
 /// Walk inputs for the loop-body span walks (EPH-I1177).
@@ -6786,7 +6784,9 @@ const LoopWalkCtx = struct {
 /// net-zero convention, so one-line blocks and struct literals leave the
 /// depth unchanged. Line comments are masked before the brace
 /// accounting, so a comment brace never opens or closes the body
-/// (EPH-I1213). found_inc carries the increment-seen state (EPH-I1177).
+/// (EPH-I1213). found_inc carries the increment-seen state (EPH-I1177);
+/// the verdicts return the raw end, and loopIncrementSpan applies the
+/// seen gate (ZA506 D7, EPH-I1081).
 fn bracedLoopBodyEnd(
     ctx: LoopWalkCtx,
     loop_idx: usize,
@@ -6810,11 +6810,11 @@ fn bracedLoopBodyEnd(
             // close-first line and swallowed the post-loop lines
             // into the span.
             const close_pos = trailingClosePos(code, before) orelse return null;
-            return closeLineVerdict(code[close_pos..], ctx.counter, found_inc.*, j + 1);
+            return closeLineVerdict(code[close_pos..], ctx.counter, j + 1);
         }
         const run = leadingCloseRun(code);
         if (run.closes >= depth)
-            return closeLineVerdict(code[run.len..], ctx.counter, found_inc.*, j + 1);
+            return closeLineVerdict(code[run.len..], ctx.counter, j + 1);
         const bc = braceCountOnLine(code);
         depth = (depth -| bc.closes) + bc.opens;
     }
@@ -6857,16 +6857,16 @@ fn trailingClosePos(code: []const u8, depth: usize) ?usize {
 /// Verdict for a line whose close ends the loop body (EPH-I1191,
 /// EPH-I1209): the tail past the close sits outside the body, so a
 /// counter write there breaks the guard's zero-reading correlation —
-/// null. A clean tail returns the exclusive end when the increment was
-/// seen, else the fail-closed null.
+/// null. A clean tail returns the exclusive end. The increment-seen
+/// gate sits in loopIncrementSpan (ZA506 D7, EPH-I1081): it wraps the
+/// verdict with the fail-closed null when the increment was not seen.
 fn closeLineVerdict(
     tail: []const u8,
     counter: []const u8,
-    found_inc: bool,
     end_line: usize,
 ) ?usize {
     if (tailWritesCounter(tail, counter)) return null;
-    return endOrNull(found_inc, end_line);
+    return end_line;
 }
 
 /// Leading `}` run of a close-first line: the count of close braces
@@ -6909,7 +6909,8 @@ fn tailWritesCounter(tail: []const u8, counter: []const u8) bool {
 /// statement-end walk stops at the body's own `;`, so a write after the
 /// body stays outside the span and breaks the correlation (the B100 r1
 /// F1 shape). An Allman brace on the next line stays excluded
-/// (EPH-I1177).
+/// (EPH-I1177). The verdicts return the raw end; loopIncrementSpan
+/// applies the increment-seen gate (ZA506 D7, EPH-I1081).
 fn bracelessLoopBodyEnd(
     ctx: LoopWalkCtx,
     loop_idx: usize,
@@ -6919,7 +6920,7 @@ fn bracelessLoopBodyEnd(
         // A tail write after the same-line body sits on the opener line
         // and breaks the correlation (EPH-I1187).
         if (lineHasOtherCounterWrite(ctx.t, ctx.counter)) return null;
-        return endOrNull(found_inc.*, loop_idx + 1);
+        return loop_idx + 1;
     }
     var depth: usize = 0;
     var mode: QuoteMode = .none;
@@ -6936,7 +6937,7 @@ fn bracelessLoopBodyEnd(
         // breaks the correlation: the body ends at the statement, so
         // the tail is outside the loop (EPH-I1187).
         if (lineWritesName(body[stmt_end..], ctx.counter)) return null;
-        return endOrNull(found_inc.*, j + 1);
+        return j + 1;
     }
     return null;
 }
@@ -10812,8 +10813,9 @@ fn checkAliasBlockFree(
             continue;
         }
         // A vetoed root free contributes nothing: no free state, no exit
-        // vote (EPH-I0835).
-        if (isVetoedAliasFreeLine(scan, cl, root_rebound, &join_buf)) continue;
+        // vote (EPH-I0835). The rebind gate lives here (ZA506 D7,
+        // EPH-I1081): the probe runs only after a rebind.
+        if (root_rebound and isVetoedAliasFreeLine(scan, cl, &join_buf)) continue;
         if (isFreeOfVarOrAliasLine(scan, cl, ct, &join_buf)) {
             freed = true;
             freed_line = cl;
@@ -10830,16 +10832,16 @@ fn isRootRebindLine(scan: *const VarFreeCtx, cl: usize, ct: []const u8) bool {
     return cl > scan.alloc_info.alloc_line and hasDirectReassignment(ct, scan.var_name);
 }
 
-/// True when the line's free must be ignored entirely: a root free after
-/// the root's rebind (EPH-I0835). The line then contributes nothing — no
-/// free state, no exit vote.
+/// True when the line directly frees the root (ZA506 D7, EPH-I1081). The
+/// caller invokes it only after the root's rebind, where such a free must
+/// be ignored entirely: it neither frees the alias's target nor resurrects
+/// it (EPH-I0835). The line then contributes nothing — no free state, no
+/// exit vote.
 fn isVetoedAliasFreeLine(
     scan: *const VarFreeCtx,
     ln: usize,
-    root_rebound: bool,
     buf: []u8,
 ) bool {
-    if (!root_rebound) return false;
     const idx = ln - scan.func_line;
     const ct = mem.trim(u8, scan.lines[idx], " \t\r");
     if (!hasRealFreePattern(ct)) return false;
@@ -31149,8 +31151,13 @@ fn checkTypeReturningFnName(ctx: NamingLineCtx, name: []const u8, name_col: usiz
 /// change that triggered the hit (RhyOS accepted ~48 of this class,
 /// ephor-error.log 2026-07-30). The declaration is the one actionable
 /// surface.
-fn checkErrorNaming(ctx: NamingLineCtx, in_error_block: bool) !void {
-    if (!in_error_block) return;
+/// Error-block membership for the ZA703 member check (ZA506 D7,
+/// EPH-I1081): the former in_error_block flag became an enum so the gate
+/// names the membership state instead of a bare flag.
+const ErrorBlockScope = enum { inside, outside };
+
+fn checkErrorNaming(ctx: NamingLineCtx, scope: ErrorBlockScope) !void {
+    if (scope == .outside) return;
     try checkErrorSetMemberNames(ctx);
 }
 
@@ -31442,7 +31449,7 @@ fn analyzeNamingLine(
         try checkVarNaming(naming_ctx);
     if (realTokenPos(t, "fn") != null)
         try checkFnNaming(naming_ctx);
-    try checkErrorNaming(naming_ctx, in_error_block);
+    try checkErrorNaming(naming_ctx, if (in_error_block) .inside else .outside);
     trackErrorBlockDepth(t, error_block_depth);
 }
 
@@ -42890,8 +42897,7 @@ fn buildRuleFacts(allocator: Allocator, content: []const u8, rule: []const u8) !
     var line_num: usize = 1;
     var lines = mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| : (line_num += 1) {
-        const prev_ignores = if (prev_line) |pl| isIgnoreCommentLine(pl, rule) else false;
-        if (ruleLineSuppressed(&scope, line, prev_ignores, rule) == .suppressed)
+        if (ruleLineSuppressed(&scope, line, prev_line, rule) == .suppressed)
             try facts.lines.put(allocator, line_num, {});
         prev_line = line;
     }
@@ -42910,9 +42916,13 @@ const RuleLineVerdict = enum { suppressed, clean };
 fn ruleLineSuppressed(
     scope: *ScopeIgnore,
     line: []const u8,
-    prev_ignores: bool,
+    prev_line: ?[]const u8,
     rule: []const u8,
 ) RuleLineVerdict {
+    // The former prev_ignores flag derives here from the previous line
+    // (ZA506 D7, EPH-I1081): the caller passes the line, and the verdict
+    // tree keeps the same prev-ignored tests branch-for-branch.
+    const prev_ignores = if (prev_line) |pl| isIgnoreCommentLine(pl, rule) else false;
     if (scope.active) {
         // consumeIgnoredScopeLine returns is_target, so true here means the
         // line is suppressed; the call's purpose is the scope tracking.
@@ -90948,7 +90958,7 @@ test "checkErrorNaming: use-site error references never fire (EPH-I1075)" {
         .t = "return error.file_not_found;",
         .line_num = 1,
         .error_naming = .snake_case,
-    }, false);
+    }, .outside);
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
@@ -90956,7 +90966,7 @@ test "checkErrorNaming: use-site error references never fire (EPH-I1075)" {
         .t = "return error.out_of_memory;",
         .line_num = 1,
         .error_naming = .snake_case,
-    }, false);
+    }, .outside);
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
@@ -90964,7 +90974,7 @@ test "checkErrorNaming: use-site error references never fire (EPH-I1075)" {
         .t = "return error.MyCustomFailure;",
         .line_num = 2,
         .error_naming = .snake_case,
-    }, false);
+    }, .outside);
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
@@ -90972,7 +90982,7 @@ test "checkErrorNaming: use-site error references never fire (EPH-I1075)" {
         .t = "return error.my_project_error;",
         .line_num = 3,
         .error_naming = .title_case,
-    }, false);
+    }, .outside);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -90992,7 +91002,7 @@ test "checkErrorNaming: declaration fires while use sites stay silent (EPH-I1075
         .t = "error{ MyCustomFailure }",
         .line_num = 1,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     // ...while a use site of the same name stays silent.
     try checkErrorNaming(.{
         .issues = &issues,
@@ -91001,7 +91011,7 @@ test "checkErrorNaming: declaration fires while use sites stay silent (EPH-I1075
         .t = "return error.MyCustomFailure;",
         .line_num = 2,
         .error_naming = .snake_case,
-    }, false);
+    }, .outside);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
         "error set member 'MyCustomFailure' should be snake_case",
@@ -91025,7 +91035,7 @@ test "checkErrorNaming: error set members must be snake_case" {
         .t = "error{ NotSnakeCase, access_denied }",
         .line_num = 1,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
         "error set member 'NotSnakeCase' should be snake_case",
@@ -91053,7 +91063,7 @@ test "checkErrorNaming: declared members carry no std-name exemption (EPH-I0473,
         .t = oom_line,
         .line_num = 1,
         .error_naming = .snake_case,
-    }, false);
+    }, .outside);
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
@@ -91061,7 +91071,7 @@ test "checkErrorNaming: declared members carry no std-name exemption (EPH-I0473,
         .t = "error.OutOfMemory => continue,",
         .line_num = 2,
         .error_naming = .snake_case,
-    }, false);
+    }, .outside);
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
@@ -91069,7 +91079,7 @@ test "checkErrorNaming: declared members carry no std-name exemption (EPH-I0473,
         .t = "return error.FileNotFound;",
         .line_num = 3,
         .error_naming = .snake_case,
-    }, false);
+    }, .outside);
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
@@ -91077,7 +91087,7 @@ test "checkErrorNaming: declared members carry no std-name exemption (EPH-I0473,
         .t = "return error.my_project_error;",
         .line_num = 4,
         .error_naming = .snake_case,
-    }, false);
+    }, .outside);
     // The reference lines never fire (EPH-I1075).
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 
@@ -91090,7 +91100,7 @@ test "checkErrorNaming: declared members carry no std-name exemption (EPH-I0473,
         .t = "    OutOfMemory,",
         .line_num = 5,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
@@ -91098,7 +91108,7 @@ test "checkErrorNaming: declared members carry no std-name exemption (EPH-I0473,
         .t = "    FileNotFound,",
         .line_num = 6,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     try std.testing.expectEqual(@as(usize, 2), issues.items.len);
     try std.testing.expectEqualStrings(
         "error set member 'OutOfMemory' should be snake_case",
@@ -91127,7 +91137,7 @@ test "checkErrorNaming: title_case mode stays silent on std-name members (EPH-I0
         .t = "error{ OutOfMemory, FileNotFound }",
         .line_num = 1,
         .error_naming = .title_case,
-    }, true);
+    }, .inside);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -91148,7 +91158,7 @@ test "checkErrorNaming: non-std TitleCase error set members are still flagged" {
         .t = "error{ TotallyMadeUp }",
         .line_num = 1,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
         "error set member 'TotallyMadeUp' should be snake_case",
@@ -91172,7 +91182,7 @@ test "checkErrorNaming: error set composition stops at ||" {
         .t = composed,
         .line_num = 1,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
@@ -91180,7 +91190,7 @@ test "checkErrorNaming: error set composition stops at ||" {
         .t = "} || rlp.Error || Allocator.Error;",
         .line_num = 2,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -91201,7 +91211,7 @@ test "checkErrorNaming: TitleCase mode use sites stay silent (EPH-I1075)" {
         .t = "return error.my_project_error;",
         .line_num = 1,
         .error_naming = .title_case,
-    }, false);
+    }, .outside);
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
@@ -91209,7 +91219,7 @@ test "checkErrorNaming: TitleCase mode use sites stay silent (EPH-I1075)" {
         .t = "return error.MyProjectError;",
         .line_num = 2,
         .error_naming = .title_case,
-    }, false);
+    }, .outside);
     // The declaration of the same name fires in TitleCase mode.
     try checkErrorNaming(.{
         .issues = &issues,
@@ -91218,7 +91228,7 @@ test "checkErrorNaming: TitleCase mode use sites stay silent (EPH-I1075)" {
         .t = "error{ my_project_error }",
         .line_num = 3,
         .error_naming = .title_case,
-    }, true);
+    }, .inside);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
         "error set member 'my_project_error' should be TitleCase",
@@ -91241,7 +91251,7 @@ test "checkErrorNaming: TitleCase mode flags snake_case error set members" {
         .t = "error{ my_member, also_bad, WellFormed }",
         .line_num = 1,
         .error_naming = .title_case,
-    }, true);
+    }, .inside);
     try std.testing.expectEqual(@as(usize, 2), issues.items.len);
     try std.testing.expectEqualStrings(
         "error set member 'my_member' should be TitleCase",
@@ -91269,7 +91279,7 @@ test "checkErrorNaming: member scan stops at the set's closing brace" {
         .t = ") error{ Canceled, OutOfMemory }!?struct { std.Io.File, []const u8 } {",
         .line_num = 1,
         .error_naming = .title_case,
-    }, true);
+    }, .inside);
     // snake_case mode: post-close TitleCase type tokens must not fire either.
     try checkErrorNaming(.{
         .issues = &issues,
@@ -91278,7 +91288,7 @@ test "checkErrorNaming: member scan stops at the set's closing brace" {
         .t = "const f = error{ foo }!std.Io.File;",
         .line_num = 2,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     // Multi-line sets: the closing line's `}!void` carries no members.
     try checkErrorNaming(.{
         .issues = &issues,
@@ -91287,7 +91297,7 @@ test "checkErrorNaming: member scan stops at the set's closing brace" {
         .t = "}!void;",
         .line_num = 3,
         .error_naming = .title_case,
-    }, true);
+    }, .inside);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -91310,7 +91320,7 @@ test "checkErrorNaming: member scan stops at the error-union boundary (EPH-I0274
         .t = "pub fn encode(v: anytype) (rlp.EncodeError || error{BadMember})!Hash32 {",
         .line_num = 1,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     // Shape 2: inline error-union payload (error{usage}!ParsedArgs).
     try checkErrorNaming(.{
         .issues = &issues,
@@ -91319,7 +91329,7 @@ test "checkErrorNaming: member scan stops at the error-union boundary (EPH-I0274
         .t = "pub fn parse() error{BadUsage}!ParsedArgs {",
         .line_num = 2,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     // Shape 4: error{invalid_hex}!LineLayout and error{invalid_hex}!T
     // (ZPL-I0805).
     try checkErrorNaming(.{
@@ -91329,7 +91339,7 @@ test "checkErrorNaming: member scan stops at the error-union boundary (EPH-I0274
         .t = "fn parseLine(s: []const u8) error{InvalidHex}!LineLayout {",
         .line_num = 3,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
@@ -91337,7 +91347,7 @@ test "checkErrorNaming: member scan stops at the error-union boundary (EPH-I0274
         .t = "fn decodeHex(comptime T: type) error{InvalidHex}!T {",
         .line_num = 4,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     // Exactly the four real members fire; payload and return types never do.
     try std.testing.expectEqual(@as(usize, 4), issues.items.len);
     const expected = [_][]const u8{
@@ -91399,7 +91409,7 @@ test "checkErrorNaming: TitleCase mode exempts std-lib and underscore names" {
             .t = line,
             .line_num = n,
             .error_naming = .title_case,
-        }, false);
+        }, .outside);
     }
     try checkErrorNaming(.{
         .issues = &issues,
@@ -91408,7 +91418,7 @@ test "checkErrorNaming: TitleCase mode exempts std-lib and underscore names" {
         .t = "error{ OutOfMemory, _internal, WellFormed }",
         .line_num = 4,
         .error_naming = .title_case,
-    }, true);
+    }, .inside);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -91714,7 +91724,7 @@ test "checkErrorNaming: underscore-prefixed error names are exempt" {
         .path = "test.zig",
         .t = "error{ _FileNotFound, _internal }",
         .line_num = 1,
-    }, true);
+    }, .inside);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -91735,7 +91745,7 @@ test "checkErrorNaming: member scan is code-position masked (EPH-I0274, B57c)" {
         .t = "    usage, // doc: error{NotReal}",
         .line_num = 1,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     // A fake `error{` inside a string literal is data, not an opener.
     try checkErrorNaming(.{
         .issues = &issues,
@@ -91744,7 +91754,7 @@ test "checkErrorNaming: member scan is code-position masked (EPH-I0274, B57c)" {
         .t = "    usage, // \"error{Fake}\"",
         .line_num = 2,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     // Control: a real member on the same line still fires — the mask must
     // not swallow the set's own body.
     try checkErrorNaming(.{
@@ -91754,7 +91764,7 @@ test "checkErrorNaming: member scan is code-position masked (EPH-I0274, B57c)" {
         .t = "    BadMember, // doc: error{NotReal}",
         .line_num = 3,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
         "error set member 'BadMember' should be snake_case",
@@ -91780,7 +91790,7 @@ test "checkErrorNaming: comment after a char-literal quote is prose (EPH-I0464)"
         .t = "    const q = '\"'; // doc: error{BadName}",
         .line_num = 1,
         .error_naming = .snake_case,
-    }, true);
+    }, .inside);
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -124600,7 +124610,7 @@ fn installVerifyFakes(
     errdefer allocator.free(curl_path);
     const minisign_ran = try tmpFilePath(allocator, tmp, "minisign-ran");
     defer allocator.free(minisign_ran);
-    const minisign_body = try fakeMinisignBody(allocator, minisign_ran, mode == .bad_signature);
+    const minisign_body = try fakeMinisignBody(allocator, minisign_ran, mode);
     defer allocator.free(minisign_body);
     const minisign_path = try installFakeTool(tmp, allocator, "fakeminisign", minisign_body);
     errdefer allocator.free(minisign_path);
@@ -124651,8 +124661,10 @@ fn fakeCurlBody(allocator: Allocator, marker: []const u8, base: []const u8) ![]c
 /// the marker file, answers the -v presence probe, parses -Vm/-p like
 /// the real tool, checks the files the real minisign requires, and
 /// prints the verdict to the stream the real tool uses, then exits 0
-/// or 1 per the scenario.
-fn fakeMinisignBody(allocator: Allocator, marker: []const u8, fail: bool) ![]const u8 {
+/// or 1 per the scenario. The scenario mode replaces the former fail
+/// flag (ZA506 D7, EPH-I1081); only .bad_signature selects the failure
+/// arm.
+fn fakeMinisignBody(allocator: Allocator, marker: []const u8, mode: FakeVerifyMode) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
         "#!/bin/sh\n" ++
@@ -124676,7 +124688,7 @@ fn fakeMinisignBody(allocator: Allocator, marker: []const u8, fail: bool) ![]con
             "fi\n" ++
             "echo \"Signature and comment signature verified\"\n" ++
             "exit 0\n",
-        .{ marker, if (fail) "1" else "0" },
+        .{ marker, if (mode == .bad_signature) "1" else "0" },
     );
 }
 

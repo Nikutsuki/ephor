@@ -908,7 +908,7 @@ fn aliasTarget(sctx: ScanCtx, scan: *const FnScan, init: NodeIndex) ?[]const u8 
             const name = sctx.tree.tokenSlice(sctx.tree.nodeMainToken(e));
             return scan.aliasRoot(name);
         }
-        if (isLabeledBlockTag(tag)) return blockValueRoot(sctx, scan, e, true);
+        if (isLabeledBlockTag(tag)) return blockValueRoot(sctx, scan, e, .commit);
         if (tag == .@"switch" or tag == .switch_comma) return switchValueRoot(sctx, scan, e);
         e = peelCastBuiltin(sctx.tree, e) orelse return null;
     }
@@ -928,7 +928,7 @@ fn switchValueRoot(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?[]const
         while (!isLabeledBlockTag(sctx.tree.nodeTag(e))) {
             e = peelCastBuiltin(sctx.tree, e) orelse return null;
         }
-        const target = blockValueRoot(sctx, scan, e, true) orelse return null;
+        const target = blockValueRoot(sctx, scan, e, .commit) orelse return null;
         if (found == null) {
             found = target;
             continue;
@@ -1040,7 +1040,7 @@ fn classifyReturn(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Finding 
 /// escape, so the block's resolved stack value fires. A bare `&v`
 /// break here is compiler-caught (probed 0.16.0) and stays silent.
 fn classifyBlockReturn(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?Finding {
-    const root = blockValueRoot(sctx, scan, node, false) orelse return null;
+    const root = blockValueRoot(sctx, scan, node, .skip) orelse return null;
     return .{
         .name = root,
         .via = null,
@@ -1075,16 +1075,15 @@ fn sameRoot(committed: ?[]const u8, target: []const u8) bool {
 /// Label-aware (EPH-I1183): only breaks naming this block's label set
 /// its value.
 ///
-/// `allow_bare`: a bare `&var` break feeding a direct return is
-/// compiler-caught (probed 0.16.0) — the return sink passes false, the
-/// alias machinery and the store sink pass true (Sema-silent,
-/// probe-pinned, EPH-I1210). The field form (`&v.a`) is Sema-silent
-/// everywhere and fires.
+/// `bare`: the sink's BarePolicy — the return sink passes `.skip`
+/// (compiler-caught, probed 0.16.0), the alias and store sinks pass
+/// `.commit` (Sema-silent, probe-pinned, EPH-I1210). The field form
+/// (`&v.a`) is Sema-silent everywhere and fires.
 fn blockValueRoot(
     sctx: ScanCtx,
     scan: *const FnScan,
     block: NodeIndex,
-    allow_bare: bool,
+    bare: BarePolicy,
 ) ?[]const u8 {
     const block_first = sctx.tree.firstToken(block);
     const block_last = sctx.tree.lastToken(block);
@@ -1098,7 +1097,7 @@ fn blockValueRoot(
         if (insideComptime(sctx.comptime_ranges, tok)) continue;
         if (!breakLabelMatches(sctx.tree, brk, label_name)) continue;
         const operand = sctx.tree.nodeData(brk).opt_token_and_opt_node[1].unwrap() orelse continue;
-        const target = blockBreakTarget(sctx, scan, operand, allow_bare) orelse return null;
+        const target = blockBreakTarget(sctx, scan, operand, bare) orelse return null;
         if (!sameRoot(found, target)) return null;
         found = target;
     }
@@ -1113,22 +1112,25 @@ fn blockLabelToken(tree: *const Ast, block: NodeIndex) ?Ast.TokenIndex {
     return lbrace - 2;
 }
 
+/// A sink's bare-&var policy (ZA506, EPH-I1081): `.skip` keeps the
+/// bare break silent, `.commit` resolves it to its root.
+const BarePolicy = enum { skip, commit };
+
 /// The stack root one labeled-block break operand points into, or
-/// null. A direct address-of operand applies the bare-&var rule for
-/// the sink's strictness; any other shape resolves through the alias
-/// machinery (EPH-I0046).
+/// null. A direct address-of operand applies the sink's bare policy;
+/// any other shape resolves through the alias machinery (EPH-I0046).
 fn blockBreakTarget(
     sctx: ScanCtx,
     scan: *const FnScan,
     operand: NodeIndex,
-    allow_bare: bool,
+    bare: BarePolicy,
 ) ?[]const u8 {
     const e = unwrapGroup(sctx.tree, operand);
     if (sctx.tree.nodeTag(e) == .address_of) {
         const info = chainInfo(sctx.tree, sctx.tree.nodeData(e).node);
         if (info.root.len == 0) return null;
         const bind = bindForRoot(info.root, scan) orelse return null;
-        if (info.hop_count == 0 and !allow_bare) return null;
+        if (info.hop_count == 0 and bare == .skip) return null;
         if (info.hop_count > 0 and !chainIsUnsafe(sctx, info, bind)) return null;
         return info.root;
     }
@@ -1365,13 +1367,13 @@ fn checkEscapeAssign(
 }
 
 /// The stack root an out-store rhs points into. A labeled-block rhs
-/// uses the alias posture (allow_bare=true): the 0.16.0 probe shows
+/// uses the alias posture (bare = .commit): the 0.16.0 probe shows
 /// Sema stays silent on a bare `&var` break feeding a store, so the
 /// bare form fires here (EPH-I1210) beside the field form (EPH-I0046).
 /// Other shapes resolve via aliasTarget.
 fn assignRhsTarget(sctx: ScanCtx, scan: *const FnScan, rhs: NodeIndex) ?[]const u8 {
     const e = unwrapGroup(sctx.tree, rhs);
-    if (isLabeledBlockTag(sctx.tree.nodeTag(e))) return blockValueRoot(sctx, scan, e, true);
+    if (isLabeledBlockTag(sctx.tree.nodeTag(e))) return blockValueRoot(sctx, scan, e, .commit);
     return aliasTarget(sctx, scan, rhs);
 }
 

@@ -50,8 +50,9 @@ pub const RULE_COGNITIVE = "ZA306";
 pub const RULE_UNUSED_IMPORT = "ZA401";
 pub const RULE_UNUSED_CONST = "ZA402";
 pub const RULE_UNUSED_VAR = "ZA403";
-// ZA404 is reserved for the unused-non-exported-fn rule (EPH-I1084, B135).
+pub const RULE_UNUSED_PRIVATE_FN = "ZA404";
 pub const RULE_UNUSED_PARAM = "ZA405";
+pub const RULE_UNNECESSARY_VAR = "ZA406";
 
 // ZA5xx - Structure
 pub const RULE_ORPHAN_FILE = "ZA501";
@@ -61,6 +62,8 @@ pub const RULE_FILE_TOO_LARGE = "ZA502";
 pub const RULE_DUPLICATED_BLOCK = "ZA504";
 pub const RULE_PASSTHROUGH_WRAPPER = "ZA505";
 pub const RULE_BOOL_FLAG_PARAM = "ZA506";
+pub const RULE_REDUNDANT_ELSE = "ZA507";
+pub const RULE_SIMPLIFIABLE_BOOL_RETURN = "ZA508";
 
 // ZA6xx - Formatting (ZA607 is a semantic definite-assignment check that kept
 // its ZA6xx ID for backward compatibility with existing inline-ignores)

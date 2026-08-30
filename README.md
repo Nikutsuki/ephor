@@ -501,7 +501,9 @@ ZA305 and ZA306 are off by default. To enable them, remove `"ZA305"` and `"ZA306
 | **ZA401** | warning | ON | Unused import |
 | **ZA402** | warning | ON | Unused const declaration |
 | **ZA403** | warning | ON | Unused var declaration |
+| **ZA404** | warning | ON | Unused private function: a fn declared without `pub` that no code position references anywhere in the project — no call site, no fn-value reference, and no test caller. The tests-as-callers carve-out is principled, not a blanket exclusion: a test decl is the caller of record (EPH-I1082). Name-level and conservative: any identifier occurrence sharing the name suppresses the finding (the ZT105 flat-namespace direction). Exempt: C-ABI decls (their callers live outside Zig source) and `main`. Statically invisible invocation (`@field` dispatch, external callers) is the residual class |
 | **ZA405** | warning | ON | Unused parameter: a private fn declares a parameter its body never references. Exempt: pub fns (interface and vtable impls are public by construction), the `self` receiver, `_`-prefixed names (the deliberate-unused convention), generic fns (`comptime`/`anytype` params and the bare `T: type` spelling), and C-ABI decls (EPH-I1080) |
+| **ZA406** | warning | ON | Unnecessary var: a var whose binding is never mutated anywhere in the body — `const` suffices (Zig's const is deep). Any mutation shape requires `var` and stays silent: a reassignment (`x = 1`), a compound assignment (`x += 1`, the saturating and wraparound forms), a field store (`x.field = 1`), an element or slice position (`x[i] = 1`, `x[0..]`), an address-taken view (`&x`), a dotted call chain (`x.append(...)`, `x.changes.?.map.put(...)`), an `@field`/`@memset`/`@memcpy` first argument, a pointer capture (`if (x) \|*v\|`), a destructuring assignment (`x, y = .{...}`), and an inline-asm operand. Exempt: `comptime var` and `threadlocal var`, a `var` inside a struct/enum/union/error/opaque body (a static field is always mutable), and the fn-interface carve-outs (generic fns, type factories, C-ABI decls stay silent). Name-level and conservative: a shadowed or aliased mutation silences the finding |
 
 **ZA405 and interface signatures:** the carve-out for pub fns is
 structural: a fn that implements an interface or fills a vtable slot must
@@ -519,6 +521,8 @@ choice, so an unused parameter there is speculative generality.
 | **ZA504** | warning | ON | Duplicated block: a run of 6 or more normalized lines that repeats within one file or across files (copy-paste duplication, EPH-I1076) |
 | **ZA505** | warning | ON | Passthrough wrapper: the fn body is a single call statement (`return`/`try` prefixes allowed) whose argument list is exactly the parameter list in order (a shallow module that adds interface without hiding implementation, EPH-I1077) |
 | **ZA506** | warning | ON | Boolean flag parameter: a `bool`-typed parameter whose name appears inside an `if`/`switch` condition in the body — the flag selects between two code paths (two functions in one signature, EPH-I1081) |
+| **ZA507** | note | ON | Redundant else: an else whose if-branch ends in return/break/continue — the guard-clause style removes the else and one nesting level. else-if chain links, switch `else =>` prongs, and error-capture elses (`else \|err\|`) stay silent: they carry real branch structure, not redundant nesting |
+| **ZA508** | note | ON | Simplifiable boolean return: `if (x) return true else return false;` (or the reversed form) where `return x;` / `return !(x);` suffices. Both branches must be exactly one `return <bool literal>;`; equal literals, extra statements, and else-if links stay silent |
 
 **ZA505 and interface implementations:** a forward to a method of the
 same name (`fn write(...) { return self.backend.write(...); }`) is an
@@ -526,6 +530,14 @@ interface impl by structure — the wrapper IS the job — and never fires.
 A forward to a different name (a rename-only lifecycle wrapper like
 `deinit` → `destroy`) is the finding class. Generic fns and C-ABI decls
 are exempt: their signatures are compile-time or external contracts.
+A wrapper whose name the file references as a fn value — an argument
+segment, an assignment right-hand side, or a return expression — is a
+generic-instantiation adapter and never fires (the value-reference
+carve-out, EPH-I1238): a generic callee cannot serve a value position,
+so the wrapper exists to monomorphize it.
+**ZA507/ZA508 and the fn-interface carve-outs:** both rules ride the
+fn-interface pass, so generic fns, type factories, and C-ABI decls stay
+silent — their bodies are compile-time machinery or external contracts.
 **ZA506 and flag conventions:** the rule fires on the selector shape
 (the flag sits in a condition), never on a flag that is only passed
 along or returned. `?bool` counts as a flag type; the receiver and

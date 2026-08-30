@@ -186,11 +186,15 @@ $child.StartInfo = $psi
 # so the accept stays on this thread through GetContextAsync polling.
 # One accept is pending at a time. A wait that times out keeps waiting
 # on the same task: an abandoned task would still hold the next
-# connection (EPH-I1237).
+# connection (EPH-I1237). The serve loop carries a wall-clock bound
+# (EPH-I1241): a child that hangs before its first request must reach
+# the WaitForExit/Kill path below instead of spinning forever.
+$serveDeadlineMs = 90000
 $ctxTask = $listener.GetContextAsync()
 $child.Start() | Out-Null
 $served = $false
-while (-not $child.HasExited) {
+$serveDeadline = [System.Diagnostics.Stopwatch]::StartNew()
+while (-not $child.HasExited -and $serveDeadline.ElapsedMilliseconds -lt $serveDeadlineMs) {
     if ($ctxTask.Wait(200)) {
         $ctx = $ctxTask.Result
         $body = [System.Text.Encoding]::UTF8.GetBytes($tagsJson)
@@ -211,7 +215,7 @@ while (-not $child.HasExited) {
 }
 # Bound the wait so a hung child cannot stall the gate forever. The
 # child's own 30s fetch timeout keeps a healthy run well inside 90s.
-if (-not $child.WaitForExit(90000)) {
+if (-not $child.WaitForExit($serveDeadlineMs)) {
     $child.Kill($true)
     throw "install subprocess timed out"
 }
@@ -395,9 +399,13 @@ function runPubkeyInstall {
     # same task. An abandoned task still holds the next connection, and
     # the loop never reads it again (EPH-I1237: the old 500 ms fixed
     # wait lost whole pubkey runs when a slow child stretched one
-    # request past the window).
+    # request past the window). The loop also carries the wall-clock
+    # bound (EPH-I1241): a child that hangs after its last download
+    # must reach the WaitForExit/Kill path below instead of spinning
+    # forever.
     $ctxTask = $listener.GetContextAsync()
-    while (-not $child.HasExited) {
+    $serveDeadline = [System.Diagnostics.Stopwatch]::StartNew()
+    while (-not $child.HasExited -and $serveDeadline.ElapsedMilliseconds -lt $serveDeadlineMs) {
         if (-not $ctxTask.Wait(200)) { continue }
         servePubkeyRequest $ctxTask.Result
         $ctxTask = $listener.GetContextAsync()
@@ -408,7 +416,7 @@ function runPubkeyInstall {
     if ($ctxTask.Wait(300)) {
         servePubkeyRequest $ctxTask.Result
     }
-    if (-not $child.WaitForExit(90000)) {
+    if (-not $child.WaitForExit($serveDeadlineMs)) {
         $child.Kill($true)
         throw "pubkey-channel install subprocess timed out"
     }

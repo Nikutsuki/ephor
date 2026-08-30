@@ -28217,13 +28217,25 @@ fn visitFnInterfaceFile(c: FnIfaceCtx, content: []const u8) !void {
     if (isCImportFile(c.path, content)) return;
     var scan = FnIfaceScan{};
     var blank_buf: [16 * 1024]u8 = undefined;
+    var mask_buf: [256]u8 = undefined;
     var lines = mem.splitScalar(u8, content, '\n');
     var line_num: usize = 0;
     var offset: usize = 0;
+    // Cross-line multiline-string state (the classifyMultilineContent
+    // model, EPH-I0944/I0973/I0974, EPH-I1240): after a mid-line `\\`
+    // opener every following line is string content until a
+    // terminator-shaped line, and its braces never reach the span walk.
+    // The `\\`-starting body lines stay content in every state and drop
+    // at the comment/multiline skip below.
+    var in_mline = false;
+    var open_braces: isize = 0;
     while (lines.next()) |raw| : (line_num += 1) {
         defer offset += raw.len + 1;
         const t = mem.trim(u8, raw, " \t\r");
         if (t.len == 0 or isCommentOrMultilineString(t)) continue;
+        // String content: a `}` here is string data, never the fn's
+        // close (the ZA405 false-close fix, EPH-I1240).
+        if (advanceFnIfaceMline(&in_mline, &open_braces, t, &mask_buf)) continue;
         const code_end = findCommentStart(raw) orelse raw.len;
         const code = raw[0..code_end];
         try processFnIfaceLine(c, &scan, .{
@@ -28235,6 +28247,26 @@ fn visitFnInterfaceFile(c: FnIfaceCtx, content: []const u8) !void {
             .content = content,
         });
     }
+}
+
+/// Advance the fn-interface multiline-string state for one non-blank,
+/// non-`\\`/`//` line. Returns true when the line is string content and
+/// the caller must skip it. A mid-line `\\` opener enters the string; a
+/// terminator-shaped line (`;`/`,` or a closer, EPH-I0973/I0974) leaves
+/// it; every other line stays content.
+fn advanceFnIfaceMline(in_mline: *bool, open_braces: *isize, t: []const u8, mask_buf: []u8) bool {
+    if (!in_mline.*) {
+        if (hasMidLineMultilineOpener(t)) {
+            in_mline.* = true;
+            open_braces.* = braceBalance(maskOrRaw(t, mask_buf));
+        }
+        return false;
+    }
+    if (isMultilineStringTerminator(t, open_braces.*)) {
+        in_mline.* = false;
+        return false;
+    }
+    return true;
 }
 
 /// One line of the per-file pass, dispatched by span mode.
@@ -28437,17 +28469,22 @@ fn hasTypeParam(params: []const FnParam) bool {
 
 /// Parse the parameter list of `sig` (a fn signature slice that may span
 /// lines) into `out`. The list splits on top-level commas, with depth
-/// tracked and literals masked.
+/// tracked and literals masked. A segment whose trimmed form is empty —
+/// the trailing-comma wrapped shape's post-comma whitespace — is not a
+/// parameter and drops (EPH-I1239): parsing it as one gave the phantom
+/// param an empty name and silently killed the ZA505 forward match on
+/// the dominant zig-fmt wrapped signature.
 fn parseFnParams(sig: []const u8, out: []FnParam) ParamParse {
     const close = paramListEnd(sig) orelse return .{ .count = 0, .truncated = false };
     const open = mem.indexOf(u8, sig, "(") orelse return .{ .count = 0, .truncated = false };
     const segs = splitTopLevelCommas(sig, open + 1, close);
     var result: ParamParse = .{ .count = 0, .truncated = segs.truncated };
-    var i: usize = 0;
-    while (i < segs.count and i < out.len) : (i += 1) {
-        out[i] = parseFnParam(segs.segs[i]);
+    for (segs.segs[0..segs.count]) |seg| {
+        if (mem.trim(u8, seg, " \t\r\n").len == 0) continue;
+        if (result.count >= out.len) break;
+        out[result.count] = parseFnParam(seg);
+        result.count += 1;
     }
-    result.count = i;
     return result;
 }
 
@@ -36537,7 +36574,7 @@ fn isDecrementGuarded(
     if (hasPairedIncrementInLines(ctx.lines[0..ctx.idx], var_name)) return true;
     if (isInComptimeBlock(ctx.lines, ctx.idx)) return true;
     if (hasAssertGeGuard(ctx.lines, ctx.idx, var_name, decrement_amount)) return true;
-    if (hasEnclosingVarGuard(ctx.lines, ctx.idx, var_name, decrement_amount)) return true;
+    if (hasEnclosingGuardForVar(ctx.lines, ctx.idx, var_name, decrement_amount)) return true;
     if (hasElseBranchGuard(ctx.lines, ctx.idx)) return true;
     return false;
 }
@@ -39695,16 +39732,6 @@ fn cfgGuardCoversBracket(ctx: GuardLineCtx, sub: IdxSub) bool {
     const scan_start = gi + 1;
     if (scan_start >= ctx.idx) return true;
     return !indexVarReassignedAfter(ctx.lines, scan_start, ctx.idx, sub.idx_var);
-}
-
-/// Check if current line is inside an enclosing block guarded by if/while (var > 0) for decrements
-fn hasEnclosingVarGuard(
-    lines: []const []const u8,
-    current_idx: usize,
-    var_name: []const u8,
-    amount: ?usize,
-) bool {
-    return hasEnclosingGuardForVar(lines, current_idx, var_name, amount);
 }
 
 /// Check if a real operand ends at or before `pos` in an index expression:
@@ -127118,12 +127145,22 @@ test "ZA405 handles a multi-line signature" {
         \\fn wrapper(
         \\    diag: u8,
         \\    allocator: u8,
-        \\) !u8 {
-        \\    return compute(diag, allocator);
+        \\) u8 {
+        \\    return diag + allocator;
         \\}
-        \\
-        \\fn compute(a: u8, b: u8) !u8 {
-        \\    return a + b;
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA405 stays silent when a multiline-string continuation carries a brace" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn build(a: u8) u8 {
+        \\    const msg = \\usage
+        \\    } trailing prose
+        \\    return a + 1;
         \\}
     );
     defer run.deinit(allocator);
@@ -127164,6 +127201,34 @@ test "ZA505 fires on a single-return forward of all parameters" {
     defer run.deinit(allocator);
     try expectSingleFinding(&run, RULE_PASSTHROUGH_WRAPPER);
     try std.testing.expect(mem.indexOf(u8, run.structure.items[0].message, "inner") != null);
+}
+
+test "ZA505 fires on a trailing-comma wrapped forwarding signature" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn wrapper(
+        \\    a: u8,
+        \\    b: u8,
+        \\) u8 {
+        \\    return inner(a, b);
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_PASSTHROUGH_WRAPPER);
+    try std.testing.expect(mem.indexOf(u8, run.structure.items[0].message, "inner") != null);
+}
+
+test "ZA505 fires on a nullary rename wrapper (the empty-segment consequence)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn f() u32 {
+        \\    return compute();
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_PASSTHROUGH_WRAPPER);
 }
 
 test "ZA505 fires on a method forwarding self to a free fn" {

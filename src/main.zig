@@ -43182,28 +43182,37 @@ const Config = struct {
 fn excludePatternMatchesPath(path: []const u8, pattern: []const u8) bool {
     var comp_it = mem.splitScalar(u8, pattern, '/');
     var path_pos: usize = 0;
-    var comp = comp_it.next();
-    while (comp) |pat_comp| : (comp = comp_it.next()) {
-        const is_last = comp_it.peek() == null;
+    while (comp_it.next()) |pat_comp| {
         if (pat_comp.len == 0) continue;
-        if (!nextPathComponentMatches(path, &path_pos, pat_comp, is_last)) return false;
+        // The final pattern component carries the dot-extension form
+        // (ZA506 D2): the mode derives from the structural position,
+        // not from a flag threaded through the walkers.
+        const mode: ComponentMatchMode = if (comp_it.peek() == null) .extended else .exact;
+        if (!nextPathComponentMatches(path, &path_pos, pat_comp, mode)) return false;
     }
     return true;
 }
 
+/// Match mode for one exclude-pattern component (EPH-I0076, ZA506 D2):
+/// the final component accepts a dot-extension of its name, every
+/// earlier component matches exactly.
+const ComponentMatchMode = enum {
+    exact,
+    extended,
+};
+
 /// Advance `*path_pos` to the next path component matching `pat_comp`
-/// (exact, or dot-extended when `is_last`). False when no later
-/// component matches (EPH-I0076).
+/// under `mode`. False when no later component matches (EPH-I0076).
 fn nextPathComponentMatches(
     path: []const u8,
     path_pos: *usize,
     pat_comp: []const u8,
-    is_last: bool,
+    mode: ComponentMatchMode,
 ) bool {
     while (path_pos.* <= path.len) {
         var comp_end = path_pos.*;
         while (comp_end < path.len and path[comp_end] != '/') comp_end += 1;
-        const matched = excludeComponentMatches(path[path_pos.*..comp_end], pat_comp, is_last);
+        const matched = excludeComponentMatches(path[path_pos.*..comp_end], pat_comp, mode);
         path_pos.* = comp_end + 1;
         if (matched) return true;
         if (comp_end >= path.len) break;
@@ -43212,11 +43221,15 @@ fn nextPathComponentMatches(
 }
 
 /// One component of excludePatternMatchesPath (EPH-I0076): exact
-/// equality always matches; the final pattern component also matches a
-/// component that extends it with a dot.
-fn excludeComponentMatches(path_comp: []const u8, pat_comp: []const u8, is_last: bool) bool {
+/// equality always matches; the extended mode also matches a component
+/// that extends the pattern component with a dot.
+fn excludeComponentMatches(
+    path_comp: []const u8,
+    pat_comp: []const u8,
+    mode: ComponentMatchMode,
+) bool {
     if (mem.eql(u8, path_comp, pat_comp)) return true;
-    if (!is_last) return false;
+    if (mode == .exact) return false;
     return mem.startsWith(u8, path_comp, pat_comp) and
         path_comp.len > pat_comp.len and path_comp[pat_comp.len] == '.';
 }
@@ -43510,7 +43523,14 @@ fn commitLoadedConfig(c: LoadedConfigCommit) !void {
     const allocator = c.lctx.allocator;
     const cfg = c.lctx.cfg;
     const roots: EntriesRoots = .{ .base = c.dir_copy, .scan_root = c.saved_path };
-    const dropped_entries = try makeEntriesAbsolute(c.lctx, roots, c.trusted);
+    // ZA506 D2: the trusted channel absolutizes without the containment
+    // gate (RED4-3) and drops nothing; the untrusted channel gates.
+    var dropped_entries: usize = 0;
+    if (c.trusted) {
+        try makeEntriesAbsoluteTrusted(c.lctx, roots);
+    } else {
+        dropped_entries = try makeEntriesAbsolute(c.lctx, roots);
+    }
     if (dropped_entries > 0) try noteEntriesRejected(
         c.lctx.diag,
         allocator,
@@ -43801,34 +43821,24 @@ const EntriesRoots = struct {
 ///
 /// The containment root is roots.scan_root, never cfg.path: the loader
 /// commits cfg.path only after the fallible phase, so mid-load cfg.path
-/// does not hold the scan root yet (EPH-I0689).
-fn makeEntriesAbsolute(
-    lctx: ConfigLoadCtx,
-    roots: EntriesRoots,
-    trusted: bool,
-) !usize {
+/// does not hold the scan root yet (EPH-I0689). The trusted channel never
+/// enters this gate (ZA506 D2): commitLoadedConfig routes it to
+/// makeEntriesAbsoluteTrusted, which absolutizes without containment.
+fn makeEntriesAbsolute(lctx: ConfigLoadCtx, roots: EntriesRoots) !usize {
     const allocator = lctx.allocator;
     const cfg = lctx.cfg;
     if (roots.base.len == 0) return 0;
     var root_buf: [Fs.max_path_bytes]u8 = undefined;
-    const root_real: ?[]const u8 = if (trusted)
-        null
-    else
-        Fs.cwd(lctx.diag.io).realpath(roots.scan_root, &root_buf) catch null;
+    const root_real = Fs.cwd(lctx.diag.io).realpath(roots.scan_root, &root_buf) catch null;
 
-    // Phase 1 (fallible): absolutize each entry into its own slot. An OOM
-    // here leaves the array owned 1:1, so Config.deinit frees each slot
-    // exactly once.
-    for (cfg.entries.items, 0..) |entry, i| {
-        cfg.entries.items[i] = try absolutizeEntry(allocator, roots.base, entry);
-    }
+    try absolutizeEntries(allocator, roots.base, &cfg.entries);
 
     // Phase 2 (infallible): gate, then compact in place. kept never leads
     // the read index, so a kept write never clobbers an unread slot.
     var dropped: usize = 0;
     var kept: usize = 0;
     for (cfg.entries.items) |entry| {
-        if (entryPassesTrust(lctx.diag.io, trusted, root_real, entry)) {
+        if (entryPassesTrust(lctx.diag.io, root_real, entry)) {
             cfg.entries.items[kept] = entry;
             kept += 1;
             continue;
@@ -43839,6 +43849,31 @@ fn makeEntriesAbsolute(
     }
     cfg.entries.shrinkRetainingCapacity(kept);
     return dropped;
+}
+
+/// Trusted-channel absolutization (ZA506 D2, EPH-I1081): the former
+/// trusted flag on makeEntriesAbsolute routed the whole pass past the
+/// containment gate — exactly the trusted semantic, absolutize and drop
+/// nothing (RED4-3: operator channels may point outside the root for
+/// orphan completeness). The split names that semantic instead of
+/// selecting it with a flag.
+fn makeEntriesAbsoluteTrusted(lctx: ConfigLoadCtx, roots: EntriesRoots) !void {
+    if (roots.base.len == 0) return;
+    try absolutizeEntries(lctx.allocator, roots.base, &lctx.cfg.entries);
+}
+
+/// Phase 1 of both makeEntriesAbsolute channels: absolutize each entry
+/// in place. absolutizeEntry frees the old slice only after the
+/// replacement exists, so an OOM leaves the caller's array owned 1:1
+/// (the EPH-I0061 slot invariant).
+fn absolutizeEntries(
+    allocator: Allocator,
+    base_path: []const u8,
+    entries: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    for (entries.items, 0..) |entry, i| {
+        entries.items[i] = try absolutizeEntry(allocator, base_path, entry);
+    }
 }
 
 /// Make one config entry absolute against the config file's directory.
@@ -43852,13 +43887,12 @@ fn absolutizeEntry(allocator: Allocator, base_path: []const u8, entry: []const u
     return abs;
 }
 
-/// Trust gate for one config entry (EPH-I0195). Trusted entries pass
-/// untouched: operator channels may point outside the root for orphan
-/// completeness (RED4-3). Untrusted entries must realpath inside the
-/// scan-root realpath. A null root_real means the scan root itself did
-/// not resolve, which fails closed.
-fn entryPassesTrust(io: std.Io, trusted: bool, root_real: ?[]const u8, abs: []const u8) bool {
-    if (trusted) return true;
+/// Containment gate for one untrusted config entry (EPH-I0195). The
+/// trusted channel never calls it (ZA506 D2): trusted entries pass
+/// untouched, so only the untrusted gate runs the realpath check. A
+/// null root_real means the scan root itself did not resolve, which
+/// fails closed.
+fn entryPassesTrust(io: std.Io, root_real: ?[]const u8, abs: []const u8) bool {
     const root = root_real orelse return false;
     return realpathContained(io, root, abs);
 }
@@ -46278,7 +46312,9 @@ const UpgradeRun = struct {
     /// fetch already ran — it must, to resolve the upgrade target the
     /// floor compares (B13-20).
     fn refuseDowngrade(self: *const UpgradeRun, ver: []const u8) !void {
-        if (upgradeFloorAllows(EPHOR_VERSION, ver, self.opts.force)) return;
+        // ZA506 D2: the forced bypass is the caller's composition — a
+        // forced run skips the floor entirely.
+        if (self.opts.force or upgradeFloorAllows(EPHOR_VERSION, ver)) return;
         cliDiag(
             self.diag,
             "ERROR: refusing to downgrade ephor from v{s} to v{s}. Use --force to override.\n",
@@ -47450,12 +47486,13 @@ fn isNewerVersion(local: []const u8, remote: []const u8) bool {
 }
 
 /// True when the upgrade path may resolve to target. A target older than
-/// current is a downgrade and needs force. WHY: tag order and explicit
-/// flags can resolve below the installed binary, and a silent downgrade
-/// re-introduces fixed bugs (EPH-I0193). An unparseable target is not
-/// blocked here: explicit-flag validation belongs to EPH-I0166.
-fn upgradeFloorAllows(current: []const u8, target: []const u8, force: bool) bool {
-    if (force) return true;
+/// current is a downgrade (EPH-I0193); the caller composes the --force
+/// bypass (ZA506 D2), so a forced run skips this floor entirely. WHY:
+/// tag order and explicit flags can resolve below the installed binary,
+/// and a silent downgrade re-introduces fixed bugs. An unparseable
+/// target is not blocked here: explicit-flag validation belongs to
+/// EPH-I0166.
+fn upgradeFloorAllows(current: []const u8, target: []const u8) bool {
     // isNewerVersion(local=target, remote=current) is true exactly when
     // current is newer than target — the downgrade case.
     return !isNewerVersion(target, current);
@@ -47654,22 +47691,18 @@ fn isCwdDir(diag: *DiagCtx, dir: []const u8) bool {
     return mem.eql(u8, dir_real, cwd_real);
 }
 
+/// Dir-target entry detection (ZA506 D2, EPH-I1081): the former
+/// cli_entries flag selected between this whole body and
+/// detectCliEntriesTarget, so the flag left the signature and the
+/// caller dispatches the shapes. File targets dispatch to
+/// detectFileTargetEntries from the caller too (EPH-I0801), so this fn
+/// assumes a directory target: the target tree's own entries replace
+/// the cwd config's.
 fn detectTargetEntries(
     diag: *DiagCtx,
     allocator: Allocator,
     cfg: *Config,
-    cli_entries: bool,
 ) !void {
-    // EPH-I0801: a file target has no target tree to switch into, so it
-    // takes its own path below. A directory target switches project
-    // context: the target tree's own entries replace the cwd config's.
-    if (isFileTarget(diag, cfg.path)) return detectFileTargetEntries(diag, allocator, cfg);
-    // EPH-I0201 (RED3-2): an explicit --entry is operator intent. The
-    // unconditional wipe below discarded it, so a hostile target config
-    // replaced the victim's pinned entry and defeated the orphan scan.
-    // The CLI-entry path keeps the entries while the target sources
-    // load, then re-appends them.
-    if (cli_entries) return detectCliEntriesTarget(diag, allocator, cfg);
     for (cfg.entries.items) |e| allocator.free(e);
     cfg.entries.clearRetainingCapacity();
     try loadConfigFromTargetPath(diag, allocator, cfg, cfg.path);
@@ -47683,7 +47716,10 @@ fn detectTargetEntries(
 /// rebases and gates every entry it sees, and CLI entries must keep
 /// their operator spelling), then re-append after — the scan stays the
 /// CLI path UNION the honored entries (EPH-I0784). A note names the
-/// target source that contributed entries alongside the CLI set.
+/// target source that contributed entries alongside the CLI set. The
+/// caller dispatches this shape (ZA506 D2): the former cli_entries flag
+/// on detectTargetEntries selected it, so the flag left the signature
+/// and the call site names the shape.
 fn detectCliEntriesTarget(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     var kept = cfg.entries;
     cfg.entries = .empty;
@@ -49095,6 +49131,23 @@ fn silenceVerboseInJson(cfg: *Config) void {
     cfg.verbose = false;
 }
 
+/// Reject the human-output commands under --format=json (EPH-I1070,
+/// EPH-I1097): their lines would leak raw text onto the machine stream,
+/// and routing them through cliDiag would leave the stream empty. The
+/// stashed diagnostic rides the abort object, and the run exits 1.
+/// parseTailArgs parses the command word in flag-first order too
+/// (EPH-I1098), so either spelling reaches this rejection. Split out of
+/// parseArgs to keep that function under the ZA301 cap (ZA506 D2).
+fn rejectJsonCommand(diag: *DiagCtx, cfg: *const Config) error{JsonCommandUnsupported}!void {
+    const name = jsonRejectedCommandName(cfg) orelse return;
+    cliDiag(
+        diag,
+        "error: the {s} command has no machine-readable output. Run it without --format=json\n",
+        .{name},
+    );
+    return error.JsonCommandUnsupported;
+}
+
 /// Name of the command that must reject JSON output (EPH-I1070,
 /// EPH-I1097), or null when the command may run under --format=json.
 /// init, install, and upgrade emit human progress text and carry no
@@ -49189,25 +49242,21 @@ fn parseArgs(diag: *DiagCtx, allocator: Allocator, proc_args: std.process.Args) 
     // JSON mode makes verbose a no-op: settled after the flag loop so
     // either flag order lands on the same outcome (EPH-I0213).
     silenceVerboseInJson(&cfg);
-    // The human-output commands reject --format=json (EPH-I1070,
-    // EPH-I1097): their lines would leak raw text onto the machine
-    // stream, and routing them through cliDiag would leave the stream
-    // empty. The stashed diagnostic rides the abort object, and the run
-    // exits 1. parseTailArgs parses the command word in flag-first
-    // order too (EPH-I1098), so either spelling reaches this rejection.
-    if (jsonRejectedCommandName(&cfg)) |name| {
-        cliDiag(
-            diag,
-            "error: the {s} command has no machine-readable output. Run it without --format=json\n",
-            .{name},
-        );
-        return error.JsonCommandUnsupported;
-    }
+    try rejectJsonCommand(diag, &cfg);
     try stripTrailingSlashes(allocator, &cfg);
     try autoDetectPath(diag, allocator, &cfg);
-    if (cfg.path_owned and !mem.eql(u8, cfg.path, "src"))
-        // EPH-I0201: an explicit --entry survives the target switch.
-        try detectTargetEntries(diag, allocator, &cfg, cli_entries);
+    if (cfg.path_owned and !mem.eql(u8, cfg.path, "src")) {
+        // The three target-entry shapes dispatch here (ZA506 D2):
+        // a file target keeps the cwd config's entries (EPH-I0801),
+        // a CLI-entry dir run keeps its entries alongside the target
+        // sources (EPH-I0201), and a plain dir run replaces them.
+        if (isFileTarget(diag, cfg.path))
+            try detectFileTargetEntries(diag, allocator, &cfg)
+        else if (cli_entries)
+            try detectCliEntriesTarget(diag, allocator, &cfg)
+        else
+            try detectTargetEntries(diag, allocator, &cfg);
+    }
     if (cfg.entries.items.len == 0) try detectStandardEntries(diag, allocator, &cfg);
     return cfg;
 }
@@ -87860,13 +87909,40 @@ test "requireStrictExplicitVersion rejects non-strict values (EPH-I0155)" {
     }
 }
 
-test "upgradeFloorAllows blocks downgrades without force (EPH-I0193)" {
-    try std.testing.expect(!upgradeFloorAllows("0.14.3", "0.13.0", false));
-    try std.testing.expect(upgradeFloorAllows("0.14.3", "0.13.0", true));
-    try std.testing.expect(upgradeFloorAllows("0.14.3", "0.14.3", false));
-    try std.testing.expect(upgradeFloorAllows("0.14.3", "0.15.0", false));
+test "upgradeFloorAllows blocks downgrades (EPH-I0193)" {
+    try std.testing.expect(!upgradeFloorAllows("0.14.3", "0.13.0"));
+    try std.testing.expect(upgradeFloorAllows("0.14.3", "0.14.3"));
+    try std.testing.expect(upgradeFloorAllows("0.14.3", "0.15.0"));
     // Unparseable targets pass the floor: EPH-I0166 owns flag validation.
-    try std.testing.expect(upgradeFloorAllows("0.14.3", "garbage", false));
+    try std.testing.expect(upgradeFloorAllows("0.14.3", "garbage"));
+}
+
+test "refuseDowngrade honors --force over the floor (EPH-I0193)" {
+    // ZA506 D2 moved the forced bypass into the caller's composition:
+    // upgradeFloorAllows lost its force flag, so this pin holds the
+    // bypass contract directly — a forced run skips the floor, an
+    // unforced downgrade refuses.
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const run: UpgradeRun = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .project_dir = tmp.dir,
+        .opts = .{ .install_version = null, .force = false },
+        .fetch_fn = testFetchFn,
+    };
+    try std.testing.expectError(error.UpgradeFailed, run.refuseDowngrade("0.0.1"));
+    const forced: UpgradeRun = .{
+        .diag = &diag,
+        .allocator = allocator,
+        .project_dir = tmp.dir,
+        .opts = .{ .install_version = null, .force = true },
+        .fetch_fn = testFetchFn,
+    };
+    try forced.refuseDowngrade("0.0.1");
 }
 
 test "parseEphorHashFromZon extracts the hash from a zig-written entry (EPH-I0139)" {
@@ -121243,7 +121319,7 @@ test "target build.zig entries outside the scan root are dropped (EPH-I0195)" {
     defer cfg.deinit(allocator);
     try setOwnedPath(allocator, &cfg, root_path);
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg, false);
+    try detectTargetEntries(&diag, allocator, &cfg);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     const want_entry = try std.fmt.allocPrint(allocator, "{s}/inside.zig", .{root_path});
@@ -121284,7 +121360,7 @@ test "file target keeps the cwd config's entries (EPH-I0801)" {
     // The cwd config's entry, as loadConfigFile leaves it (relative).
     try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg, false);
+    try detectFileTargetEntries(&diag, allocator, &cfg);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);
@@ -121319,7 +121395,7 @@ test "directory target still replaces the cwd config's entries (EPH-I0801)" {
     try setOwnedPath(allocator, &cfg, target_path);
     try cfg.entries.append(allocator, try allocator.dupe(u8, "stale.zig"));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg, false);
+    try detectTargetEntries(&diag, allocator, &cfg);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     const want_entry = try std.fmt.allocPrint(allocator, "{s}/src/main.zig", .{target_path});
@@ -121327,7 +121403,7 @@ test "directory target still replaces the cwd config's entries (EPH-I0801)" {
     try std.testing.expectEqualStrings(want_entry, cfg.entries.items[0]);
 }
 
-test "detectTargetEntries keeps CLI --entry values on a dir target (EPH-I0201)" {
+test "detectCliEntriesTarget keeps CLI --entry values on a dir target (EPH-I0201)" {
     var diag = testDiagCtx();
     // RED3-2 pin: an explicit --entry is operator intent. Pre-fix the
     // dir-target wipe discarded it, so a hostile target config replaced
@@ -121359,7 +121435,7 @@ test "detectTargetEntries keeps CLI --entry values on a dir target (EPH-I0201)" 
     // The CLI entry, as handleEntryArg leaves it.
     try cfg.entries.append(allocator, try allocator.dupe(u8, victim));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg, true);
+    try detectCliEntriesTarget(&diag, allocator, &cfg);
 
     // The CLI entry survives and the tree-scanned entry joins it.
     try std.testing.expectEqual(@as(usize, 2), cfg.entries.items.len);
@@ -121409,7 +121485,7 @@ test "file target keeps the cwd config's entries past an untrusted parent config
     try setOwnedPath(allocator, &cfg, file_path);
     try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg, false);
+    try detectFileTargetEntries(&diag, allocator, &cfg);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);
@@ -121439,7 +121515,7 @@ test "file target attributes only the parent config's own drops (EPH-I0801)" {
     try setOwnedPath(allocator, &cfg, file_path);
     try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg, false);
+    try detectFileTargetEntries(&diag, allocator, &cfg);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);
@@ -121464,7 +121540,7 @@ test "file target keeps the cwd config's entries past a trusted parent config (E
     try setOwnedPath(allocator, &cfg, file_path);
     try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg, false);
+    try detectFileTargetEntries(&diag, allocator, &cfg);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);
@@ -121490,7 +121566,7 @@ test "file target unions a trusted parent config's entries (EPH-I0801)" {
     try setOwnedPath(allocator, &cfg, file_path);
     try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg, false);
+    try detectFileTargetEntries(&diag, allocator, &cfg);
 
     try std.testing.expectEqual(@as(usize, 2), cfg.entries.items.len);
     const parent_dir = std.fs.path.dirname(file_path).?;
@@ -121523,7 +121599,7 @@ test "file target survives a dot-slash-infix parent config load (EPH-I0801)" {
     try setOwnedPath(allocator, &cfg, file_path);
     try cfg.entries.append(allocator, try allocator.dupe(u8, "main.zig"));
     diag.cli_diagnostics_enabled = false;
-    try detectTargetEntries(&diag, allocator, &cfg, false);
+    try detectFileTargetEntries(&diag, allocator, &cfg);
 
     try std.testing.expectEqual(@as(usize, 1), cfg.entries.items.len);
     try std.testing.expectEqualStrings("main.zig", cfg.entries.items[0]);
@@ -121604,7 +121680,6 @@ fn runEntriesSweepIteration(
         const dropped = try makeEntriesAbsolute(
             .{ .diag = diag, .allocator = failing.allocator(), .cfg = &cfg },
             roots,
-            false,
         );
         try std.testing.expectEqual(@as(usize, 1), dropped);
         try std.testing.expectEqual(@as(usize, 2), cfg.entries.items.len);
@@ -121619,7 +121694,6 @@ fn runEntriesSweepIteration(
         try std.testing.expectError(error.OutOfMemory, makeEntriesAbsolute(
             .{ .diag = diag, .allocator = failing.allocator(), .cfg = &cfg },
             roots,
-            false,
         ));
     }
     cfg.deinit(failing.allocator());
@@ -121661,7 +121735,6 @@ test "makeEntriesAbsolute OOM sweep keeps every slot owned 1:1 (EPH-I0195)" {
     _ = try makeEntriesAbsolute(
         .{ .diag = &diag, .allocator = probe.allocator(), .cfg = &probe_cfg },
         probe_roots,
-        false,
     );
     probe_cfg.deinit(probe.allocator());
     const inner_allocs = probe.allocations - probe_base;
@@ -121670,6 +121743,26 @@ test "makeEntriesAbsolute OOM sweep keeps every slot owned 1:1 (EPH-I0195)" {
     while (fail_at <= inner_allocs) : (fail_at += 1) {
         try runEntriesSweepIteration(&diag, root_path, fail_at, inner_allocs);
     }
+}
+
+test "makeEntriesAbsoluteTrusted absolutizes without gating (EPH-I0195)" {
+    var diag = testDiagCtx();
+    // The trusted channel (RED4-3): operator channels may point outside
+    // the root for orphan completeness, so the trusted pass absolutizes
+    // and gates nothing. The split moved the trusted flag out of the
+    // makeEntriesAbsolute signature (ZA506 D2); this pin holds the
+    // trusted semantic directly.
+    const allocator = std.testing.allocator;
+    var cfg = try buildEntriesSweepConfig(allocator, "/trusted/root");
+    defer cfg.deinit(allocator);
+    diag.entries_reject_count = 0;
+    const roots: EntriesRoots = .{ .base = "/trusted/root", .scan_root = "/trusted/root" };
+    try makeEntriesAbsoluteTrusted(.{ .diag = &diag, .allocator = allocator, .cfg = &cfg }, roots);
+    try std.testing.expectEqual(@as(usize, 3), cfg.entries.items.len);
+    try std.testing.expectEqualStrings("/etc/passwd", cfg.entries.items[0]);
+    try std.testing.expectEqualStrings("/trusted/root/b.zig", cfg.entries.items[1]);
+    try std.testing.expectEqualStrings("/trusted/root/c.zig", cfg.entries.items[2]);
+    try std.testing.expectEqual(@as(usize, 0), diag.entries_reject_count);
 }
 
 /// One armed OOM-sweep probe: a FailingAllocator over the testing

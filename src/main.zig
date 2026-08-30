@@ -14092,13 +14092,18 @@ fn scanBlocksForPatterns(
     return state;
 }
 
+/// The two roles a line plays for one carried defer depth: the block's
+/// opener line restarts its own depth; a body line contributes its brace
+/// balance while the block stays open (EPH-I0883).
+const DeferDepthStep = enum { opener, body };
+
 /// Update a multi-line defer/errdefer block depth from one line: the
 /// opener line restarts the depth, every following line contributes its
 /// brace balance. The arm and the counter use the same code-position
 /// brace notion (EPH-I0883): the depth walk routes through
 /// computeBraceDepth (EPH-I0894).
-fn trackDeferBlockDepthLine(is_block_start: bool, t: []const u8, depth: *usize) void {
-    if (is_block_start) {
+fn trackDeferBlockDepthLine(step: DeferDepthStep, t: []const u8, depth: *usize) void {
+    if (step == .opener) {
         depth.* = computeBraceDepth(t, 0);
     } else if (depth.* > 0) {
         depth.* = computeBraceDepth(t, depth.*);
@@ -14139,12 +14144,12 @@ const BlockLineScan = struct {
     /// (EPH-I0349).
     fn applyDeferDepths(self: *BlockLineScan, t: []const u8, kind: LineDeferKind) void {
         trackDeferBlockDepthLine(
-            kind == .errdefer_kw and hasCodeChar(t, '{'),
+            if (kind == .errdefer_kw and hasCodeChar(t, '{')) .opener else .body,
             t,
             &self.errdefer_depth,
         );
         trackDeferBlockDepthLine(
-            kind == .defer_kw and hasCodeChar(t, '{'),
+            if (kind == .defer_kw and hasCodeChar(t, '{')) .opener else .body,
             t,
             &self.defer_depth,
         );
@@ -25674,22 +25679,27 @@ fn trackConcurrencyDefer(
     state: *ConcurrencyScanState,
 ) void {
     const kw = keyword_code_pos orelse blanked.len;
-    var opener_seen = false;
+    // The first `{` at/after the keyword opens the deferred statement's
+    // block (EPH-I0928); a line with no keyword has no opener (the kw
+    // sentinel sits past the line end, so no brace position matches it).
+    const opener_pos = mem.indexOfPos(u8, blanked, kw, "{") orelse blanked.len;
     for (blanked, 0..) |c, i| {
-        if (c == '{') {
-            // The first `{` at/after the keyword opens the deferred
-            // statement's block (EPH-I0928); a line with no keyword has
-            // no opener (kw sentinel past the line end).
-            const opener = !opener_seen and i >= kw;
-            opener_seen = opener_seen or opener;
-            pushDeferBrace(state, opener, defer_stmt_depth);
-            continue;
+        if (i == opener_pos) {
+            pushDeferBrace(state, .opener, defer_stmt_depth);
+        } else if (c == '{') {
+            pushDeferBrace(state, .inner, defer_stmt_depth);
+        } else if (c == '}') {
+            popDeferBrace(state);
         }
-        if (c == '}') popDeferBrace(state);
     }
 }
 
-/// Push one `{` onto the defer brace-kind stack (EPH-I0928): `opener`
+/// The two roles a `{` plays in the defer brace-kind stack (EPH-I0928):
+/// the deferred statement's block opener, or an inner brace inside the
+/// defer context.
+const DeferBraceRole = enum { opener, inner };
+
+/// Push one `{` onto the defer brace-kind stack (EPH-I0928): `.opener`
 /// marks the deferred statement's block opener on an armed line, which
 /// also captures the defer statement's depth and arms in_defer. A brace
 /// outside the defer context is untracked — the empty-stack `}` clamp
@@ -25699,10 +25709,10 @@ fn trackConcurrencyDefer(
 /// plain, the over-report direction ZC101 documents as safe.
 fn pushDeferBrace(
     state: *ConcurrencyScanState,
-    opener: bool,
+    role: DeferBraceRole,
     defer_stmt_depth: usize,
 ) void {
-    if (!opener and !state.in_defer) return;
+    if (role == .inner and !state.in_defer) return;
     if (state.defer_stack_len == max_defer_stack_depth) {
         state.defer_stack_len = 0;
         state.defer_kinds = 0;
@@ -25711,7 +25721,7 @@ fn pushDeferBrace(
         return;
     }
     const bit = @as(u64, 1) << @intCast(state.defer_stack_len);
-    if (opener) {
+    if (role == .opener) {
         state.defer_kinds |= bit;
         state.defer_depth += 1;
         state.defer_stmt_depth = defer_stmt_depth;
@@ -26544,20 +26554,23 @@ fn hasCoveringDeferRelease(releases: []const LockRelease, acq: LockAcquire) bool
     return false;
 }
 
+/// The plain-release class a scan targets (ZC101): depth-1 statements
+/// (they cover every path that reaches them) or deeper branch-scoped
+/// releases (they cover only the paths through their branch — the
+/// failure-branch half of a cross-fn acquire/release API).
+const ReleaseLevel = enum { top_level, branch };
+
 /// True when the fn holds a matching plain release at the requested
-/// path-covering level (ZC101): `top_level` selects depth-1 statements
-/// (cover every path that reaches them) vs deeper branch-scoped releases
-/// (cover only the paths through their branch — the failure-branch half
-/// of a cross-fn acquire/release API).
+/// path-covering level (ZC101).
 fn hasPlainReleaseAtDepth(
     rec: *const FnLockRecord,
     acq: LockAcquire,
-    top_level: bool,
+    level: ReleaseLevel,
 ) bool {
     for (rec.plain_releases.items) |rel| {
         if (!mem.eql(u8, rel.receiver, acq.receiver)) continue;
         if (!releaseMatchesAcquire(acq.method, rel.method)) continue;
-        if ((rel.depth <= 1) == top_level) return true;
+        if ((rel.depth <= 1) == (level == .top_level)) return true;
     }
     return false;
 }
@@ -26637,12 +26650,12 @@ fn evaluateAcquire(
     const rec = &records[rec_idx];
     if (isSemaphoreAcquire(acq.method) and !hasSemaphoreEvidence(records, acq)) return;
     if (hasCoveringDeferRelease(rec.defer_releases.items, acq)) return;
-    if (hasPlainReleaseAtDepth(rec, acq, true)) return emitUnlockNotDeferred(sink, acq);
+    if (hasPlainReleaseAtDepth(rec, acq, .top_level)) return emitUnlockNotDeferred(sink, acq);
     // Tiny acquire wrapper (`fn acquire() void { mu.lock(); }`): the
     // release belongs to a sibling unlock API by design.
     if (rec.stmt_count <= 1) return;
     if (hasCrossFnRelease(records, rec_idx, acq)) return;
-    if (hasPlainReleaseAtDepth(rec, acq, false)) return emitUnlockNotDeferred(sink, acq);
+    if (hasPlainReleaseAtDepth(rec, acq, .branch)) return emitUnlockNotDeferred(sink, acq);
     try sink.issues.append(sink.allocator, .{
         .file = sink.path,
         .line = acq.line,
@@ -29882,6 +29895,9 @@ fn hasCodeArrow(t: []const u8) bool {
 const BraceScan = struct {
     /// First `{` of an arrow line is the switch prong's open (EPH-I0451).
     first: bool = true,
+    /// The line is a switch arrow line (`==>` seen, EPH-I0451): only the
+    /// line's first `{` opens a prong and adds no depth.
+    is_arrow: bool = false,
     /// Previous NON-WHITESPACE code char: a `{` right after a code `.`
     /// opens an anonymous struct/array literal, not a block (EPH-I0811).
     /// Whitespace between tokens is not adjacency, so `' '`/`'\t'` never
@@ -29900,7 +29916,6 @@ const BraceScan = struct {
 /// Track brace nesting, returns true if function ended.
 /// Also updates cognitive nesting via cog_markers and cog_nest.
 fn trackBraceNesting(t: []const u8, state: *ComplexityState) bool {
-    const is_switch = hasCodeArrow(t);
     var lit = types.LiteralState.forLine(t) orelse return false;
     // EPH-I0819: the scan starts from the previous line's last
     // non-whitespace code char — a `.` at end of line still masks the
@@ -29908,13 +29923,14 @@ fn trackBraceNesting(t: []const u8, state: *ComplexityState) bool {
     var scan = BraceScan{
         .prev_c = state.prev_code_char,
         .scope_open = opensCognitiveScope(t),
+        .is_arrow = hasCodeArrow(t),
     };
     var fn_ended = false;
     var i: usize = 0;
     while (i < t.len) : (i += 1) {
         const pos = lit.updateForChar(t, i) orelse continue;
         const c = t[pos];
-        if (updateBraceState(c, is_switch, &scan, state)) {
+        if (updateBraceState(c, &scan, state)) {
             fn_ended = true;
             break;
         }
@@ -29940,17 +29956,17 @@ fn elseFamilyNest(t: []const u8, state: *const ComplexityState) usize {
     const pos = realTokenPos(t, "else") orelse
         realTokenPos(t, "catch") orelse return state.cog_nest;
     var copy = state.*;
-    const is_switch = hasCodeArrow(t);
     var scan = BraceScan{
         .prev_c = state.prev_code_char,
         .scope_open = opensCognitiveScope(t),
+        .is_arrow = hasCodeArrow(t),
     };
     var lit = types.LiteralState.forLine(t) orelse return state.cog_nest;
     var i: usize = 0;
     while (i < pos) : (i += 1) {
         const cp = lit.updateForChar(t, i) orelse continue;
         const c = t[cp];
-        if (updateBraceState(c, is_switch, &scan, &copy)) break;
+        if (updateBraceState(c, &scan, &copy)) break;
         if (c != ' ' and c != '\t') scan.prev_c = c;
     }
     return copy.cog_nest;
@@ -29976,11 +29992,10 @@ fn markCognitiveScope(scan: *BraceScan, state: *ComplexityState) void {
 /// reached zero).
 fn updateBraceState(
     c: u8,
-    is_switch: bool,
     scan: *BraceScan,
     state: *ComplexityState,
 ) bool {
-    if (c == '{') applyOpenBrace(is_switch, scan, state);
+    if (c == '{') applyOpenBrace(scan, state);
     if (c == '}' and state.nest > 0) return applyCloseBrace(state);
     return false;
 }
@@ -29997,10 +30012,10 @@ fn updateBraceState(
 /// real open. Adjacency cannot separate it from a block: `else{`
 /// and `catch{` are real blocks whose `{` follows an identifier
 /// char, so a prev_c-is-identifier mask would be unsafe.
-fn applyOpenBrace(is_switch: bool, scan: *BraceScan, state: *ComplexityState) void {
+fn applyOpenBrace(scan: *BraceScan, state: *ComplexityState) void {
     if (scan.prev_c == '.' and state.nest < 32) {
         state.lit_opens[state.nest] += 1;
-    } else if (is_switch and scan.first and state.nest < 32) {
+    } else if (scan.is_arrow and scan.first and state.nest < 32) {
         // EPH-I0451: a switch prong's open brace adds no depth. Skipping
         // only the open left every block prong at net -1 and ended fns
         // mid-switch, so the skip is recorded per depth and the matching
@@ -31450,10 +31465,11 @@ fn isScreamingCase(name: []const u8) bool {
     return true;
 }
 
-/// Check if keyword is followed by valid boundary char
-fn isValidTypeBoundary(txt: []const u8, pos: usize, expect_brace: bool) bool {
+/// Check whether the keyword is followed by a valid boundary char. The
+/// caller runs it only for patterns that need one — `error{` carries its
+/// own brace, so its row skips the check.
+fn isValidTypeBoundary(txt: []const u8, pos: usize) bool {
     if (pos >= txt.len) return true;
-    if (!expect_brace) return true;
     const c = txt[pos];
     return c == '{' or c == '(' or c == ' ' or c == '\t';
 }
@@ -31502,7 +31518,7 @@ fn isTypeDefinitionLine(line: []const u8) bool {
 
     for (type_kws) |pat| {
         const pos = codeKeywordPos(after_eq, pat.kw) orelse continue;
-        if (!isValidTypeBoundary(after_eq, pos + pat.kw.len, pat.chk)) continue;
+        if (pat.chk and !isValidTypeBoundary(after_eq, pos + pat.kw.len)) continue;
         return true;
     }
     return false;
@@ -31528,7 +31544,7 @@ fn isClosureFunctionAlias(line: []const u8, content: []const u8, line_offset: us
 
     for (type_kws) |pat| {
         const pos = codeKeywordPos(after_eq, pat.kw) orelse continue;
-        if (!isValidTypeBoundary(after_eq, pos + pat.kw.len, pat.chk)) continue;
+        if (pat.chk and !isValidTypeBoundary(after_eq, pos + pat.kw.len)) continue;
         const kw_end_global = line_offset + eq_pos + 1 + pos + pat.kw.len;
         if (isClosureWrappingType(content, kw_end_global)) return true;
     }
@@ -107036,8 +107052,15 @@ test "trackDeferBlockDepthLine uses one code-position brace notion (EPH-I0883)" 
     try std.testing.expect(!hasCodeChar("defer f(); // {", '{'));
     try std.testing.expect(hasCodeChar("defer {", '{'));
     var depth: usize = 0;
-    trackDeferBlockDepthLine(true, "defer { const s = \"}\";", &depth);
+    trackDeferBlockDepthLine(.opener, "defer { const s = \"}\";", &depth);
     try std.testing.expectEqual(@as(usize, 1), depth);
+    // A body line contributes its balance while the block stays open.
+    trackDeferBlockDepthLine(.body, "const x = 1;", &depth);
+    try std.testing.expectEqual(@as(usize, 1), depth);
+    // A body line with no open block leaves the depth untouched.
+    var idle: usize = 0;
+    trackDeferBlockDepthLine(.body, "const x = 1;", &idle);
+    try std.testing.expectEqual(@as(usize, 0), idle);
 }
 
 test "skipBlanks skips spaces and tabs (EPH-I0421)" {

@@ -28229,7 +28229,10 @@ fn hasCompatComponent(path: []const u8) bool {
 //     is a generic-instantiation adapter and never fires (the
 //     value-reference carve-out, EPH-I1238: an argument segment, an
 //     assignment right-hand side, or a return expression are positions a
-//     generic callee cannot serve).
+//     generic callee cannot serve). The carve-out is receiver-gated
+//     (EPH-I1243): a bare identifier never binds a receiver-typed
+//     wrapper, so a shadowing local at a value position does not silence
+//     one — file-scope wrappers keep the bare form.
 //   ZA506 boolean flag parameter — a bool-typed parameter whose name
 //     appears inside an if/switch condition in the body (the
 //     two-functions-in-one-signature class).
@@ -28401,7 +28404,10 @@ fn appendSegment(list: SegmentList, seg: []const u8) SegmentList {
 /// a generic callee cannot serve those positions, so the wrapper exists to
 /// monomorphize it, and ZA505 stays silent. A passthrough whose name never
 /// takes a value position keeps firing. The keys are owned dupes (the scan
-/// surface is a per-line stack buffer), freed by deinitValueRefSet.
+/// surface is a per-line stack buffer), freed by deinitValueRefSet. The
+/// names are bare identifiers only, and the check applies the set to
+/// non-receiver-typed wrappers alone (EPH-I1243): a bare name never binds
+/// a method.
 const ValueRefSet = std.StringHashMapUnmanaged(void);
 
 /// Scan one file for the value-reference names (EPH-I1238). The line
@@ -28907,8 +28913,17 @@ fn checkPassthroughWrapper(
     if (mem.eql(u8, calleeBaseName(callee.callee), open.name)) return;
     // Generic-instantiation adapter (EPH-I1238): a generic callee cannot
     // serve a value position, so the name taking one means the wrapper is
-    // the required monomorphization, not a passthrough.
-    if (c.value_refs.contains(open.name)) return;
+    // the required monomorphization, not a passthrough. The carve-out is
+    // receiver-gated (EPH-I1243): a bare identifier never binds a
+    // receiver-typed wrapper (methods live on containers, not in lexical
+    // scope), so a same-named local at a value position must not silence
+    // one. A dotted ref could bind a method, but the same bytes also read
+    // as a field or slice-length access (`items.len`), so no value-ref
+    // form silences a receiver-typed wrapper — the FN-eliminating
+    // direction; a method genuinely taken as a fn value stays a rare
+    // un-silenced firing.
+    const has_self_receiver = params.len > 0 and params[0].is_self;
+    if (!has_self_receiver and c.value_refs.contains(open.name)) return;
     if (!argsForwardParams(callee.args, params)) return;
     const msg = try std.fmt.allocPrint(
         c.allocator,
@@ -129032,6 +129047,49 @@ test "ZA505 keeps firing when the name appears only in a string" {
     );
     defer run.deinit(allocator);
     try expectSingleFinding(&run, RULE_PASSTHROUGH_WRAPPER);
+}
+
+test "ZA505 fires on a method whose name a local value ref shadows" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The sig Db.zig shape (EPH-I1243): a local `len` at a value position
+    // can never bind the receiver-typed `len` wrapper, so the value-ref
+    // carve-out must not silence it.
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\const Db = struct {
+        \\    entries: usize,
+        \\
+        \\    pub fn getLargest(self: *Db, limit: usize) usize {
+        \\        const len = self.entries;
+        \\        return @min(len, limit);
+        \\    }
+        \\
+        \\    pub fn len(self: *Db) usize {
+        \\        return self.entries.count();
+        \\    }
+        \\};
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_PASSTHROUGH_WRAPPER);
+}
+
+test "ZA505 stays silent for a file-scope wrapper a same-named local shadows" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The control (EPH-I1243): a bare value ref binds lexical scope, so a
+    // same-named local still marks a file-scope wrapper as an adapter.
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn len(a: u32, limit: u32) u32 {
+        \\    return std.math.max(a, limit);
+        \\}
+        \\
+        \\fn useLargest(x: u32, limit: u32) u32 {
+        \\    const len = x;
+        \\    return @min(len, limit);
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
 }
 
 // --- ZA506: boolean flag parameters ------------------------------------------

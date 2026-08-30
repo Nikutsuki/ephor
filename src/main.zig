@@ -29125,8 +29125,9 @@ fn recordVarDeclName(
     masked: []const u8,
     after: usize,
 ) !void {
-    const name = varDeclName(masked, after) orelse return;
-    try decls.append(allocator, .{ .name = name, .name_pos = after });
+    const start = varDeclNameStart(masked, after) orelse return;
+    const name = masked[start..identRunEnd(masked, start)];
+    try decls.append(allocator, .{ .name = name, .name_pos = start });
 }
 
 /// True when a `var` keyword at `i` is a binding declaration, never a
@@ -29174,15 +29175,15 @@ fn containerOpenBefore(masked: []const u8, pos: usize) bool {
     return false;
 }
 
-/// The declared name after the `var` keyword ending at `after`, else
-/// null: skip whitespace and expect an identifier run. Quoted `@"..."`
-/// var names stay silent (the FN-safe direction — a rare shape).
-fn varDeclName(masked: []const u8, after: usize) ?[]const u8 {
+/// The declared name's start byte after the `var` keyword ending at
+/// `after`, else null: skip whitespace and expect an identifier run. The
+/// start lands in `name_pos` so varDeclOccurrence skips the declaration's
+/// own initializer (EPH-I1245). Quoted `@"..."` var names stay silent
+/// (the FN-safe direction — a rare shape).
+fn varDeclNameStart(masked: []const u8, after: usize) ?usize {
     const i = skipMaskedWs(masked, after);
     if (i >= masked.len or !isIdent(masked[i])) return null;
-    const end = identRunEnd(masked, i);
-    if (end == i) return null;
-    return masked[i..end];
+    return i;
 }
 
 /// True when the token before the `var` keyword at `pos` is `kw`.
@@ -29415,6 +29416,25 @@ fn precededByElse(masked: []const u8, pos: usize) bool {
     return wordEndsAt(masked[0..w], "else");
 }
 
+/// True when the `if` at `if_pos` sits in a consumed-value position — the
+/// else carries the value, so dropping it is a compile error, and ZA507
+/// stays silent (EPH-I1244). The token before the keyword marks the
+/// position: an `=`-ending token (an assignment `=`, a comparison
+/// `==`/`!=`/`<=`/`>=`, or a compound assignment) or a switch prong `=>`
+/// always precedes an if-expression. The set is census-derived: the 119
+/// findings at the 5bf9977 baseline held 4 assignment-RHS sites and 3
+/// switch-prong sites, zero return/paren/comma sites. A statement if
+/// always follows `;`, `}`, `{`, or the line start, so no statement
+/// position can match.
+fn ifInExpressionPosition(masked: []const u8, if_pos: usize) bool {
+    var w = if_pos;
+    while (w > 0 and isMaskedWs(masked[w - 1])) w -= 1;
+    if (w == 0) return false;
+    const prev = masked[w - 1];
+    if (prev == '=') return true;
+    return prev == '>' and w >= 2 and masked[w - 2] == '=';
+}
+
 /// ZA507: an else whose if-branch ends in return/break/continue — the
 /// guard-clause style removes the else and one nesting level (EPH-I1079).
 /// Note severity per the done-when record. else-if chain links, switch
@@ -29461,27 +29481,36 @@ fn maskedElsePos(masked: []const u8, from: usize) ?usize {
 
 /// True when the if-branch immediately before the `else` at `e` ends in
 /// return/break/continue: a braced branch checks its last statement, an
-/// unbraced branch checks the statement ending at `e`.
+/// unbraced branch checks the statement ending at `e`. The owning if must
+/// not sit in a consumed-value position — an if-expression's else carries
+/// the value, so dropping it is a compile error (EPH-I1244).
 fn ifBranchEndsInExit(masked: []const u8, e: usize) bool {
     var j = e;
     while (j > 0 and isMaskedWs(masked[j - 1])) j -= 1;
     if (j == 0) return false;
-    if (masked[j - 1] == '}') return blockEndsInExit(masked, j - 1);
-    return stmtThenEndsInExit(masked, j);
+    if (masked[j - 1] == '}') {
+        const kw = bracedOwningIf(masked, j - 1) orelse return false;
+        if (ifInExpressionPosition(masked, kw)) return false;
+        const open_p = maskedOpenBackward(masked, j - 1, '{', '}') orelse return false;
+        const stmt = lastStmtInBlock(masked, open_p, j - 1) orelse return false;
+        return singleExitStmt(stmt);
+    }
+    const owning = unbracedOwningIf(masked, j) orelse return false;
+    if (ifInExpressionPosition(masked, owning.kw)) return false;
+    return singleExitStmt(masked[owning.cond_close + 1 .. j]);
 }
 
-/// The unbraced then-branch: a statement ending at `stmt_end`. The owning
-/// if is the nearest one backward; its condition must bound the statement
-/// start, the statement must be exactly one branch-exit statement, and
-/// the owning if must not be a chain link.
-fn stmtThenEndsInExit(masked: []const u8, stmt_end: usize) bool {
-    const k = nearestIfBackward(masked, stmt_end) orelse return false;
+/// The owning if of an unbraced then-branch: the nearest if backward whose
+/// condition opens right after the keyword. The condition must bound the
+/// statement start, and the owning if must not be a chain link.
+fn unbracedOwningIf(masked: []const u8, stmt_end: usize) ?OwningIf {
+    const k = nearestIfBackward(masked, stmt_end) orelse return null;
     const i = skipMaskedWs(masked, k + 2);
-    if (i >= masked.len or masked[i] != '(') return false;
+    if (i >= masked.len or masked[i] != '(') return null;
     var depth: usize = 0;
-    const close = matchingParenCol(masked, i, &depth) orelse return false;
-    if (precededByElse(masked, k)) return false;
-    return singleExitStmt(masked[close + 1 .. stmt_end]);
+    const close = matchingParenCol(masked, i, &depth) orelse return null;
+    if (precededByElse(masked, k)) return null;
+    return .{ .kw = k, .cond_close = close };
 }
 
 /// True when `stmt` is exactly one branch-exit statement (EPH-I1079): it
@@ -29506,25 +29535,28 @@ fn singleExitStmt(stmt: []const u8) bool {
 
 /// The braced then-branch ending at `close_brace`: the matching `{` must
 /// open an if's body (the token before it is the condition close, and the
-/// token before the condition open is `if`), the owning if must not be a
-/// chain link, and the block's last top-level statement must be exactly
-/// one branch-exit statement.
-fn blockEndsInExit(masked: []const u8, close_brace: usize) bool {
-    const open_p = maskedOpenBackward(masked, close_brace, '{', '}') orelse return false;
+/// token before the condition open is `if`), and the owning if must not
+/// be a chain link. Returns the owning if keyword's position.
+fn bracedOwningIf(masked: []const u8, close_brace: usize) ?usize {
+    const open_p = maskedOpenBackward(masked, close_brace, '{', '}') orelse return null;
     var w = open_p;
     while (w > 0 and isMaskedWs(masked[w - 1])) w -= 1;
-    if (w == 0 or masked[w - 1] != ')') return false;
-    while (w > 0 and isMaskedWs(masked[w - 1])) w -= 1;
-    if (w == 0 or masked[w - 1] != ')') return false;
-    const cond_open = maskedOpenBackward(masked, w, '(', ')') orelse return false;
+    if (w == 0 or masked[w - 1] != ')') return null;
+    const cond_open = maskedOpenBackward(masked, w, '(', ')') orelse return null;
     var w2 = cond_open;
     while (w2 > 0 and isMaskedWs(masked[w2 - 1])) w2 -= 1;
-    if (w2 < 2 or !mem.eql(u8, masked[w2 - 2 .. w2], "if")) return false;
-    if (w2 - 2 > 0 and isIdent(masked[w2 - 3])) return false;
-    if (precededByElse(masked, w2 - 2)) return false;
-    const stmt = lastStmtInBlock(masked, open_p, close_brace) orelse return false;
-    return singleExitStmt(stmt);
+    if (w2 < 2 or !mem.eql(u8, masked[w2 - 2 .. w2], "if")) return null;
+    if (w2 - 2 > 0 and isIdent(masked[w2 - 3])) return null;
+    if (precededByElse(masked, w2 - 2)) return null;
+    return w2 - 2;
 }
+
+/// The owning if of an else: the keyword position and the unbraced form's
+/// condition-close paren (the braced form never uses the second field).
+const OwningIf = struct {
+    kw: usize,
+    cond_close: usize,
+};
 
 /// The open byte matching the close byte just before `end`, scanning
 /// backward (the masked body holds only code bytes, EPH-I1079). An open
@@ -128916,6 +128948,35 @@ test "ZA406 fires when a var is only ever read" {
     try expectSingleFinding(&run, RULE_UNNECESSARY_VAR);
 }
 
+test "ZA406 fires for an untyped var whose initializer is the only assignment" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The declaration's own initializer is not a reassignment — the
+    // declaration occurrence must be skipped (EPH-I1245).
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn compute(a: u8) u8 {
+        \\    var total = a;
+        \\    return total;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_UNNECESSARY_VAR);
+}
+
+test "ZA406 stays silent for an untyped var reassigned later" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn compute(a: u8) u8 {
+        \\    var total = a;
+        \\    total = total + 1;
+        \\    return total;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
 test "ZA406 stays silent when the var is reassigned" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -129354,6 +129415,60 @@ test "ZA507 ignores an else that appears only in a string or comment" {
         \\    const note = "if (x) return 1 else return 2";
         \\    // if (x) return 1 else return 2
         \\    return if (x > 0) 1 else 2;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA507 stays silent when the single-line if-expression's value is consumed" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The zls compiler-test fixture (peer_type_resolution.zig:169): the
+    // else carries the value, so dropping it is a compile error — the
+    // assignment position silences the rule (EPH-I1244).
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn pick(s: u8, n: u8) u8 {
+        \\    const noreturn_1 = if (n > 0) return else s;
+        \\    _ = noreturn_1;
+        \\    return 0;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA507 stays silent when the braced if-expression's value is consumed" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The r1 probe: the else body produces the value, so the guard-clause
+    // fix would not compile — the assignment position silences the rule
+    // (EPH-I1244).
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn first(n: u8) !u8 {
+        \\    const x = if (n > 0) {
+        \\        return error.Bad;
+        \\    } else {
+        \\        try maybe();
+        \\    };
+        \\    return x;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA507 stays silent when the if-expression is a switch prong value" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The prong marker `=>` marks the consumed-value position (the census
+    // class, EPH-I1244): the else is the prong's value.
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn pick(v: u8, n: u8) u8 {
+        \\    return switch (v) {
+        \\        0 => if (n > 0) return 1 else 2,
+        \\        else => 3,
+        \\    };
         \\}
     );
     defer run.deinit(allocator);

@@ -393,7 +393,11 @@ note: scan includes <N> entry points outside <path> (entry points always join th
 
 A target config's `path_dir` is containment-checked and then discarded. The scan root comes from the CLI path, the trusted working-directory config, or auto-detection.
 
-The directory walk prunes a hardcoded set: every dot-prefixed directory (`.git`, `.zig-cache`, and other hidden dirs) plus `zig-out`, `zig-cache`, `.build`, `node_modules`, `deps`, `.packages`, and `vendor` (one predicate serves the main walk and the nested discovery walks, EPH-I0377). First-party code under a directory with one of these names is not scanned. The config `exclude` list applies on top of this set.
+The directory walk prunes a hardcoded set: every dot-prefixed directory (`.git`, `.zig-cache`, and other hidden dirs) plus `zig-out`, `zig-cache`, `.build`, `node_modules`, `deps`, `.packages`, and `vendor` (one predicate serves the main walk and the nested discovery walks, EPH-I0377). First-party code under a directory with one of these names is not scanned. The config `exclude` list applies on top of this set. A prune is disclosed: when the main walk skips at least one directory, the run prints one note with the count.
+
+```
+note: N directories skipped (hidden or known-cache names). Files inside them are not analyzed.
+```
 
 The `.ephor-ignore` auto-load honors the same trust decision. Ephor refuses an untrusted file with one skip note:
 
@@ -403,7 +407,7 @@ note: ignoring untrusted .ephor-ignore at <path> (use --trust-target-config to h
 
 Ephor always honors an explicit `--known-issues=<file>`, and the load stays silent. An explicit file that cannot be read is a hard usage error: a mistyped path never silently un-filters the known-issue list.
 
-Residual: running ephor inside a tree trusts that tree's config. To audit an untrusted repo, run `ephor check <path>` from outside it, or review its `ephor.json` first.
+The trust decision depends on the invocation directory. The model trusts the operator's own tree, identified as the working directory and its ancestors (realpath compare, `isConfigDirTrusted` in `src/main.zig`). Running ephor from inside a scanned tree makes that tree the trusted one, so the tree's own `ephor.json` then honors its suppression and gate keys. The only signal is the `note: trusting config at <path>` line. To audit a repo you do not trust, run `ephor check <path>` from outside it, or review its `ephor.json` first.
 
 Validation rules:
 

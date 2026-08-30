@@ -403,6 +403,10 @@ const DiagCtx = struct {
     /// Depth-cap truncation notes (EPH-I0667, trust-model F-5). One note
     /// per run, the first time any directory-depth cap truncates a subtree.
     depth_cap_note_count: usize = 0,
+    /// Directories the main walk pruned as hidden or known-cache names
+    /// (EPH-I1260). The run-end note surfaces the count so a pruned
+    /// subtree never leaves the analyzed set silently.
+    skipped_dir_count: usize = 0,
     /// Entries-widen-scan notes (EPH-I0784).
     entries_widen_note_count: usize = 0,
     /// Resident-content budget for the corpus warning (EPH-I0199). Real
@@ -13020,10 +13024,9 @@ fn collectCFGAllocations(
 /// inside strings or comments are text, never statement structure
 /// (EPH-I0675 makes the span verdict-bearing, and an unbalanced `(` inside
 /// a string would otherwise inflate the span past the real statement).
-/// Lines longer than the 16 KiB mask buffer fall back to the raw line, so
-/// a literal brace or semicolon on an over-cap line still counts as
-/// structure (documented bound, EPH-I0444: generated or giant lines
-/// only).
+/// Lines longer than the 16 KiB mask buffer drop their overhang, so
+/// structure past the bound never reads as statement structure (fail
+/// closed, EPH-I1258: generated or giant lines only).
 fn findAllocStatementEnd(lines: []const []const u8, start: usize) usize {
     var brace_depth: i32 = 0;
     var blank_buf: [16 * 1024]u8 = undefined;
@@ -14411,10 +14414,11 @@ fn exitFreeSpanHasExitKeyword(
 }
 
 /// True when a masked line in `start_line..end_line` (inclusive) carries
-/// an exit keyword (EPH-I0116). Lines shorter than the mask buffer are
-/// blanked code. Longer lines fall back raw (documented bound). The two
-/// exit-keyword range probes (spanHasExitKeyword's former walk,
-/// conditionSpanHasExitKeyword's second walk) share the scan.
+/// an exit keyword (EPH-I0116). Lines longer than the mask buffer drop
+/// their overhang (fail closed, EPH-I1258), so prose past the bound never
+/// reads as an exit keyword. The two exit-keyword range probes
+/// (spanHasExitKeyword's former walk, conditionSpanHasExitKeyword's
+/// second walk) share the scan.
 fn scanRangeHasExitKeyword(
     lines: []const []const u8,
     func_line: usize,
@@ -15160,9 +15164,9 @@ fn checkErrdeferOwnershipTransfer(
 
 /// Comment-stripped, string-blanked code form of `line`: prose in
 /// comments and literals never carries ownership transfers or braces
-/// (EPH-I0369, band-B03 F5). Lines longer than the mask buffer fall back
-/// to the comment-stripped raw line (documented bound, same as ZC104's
-/// blanking callers).
+/// (EPH-I0369, band-B03 F5). Lines longer than the mask buffer drop their
+/// overhang (fail closed, EPH-I1258), the same bound ZC104's blanking
+/// callers share.
 fn maskedCodeLine(line: []const u8, buf: []u8) []const u8 {
     const code_end = findCommentStart(line) orelse line.len;
     const code = blankLiteralContents(line[0..code_end], buf);
@@ -16311,7 +16315,7 @@ const ImportGraph = struct {
                 },
                 .directory => {
                     defer self.allocator.free(path);
-                    var subdir = openSubdir(self.diag.io, dir, entry.name) orelse continue;
+                    var subdir = self.openSubdir(self.diag.io, dir, entry.name) orelse continue;
                     defer subdir.close(self.diag.io);
                     try self.scanRecursive(subdir, path, depth + 1);
                 },
@@ -16341,11 +16345,17 @@ const ImportGraph = struct {
     /// skip it (skip-list name) or cannot open it (EPH-I0761). The main
     /// walk prunes with the same predicate as the nested discovery walks
     /// (band-B03 F23, EPH-I0377): one skip set keeps coverage consistent.
-    /// RED4-7 (EPH-I0210): no-follow on the final component — a directory
-    /// swapped for a symlink after the dirent kind check fails the open
-    /// and reads as a skip, never as a descent into its target.
-    fn openSubdir(io: std.Io, dir: std.Io.Dir, name: []const u8) ?std.Io.Dir {
-        if (isSkippableDir(name)) return null;
+    /// A prune counts into the run-end note (EPH-I1260): a hidden or
+    /// known-cache subtree leaving the analyzed set silently was the
+    /// pre-fix gap. RED4-7 (EPH-I0210): no-follow on the final component —
+    /// a directory swapped for a symlink after the dirent kind check
+    /// fails the open and reads as a skip, never as a descent into its
+    /// target.
+    fn openSubdir(self: *ImportGraph, io: std.Io, dir: std.Io.Dir, name: []const u8) ?std.Io.Dir {
+        if (isSkippableDir(name)) {
+            self.diag.skipped_dir_count += 1;
+            return null;
+        }
         return dir.openDir(io, name, .{ .iterate = true, .follow_symlinks = false }) catch null;
     }
 
@@ -23259,10 +23269,11 @@ fn reportTestBlock(ctx: *const TestScanCtx, state: *const TestFileScanState) !vo
 /// `test "catch {}"` and fixtures like `"} || rlp.Error"` would otherwise
 /// corrupt the block depth and misplace the block boundary. A `\\` multiline
 /// opener's tail blanks to end of line for the same reason (EPH-I0671).
-/// Lines longer than `buf` fall back to the raw line — a literal brace on
-/// an over-cap line still reaches brace tracking (documented bound,
-/// EPH-I0444: generated/giant lines only. The ZT band masks those
-/// chunk-wise via BlankChunkIter, EPH-I0423).
+/// Lines longer than `buf` drop their overhang (fail closed, EPH-I1258):
+/// literal content past the bound never reaches brace tracking. Only
+/// generated or giant lines carry the overhang (EPH-I0444). The ZT band
+/// masks those chunk-wise via BlankChunkIter when the full line matters
+/// (EPH-I0423).
 fn blankLiteralContents(line: []const u8, buf: []u8) []const u8 {
     return maskLiteralContents(line, buf, .blank);
 }
@@ -23276,14 +23287,20 @@ const QuotedNameMode = enum { blank, keep };
 /// One masked line (EPH-I1249): the mode decides the quoted-identifier
 /// treatment, every other rule matches the classic blankLiteralContents.
 fn maskLiteralContents(line: []const u8, buf: []u8, mode: QuotedNameMode) []const u8 {
-    if (line.len > buf.len) return line;
+    // Over-cap lines fail closed (EPH-I1258): the mask covers the head
+    // that fits and the overhang drops. The pre-fix raw fallback let
+    // string or comment content past the bound reach the analyzers as
+    // code. Only generated or giant lines carry the overhang (EPH-I0444),
+    // and BlankChunkIter still offers full-line masking for the scans
+    // that need every byte.
+    const n = @min(line.len, buf.len);
     var i: usize = 0;
-    while (i < line.len) {
+    while (i < n) {
         const c = line[i];
-        // A `\\` opener's tail is string data (EPH-I0671): blank to end of
-        // line so tail braces never reach brace tracking.
+        // A `\\` opener's tail is string data (EPH-I0671): blank to the
+        // mask end so tail braces never reach brace tracking.
         if (types.isMultilineOpenerAt(line, i)) {
-            blankRange(buf, i, line.len);
+            blankRange(buf, i, n);
             break;
         }
         const start = i;
@@ -23292,14 +23309,16 @@ fn maskLiteralContents(line: []const u8, buf: []u8, mode: QuotedNameMode) []cons
             continue;
         }
         if (skipLiteral(line, &i)) {
-            // Blank the literal contents AND both quote delimiters.
-            blankRange(buf, start, i);
+            // Blank the literal contents AND both quote delimiters. The
+            // clamp keeps the blank inside the mask when the literal runs
+            // past it (EPH-I1258).
+            blankRange(buf, start, @min(i, n));
             continue;
         }
         buf[i] = c;
         i += 1;
     }
-    return buf[0..line.len];
+    return buf[0..n];
 }
 
 /// Mask or preserve the quoted identifier opening at `line[i]`
@@ -23316,12 +23335,15 @@ fn maskQuotedIdent(line: []const u8, buf: []u8, i: usize, mode: QuotedNameMode) 
     // skipQuotedIdent clamps at the line end, so a closing quote at
     // `end - 1` is the closed-on-this-line signature.
     if (line[end - 1] != '"') return null;
+    // The write bound is the mask end: a quoted name running past the
+    // buffer stops there and the overhang drops (EPH-I1258).
+    const stop = @min(end, buf.len);
     if (spanHasBrace(line, i, end)) {
-        blankRange(buf, i, end);
+        blankRange(buf, i, stop);
     } else {
-        @memcpy(buf[i..end], line[i..end]);
+        @memcpy(buf[i..stop], line[i..stop]);
     }
-    return end;
+    return stop;
 }
 
 /// True when text[start..end] carries a brace byte (the preservation
@@ -23342,17 +23364,19 @@ fn blankRange(buf: []u8, start: usize, end: usize) void {
 }
 
 /// Chunked literal-blanker for lines longer than the caller's mask buffer
-/// (EPH-I0423, band B06 F17). blankLiteralContents fails open past the
-/// buffer — a long generated line returns unmasked and a brace inside a
-/// string literal corrupts the caller's brace scan. This iterator masks
-/// in buffer-sized chunks and keeps the LineClassifier state across
-/// chunks, so a literal split by a chunk boundary stays masked. The mask
-/// rule matches blankLiteralContents: string AND char literal contents
-/// plus their quote delimiters, and a `\\` multiline opener plus its
-/// tail. Exactly ONE classifier query per byte: the walk overshoots the
-/// column by one byte on an escape (stepQuoteMode skips the escaped
-/// char), so a second query at the same column fires the ascending
-/// assert (reviewer r2, EPH-I0423). Cost stays O(line).
+/// (EPH-I0423, band B06 F17). The single-shot mask functions drop the
+/// overhang past the buffer (EPH-I1258) — a long generated line loses its
+/// tail, and a brace inside a string literal beyond the bound would
+/// otherwise corrupt a full-line brace scan. This iterator masks in
+/// buffer-sized chunks and keeps the LineClassifier state across
+/// chunks, so a literal split by a chunk boundary stays masked and the
+/// caller sees the FULL line. The mask rule matches blankLiteralContents:
+/// string AND char literal contents plus their quote delimiters, and a
+/// `\\` multiline opener plus its tail. Exactly ONE classifier query per
+/// byte: the walk overshoots the column by one byte on an escape
+/// (stepQuoteMode skips the escaped char), so a second query at the same
+/// column fires the ascending assert (reviewer r2, EPH-I0423). Cost stays
+/// O(line).
 const BlankChunkIter = struct {
     line: []const u8,
     buf: []u8,
@@ -25669,8 +25693,7 @@ const ConcurrencyScanState = struct {
     defer_kinds: u64 = 0,
     defer_stack_len: usize = 0,
     /// Literal-blanking buffer for one file pass (16 KB): an over-cap
-    /// line returns unblanked, so a literal brace on it still counts
-    /// toward brace depth (documented bound, EPH-I0444 — rare,
+    /// line drops its overhang (fail closed, EPH-I1258 — rare,
     /// generated/giant lines only. See blankLiteralContents).
     blank_buf: [16 * 1024]u8 = undefined,
 
@@ -27215,7 +27238,7 @@ const BoundSpawn = struct {
 
 /// Bundled scan context for ZC104 line passes (param counts). `blank_buf`
 /// is the file pass's 16 KB literal-blanking buffer: an over-cap line
-/// returns unblanked (documented bound, EPH-I0444).
+/// drops its overhang (fail closed, EPH-I1258).
 const SpawnScanCtx = struct {
     lines: []const []const u8,
     blank_buf: []u8,
@@ -44121,8 +44144,12 @@ const cimport_markers = [_][]const u8{ "__builtin_", "enum_unnamed_", "@cImport"
 
 /// Check if file is an auto-generated C import file (should be skipped)
 fn isCImportFile(file_path: []const u8, content: []const u8) bool {
-    // Skip files ending in cimport.zig
-    if (mem.endsWith(u8, file_path, "cimport.zig")) return true;
+    // A file ending in cimport.zig is a name hint, never a verdict
+    // (EPH-I1254): a hand-written file with that name must keep every
+    // analyzer tier. The skip requires a C-translation marker in code
+    // position, decided by the shared marker scan below — the name hint
+    // only skips the absence pre-filter. Generated cimport.zig files
+    // carry a code-position marker and still skip.
 
     // Skip any file with C translation markers in code position (not just
     // /deps/). Auto-generated C bindings can be anywhere (e.g., capy's
@@ -44131,7 +44158,8 @@ fn isCImportFile(file_path: []const u8, content: []const u8) bool {
     // multiline body is text, not a marker. Ephor's own main.zig carries
     // all three markers as string-literal data in this predicate and its
     // test fixtures, so a raw match must not skip the file.
-    if (!containsAnyPattern(content, &cimport_markers)) return false;
+    if (!mem.endsWith(u8, file_path, "cimport.zig") and
+        !containsAnyPattern(content, &cimport_markers)) return false;
 
     var lines = mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
@@ -48925,7 +48953,11 @@ fn fetchLatestVersion(io: std.Io, allocator: Allocator) ?[]const u8 {
     defer allocator.free(api_result.stdout);
     defer allocator.free(api_result.stderr);
 
-    if (api_result.stdout.len > 0) {
+    // Only a clean exit makes stdout evidence (EPH-I1255): a failing curl
+    // with partial or bogus stdout must never feed the version parser.
+    if (api_result.term == .exited and api_result.term.exited == 0 and
+        api_result.stdout.len > 0)
+    {
         if (parseVersionFromTagsApi(allocator, api_result.stdout)) |ver| return ver;
     }
 
@@ -48944,6 +48976,9 @@ fn fetchVersionFromZon(io: std.Io, allocator: Allocator) ?[]const u8 {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
+    // Only a clean exit makes stdout evidence (EPH-I1255): a failing curl
+    // with partial or bogus stdout must never feed the version parser.
+    if (result.term != .exited or result.term.exited != 0) return null;
     if (result.stdout.len == 0) return null;
     return parseVersionFromZon(allocator, result.stdout);
 }
@@ -52621,27 +52656,44 @@ const skip_note_path_buf_bytes: usize = 1024;
 /// Render the skip note's path segment into `buf`: "a.zig, b.zig", or
 /// "a.zig, ..., h.zig, ... (12 total)" when the log capped. Empty when
 /// no paths were recorded (EPH-I1197).
-fn formatSkipPaths(buf: []u8, log: SkipPathLog, skipped: usize) []const u8 {
+fn formatSkipPaths(allocator: Allocator, buf: []u8, log: SkipPathLog, skipped: usize) ![]const u8 {
     if (log.count == 0) return "";
     var w: std.Io.Writer = .fixed(buf);
-    writeSkipPaths(&w, log, skipped) catch return w.buffered();
+    writeSkipPaths(allocator, &w, log, skipped) catch return w.buffered();
     return w.buffered();
 }
 
-/// Writer half of formatSkipPaths: the fixed buffer cannot overflow the
-/// proven bounds, and on the impossible overflow the partial render
-/// stays (the note keeps its head) (EPH-I1197).
-fn writeSkipPaths(w: *std.Io.Writer, log: SkipPathLog, skipped: usize) !void {
+/// Writer half of formatSkipPaths: each path crosses sanitizeTerminal
+/// before the write (EPH-I1256), so control bytes in a hostile filename
+/// never reach the terminal raw — the same filter the issue fields use.
+/// The fixed buffer cannot overflow the proven bounds, and on the
+/// impossible overflow or a sanitize OOM the partial render stays (the
+/// note keeps its head) (EPH-I1197).
+fn writeSkipPaths(
+    allocator: Allocator,
+    w: *std.Io.Writer,
+    log: SkipPathLog,
+    skipped: usize,
+) !void {
     for (log.paths[0..log.count], 0..) |p, i| {
         if (i > 0) try w.writeAll(", ");
-        if (p.len > skip_note_path_bytes) {
-            try w.writeAll(p[0..skip_note_path_bytes]);
-            try w.writeAll("...");
-        } else {
-            try w.writeAll(p);
-        }
+        try writeOneSkipPath(allocator, w, p);
     }
     if (skipped > log.count) try w.print(", ... ({d} total)", .{skipped});
+}
+
+/// Sanitize and write one skip-note path (EPH-I1256): the path crosses
+/// sanitizeTerminal, then the capped head renders with an ellipsis for an
+/// over-cap path (EPH-I1197).
+fn writeOneSkipPath(allocator: Allocator, w: *std.Io.Writer, p: []const u8) !void {
+    var safe = try types.sanitizeTerminal(allocator, p);
+    defer safe.deinit(allocator);
+    if (safe.slice.len > skip_note_path_bytes) {
+        try w.writeAll(safe.slice[0..skip_note_path_bytes]);
+        try w.writeAll("...");
+    } else {
+        try w.writeAll(safe.slice);
+    }
 }
 
 /// Surface partial AST-tier coverage (EPH-I0200): a version-skew or
@@ -52651,11 +52703,17 @@ fn writeSkipPaths(w: *std.Io.Writer, log: SkipPathLog, skipped: usize) !void {
 /// instrumentation (EPH-I1197). JSON mode skips the note so the machine
 /// stream stays pure (EPH-I0213). With --summary the ast_skipped member
 /// carries the same fact.
-fn noteAstTierSkips(diag: *DiagCtx, stats: ast_tier.Stats, log: SkipPathLog) void {
+fn noteAstTierSkips(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    stats: ast_tier.Stats,
+    log: SkipPathLog,
+) void {
     if (stats.skipped == 0 or diag.json_stream) return;
     diag.ast_skip_note_count += 1;
     var buf: [skip_note_path_buf_bytes]u8 = undefined;
-    const paths = formatSkipPaths(&buf, log, stats.skipped);
+    // A sanitize OOM degrades to the count-only note form below.
+    const paths = formatSkipPaths(allocator, &buf, log, stats.skipped) catch "";
     const plural = if (stats.skipped == 1) @as([]const u8, "") else "s";
     if (paths.len == 0) {
         cliDiag(
@@ -52686,6 +52744,22 @@ fn noteDepthCapTruncation(diag: *DiagCtx, cap: usize) void {
         "note: scan depth cap of {d} reached; deeper subtrees are not analyzed. " ++
             "Scan deep subtrees separately to include them.\n",
         .{cap},
+    );
+}
+
+/// Surface pruned hidden or known-cache directories (EPH-I1260): the walk
+/// skips dot-prefixed dirs and the shared skip list, and a path hidden in
+/// one never enters the analyzed set. Fires once per run when the main
+/// walk pruned at least one, with the count. JSON mode skips the note so
+/// the machine stream stays pure (EPH-I0213).
+fn noteHiddenDirSkips(diag: *DiagCtx) void {
+    const skipped = diag.skipped_dir_count;
+    if (skipped == 0 or diag.json_stream) return;
+    cliDiag(
+        diag,
+        "note: {d} director{s} skipped (hidden or known-cache names). " ++
+            "Files inside them are not analyzed.\n",
+        .{ skipped, if (skipped == 1) "y" else "ies" },
     );
 }
 
@@ -53079,8 +53153,14 @@ fn handleListTests(ctx: *RunCtx) !void {
     defer g.deinit();
     var blocks = try collectTestBlocks(ctx.alloc, &g);
     defer blocks.deinit(ctx.alloc);
-    printTestListing(ctx.alloc, blocks.items, ctx.cfg.format);
+    try printTestListing(ctx.alloc, blocks.items, ctx.cfg.format);
 }
+
+/// Fixed render buffer for one text-listing line (EPH-I1257): a file
+/// path, a line number, a test name, and the frame fit with room to
+/// spare. Over-cap truncates to the head — the listing is diagnostic
+/// text, not a machine document.
+const listing_line_buf_bytes: usize = 1024;
 
 /// Print the discovery listing: one `file:line test "name"` per block in
 /// text mode, a machine object in JSON mode. The final text line carries
@@ -53089,7 +53169,7 @@ fn printTestListing(
     allocator: Allocator,
     blocks: []const TestBlockInfo,
     format: OutputFormat,
-) void {
+) !void {
     if (format == .json) {
         var obj = types.OutBuf{ .allocator = allocator };
         defer obj.deinit();
@@ -53098,12 +53178,37 @@ fn printTestListing(
         return;
     }
     for (blocks) |b| {
-        std.debug.print("{s}:{d} test \"{s}\"\n", .{ b.file, b.line, b.name });
+        var buf: [listing_line_buf_bytes]u8 = undefined;
+        const line = try formatTestListingLine(allocator, &buf, b);
+        std.debug.print("{s}", .{line});
     }
     std.debug.print(
         "{d} test block{s} found\n",
         .{ blocks.len, if (blocks.len == 1) "" else "s" },
     );
+}
+
+/// Render one sanitized text-listing line into `buf` (EPH-I1257): the
+/// file and the name are repo-derived fields, so both cross
+/// sanitizeTerminal — the same filter JSON mode's escapeJson and the
+/// issue channel already apply. A hostile filename or test name must not
+/// inject terminal controls. Returns the rendered head on the impossible
+/// over-cap.
+fn formatTestListingLine(
+    allocator: Allocator,
+    buf: []u8,
+    b: TestBlockInfo,
+) error{OutOfMemory}![]const u8 {
+    var safe_file = try types.sanitizeTerminal(allocator, b.file);
+    defer safe_file.deinit(allocator);
+    var safe_name = try types.sanitizeTerminal(allocator, b.name);
+    defer safe_name.deinit(allocator);
+    const line_args = .{ safe_file.slice, b.line, safe_name.slice };
+    var w: std.Io.Writer = .fixed(buf);
+    w.print("{s}:{d} test \"{s}\"\n", line_args) catch |err| switch (err) {
+        error.WriteFailed => {},
+    };
+    return w.buffered();
 }
 
 /// Render the list-tests machine object: file, line, and name per block
@@ -53390,6 +53495,7 @@ fn handleCheck(ctx: *RunCtx) !void {
     if (ctx.should_exit_error) return;
     var findings = try collectCheckFindings(ctx, &g);
     defer findings.deinit(ctx.alloc);
+    noteHiddenDirSkips(ctx.diag);
     try reportCheckFindings(ctx, &g, &findings);
 }
 
@@ -53570,7 +53676,7 @@ fn collectCheckFindings(ctx: *const RunCtx, g: *ImportGraph) !CheckFindings {
     errdefer deinitIssues(&test_issues, alloc);
     var conc_issues = try analyzeConcurrency(alloc, g);
     errdefer deinitIssues(&conc_issues, alloc);
-    noteAstTierSkips(ctx.diag, ast_stats, skip_log);
+    noteAstTierSkips(ctx.diag, ctx.alloc, ast_stats, skip_log);
     var ignored_err_issues = try analyzeIgnoredErrors(alloc, g);
     errdefer deinitIssues(&ignored_err_issues, alloc);
     return .{
@@ -55445,16 +55551,16 @@ test "stats scanner ignores comptime-concatenated marker spellings (EPH-I0538)" 
 test "AST skip note fires only when files were skipped" {
     var diag = testDiagCtx();
     diag.cli_diagnostics_enabled = false;
-    noteAstTierSkips(&diag, .{ .parsed = 3, .skipped = 0 }, .{});
+    noteAstTierSkips(&diag, std.testing.allocator, .{ .parsed = 3, .skipped = 0 }, .{});
     try std.testing.expectEqual(@as(usize, 0), diag.ast_skip_note_count);
-    noteAstTierSkips(&diag, .{ .parsed = 3, .skipped = 2 }, .{});
+    noteAstTierSkips(&diag, std.testing.allocator, .{ .parsed = 3, .skipped = 2 }, .{});
     try std.testing.expectEqual(@as(usize, 1), diag.ast_skip_note_count);
 }
 
 test "AST skip note stays off the JSON machine stream (EPH-I0213)" {
     var diag = testDiagCtx();
     diag.json_stream = true;
-    noteAstTierSkips(&diag, .{ .parsed = 3, .skipped = 2 }, .{});
+    noteAstTierSkips(&diag, std.testing.allocator, .{ .parsed = 3, .skipped = 2 }, .{});
     try std.testing.expectEqual(@as(usize, 0), diag.ast_skip_note_count);
 }
 
@@ -55465,13 +55571,31 @@ test "AST skip note names the skipped paths (EPH-I1197)" {
     var log = SkipPathLog{};
     log.record("src/main.zig");
     log.record("src/compat/v0_16.zig");
-    noteAstTierSkips(&diag, .{ .parsed = 1, .skipped = 2 }, log);
+    noteAstTierSkips(&diag, std.testing.allocator, .{ .parsed = 1, .skipped = 2 }, log);
     try std.testing.expectEqual(@as(usize, 1), diag.ast_skip_note_count);
     try std.testing.expectEqualStrings(
         "note: 2 files skipped by the AST tier (parse errors, byte cap, or grammar pre-scan): " ++
             "src/main.zig, src/compat/v0_16.zig. ZA111 coverage is partial for those files.\n",
         capture.slice(),
     );
+    try std.testing.expect(!capture.truncated);
+}
+
+test "AST skip note sanitizes hostile path bytes (EPH-I1256)" {
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    var log = SkipPathLog{};
+    log.record("evil\x1b[31m.zig");
+    log.record("csi\xc2\x9b31m.zig");
+    noteAstTierSkips(&diag, std.testing.allocator, .{ .parsed = 1, .skipped = 2 }, log);
+    try std.testing.expectEqual(@as(usize, 1), diag.ast_skip_note_count);
+    // Both hostile forms cross sanitizeTerminal before the print: the raw
+    // ESC and the UTF-8-encoded C1 CSI (U+009B) each render as one '?'.
+    const out = capture.slice();
+    try std.testing.expect(mem.indexOf(u8, out, "\x1b") == null);
+    try std.testing.expect(mem.indexOf(u8, out, "\xc2\x9b") == null);
+    try std.testing.expect(mem.indexOf(u8, out, "evil?[31m.zig, csi?31m.zig") != null);
     try std.testing.expect(!capture.truncated);
 }
 
@@ -55484,7 +55608,7 @@ test "AST skip note caps the path list with a count suffix (EPH-I1197)" {
     while (i < max_logged_skip_paths) : (i += 1) {
         log.record("p.zig");
     }
-    noteAstTierSkips(&diag, .{ .parsed = 1, .skipped = 12 }, log);
+    noteAstTierSkips(&diag, std.testing.allocator, .{ .parsed = 1, .skipped = 12 }, log);
     try std.testing.expectEqual(@as(usize, 1), diag.ast_skip_note_count);
     try std.testing.expect(mem.indexOf(u8, capture.slice(), ", ... (12 total). ZA111") != null);
     try std.testing.expect(!capture.truncated);
@@ -55494,7 +55618,7 @@ test "AST skip note with no recorded paths keeps the bare form (EPH-I1197)" {
     var diag = testDiagCtx();
     var capture = CaptureSink{};
     diag.diag_sink = capture.sink();
-    noteAstTierSkips(&diag, .{ .parsed = 1, .skipped = 2 }, .{});
+    noteAstTierSkips(&diag, std.testing.allocator, .{ .parsed = 1, .skipped = 2 }, .{});
     try std.testing.expectEqual(@as(usize, 1), diag.ast_skip_note_count);
     try std.testing.expectEqualStrings(
         "note: 2 files skipped by the AST tier (parse errors, byte cap, or grammar pre-scan). " ++
@@ -74679,6 +74803,40 @@ test "blankLiteralContents blanks a mid-line multiline opener tail (EPH-I0671)" 
     try std.testing.expectEqualStrings("const s = " ++ (" " ** 13), out);
 }
 
+test "maskLiteralContents drops the overhang past the buffer (EPH-I1258)" {
+    var buf: [64]u8 = undefined;
+    // The line opens a string inside the buffer and runs past it. The
+    // mask covers the head (string contents blanked) and the overhang
+    // drops: the tail's braces and semicolons never survive as code.
+    const line = "const s = \"" ++ ("a" ** 40) ++ "}; }; def;\"" ++ ("b" ** 40);
+    const out = blankLiteralContents(line, &buf);
+    try std.testing.expectEqual(@as(usize, 64), out.len);
+    try std.testing.expect(mem.indexOf(u8, out, ";") == null);
+    try std.testing.expect(mem.indexOf(u8, out, "{") == null);
+    try std.testing.expect(mem.indexOf(u8, out, "}") == null);
+    // The head before the string survives as code.
+    try std.testing.expect(mem.startsWith(u8, out, "const s = "));
+}
+
+test "statement-end mask fails closed past the 16 KiB bound (EPH-I1258)" {
+    const allocator = std.testing.allocator;
+    // One giant line: `s = "` then padding to 16 KiB, then string content
+    // carrying `;` in the overhang. Pre-fix, the raw fallback let that
+    // string `;` terminate the statement on the giant line. Post-fix the
+    // overhang drops, so the statement ends on the next `;` line.
+    var giant = std.ArrayListUnmanaged(u8).empty;
+    defer giant.deinit(allocator);
+    try giant.appendSlice(allocator, "s = \"");
+    while (giant.items.len < 16 * 1024 + 1) try giant.append(allocator, 'a');
+    try giant.appendSlice(allocator, "; x }; \"");
+    const lines = [_][]const u8{
+        "const alloc = allocator.create(T)",
+        giant.items,
+        "_ = alloc;",
+    };
+    try std.testing.expectEqual(@as(usize, 2), findAllocStatementEnd(&lines, 0));
+}
+
 test "analyzeNaming: error{ in comments and strings does not open an error block" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -89520,6 +89678,52 @@ test "buildCurlFetchArgv pins the https clamp flags (EPH-I0156)" {
     try std.testing.expectEqualStrings("--proto-redir", argv[6]);
     try std.testing.expectEqualStrings("=https", argv[7]);
     try std.testing.expectEqualStrings("https://example.invalid/tags", argv[8]);
+}
+
+test "fetchLatestVersion rejects a failing curl carrying bogus stdout (EPH-I1255)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The fake curl prints a spoofed tag payload and exits 1. The bogus
+    // stdout must never reach a version parser: the tags fetch fails over
+    // to the zon fallback, which fails closed too, so the run resolves
+    // null. Pre-fix, both spawns parsed the bogus bytes and the run
+    // steered to v99.0.0 (the redteam live probe).
+    const fake_path = try installFakeTool(
+        &tmp,
+        allocator,
+        "fakecurl",
+        "#!/bin/sh\necho '{\"name\":\"v99.0.0\"}'\necho '.version = \"99.0.0\"'\nexit 1\n",
+    );
+    defer allocator.free(fake_path);
+    const saved_curl = tool_curl_path;
+    defer tool_curl_path = saved_curl;
+    tool_curl_path = fake_path;
+    try std.testing.expect(fetchLatestVersion(std.testing.io, allocator) == null);
+}
+
+test "fetchLatestVersion parses a clean-exit tags payload (EPH-I1255)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The positive control: a clean exit makes stdout evidence, so the
+    // tags payload parses and the zon fallback never runs.
+    const fake_path = try installFakeTool(
+        &tmp,
+        allocator,
+        "fakecurl",
+        "#!/bin/sh\necho '[{\"name\":\"v0.14.2\"},{\"name\":\"v0.13.0\"}]'\nexit 0\n",
+    );
+    defer allocator.free(fake_path);
+    const saved_curl = tool_curl_path;
+    defer tool_curl_path = saved_curl;
+    tool_curl_path = fake_path;
+    const ver = fetchLatestVersion(std.testing.io, allocator) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(ver);
+    try std.testing.expectEqualStrings("0.14.2", ver);
 }
 
 test "requireStrictExplicitVersion accepts null and strict X.Y.Z (EPH-I0155)" {
@@ -110958,6 +111162,74 @@ test "isCImportFile: __builtin_ in code skips, in string does not (EPH-I0758)" {
     try std.testing.expect(!isCImportFile("docs.zig", string_marker));
 }
 
+test "isCImportFile: hand-written cimport.zig keeps analysis without a code marker (EPH-I1254)" {
+    // The filename alone must not skip. The markers appear only as string
+    // data, so the file analyzes like any other hand-written source.
+    const code =
+        \\const s = "@cImport in a string";
+        \\const doc = "generated files carry __builtin_ names";
+        \\fn over_cap() void {
+        \\    _ = 1;
+        \\    _ = 2;
+        \\    _ = 3;
+        \\    _ = 4;
+        \\    _ = 5;
+        \\    _ = 6;
+        \\}
+    ;
+    try std.testing.expect(!isCImportFile("cimport.zig", code));
+}
+
+test "isCImportFile: generated cimport.zig with a code marker still skips (EPH-I1254)" {
+    const code =
+        \\const c = @cImport({
+        \\    @cInclude("x.h");
+        \\});
+    ;
+    try std.testing.expect(isCImportFile("cimport.zig", code));
+}
+
+test "analyzeFileComplexity runs on a hand-written cimport.zig (EPH-I1254)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A hand-written file named cimport.zig must reach the analyzer tiers
+    // like any other source file (the pre-fix filename skip blinded six
+    // families silently).
+    const code =
+        \\const s = "cimport.zig holds no generated bindings";
+        \\fn over_cap() void {
+        \\    _ = 1;
+        \\    _ = 2;
+        \\    if (s.len == 0) {}
+        \\    _ = 3;
+        \\    _ = 4;
+        \\    _ = 5;
+        \\    _ = 6;
+        \\}
+    ;
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    const analysis = try createTestFileAnalysis(allocator, "cimport.zig", code);
+    try graph.files.put(analysis.path, analysis);
+    try graph.reachable.put(try allocator.dupe(u8, "cimport.zig"), {});
+
+    const th = Thresholds{ .max_function_lines = 5 };
+    // The run reaches analyzeFileComplexity through analyzeAllFiles'
+    // comptime analyzer parameter — invisible to ZT101's call graph. The
+    // value reference documents the covered fn (EPH-I0029 workaround).
+    _ = analyzeFileComplexity;
+    var issues = try analyzeComplexity(allocator, &graph, th);
+    defer deinitIssues(&issues, allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(issues.items, "cimport.zig", RULE_FUNC_TOO_LONG),
+    );
+}
+
 test "analyzeFileComplexity runs on a string-only marker file (EPH-I0758)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -121346,6 +121618,24 @@ test "list-tests JSON listing parses and counts (EPH-I1088)" {
     try std.testing.expectEqual(@as(i64, 7), tests[0].object.get("line").?.integer);
 }
 
+test "list-tests text listing sanitizes an ESC-bearing name (EPH-I1257)" {
+    const allocator = std.testing.allocator;
+    var buf: [listing_line_buf_bytes]u8 = undefined;
+    const line = try formatTestListingLine(allocator, &buf, .{
+        .file = "evil\x1b[31m.zig",
+        .line = 3,
+        .name = "hostile\xc2\x9b31m name",
+    });
+    // Both hostile forms render as '?': the raw ESC and the UTF-8-encoded
+    // C1 CSI (U+009B) never reach the terminal.
+    try std.testing.expect(mem.indexOf(u8, line, "\x1b") == null);
+    try std.testing.expect(mem.indexOf(u8, line, "\xc2\x9b") == null);
+    try std.testing.expectEqualStrings(
+        "evil?[31m.zig:3 test \"hostile?31m name\"\n",
+        line,
+    );
+}
+
 test "config coverage block parses the three keys (EPH-I1091)" {
     var diag = testDiagCtx();
     var cfg = testConfig();
@@ -127570,6 +127860,73 @@ test "scan depth cap truncation notes once per run (EPH-I0667, F-5)" {
     try graph.scanDirectory(tmp_path);
     try std.testing.expectEqual(@as(usize, 1), diag.depth_cap_note_count);
     try std.testing.expectEqual(@as(usize, 0), graph.files.count());
+}
+
+test "hidden-directory skip counts and the file stays out (EPH-I1260)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    // A hidden dir prunes silently otherwise: the file inside it never
+    // joins the analyzed set and the run shows no coverage signal. The
+    // walk must record the prune so the run-end note can name it.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "visible.zig",
+        .data = "pub fn f() void {}\n",
+    });
+    try tmp.dir.createDirPath(std.testing.io, ".hidden");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".hidden/secret.zig",
+        .data = "pub fn g() void {}\n",
+    });
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    try graph.scanDirectory(tmp_path);
+    try std.testing.expectEqual(@as(usize, 1), diag.skipped_dir_count);
+    try std.testing.expectEqual(@as(usize, 1), graph.files.count());
+}
+
+test "hidden-directory skip note prints the count (EPH-I1260)" {
+    // The singular form.
+    {
+        var diag = testDiagCtx();
+        var capture = CaptureSink{};
+        diag.diag_sink = capture.sink();
+        diag.skipped_dir_count = 1;
+        noteHiddenDirSkips(&diag);
+        try std.testing.expectEqualStrings(
+            "note: 1 directory skipped (hidden or known-cache names). " ++
+                "Files inside them are not analyzed.\n",
+            capture.slice(),
+        );
+    }
+    // The plural form.
+    {
+        var diag = testDiagCtx();
+        var capture = CaptureSink{};
+        diag.diag_sink = capture.sink();
+        diag.skipped_dir_count = 4;
+        noteHiddenDirSkips(&diag);
+        try std.testing.expectEqualStrings(
+            "note: 4 directories skipped (hidden or known-cache names). " ++
+                "Files inside them are not analyzed.\n",
+            capture.slice(),
+        );
+    }
+}
+
+test "hidden-directory skip note stays off the JSON machine stream (EPH-I1260)" {
+    var diag = testDiagCtx();
+    diag.json_stream = true;
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    diag.skipped_dir_count = 2;
+    noteHiddenDirSkips(&diag);
+    try std.testing.expectEqualStrings("", capture.slice());
 }
 
 test "entry-discovery depth cap truncation notes once per run (EPH-I0667, F-5)" {

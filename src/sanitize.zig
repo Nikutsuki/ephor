@@ -94,8 +94,8 @@ const hostile_leads = blk: {
 };
 
 /// Classify the byte at `s[0]` against the hostile set (the classifier
-/// table above). A hostile sequence reports its length and codepoint; a
-/// clean byte reports len 0.
+/// table above). A hostile sequence reports its length and codepoint. A
+/// Clean byte reports len 0.
 fn hostileUnit(s: []const u8) HostileUnit {
     const unit_fn = hostile_leads[s[0]] orelse return .{ .len = 0, .cp = 0 };
     return unit_fn(s);
@@ -247,7 +247,7 @@ fn terminalUnit(s: []const u8) SanitizeUnit {
 }
 
 /// Writer shared by sanitizeTerminal and sanitizeSnippet: a changed unit
-/// becomes one '?' per emitted byte; a clean unit copies its bytes raw.
+/// becomes one '?' per emitted byte. A clean unit copies its bytes raw.
 fn writePlaceholderOrCopy(dst: []u8, src: []const u8, unit: SanitizeUnit) usize {
     if (unit.dirty) {
         @memset(dst[0..unit.emitted], '?');
@@ -262,7 +262,7 @@ fn writePlaceholderOrCopy(dst: []u8, src: []const u8, unit: SanitizeUnit) usize 
 /// write (JSON only), and whether the unit changes under sanitization.
 /// The classifier owns both counts so the two passes cannot drift. The
 /// terminal, markdown, and snippet units use only the first three
-/// fields; the JSON units use the rest.
+/// fields. The JSON units use the rest.
 const SanitizeUnit = struct {
     consumed: usize,
     emitted: usize,
@@ -280,7 +280,7 @@ const SanitizeUnit = struct {
 
 /// Shared two-pass body: classify every input unit to size the output,
 /// borrow the input when nothing changed, then classify again to write.
-/// Each sanitizer supplies only its classifier and writer; the loop, the
+/// Each sanitizer supplies only its classifier and writer. The loop, the
 /// borrow-or-allocate decision, and the allocation discipline live here
 /// once (EPH-I1232: four sibling copies collapsed).
 fn twoPassSanitize(
@@ -347,8 +347,8 @@ fn classifyJsonUnit(s: []const u8) SanitizeUnit {
             .dirty = true,
         };
     }
-    // Other multi-byte bytes: well-formed sequences pass through whole;
-    // invalid bytes become U+FFFD so the document stays strict UTF-8
+    // Other multi-byte bytes: well-formed sequences pass through whole.
+    // Invalid bytes become U+FFFD so the document stays strict UTF-8
     // (RFC 8259 section 8.1, EPH-I0580).
     const expect = utf8ExpectLen(b) orelse return invalidJsonUnit();
     if (!utf8Valid(s, expect)) return invalidJsonUnit();
@@ -459,7 +459,7 @@ fn writeHex4(dst: []u8, v: u16) void {
 
 /// Escape a string for embedding in JSON output: quotes, backslashes, and
 /// control bytes use the standard escapes, bidi or invisible format
-/// characters escape as \uXXXX (the surrogate-pair form beyond the BMP;
+/// characters escape as \uXXXX (the surrogate-pair form beyond the BMP,
 /// legal raw in JSON but hostile to humans and downstream tools), and
 /// invalid UTF-8 bytes become \uFFFD so the document always satisfies
 /// RFC 8259 section 8.1. Clean input borrows without allocation.
@@ -540,7 +540,7 @@ pub fn sanitizeSnippet(
 }
 
 /// Classify the unit at `s[0]` for sanitizeSnippet: hostile sequences
-/// collapse to one placeholder; backtick runs keep their length either
+/// collapse to one placeholder. Backtick runs keep their length either
 /// way, marked dirty from three backticks up.
 fn snippetUnit(s: []const u8) SanitizeUnit {
     const skip = hostileSeqLen(s);
@@ -755,7 +755,7 @@ test "escapeJson escapes the full hostile set (EPH-I0579)" {
             defer allocator.free(input);
             var result = try escapeJson(allocator, input);
             defer result.deinit(allocator);
-            // BMP members escape as \uXXXX; astral members as the RFC
+            // BMP members escape as \uXXXX. Astral members as the RFC
             // 8259 section 7 surrogate pair.
             if (cp <= 0xFFFF) {
                 const want = try std.fmt.allocPrint(allocator, "a\\u{X:0>4}b", .{cp});

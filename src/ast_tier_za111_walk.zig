@@ -2,7 +2,7 @@
 // ZA111 walker: the AST body-walk machinery, split out of
 // ast_tier_za111.zig to keep both halves under the 64 KiB AST-tier
 // input cap (EPH-I0601, EPH-I0046). This file owns the fn-body DFS and
-// the node records; the rule file owns collection and classification.
+// the node records. The rule file owns collection and classification.
 // Copyright (C) 2025 Rhyos Labs LLC
 // SPDX-License-Identifier: MIT
 
@@ -58,8 +58,8 @@ pub const Walker = struct {
     var_decls: std.ArrayListUnmanaged(NodeIndex) = .empty,
     returns: std.ArrayListUnmanaged(NodeIndex) = .empty,
     /// Labeled-block breaks with a value operand (`break :blk &x;`,
-    /// EPH-I0046): these records resolve the block's value; only a
-    /// consumer that provably escapes adjudicates (the block itself
+    /// EPH-I0046): these records resolve the block's value. Only a
+    /// Consumer that provably escapes adjudicates (the block itself
     /// never fires).
     breaks: std.ArrayListUnmanaged(NodeIndex) = .empty,
     /// Plain `=` assignments: out-param escapes and var-alias rebinds
@@ -145,8 +145,8 @@ pub const Walker = struct {
         body: NodeIndex,
     ) !void {
         const ptok = payload_token orelse return;
-        // The payload token is the `*` itself for a pointer capture; the
-        // binding name is the next token (verified against Parse.zig:
+        // The payload token is the `*` itself for a pointer capture. The
+        // Binding name is the next token (verified against Parse.zig:
         // payload_token = payload_pipe + 1).
         const raw = self.tree.tokenSlice(ptok);
         const is_ptr = mem.eql(u8, raw, "*");
@@ -345,7 +345,7 @@ pub const Walker = struct {
     }
 
     /// Children of the `extra_and_node` tags: plain pointer types push
-    /// their elem type; `assign_destructure` pushes lhs bindings plus
+    /// their elem type. `assign_destructure` pushes lhs bindings plus
     /// the value (EPH-I0596).
     fn pushShapedTail(self: *Walker, node: NodeIndex) !void {
         const data = self.tree.nodeData(node);
@@ -421,7 +421,7 @@ pub const Walker = struct {
     }
 
     /// Pointer-type and destructure children (extra_and_node shapes):
-    /// aligned/sentinel push the optional align/sentinel plus the elem;
+    /// aligned/sentinel push the optional align/sentinel plus the elem.
     /// plain/sized/destructure push their tail (EPH-I0596).
     fn pushShapedPtr(self: *Walker, node: NodeIndex) !bool {
         const data = self.tree.nodeData(node);
@@ -451,7 +451,7 @@ pub const Walker = struct {
             return true;
         }
         // `lhs..rhs` and open `lhs..` — the end is optional (shape is
-        // node_and_opt_node, NOT node_and_node; verified against
+        // node_and_opt_node, NOT node_and_node. Verified against
         // Parse.zig forPrefix).
         if (tag == .for_range) {
             const lhs, const rhs = data.node_and_opt_node;
@@ -488,7 +488,7 @@ const binary_like_tags = blk: {
 
 /// Container-declaration tags: the boundary set's container half, shared
 /// with the type index in ast_tier_za111.zig. The B75/B76 split mirrored
-/// this list across the two files; it lives here once (EPH-I1232).
+/// this list across the two files. It lives here once (EPH-I1232).
 pub fn isContainerDeclTag(tag: Ast.Node.Tag) bool {
     return switch (tag) {
         .container_decl,

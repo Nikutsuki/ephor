@@ -86,7 +86,7 @@ pub fn parseVersion(version_str: []const u8) VersionInfo {
 /// the project being scanned. The value is a comptime constant of the
 /// build toolchain, and the resolved tables then serve every scanned
 /// project regardless of its own toolchain. Table selection is build-time
-/// by design; per-target selection would start here (F17).
+/// by design. Per-target selection would start here (F17).
 pub fn getCurrentVersion() VersionInfo {
     return comptime parseVersion(builtin.zig_version_string);
 }
@@ -214,15 +214,15 @@ fn fallbackTablesFor(version: VersionInfo) Tables {
 /// from the main thread: the process's only non-test worker is the parse
 /// worker (spawn at ast_tier.zig:147), which spawns per file, calls only
 /// Ast.parse (never compat), and joins before analysis resumes
-/// (ast_tier.zig:161); a test-only chain-walk thread (spawn at
+/// (ast_tier.zig:161). A test-only chain-walk thread (spawn at
 /// main.zig:42716) joins before any compat access and never touches
 /// compat either. The worker-side pin of the same contract lives at the
 /// spawn site (F10, EPH-I0697).
 var cached_tables: ?Tables = null;
 
 /// Pending unknown-version fallback state (EPH-I1054): currentTables
-/// sets the flag when the running compiler needs fallback tables; main
-/// consumes it once per run through takeUnknownVersionWarning() and
+/// sets the flag when the running compiler needs fallback tables. Main
+/// Consumes it once per run through takeUnknownVersionWarning() and
 /// prints the message on the CLI diagnostics channel, whose json_stream
 /// latch keeps it off the JSON machine stream. compat cannot reach
 /// main's diagnostics helpers without a circular import, so the flag
@@ -236,7 +236,7 @@ pub fn markUnknownVersionFallback() void {
 }
 
 /// Consume the pending fallback warning (EPH-I1054). main calls this
-/// once per run; a consumed flag never fires again.
+/// once per run. A consumed flag never fires again.
 pub fn takeUnknownVersionWarning() bool {
     const pending = pending_unknown_version_warning;
     pending_unknown_version_warning = false;
@@ -279,7 +279,7 @@ pub fn getSupportedVersionsString() []const u8 {
 }
 
 /// Build the fallback warning text. Parameterized so tests can pin the
-/// wording for any version; the production text is the comptime call in
+/// wording for any version. The production text is the comptime call in
 /// unknown_version_warning_text.
 pub fn formatUnknownVersionWarning(
     comptime version: VersionInfo,
@@ -300,7 +300,7 @@ pub fn formatUnknownVersionWarning(
 const running_resolution = resolveVersion(getCurrentVersion());
 
 /// Warning text for a fallback-tables build (EPH-I1054). Comptime-built
-/// from the running version and the fallback label; empty on a supported
+/// from the running version and the fallback label, empty on a supported
 /// build, where the warning can never fire. main prints it through
 /// cliDiag when takeUnknownVersionWarning() returns true.
 pub const unknown_version_warning_text: []const u8 = if (running_resolution.used_fallback)
@@ -430,7 +430,7 @@ const first_arg_excluded_patterns: []const []const u8 = &.{
 /// The deleted main.zig hand table's literals, in the deleted table's
 /// order: the derivation's order spec and the byte-verification
 /// reference. A pin entry leaves the derived list only when BOTH
-/// version registries drop the form; the containment proofs below turn
+/// version registries drop the form. The containment proofs below turn
 /// every such change into a compile error until the pin or the
 /// exclusions change consciously.
 const first_arg_order_pin: []const []const u8 = &.{
@@ -565,7 +565,7 @@ pub fn getStdlibContainerInitPatterns() []const []const u8 {
     return currentTables().stdlib_container_init_patterns;
 }
 
-/// Managed-container type families (heap backing store; by-value copy aliases)
+/// Managed-container type families (heap backing store, by-value copy aliases)
 pub fn getManagedContainerTypePatterns() []const []const u8 {
     return currentTables().managed_container_type_patterns;
 }
@@ -673,8 +673,8 @@ test "getAllocMethodPatterns includes dupe" {
 }
 
 test "first-arg derivation serves the deleted hand-table contract (EPH-I1232 C8)" {
-    // The comptime proofs byte-verify the derivation against the pin;
-    // this test pins the public shape at runtime: 16 forms, the
+    // The comptime proofs byte-verify the derivation against the pin.
+    // This test pins the public shape at runtime: 16 forms, the
     // representative members present, the excluded forms absent.
     const patterns = first_arg_alloc_patterns;
     try std.testing.expectEqual(@as(usize, 16), patterns.len);

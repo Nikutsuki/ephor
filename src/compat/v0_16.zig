@@ -156,7 +156,7 @@ pub const builtins = [_][]const u8{
     "@prefetch",
 
     // GPU and WebAssembly builtins: all five names verified against the
-    // pinned 0.16.0 compiler (probe compile; a recognized builtin reports
+    // pinned 0.16.0 compiler (probe compile. A recognized builtin reports
     // a scope or target error, an unknown name reports invalid builtin).
     "@wasmMemorySize",
     "@wasmMemoryGrow",
@@ -212,7 +212,7 @@ pub const optional_methods = [_][]const u8{
 };
 
 // Comptime Flat Arrays - for fast substring matching in main.zig
-// Hand-maintained; keep in sync with the structured tables above (F14)
+// Hand-maintained. Keep in sync with the structured tables above (F14)
 // ============================================================================
 
 /// Init patterns for allocator types that don't need per-allocation free
@@ -284,7 +284,7 @@ pub const alloc_method_patterns: []const []const u8 = &.{
     ".toOwnedSlice(",
     ".toOwnedSliceSentinel(",
     ".cloneWithAllocator(",
-    // File I/O (allocating reads; allocator is the first argument)
+    // File I/O (allocating reads. Allocator is the first argument)
     ".readFileAlloc(",
     ".readFileAllocOptions(",
     ".readAlloc(",
@@ -454,16 +454,16 @@ pub const stdlib_container_init_patterns: []const []const u8 = &.{
     "EnumSet(",
     "BufSet.init(",
     "BufMap.init(",
-    // IO (0.16 moved File and Dir from std.fs to std.Io: Io.zig:41-45;
-    // the BufferedReader/BufferedWriter names left the stdlib in 0.15)
+    // IO (0.16 moved File and Dir from std.fs to std.Io: Io.zig:41-45.
+    // The BufferedReader/BufferedWriter names left the stdlib in 0.15)
     "Io.File",
     "Io.Dir",
     "Io.Reader",
 };
 
 /// Managed-container exclusions: init-table entries that copy safely or
-/// own no heap backing (node-based lists keep their nodes user-owned;
-/// the inline-storage containers copy by value; Io.Reader is an
+/// own no heap backing (node-based lists keep their nodes user-owned.
+/// The inline-storage containers copy by value. Io.Reader is an
 /// interface struct whose by-value return is the idiomatic construction
 /// pattern). The idx field is the entry's position in
 /// stdlib_container_init_patterns, and the comptime block below asserts
@@ -488,7 +488,7 @@ const managed_exclusions = [_]struct { idx: usize, name: []const u8 }{
 const managed_extras = [_][]const u8{ "BufMap", "BufSet", "Io.File", "Io.Dir" };
 
 /// Managed-container type families: structs that own a backing resource
-/// (ptr + capacity + allocator fields for the containers; an OS handle for
+/// (ptr + capacity + allocator fields for the containers. An OS handle for
 /// Io.File/Io.Dir), so a BY-VALUE copy aliases the same backing — returning
 /// one from a fn creates a second owner with no language-level transfer
 /// (double-free on deinit, dangle after a callee defer, use of a closed
@@ -663,7 +663,7 @@ test "code-position mask keeps the shared classifier edges (EPH-I0880)" {
 
 test "alloc tables include allocPrintSentinel and allocRemainingAlignedSentinel (EPH-I1114)" {
     // findAllocCall/hasAllocCallPattern read the flat pattern table and
-    // isNonAllocFnCallAt reads the short-name table; both names must land
+    // isNonAllocFnCallAt reads the short-name table. Both names must land
     // in both (pinned 0.16 std: fmt.zig:639, Io/Reader.zig:299).
     var found_pattern_print = false;
     var found_pattern_remaining = false;
@@ -705,8 +705,8 @@ test "vocabulary all_init_patterns includes MemoryPool and omits the removed 0.1
     var found_threadsafe = false;
     for (all_init_patterns) |p| {
         if (std.mem.eql(u8, p, "MemoryPool(")) found_pool = true;
-        // 0.16 removed both names from std.heap; no pattern table
-        // carries them (the deprecated-patterns table was deleted).
+        // 0.16 removed both names from std.heap. No pattern table
+        // Carries them (the deprecated-patterns table was deleted).
         if (std.mem.eql(u8, p, "GeneralPurposeAllocator(")) found_gpa = true;
         if (std.mem.eql(u8, p, "ThreadSafeAllocator.init(")) found_threadsafe = true;
     }

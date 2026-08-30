@@ -6,8 +6,8 @@
 //! ZA111 (returned-stack-reference) lives here, split out of
 //! ast_tier.zig so each half stays under the 64 KiB AST-tier input cap
 //! (EPH-I0601): the file implementing the rule must stay analyzable.
-//! ast_tier.zig owns the parse and the per-file pipeline; this file
-//! owns the ZA111 analysis, its type index, and its collection passes.
+//! ast_tier.zig owns the parse and the per-file pipeline. This file
+//! Owns the ZA111 analysis, its type index, and its collection passes.
 //! The fn-body walker lives in ast_tier_za111_walk.zig (EPH-I0046).
 //! Only `buildTypeIndex`, `Za111Ctx`, and `analyzeFileZa111` export.
 
@@ -34,22 +34,22 @@ const OptIndex = Ast.Node.OptionalIndex;
 //   &param, &param.field, &var.slice_field, &var.ptr_field, &opt.?,
 //   const p = &var; return p, and the bare &var store.  SAFE:
 //   comptime consts/params/var (string-builder idiom).
-// ZA111 covers exactly the MISSED forms; the bare-var return form is
-// skipped so ephor never duplicates a hard compile error. (Slot-address
+// ZA111 covers exactly the MISSED forms. The bare-var return form is
+// Skipped so ephor never duplicates a hard compile error. (Slot-address
 // rows re-verified 2026-08-23, EPH-I0590.)
 //
 // Precision: a chained address-of fires only when every hop provably
-// stays inside the stack frame; a pointer/slice hop is caller memory
-// (safe) while hops remain behind it; an unresolvable hop is SILENT.
+// stays inside the stack frame. A pointer/slice hop is caller memory
+// (safe) while hops remain behind it. An unresolvable hop is SILENT.
 // Escape (EPH-I0046): a return and an out-param store escape by
-// construction; a labeled-block value fires only when a consumer
-// provably escapes (a return of the block, an out-param store of it,
+// construction. A labeled-block value fires only when a consumer
+// Provably escapes (a return of the block, an out-param store of it,
 // or an alias chain from its binding), so in-function consumption (the
 // sig merlin.zig shape) and discarded statements stay silent.
 // Deferred: runtime-known const locals (needs comptime-provenance),
 // global-var stores, non-param field stores, destructured chains, and
-// the no-rebind var binding (hard compile errors never echoed); the
-// element-mutated var slice binding compiles but stays silent without
+// the no-rebind var binding (hard compile errors never echoed). The
+// Element-mutated var slice binding compiles but stays silent without
 // a rebind (EPH-I0046).
 
 const RULE_ZA111 = types.RULE_RETURNED_STACK_REF;
@@ -73,7 +73,7 @@ const Param = struct {
     is_pointer: bool,
     type_node: OptIndex,
     /// Provably an array type — slicing an array param points into the
-    /// param's stack slot; slicing a slice/pointer copies caller memory
+    /// param's stack slot. Slicing a slice/pointer copies caller memory
     /// (EPH-I0046).
     provably_array: bool = false,
 };
@@ -89,7 +89,7 @@ const Alias = struct {
     init: OptIndex = .none,
     is_var: bool = false,
     decl_tok: u32 = 0,
-    /// Set when the rebind adjudication or the fixpoint drops the alias;
+    /// Set when the rebind adjudication or the fixpoint drops the alias.
     /// aliasRoot skips dropped entries (EPH-I0046).
     dropped: bool = false,
 };
@@ -168,7 +168,7 @@ const FnScan = struct {
 // it is a slice field — the syntax is identical, only the field type
 // differs. This index maps type names to their container declarations so
 // chain hops can be resolved. It is deliberately not a semantic layer:
-// only same-file, name-resolvable types participate; everything else is
+// only same-file, name-resolvable types participate. Everything else is
 // .unknown and the caller stays silent.
 
 const TypeIndex = struct {
@@ -188,7 +188,7 @@ const TypeIndex = struct {
     /// The container a chain in `body` resolves `name` against: the
     /// innermost fn-local scope containing `body`, else the file-scope
     /// declaration. Same-scope duplicates are a compile error in real
-    /// code; the later wins for determinism.
+    /// code. The later wins for determinism.
     fn lookup(
         self: *const TypeIndex,
         tree: *const Ast,
@@ -238,7 +238,7 @@ fn bodyInside(tree: *const Ast, sb: NodeIndex, body_first: u32, body_last: u32) 
 
 /// The container-declaration tag set lives in the walker module, shared
 /// with isBoundaryTag there (the B75/B76 split mirrored the list across
-/// the two files; it lives there once, EPH-I1232).
+/// the two files. It lives there once, EPH-I1232).
 fn isContainerDeclTag(tag: Ast.Node.Tag) bool {
     return walk.isContainerDeclTag(tag);
 }
@@ -404,7 +404,7 @@ fn stepThroughField(sctx: ScanCtx, container: NodeIndex, hop: Hop) TypeStep {
 
 /// Resolve an alias chain (`const A = B; const B = [4]u32;`) to its
 /// final type node, bounded by the alias-table size (cycles are compile
-/// errors in real code; the bound makes adversarial input terminate).
+/// errors in real code. The bound makes adversarial input terminate).
 fn flattenAlias(sctx: ScanCtx, node: NodeIndex, depth: usize) NodeIndex {
     if (depth >= 64) return node;
     if (sctx.tree.nodeTag(node) != .identifier) return node;
@@ -482,7 +482,7 @@ const ChainInfo = struct {
     overflow: bool = false,
 };
 
-/// Peel one chain hop, advancing `cur` past it; null ends the chain.
+/// Peel one chain hop, advancing `cur` past it. null ends the chain.
 /// `@field(parent, "name")` peels as a field hop on `parent`
 /// (EPH-I0046): a literal field name resolves the field type, a
 /// non-literal one records dynamic_field.
@@ -556,7 +556,7 @@ fn chainInfo(tree: *const Ast, start: NodeIndex) ChainInfo {
 
 /// Params whose address is provably static or unprovable are
 /// excluded: comptime params and comptime-only types live in constant
-/// memory; anytype params cannot be proven runtime from the AST.
+/// memory. anytype params cannot be proven runtime from the AST.
 fn collectParams(
     a: Allocator,
     sctx: ScanCtx,
@@ -682,7 +682,7 @@ fn declTokenLessThan(tree: *const Ast, a: NodeIndex, b: NodeIndex) bool {
 }
 
 /// Sort declarations into source order: the walker discovers them in
-/// DFS pop order; pointer inference and alias resolution rely on
+/// DFS pop order. Pointer inference and alias resolution rely on
 /// use-before-decl ordering.
 fn sortDeclsBySource(tree: *const Ast, decls: []NodeIndex) void {
     std.sort.pdq(NodeIndex, decls, tree, declTokenLessThan);
@@ -897,8 +897,8 @@ fn peelCastBuiltin(tree: *const Ast, node: NodeIndex) ?NodeIndex {
 
 /// The stack local or param an alias initializer points into, if
 /// provable. A chained address resolved safe/unknown does not point
-/// into the stack frame — no alias. Cast layers peel; a labeled-block
-/// switch resolves too (EPH-I0046, EPH-I1185).
+/// into the stack frame — no alias. Cast layers peel. A labeled-block
+/// Switch resolves too (EPH-I0046, EPH-I1185).
 fn aliasTarget(sctx: ScanCtx, scan: *const FnScan, init: NodeIndex) ?[]const u8 {
     var e = unwrapGroup(sctx.tree, init);
     while (true) {
@@ -916,7 +916,7 @@ fn aliasTarget(sctx: ScanCtx, scan: *const FnScan, init: NodeIndex) ?[]const u8 
 
 /// The stack root a switch expression's value points into
 /// (EPH-I1185): every prong must be a labeled block (group and cast
-/// layers allowed) resolving to the same root; else the switch stays
+/// layers allowed) resolving to the same root. Else the switch stays
 /// unresolvable (FN-only).
 fn switchValueRoot(sctx: ScanCtx, scan: *const FnScan, node: NodeIndex) ?[]const u8 {
     const sw = sctx.tree.fullSwitch(node) orelse return null;
@@ -980,8 +980,8 @@ fn chainIsUnsafe(sctx: ScanCtx, info: ChainInfo, bind: Bind) bool {
 
 /// The slot-address discrimination for pointer/slice roots (EPH-I1122):
 /// a lone `.len`/`.ptr` field hop on a slice root addresses the pointer
-/// value stored in the root's own stack slot, so the chain is unsafe;
-/// every other hop shape stays caller-owned memory and silent. The
+/// value stored in the root's own stack slot, so the chain is unsafe.
+/// Every other hop shape stays caller-owned memory and silent. The
 /// `.many` arm is defensive only: `[*]T` carries no field access.
 fn finalHopIsOwnSlot(sctx: ScanCtx, info: ChainInfo, bind: Bind) bool {
     if (info.hop_count != 1) return false;
@@ -1057,8 +1057,8 @@ fn breakLabelMatches(tree: *const Ast, brk: NodeIndex, label_name: []const u8) b
 }
 
 /// True when `target` matches a committed root, or no root is
-/// committed yet (EPH-I1221): the first break always commits; later
-/// breaks must match or the block has no single root.
+/// committed yet (EPH-I1221): the first break always commits. Later
+/// Breaks must match or the block has no single root.
 fn sameRoot(committed: ?[]const u8, target: []const u8) bool {
     return if (committed) |root| mem.eql(u8, root, target) else true;
 }
@@ -1067,7 +1067,7 @@ fn sameRoot(committed: ?[]const u8, target: []const u8) bool {
 /// null. The value comes from the block's value-breaks: when every
 /// break resolves to a stack root, the value is a stack pointer on
 /// every path (EPH-I0046). A comptime-range break is static-safe and
-/// excluded; an unresolvable break or DISTINCT cross-break roots make
+/// excluded. An unresolvable break or DISTINCT cross-break roots make
 /// the whole block unresolvable (FN-only, EPH-I1221): naming only the
 /// last break would misattribute the escape. The block itself never
 /// fires — only a consumer that provably escapes adjudicates, so the
@@ -1117,8 +1117,8 @@ fn blockLabelToken(tree: *const Ast, block: NodeIndex) ?Ast.TokenIndex {
 const BarePolicy = enum { skip, commit };
 
 /// The stack root one labeled-block break operand points into, or
-/// null. A direct address-of operand applies the sink's bare policy;
-/// any other shape resolves through the alias machinery (EPH-I0046).
+/// null. A direct address-of operand applies the sink's bare policy.
+/// Any other shape resolves through the alias machinery (EPH-I0046).
 fn blockBreakTarget(
     sctx: ScanCtx,
     scan: *const FnScan,
@@ -1244,8 +1244,8 @@ fn sliceChainIsStack(sctx: ScanCtx, info: ChainInfo, bind: Bind) bool {
 }
 
 /// True while a resolution step keeps the address inside the root's
-/// slot: arrays, optionals, and named types qualify; a pointer/slice
-/// hop or an unresolvable type leaves the slot.
+/// slot: arrays, optionals, and named types qualify. A pointer/slice
+/// Hop or an unresolvable type leaves the slot.
 fn stepStaysInSlot(cur: TypeStep) bool {
     return switch (cur) {
         .safe, .unknown => false,
@@ -1315,7 +1315,7 @@ fn captureForReturn(
 
 /// The root identifier of an assign lhs chain (deref/field/unwrap/
 /// array-access hops peeled), or null for compound lhss (EPH-I0046).
-/// `out.* = x` and `out.field = x` both root at `out`; other shapes
+/// `out.* = x` and `out.field = x` both root at `out`. Other shapes
 /// stay unresolvable.
 fn assignLhsRoot(tree: *const Ast, lhs: NodeIndex) ?[]const u8 {
     var cur = lhs;
@@ -1331,7 +1331,7 @@ fn assignLhsRoot(tree: *const Ast, lhs: NodeIndex) ?[]const u8 {
 }
 
 /// One lhs hop for assignLhsRoot: deref/field/unwrap/array-access
-/// descend to their base operand; anything else ends the peel.
+/// descend to their base operand. Anything else ends the peel.
 fn peelAssignLhsHop(tree: *const Ast, cur: NodeIndex) ?NodeIndex {
     return switch (tree.nodeTag(cur)) {
         .deref => tree.nodeData(cur).node,
@@ -1344,8 +1344,8 @@ fn peelAssignLhsHop(tree: *const Ast, cur: NodeIndex) ?NodeIndex {
 /// Out-param escape (EPH-I0046): `out.* = &local;` stores a stack
 /// address into a pointer param's pointee — caller storage that
 /// outlives the frame. The lhs must root at a pointer-typed param (a
-/// by-value param's field write touches a local copy); the rhs must
-/// resolve to a stack root.
+/// by-value param's field write touches a local copy). The rhs must
+/// Resolve to a stack root.
 fn checkEscapeAssign(
     ctx: *const Za111Ctx,
     sctx: ScanCtx,
@@ -1436,8 +1436,8 @@ fn isSliceTag(tag: Ast.Node.Tag) bool {
 /// (EPH-I0046). By-value captures return values — skip. An if-capture
 /// roots at the condition operand's own slot: any local or param
 /// qualifies, pointer-typed included. A for-capture roots at the
-/// input: `&arr` or a by-value provable array; slice and pointer
-/// inputs iterate caller memory. Nested same-name captures resolve
+/// input: `&arr` or a by-value provable array. Slice and pointer
+/// Inputs iterate caller memory. Nested same-name captures resolve
 /// first-match: both roots are stack bindings, so only the named root
 /// can misattribute.
 fn collectCaptures(
@@ -1474,7 +1474,7 @@ fn captureRootName(sctx: ScanCtx, scan: *const FnScan, rec: CaptureRecord) ?[]co
 
 pub const Za111Ctx = struct {
     a: Allocator,
-    /// The parsed tree under analysis; the parse lives in ast_tier.zig
+    /// The parsed tree under analysis. The parse lives in ast_tier.zig
     /// (AstContext), keeping the split acyclic (EPH-I0601).
     tree: *const Ast,
     tidx: *const TypeIndex,
@@ -1644,8 +1644,8 @@ test "blockValueRoot: distinct multi-break roots stay silent (EPH-I1221)" {
     defer types.deinitIssues(&out, a);
     const ctx = Za111Ctx{ .a = a, .tree = &tree, .tidx = &tidx, .path = "test.zig", .out = &out };
     try analyzeFileZa111(&ctx);
-    // f's distinct roots (s vs t) stay silent; g's same-root breaks
-    // still fire once naming 's'.
+    // f's distinct roots (s vs t) stay silent. G's same-root breaks
+    // Still fire once naming 's'.
     try std.testing.expectEqual(@as(usize, 1), out.items.len);
     try std.testing.expect(mem.indexOf(u8, out.items[0].message, "'s'") != null);
     try std.testing.expect(mem.indexOf(u8, out.items[0].message, "'t'") == null);

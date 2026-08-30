@@ -10,7 +10,7 @@
 //! Degradation guarantee: a parse error makes the tree partial and
 //! `AstContext.ok` false — AST rules skip the file and the line tier
 //! still covers it. Deep delimiter/prefix nesting skips before the parse
-//! runs (EPH-I0191); a refused thread skips too (EPH-I0597).
+//! runs (EPH-I0191). A refused thread skips too (EPH-I0597).
 //!
 //! ZA111 (returned-stack-reference) lives in ast_tier_za111.zig, split
 //! out so each half stays under the 64 KiB AST-tier input cap
@@ -51,7 +51,7 @@ pub const AstContext = struct {
     /// allocator access. Direct use on untrusted input above
     /// `max_ast_file_bytes` still reopens the crash class. Production
     /// callers must go through `analyzeFileAstTier`. A refused worker
-    /// thread surfaces as `error.ThreadSpawnFailed`; the tier counts it
+    /// thread surfaces as `error.ThreadSpawnFailed`. The tier counts it
     /// as a skip (EPH-I0597).
     pub fn init(allocator: Allocator, source: []const u8) !AstContext {
         return switch (runGuardedParse(allocator, source, spawnParseWorker)) {
@@ -122,7 +122,7 @@ fn parseOnCurrentThread(allocator: Allocator, source: []const u8) !AstContext {
 /// propagates allocation errors (EPH-I0597).
 const ParseOutcome = union(enum) {
     ok: AstContext,
-    /// The worker thread could not be created; parsing on the caller's
+    /// The worker thread could not be created. Parsing on the caller's
     /// stack would reopen the EPH-I0191 crash class, so the file
     /// degrades to line-tier coverage.
     spawn_refused,
@@ -174,7 +174,7 @@ fn resolveParseOutcome(outcome: ParseOutcome, stats: ?*Stats) !?AstContext {
 
 /// Sink for one file's AST-tier analysis: issues plus optional counters.
 /// `parse_issues` (optional) receives one ZA503 warning per file the
-/// parser rejects (EPH-I0742; helpers live in types.zig).
+/// parser rejects (EPH-I0742. Helpers live in types.zig).
 pub const AstTierOut = struct {
     issues: *std.ArrayListUnmanaged(Issue),
     stats: ?*Stats = null,
@@ -239,7 +239,7 @@ const NestingScan = struct {
 /// (EPH-I0268). Operators inside strings, char literals, `\\`
 /// multiline bodies, and `//` comments are data and do not count.
 ///
-/// Grammar-audit table (zig 0.16.0 Parse.zig; EPH-I0268). Every
+/// Grammar-audit table (zig 0.16.0 Parse.zig, EPH-I0268). Every
 /// production classified by how it consumes stack: nested (the depth
 /// counter), sequential right-recursive (the run counter), or iterative
 /// (not counted). The table is the union of the 0.15/0.16 grammars: a
@@ -255,12 +255,12 @@ const NestingScan = struct {
 ///   comptime/nosuspend/resume/         right-recursive   run
 ///   break/return (expression prefix)
 ///   await                              no keyword        identifier
-///                                      (async removed in 0.15; verified
+///                                      (async removed in 0.15, verified
 ///                                      absent from the 0.16.0 stdlib —
 ///                                      EPH-I0591)
 ///   suspend payloads                   statement prefix  not counted
 ///                                      (BlockExprStatement — one frame
-///                                      per keyword, `;` resets; the
+///                                      per keyword, `;` resets, the
 ///                                      defer/errdefer class)
 ///   if/while/for bodies                right-recursive   run
 ///   fn-type chains `fn() fn() void`    right-recursive   run (fn + `(`,
@@ -349,8 +349,8 @@ fn scanOtherChar(line: []const u8, i: *usize, scan: *NestingScan, c: u8) void {
             scan.depth += 1;
             // Sequential slice/array types (`[][]u8`) recurse per level
             // with brackets balancing within one level, invisible to
-            // depth alone (audit table row 2). Over-counting skips; an
-            // under-count is absorbed by the cap and parse stack
+            // depth alone (audit table row 2). Over-counting skips. An
+            // Under-count is absorbed by the cap and parse stack
             // (EPH-I0268).
             scan.run += 1;
         },
@@ -432,7 +432,7 @@ fn nextNonSpaceIsParen(line: []const u8, i: usize) bool {
 /// Keywords whose productions recurse into the following expression or
 /// type without a delimiter (grammar-audit table, EPH-I0268). `fn` is
 /// handled apart: only its type form recurses. `await` is absent (async
-/// removed in 0.15; the 0.16.0 stdlib has no await keyword, EPH-I0591).
+/// removed in 0.15. The 0.16.0 stdlib has no await keyword, EPH-I0591).
 /// `suspend` is statement-level — the defer/errdefer class, not a chain.
 fn isRightRecursiveKeyword(word: []const u8) bool {
     const keywords = [_][]const u8{
@@ -446,7 +446,7 @@ fn isRightRecursiveKeyword(word: []const u8) bool {
 
 /// Run every AST-tier rule over one file. Files with parse errors, deep
 /// nesting, a size past `max_ast_file_bytes`, or a refused parse thread
-/// are skipped and counted; the line tier still covers them. Allocation
+/// are skipped and counted. The line tier still covers them. Allocation
 /// errors propagate (EPH-I0597).
 pub fn analyzeFileAstTier(
     a: Allocator,
@@ -908,8 +908,8 @@ test "ZA111: slice-field chain is silent (tigerbeetle cache pattern)" {
 test "ZA111: slice field address without index fires (EPH-I0590)" {
     const a = std.testing.allocator;
     // `&self.words` addresses the slice FIELD inside the stack copy of
-    // self, not the caller-owned backing. The index form above is safe;
-    // this form is stack UB the compiler also misses.
+    // self, not the caller-owned backing. The index form above is safe.
+    // This form is stack UB the compiler also misses.
     var issues = try runZa111(a,
         \\const P = struct { words: []u32 };
         \\fn word(self: P) *[]u32 {
@@ -986,7 +986,7 @@ test "ZA111: slice slot fields fire, backing memory stays silent (EPH-I1122)" {
     );
     defer types.deinitIssues(&issues, a);
     // The four slot-address shapes fire (the alias reports on its return
-    // line); the four neighbor shapes stay silent.
+    // line). The four neighbor shapes stay silent.
     try std.testing.expectEqual(@as(usize, 4), issues.items.len);
     var lines: [4]usize = undefined;
     for (issues.items, 0..) |issue, i| {
@@ -1167,14 +1167,14 @@ test "exceedsNestingBudget: !anyframe arrow-break restores the parked run (EPH-I
     // The `!` prefix parks while a bare `anyframe` operand resolves, and
     // the non-arrow break restores the parked frames (EPH-I0599). The
     // `!anyframe` spelling is the pre-scan under-count shape the issue
-    // names; `?anyframe` above pins the same restore via the `?` prefix.
+    // names. `?anyframe` above pins the same restore via the `?` prefix.
     try std.testing.expect(exceedsNestingBudget("!anyframe.x*", 1));
     try std.testing.expect(!exceedsNestingBudget("!anyframe.x*", 2));
 }
 
 test "exceedsNestingBudget: two-char = tokens keep the run, bare = resets (EPH-I0269)" {
     // The while-continue shape keeps its while frame live across the
-    // `+=`; reading the compound token's `=` as a boundary reset the run
+    // `+=`. Reading the compound token's `=` as a boundary reset the run
     // while the frames stayed on the parser stack (under-count). Nested
     // chains pin the fix: the run reaches 2 across `+=`, `==`, `>=`.
     const chained = "while (a) : (b += 1) while (c) : (d += 1) f();";

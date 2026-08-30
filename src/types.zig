@@ -21,12 +21,12 @@ pub const RULE_ALLOC_NO_ERRDEFER = "ZA103";
 // inline-ignores reference it.
 pub const RULE_USE_AFTER_FREE = "ZA105";
 pub const RULE_DOUBLE_FREE = "ZA106";
-// ZA107-ZA109: never issued. The numbering skipped straight to ZA110;
-// no rule ever carried these IDs (verified against git history).
+// ZA107-ZA109: never issued. The numbering skipped straight to ZA110.
+// No rule ever carried these IDs (verified against git history).
 pub const RULE_MUST_RETURN_REF = "ZA110";
 pub const RULE_RETURNED_STACK_REF = "ZA111";
 
-// ZA2xx - Error handling patterns (warnings; ZA205/ZA208/ZA209/ZA210 are notes)
+// ZA2xx - Error handling patterns (warnings. ZA205/ZA208/ZA209/ZA210 are notes)
 pub const RULE_SILENT_CATCH = "ZA201";
 pub const RULE_CATCH_UNREACHABLE = "ZA202";
 pub const RULE_ORELSE_UNREACHABLE = "ZA203";
@@ -158,7 +158,7 @@ pub const OutputFormat = enum {
 // ============================================================================
 
 /// Severity level at which findings fail the run (exit 1).
-/// --strict is exactly .warning; .never keeps findings informational.
+/// --strict is exactly .warning. .never keeps findings informational.
 pub const FailOn = enum {
     never, // findings never fail the run (default)
     err, // fail only on error-severity findings
@@ -195,7 +195,7 @@ pub const FailOn = enum {
 /// Which convention ZA703 enforces for error-set member declarations.
 /// Use sites of an error value never fire (EPH-I1075). The stdlib and
 /// virtually all community code use TitleCase error names, so that is the
-/// default; snake_case preserves the pre-flip ZA703 behavior for projects
+/// default. snake_case preserves the pre-flip ZA703 behavior for projects
 /// that adopted it.
 pub const ErrorNaming = enum {
     title_case, // error{ FileNotFound } (default, community standard)
@@ -390,7 +390,7 @@ pub const sanitizeSnippet = sanitize.sanitizeSnippet;
 // ============================================================================
 // ZA503 parse-error finding (EPH-I0742)
 // ============================================================================
-// A file the host parser rejects is a real defect; before this finding
+// A file the host parser rejects is a real defect. Before this finding
 // the AST tier skipped it in silence, so a syntax-broken file exited 0
 // under every strictness. One warning per file, at the first non-note
 // parse error. The helpers live here, not in ast_tier.zig, so
@@ -411,12 +411,12 @@ fn firstRealParseError(tree: *const std.zig.Ast) std.zig.Ast.Error {
 }
 
 /// One ZA503 warning for a file the host parser rejects. The message
-/// is the rendered primary error, capped; the location is the error
+/// is the rendered primary error, capped. The location is the error
 /// token's 1-based line/col. `file` borrows the caller's path, the
 /// same lifetime pattern as the ZA111 findings.
 pub fn parseErrorIssue(a: Allocator, path: []const u8, tree: *const std.zig.Ast) !Issue {
     const err = firstRealParseError(tree);
-    // The Allocating writer owns the render buffer; toArrayList hands
+    // The Allocating writer owns the render buffer. toArrayList hands
     // the bytes to a managed list whose toOwnedSlice transfers them to
     // the issue (no fallible call follows the transfer).
     var aw = std.Io.Writer.Allocating.init(a);
@@ -514,7 +514,7 @@ pub const FileAnalysis = struct {
     pub_function_count: usize,
     line_count: usize,
     /// True when the head carries a generated-file banner (EPH-I1062).
-    /// ZA701 and ZA703 stay silent on generated files; every other
+    /// ZA701 and ZA703 stay silent on generated files. Every other
     /// analyzer keeps full coverage.
     is_generated: bool,
 
@@ -556,8 +556,8 @@ fn isPathSep(c: u8) bool {
 }
 
 /// Component-boundary "ancestor or same" test on two paths. A raw
-/// startsWith would accept "/repo-evil" for root "/repo" (RED4-3 shape);
-/// the byte after the matched prefix must be a separator. The test strips
+/// startsWith would accept "/repo-evil" for root "/repo" (RED4-3 shape).
+/// The byte after the matched prefix must be a separator. The test strips
 /// trailing separators from `ancestor` first, so both forms of a directory
 /// name match. Moved from main.zig (EPH-I0176) so relativePath can guard
 /// its strip without importing main.zig. The B89 serialized tail adopted
@@ -819,7 +819,7 @@ test "relativePath removes base" {
 
 test "relativePath strips base only on a component boundary (EPH-I0176)" {
     // A raw prefix strip would mangle "/repo-evil/x.zig" for base
-    // "/repo" into "-evil/x.zig"; the guarded form renders the full
+    // "/repo" into "-evil/x.zig". The guarded form renders the full
     // path instead.
     try std.testing.expectEqualStrings(
         "/repo-evil/x.zig",

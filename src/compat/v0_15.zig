@@ -7,7 +7,7 @@
 //   - HashMap.put(key, value) - no allocator argument
 //   - ArrayList.append(allocator, item) - allocator required
 //   - ArrayList - unmanaged by default (0.15.1 "ArrayList: make unmanaged
-//     the default"); the ArrayListUnmanaged spelling is the deprecated alias
+//     the default"). The ArrayListUnmanaged spelling is the deprecated alias
 //   - std.mem.Allocator passed to methods, not stored in containers
 //   - zig-cache renamed to .zig-cache
 
@@ -153,7 +153,7 @@ pub const builtins = [_][]const u8{
     "@optimizeFor",
     "@prefetch",
 
-    // GPU and WebAssembly builtins (verified against the 0.16.0 compiler;
+    // GPU and WebAssembly builtins (verified against the 0.16.0 compiler.
     // @setCold left in 0.14 — it is not in this list)
     "@wasmMemorySize",
     "@wasmMemoryGrow",
@@ -206,14 +206,14 @@ pub const optional_methods = [_][]const u8{
     // Tokenizer/Parser methods
     ".peek(",
 
-    // Environment (posix.getenv returns ?[:0]const u8: posix.zig:2029;
+    // Environment (posix.getenv returns ?[:0]const u8: posix.zig:2029.
     // std.process.getenv left in 0.15 — process has getenvW and EnvironMap)
     "std.posix.getenv(",
 };
 
 // ============================================================================
 // Comptime Flat Arrays - for fast substring matching in main.zig
-// Hand-maintained; keep in sync with the structured tables above (F14)
+// Hand-maintained. Keep in sync with the structured tables above (F14)
 // ============================================================================
 
 /// Init patterns for allocator types that don't need per-allocation free
@@ -290,13 +290,13 @@ pub const alloc_method_patterns: []const []const u8 = &.{
     ".toOwnedSlice(",
     ".toOwnedSliceSentinel(",
     ".cloneWithAllocator(",
-    // File I/O (allocating reads; allocator is the first argument)
+    // File I/O (allocating reads. Allocator is the first argument)
     ".readFileAlloc(",
     ".readFileAllocOptions(",
     ".readAlloc(",
     ".allocRemaining(",
     // .allocRemainingAlignedSentinel is deliberately absent — 0.16-only
-    // (Io/Reader.zig:299; zero hits in the 0.15.1 and 0.15.2 stdlib).
+    // (Io/Reader.zig:299, zero hits in the 0.15.1 and 0.15.2 stdlib).
     // v0_16 carries it, and main.zig's first_arg_alloc_patterns keeps the
     // version-agnostic superset entry (EPH-I1114).
     // Path operations (fs.zig:521/656/683)
@@ -452,8 +452,8 @@ pub const stdlib_container_init_patterns: []const []const u8 = &.{
     "EnumSet(",
     "BufSet.init(",
     "BufMap.init(",
-    // IO (File and Dir stay at std.fs in 0.15: fs.zig:18-19; Reader moved
-    // to std.Io in 0.15: Io.zig:82; the BufferedReader/BufferedWriter names
+    // IO (File and Dir stay at std.fs in 0.15: fs.zig:18-19. Reader moved
+    // to std.Io in 0.15: Io.zig:82. The BufferedReader/BufferedWriter names
     // left the stdlib in 0.15)
     "std.fs.File",
     "fs.File",
@@ -461,8 +461,8 @@ pub const stdlib_container_init_patterns: []const []const u8 = &.{
 };
 
 /// Managed-container exclusions: init-table entries that copy safely or
-/// own no heap backing (node-based lists keep their nodes user-owned;
-/// the inline-storage containers copy by value). The idx field is the
+/// own no heap backing (node-based lists keep their nodes user-owned.
+/// The inline-storage containers copy by value). The idx field is the
 /// entry's position in stdlib_container_init_patterns, and the comptime
 /// block below asserts each pair stays in sync, so a reordered or
 /// renamed init table fails the build instead of silently changing the
@@ -658,10 +658,10 @@ test "code-position mask keeps the shared classifier edges (EPH-I0880)" {
 
 test "alloc tables include allocPrintSentinel, omit 0.16-only allocRemainingAlignedSentinel (EPH-I1114)" {
     // findAllocCall/hasAllocCallPattern read the flat pattern table and
-    // isNonAllocFnCallAt reads the short-name table; a name must land in
+    // isNonAllocFnCallAt reads the short-name table. A name must land in
     // both. allocPrintSentinel pins the 0.15 std (fmt.zig:644).
     // allocRemainingAlignedSentinel is 0.16-only (Io/Reader.zig:299), so
-    // both v0_15 tables deliberately omit it; v0_16 carries it.
+    // both v0_15 tables deliberately omit it. v0_16 carries it.
     var found_pattern_print = false;
     var found_pattern_remaining = false;
     for (alloc_method_patterns) |p| {

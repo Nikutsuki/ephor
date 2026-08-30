@@ -41461,15 +41461,14 @@ fn buildRuntimeArgv(
     return 3;
 }
 
+/// ZR104 for a completed run with no parsed findings (ZA506 D1): the
+/// help text arrives as data, so the caller selects it by command shape
+/// instead of passing a bare mode flag.
 fn reportCommandFailure(
     allocator: Allocator,
     issues: *std.ArrayListUnmanaged(Issue),
-    is_custom: bool,
+    help_msg: []const u8,
 ) !void {
-    const help_msg = if (is_custom)
-        "check command output for details"
-    else
-        "run 'zig build test' to see details";
     try issues.append(allocator, .{
         .file = "build.zig",
         .line = 1,
@@ -41639,6 +41638,7 @@ fn runRuntimeAnalysis(
         .root_real = root_real,
         .root_attempted = true,
         .state = &parse_state,
+        .verbose = opts.verbose,
     };
 
     const result = runChildCapped(
@@ -41654,14 +41654,23 @@ fn runRuntimeAnalysis(
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    try parseGPADiagnostics(parse_ctx, result.stderr, opts.verbose);
-    try parseTestOutput(parse_ctx, result.stdout, opts.verbose);
+    try parseGPADiagnostics(parse_ctx, result.stderr);
+    try parseTestOutput(parse_ctx, result.stdout);
     // Panics land on stderr on the pinned 0.16 runner (probe 2026-08-13:
     // stdout stays empty, the crash block and the "panic:" line both go
     // to stderr). Classify stderr beside stdout so a panicking fixture
     // surfaces ZR105 instead of a bare ZR104 (EPH-I0489).
-    try parseTestOutput(parse_ctx, result.stderr, opts.verbose);
-    try reportRuntimeTerm(allocator, &issues, result.term, opts.custom_command != null);
+    try parseTestOutput(parse_ctx, result.stderr);
+    // ZR104 help text selects by command shape (ZA506 D1, EPH-I1081): a
+    // custom command's failure points at its own output, the default
+    // command re-runs the build. The runtime flow derives the message
+    // from opts here, so the report functions carry it as data instead
+    // of threading a mode flag.
+    const failure_help: []const u8 = if (opts.custom_command != null)
+        "check command output for details"
+    else
+        "run 'zig build test' to see details";
+    try reportRuntimeTerm(allocator, &issues, result.term, failure_help);
 
     if (opts.suppressed_out) |out| out.* = parse_state.suppressed;
     return issues;
@@ -41714,22 +41723,25 @@ fn reportNoBuildZig(
 
 /// Term-shape findings for the runtime child (EPH-I0231). Term is a
 /// tagged union in 0.16: a signal-killed child is .signal, and reading
-/// .exited on it is a safety-checked panic.
+/// .exited on it is a safety-checked panic. The failure help text
+/// arrives pre-selected by the caller (ZA506 D1): the runtime flow
+/// derives it from the command shape, so no mode flag threads through
+/// the report.
 fn reportRuntimeTerm(
     allocator: Allocator,
     issues: *std.ArrayListUnmanaged(Issue),
     term: std.process.Child.Term,
-    is_custom: bool,
+    failure_help: []const u8,
 ) !void {
     switch (term) {
         .exited => |code| {
             if (code != 0 and issues.items.len == 0)
-                try reportCommandFailure(allocator, issues, is_custom);
+                try reportCommandFailure(allocator, issues, failure_help);
         },
         .signal => |sig| try reportSignalDeath(allocator, issues, sig),
         .stopped, .unknown => {
             if (issues.items.len == 0)
-                try reportCommandFailure(allocator, issues, is_custom);
+                try reportCommandFailure(allocator, issues, failure_help);
         },
     }
 }
@@ -41763,6 +41775,11 @@ const RuntimeEmitCtx = struct {
     /// log; production passes null for the raw stderr path,
     /// byte-identical with the pre-seam output.
     writer: ?*std.Io.Writer = null,
+    /// Verbose mode for the runtime band (ZA506 D1, EPH-I1081): the
+    /// flag moved from per-handler parameters onto the emit context,
+    /// the mode every runtime parser shares. Production sets it from
+    /// RuntimeOptions; tests leave the default false.
+    verbose: bool = false,
 };
 
 /// Static rule content of a runtime-diagnostic issue
@@ -41918,22 +41935,35 @@ const LeakMessage = struct {
     located: bool,
 };
 
+/// Echo the located "  at:" note of a leak finding (EPH-I0288): the
+/// writer seam routes the bytes to the capture writer in tests and raw
+/// stderr in production, the same render contract as
+/// printVerboseRuntimeLine. The leak message carries the same location
+/// as data, so the echo stays a side note, never the finding's source.
+fn printVerboseLeakLocation(ctx: RuntimeEmitCtx, file: []const u8, line: usize) !void {
+    var safe = try types.sanitizeTerminal(ctx.allocator, file);
+    defer safe.deinit(ctx.allocator);
+    if (ctx.writer) |w| {
+        w.print("  at: {s}:{d}\n", .{ safe.slice, line }) catch |err| switch (err) {
+            error.WriteFailed => {},
+        };
+    } else {
+        std.debug.print("  at: {s}:{d}\n", .{ safe.slice, line });
+    }
+}
+
 /// Resolve the leak finding's message (EPH-I0171): the next-line location
 /// embeds only when it passes the containment gate, so a forged path
 /// never reaches the message (the generic text survives the finding).
+/// The verbose mode reads from the emit context (ZA506 D1).
 fn leakFindingMessage(
     ctx: RuntimeEmitCtx,
     loc: FileLocation,
-    verbose: bool,
 ) !LeakMessage {
     const located = loc.line > 0 and runtimeLocationAllowed(ctx, loc);
     if (!located)
         return .{ .msg = "memory leak detected at runtime", .owned = false, .located = false };
-    if (verbose) {
-        var safe = try types.sanitizeTerminal(ctx.allocator, loc.file);
-        defer safe.deinit(ctx.allocator);
-        std.debug.print("  at: {s}:{d}\n", .{ safe.slice, loc.line });
-    }
+    if (ctx.verbose) try printVerboseLeakLocation(ctx, loc.file, loc.line);
     const msg = try std.fmt.allocPrint(
         ctx.allocator,
         "memory leak at {s}:{d}",
@@ -41944,22 +41974,22 @@ fn leakFindingMessage(
 
 /// Shared handler context for the line-consuming GPA handlers
 /// (handleMemoryLeak, handleRunnerBlock): the emit context, the output
-/// line iterator, the verbose flag, and the current line.
+/// line iterator, and the current line. The verbose mode lives on the
+/// emit context (ZA506 D1), so no per-handler flag field exists.
 const GpaLineCtx = struct {
     ctx: RuntimeEmitCtx,
     line_iter: *mem.SplitIterator(u8, .scalar),
-    verbose: bool,
     t: []const u8,
 };
 
 /// Handle memory leak detection with next-line stack trace
 fn handleMemoryLeak(h: GpaLineCtx) !void {
-    if (h.verbose) try printVerboseRuntimeLine(h.ctx, "GPA", h.t);
+    if (h.ctx.verbose) try printVerboseRuntimeLine(h.ctx, "GPA", h.t);
     const loc = if (h.line_iter.next()) |next_line|
         extractFileLocation(mem.trim(u8, next_line, " \t\r"))
     else
         FileLocation{ .file = "unknown", .line = 0 };
-    const message = try leakFindingMessage(h.ctx, loc, h.verbose);
+    const message = try leakFindingMessage(h.ctx, loc);
     errdefer if (message.owned) h.ctx.allocator.free(message.msg);
     // The structured fields carry the located frame too (EPH-I0736):
     // the GCC-style prefix points at the alloc site, so editors can
@@ -41995,7 +42025,6 @@ fn handleMemoryLeak(h: GpaLineCtx) !void {
 fn parseGPADiagnostics(
     ctx: RuntimeEmitCtx,
     stderr_output: []const u8,
-    verbose: bool,
 ) !void {
     var line_iter = mem.splitScalar(u8, stderr_output, '\n');
 
@@ -42003,7 +42032,7 @@ fn parseGPADiagnostics(
         const t = mem.trim(u8, line, " \t\r");
         if (t.len == 0) continue;
 
-        try classifyGPALine(ctx, &line_iter, verbose, t);
+        try classifyGPALine(ctx, &line_iter, t);
     }
 }
 
@@ -42064,34 +42093,24 @@ const gpa_classifications = [_]GPAClassification{
 fn classifyGPALine(
     ctx: RuntimeEmitCtx,
     line_iter: *mem.SplitIterator(u8, .scalar),
-    verbose: bool,
     t: []const u8,
 ) !void {
     const leak_pats = [_][]const u8{ "memory leak", "Memory leak", "leaked:" };
     if (matchesAnyPattern(t, &leak_pats))
-        return handleMemoryLeak(.{
-            .ctx = ctx,
-            .line_iter = line_iter,
-            .verbose = verbose,
-            .t = t,
-        });
+        return handleMemoryLeak(.{ .ctx = ctx, .line_iter = line_iter, .t = t });
     if (isRunnerBlockHeader(t))
-        return handleRunnerBlock(.{
-            .ctx = ctx,
-            .line_iter = line_iter,
-            .verbose = verbose,
-            .t = t,
-        });
-    return classifyGPATable(ctx, verbose, t);
+        return handleRunnerBlock(.{ .ctx = ctx, .line_iter = line_iter, .t = t });
+    return classifyGPATable(ctx, t);
 }
 
 /// Match one line against the GPA classification table. EPH-I0732 split
 /// this out of classifyGPALine so runner-block replay can reuse it without
-/// re-entering the leak or block paths.
-fn classifyGPATable(ctx: RuntimeEmitCtx, verbose: bool, t: []const u8) !void {
+/// re-entering the leak or block paths. The verbose echo reads the emit
+/// context (ZA506 D1).
+fn classifyGPATable(ctx: RuntimeEmitCtx, t: []const u8) !void {
     for (gpa_classifications) |cls| {
         if (!matchesAnyPattern(t, cls.patterns)) continue;
-        if (verbose) try printVerboseRuntimeLine(ctx, "GPA", t);
+        if (ctx.verbose) try printVerboseRuntimeLine(ctx, "GPA", t);
         const spec = RuntimeIssueSpec{
             .rule = cls.rule,
             .message = cls.message,
@@ -42276,15 +42295,15 @@ fn emitRunnerBlockFinding(
 /// unrecognized block replays header and lines through the plain table so
 /// pre-0.16 outputs keep the pre-fix behavior.
 fn handleRunnerBlock(h: GpaLineCtx) !void {
-    if (h.verbose) try printVerboseRuntimeLine(h.ctx, "GPA", h.t);
+    if (h.ctx.verbose) try printVerboseRuntimeLine(h.ctx, "GPA", h.t);
     var buf: [max_runner_block_lines][]const u8 = undefined;
     const n = collectRunnerBlock(h.line_iter, &buf);
     const lines = buf[0..n];
     var scan: RunnerBlockScan = .{};
     for (lines) |line| scanRunnerBlockLine(&scan, line);
     if (try emitRunnerBlockFinding(h.ctx, &scan, h.t)) return;
-    try classifyGPATable(h.ctx, h.verbose, h.t);
-    for (lines) |line| try classifyGPATable(h.ctx, h.verbose, line);
+    try classifyGPATable(h.ctx, h.t);
+    for (lines) |line| try classifyGPATable(h.ctx, line);
 }
 
 /// The `" panic:"` form is a substring of `"panic:"`, so one match covers
@@ -42299,8 +42318,8 @@ const panic_issue_spec = RuntimeIssueSpec{
     .help = "runtime panic - check for integer overflow, null pointer, or unreachable",
 };
 
-fn handlePanicLine(ctx: RuntimeEmitCtx, t: []const u8, verbose: bool) !void {
-    if (verbose) try printVerboseRuntimeLine(ctx, "PANIC", t);
+fn handlePanicLine(ctx: RuntimeEmitCtx, t: []const u8) !void {
+    if (ctx.verbose) try printVerboseRuntimeLine(ctx, "PANIC", t);
     try emitLocatedIssue(ctx, panic_issue_spec, t);
 }
 
@@ -42310,8 +42329,8 @@ const fail_issue_spec = RuntimeIssueSpec{
     .help = "check test assertions and expected values",
 };
 
-fn handleFailLine(ctx: RuntimeEmitCtx, t: []const u8, verbose: bool) !void {
-    if (verbose) try printVerboseRuntimeLine(ctx, "TEST FAIL", t);
+fn handleFailLine(ctx: RuntimeEmitCtx, t: []const u8) !void {
+    if (ctx.verbose) try printVerboseRuntimeLine(ctx, "TEST FAIL", t);
     try emitLocatedIssue(ctx, fail_issue_spec, t);
 }
 
@@ -42323,7 +42342,6 @@ fn handleFailLine(ctx: RuntimeEmitCtx, t: []const u8, verbose: bool) !void {
 fn parseTestOutput(
     ctx: RuntimeEmitCtx,
     output: []const u8,
-    verbose: bool,
 ) !void {
     var lines = mem.splitScalar(u8, output, '\n');
     while (lines.next()) |line| {
@@ -42335,11 +42353,11 @@ fn parseTestOutput(
         // A real runner emits the panic and the FAIL summary on separate
         // lines, so both rules still fire on separate lines (EPH-I0489).
         if (isPanicLine(t)) {
-            try handlePanicLine(ctx, t, verbose);
+            try handlePanicLine(ctx, t);
             continue;
         }
         if (mem.startsWith(u8, t, "FAIL"))
-            try handleFailLine(ctx, t, verbose);
+            try handleFailLine(ctx, t);
     }
 }
 
@@ -49489,6 +49507,11 @@ fn loadKnownIssues(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     try loadKnownIssuesOnce(diag, allocator, cfg);
 }
 
+/// Provenance of a known-issues read (ZA506 D1, EPH-I1081): the former
+/// bool selector became an enum so the read's failure contract names the
+/// source instead of a bare flag.
+const KnownIssuesProvenance = enum { auto, explicit };
+
 /// Read the known-issues list bytes. OOM is never "no list": it
 /// propagates (EPH-I0521). An unreadable EXPLICIT --known-issues=<file>
 /// is a hard usage error naming the path — help and README promise the
@@ -49500,7 +49523,7 @@ fn readKnownIssuesContent(
     diag: *DiagCtx,
     allocator: Allocator,
     path: []const u8,
-    explicit: bool,
+    provenance: KnownIssuesProvenance,
 ) !?[]u8 {
     const content = Fs.cwd(diag.io).readFileAlloc(
         allocator,
@@ -49509,7 +49532,7 @@ fn readKnownIssuesContent(
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            if (!explicit) return null;
+            if (provenance == .auto) return null;
             // EPH-I0212: the path may derive from a hostile cfg.path
             // (path_dir), so it crosses the terminal sanitizer.
             if (types.sanitizeTerminal(allocator, path)) |safe_val| {
@@ -49534,10 +49557,13 @@ fn readKnownIssuesContent(
 fn loadKnownIssuesOnce(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void {
     // RED3-7: the auto-detected .ephor-ignore discloses its load. An
     // explicit --known-issues path stays silent (the user asked for it).
-    const explicit = cfg.known_issues_path != null;
+    const provenance: KnownIssuesProvenance = if (cfg.known_issues_path != null)
+        .explicit
+    else
+        .auto;
     const path = (try resolveKnownIssuesPath(diag, allocator, cfg)) orelse return;
 
-    const content = (try readKnownIssuesContent(diag, allocator, path, explicit)) orelse return;
+    const content = (try readKnownIssuesContent(diag, allocator, path, provenance)) orelse return;
     defer allocator.free(content);
 
     // Track how many keys we have successfully added for cleanup on error
@@ -49552,7 +49578,7 @@ fn loadKnownIssuesOnce(diag: *DiagCtx, allocator: Allocator, cfg: *Config) !void
 
     try loadKnownIssueKeys(allocator, cfg, content, &keys_added);
 
-    if (!explicit) try noteKnownIssuesAutoload(diag, allocator, path, keys_added);
+    if (provenance == .auto) try noteKnownIssuesAutoload(diag, allocator, path, keys_added);
 }
 
 /// Resolve the known-issues path: the explicit --known-issues path wins;
@@ -55931,7 +55957,7 @@ fn runClassifyGPALine(allocator: Allocator, input: []const u8) !std.ArrayListUnm
     var iter = mem.splitScalar(u8, input, '\n');
     const first = iter.next() orelse return issues;
     const ctx = RuntimeEmitCtx{ .issues = &issues, .allocator = allocator };
-    try classifyGPALine(ctx, &iter, false, first);
+    try classifyGPALine(ctx, &iter, first);
     return issues;
 }
 
@@ -56104,7 +56130,7 @@ test "parseGPADiagnostics leak consumes the stack-trace line" {
     try parseGPADiagnostics(.{
         .issues = &issues,
         .allocator = allocator,
-    }, input, false);
+    }, input);
     try std.testing.expectEqual(@as(usize, 2), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_MEMORY_LEAK, issues.items[0].rule);
     try std.testing.expectEqualStrings("memory leak detected at runtime", issues.items[0].message);
@@ -56147,7 +56173,7 @@ test "parseTestOutput classifies failure-summary shapes" {
         try parseTestOutput(.{
             .issues = &issues,
             .allocator = allocator,
-        }, c.input, false);
+        }, c.input);
         try std.testing.expectEqual(@as(usize, 1), issues.items.len);
         try std.testing.expectEqualStrings(c.rule, issues.items[0].rule);
         try std.testing.expectEqualStrings(c.file, issues.items[0].file);
@@ -56162,7 +56188,7 @@ test "parseTestOutput stays silent on clean output" {
     try parseTestOutput(.{
         .issues = &issues,
         .allocator = allocator,
-    }, "1/1 tests passed\nok\n", false);
+    }, "1/1 tests passed\nok\n");
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 }
 
@@ -56177,7 +56203,7 @@ test "parseTestOutput emits one classification for a FAIL panic line (EPH-I0508 
     try parseTestOutput(.{
         .issues = &issues,
         .allocator = allocator,
-    }, "FAIL panic: x", false);
+    }, "FAIL panic: x");
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
 }
@@ -56198,7 +56224,6 @@ test "runtime dedup collapses repeated identical lines and counts them (EPH-I021
     try parseGPADiagnostics(
         .{ .issues = &issues, .allocator = allocator, .state = &state },
         input,
-        false,
     );
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
@@ -56219,7 +56244,6 @@ test "runtime dedup keeps distinct leak locations apart (EPH-I0211)" {
     try parseGPADiagnostics(
         .{ .issues = &issues, .allocator = allocator, .state = &state },
         input,
-        false,
     );
     try std.testing.expectEqual(@as(usize, 2), issues.items.len);
     try std.testing.expectEqual(@as(usize, 0), state.suppressed);
@@ -56227,7 +56251,6 @@ test "runtime dedup keeps distinct leak locations apart (EPH-I0211)" {
     try parseGPADiagnostics(
         .{ .issues = &issues, .allocator = allocator, .state = &state },
         "0x1 leaked:\n/a.zig:1:1 x\n",
-        false,
     );
     try std.testing.expectEqual(@as(usize, 2), issues.items.len);
     try std.testing.expectEqual(@as(usize, 1), state.suppressed);
@@ -56253,7 +56276,6 @@ test "runtime cap drops the over-cap tail and counts it (EPH-I0211)" {
     try parseTestOutput(
         .{ .issues = &issues, .allocator = allocator, .state = &state },
         input.items,
-        false,
     );
     try std.testing.expectEqual(max_runtime_findings, issues.items.len);
     try std.testing.expectEqual(@as(usize, 7), state.suppressed);
@@ -56392,6 +56414,40 @@ test "printVerboseRuntimeLine sanitizes child bytes before the render (EPH-I0171
     }
 }
 
+test "runtime emit ctx verbose flag drives every echo site (EPH-I1081 D1)" {
+    // ZA506 D1 moved the runtime verbose mode from per-handler bool
+    // parameters onto RuntimeEmitCtx. Every former param site must echo
+    // through the ctx flag, and the writer seam (EPH-I0288) captures
+    // each echo so the pin never prints to the green-run log.
+    const allocator = std.testing.allocator;
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer deinitIssues(&issues, allocator);
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const ctx = RuntimeEmitCtx{
+        .issues = &issues,
+        .allocator = allocator,
+        .verbose = true,
+        .writer = &w,
+    };
+    try handlePanicLine(ctx, "thread 1 panic: boom at /x/proj/a.zig:3 now");
+    try handleFailLine(ctx, "FAIL test.foo at /x/proj/b.zig:5");
+    // The GPA table echoes only on a classification match.
+    try classifyGPATable(ctx, "double free detected at 0x1");
+    // handleMemoryLeak echoes the leak marker and the located "at:" note.
+    var iter = mem.splitScalar(u8, "/x/proj/c.zig:7:5: 0xabc in foo", '\n');
+    try handleMemoryLeak(.{ .ctx = ctx, .line_iter = &iter, .t = "0x1 leaked:" });
+    try std.testing.expectEqualStrings(
+        "PANIC: thread 1 panic: boom at /x/proj/a.zig:3 now\n" ++
+            "TEST FAIL: FAIL test.foo at /x/proj/b.zig:5\n" ++
+            "GPA: double free detected at 0x1\n" ++
+            "GPA: 0x1 leaked:\n" ++
+            "  at: /x/proj/c.zig:7\n",
+        w.buffered(),
+    );
+    try std.testing.expectEqual(@as(usize, 4), issues.items.len);
+}
+
 test "handleMemoryLeak builds an owned message from the next line" {
     const allocator = std.testing.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -56401,7 +56457,6 @@ test "handleMemoryLeak builds an owned message from the next line" {
     try handleMemoryLeak(.{
         .ctx = ctx,
         .line_iter = &iter,
-        .verbose = false,
         .t = "0x1 leaked:",
     });
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
@@ -56424,7 +56479,6 @@ test "handleMemoryLeak falls back to a static message without a location" {
     try handleMemoryLeak(.{
         .ctx = ctx,
         .line_iter = &iter,
-        .verbose = false,
         .t = "0x1 leaked:",
     });
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
@@ -56457,7 +56511,6 @@ test "handleMemoryLeak keeps the runtime anchor for a forged location (EPH-I0736
     try handleMemoryLeak(.{
         .ctx = ctx,
         .line_iter = &iter,
-        .verbose = false,
         .t = "0x1 leaked:",
     });
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
@@ -56500,7 +56553,7 @@ test "parseGPADiagnostics findings own their file bytes after the source frees" 
     try parseGPADiagnostics(.{
         .issues = &issues,
         .allocator = allocator,
-    }, source, false);
+    }, source);
     // Free the source before the reads, replicating runRuntimeAnalysis's
     // free-then-print order. Safe builds poison freed bytes with 0xAA, so
     // a borrowed file slice fails the comparison below.
@@ -56540,7 +56593,7 @@ test "parseGPADiagnostics locates a 0.16 double-free crash block at the user fra
     try parseGPADiagnostics(.{
         .issues = &issues,
         .allocator = allocator,
-    }, source, false);
+    }, source);
     // Free before the reads, replicating runRuntimeAnalysis (EPH-I0202).
     allocator.free(source);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
@@ -56570,7 +56623,7 @@ test "parseGPADiagnostics locates a no-free-frame crash block as ZR105, never ZR
     try parseGPADiagnostics(.{
         .issues = &issues,
         .allocator = allocator,
-    }, source, false);
+    }, source);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
     try std.testing.expectEqualStrings(
@@ -56606,7 +56659,7 @@ test "parseGPADiagnostics locates a clean double-free log block at the second fr
     try parseGPADiagnostics(.{
         .issues = &issues,
         .allocator = allocator,
-    }, source, false);
+    }, source);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
     try std.testing.expectEqualStrings("/x/proj/src/main.zig", issues.items[0].file);
@@ -56630,7 +56683,7 @@ test "parseGPADiagnostics replays an unrecognized runner block through the table
     try parseGPADiagnostics(.{
         .issues = &issues,
         .allocator = allocator,
-    }, source, false);
+    }, source);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
     try std.testing.expectEqualStrings("runtime", issues.items[0].file);
@@ -56654,7 +56707,7 @@ test "parseGPADiagnostics caps runner block consumption at 64 lines" {
     try parseGPADiagnostics(.{
         .issues = &issues,
         .allocator = allocator,
-    }, src.items, false);
+    }, src.items);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
     try std.testing.expectEqualStrings("runtime", issues.items[0].file);
@@ -56676,7 +56729,7 @@ test "parseGPADiagnostics falls back to the first user frame without a Second fr
     try parseGPADiagnostics(.{
         .issues = &issues,
         .allocator = allocator,
-    }, source, false);
+    }, source);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
     try std.testing.expectEqualStrings("/x/proj/src/main.zig", issues.items[0].file);
@@ -56699,7 +56752,7 @@ test "parseGPADiagnostics reports unknown:0 for a crash block with only toolchai
     try parseGPADiagnostics(.{
         .issues = &issues,
         .allocator = allocator,
-    }, source, false);
+    }, source);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
     try std.testing.expectEqualStrings("unknown", issues.items[0].file);
@@ -56723,7 +56776,7 @@ test "parseGPADiagnostics keeps unknown:0 when the header names a zig step" {
     try parseGPADiagnostics(.{
         .issues = &issues,
         .allocator = allocator,
-    }, source, false);
+    }, source);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
     try std.testing.expectEqualStrings("unknown", issues.items[0].file);
@@ -56747,7 +56800,7 @@ test "parseGPADiagnostics filters Windows toolchain frames in a trace" {
     try parseGPADiagnostics(.{
         .issues = &issues,
         .allocator = allocator,
-    }, source, false);
+    }, source);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_DOUBLE_FREE, issues.items[0].rule);
     try std.testing.expectEqualStrings("C:\\proj\\src\\main.zig", issues.items[0].file);
@@ -56789,7 +56842,7 @@ test "parseTestOutput located findings own their file bytes after the source fre
     try parseTestOutput(.{
         .issues = &issues,
         .allocator = allocator,
-    }, source, false);
+    }, source);
     allocator.free(source);
     try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(RULE_RUNTIME_PANIC, issues.items[0].rule);
@@ -56851,7 +56904,6 @@ test "null containment root fails the located-finding gate closed (EPH-I1140)" {
         try handleMemoryLeak(.{
             .ctx = ctx,
             .line_iter = &iter,
-            .verbose = false,
             .t = "0x1 leaked:",
         });
         try std.testing.expectEqual(@as(usize, 1), issues.items.len);
@@ -56862,12 +56914,12 @@ test "null containment root fails the located-finding gate closed (EPH-I1140)" {
     }
 }
 
-test "reportCommandFailure varies help by command kind" {
+test "reportCommandFailure carries the caller-selected help (EPH-I1081 D1)" {
     const allocator = std.testing.allocator;
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     defer deinitIssues(&issues, allocator);
-    try reportCommandFailure(allocator, &issues, false);
-    try reportCommandFailure(allocator, &issues, true);
+    try reportCommandFailure(allocator, &issues, "run 'zig build test' to see details");
+    try reportCommandFailure(allocator, &issues, "check command output for details");
     try std.testing.expectEqual(@as(usize, 2), issues.items.len);
     for (issues.items) |issue| {
         try std.testing.expectEqualStrings("build.zig", issue.file);

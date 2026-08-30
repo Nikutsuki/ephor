@@ -29407,14 +29407,24 @@ fn isBuiltinFirstArg(masked: []const u8, pos: usize) bool {
 /// (`if (x) |*v|` — the capture needs the mutable payload), or a dotted
 /// chain whose segment is followed by one of those shapes
 /// (`x.field = 1`, `x.changes.?.map.put(...)` — an optional-unwrap or
-/// deref segment keeps the chain).
+/// deref segment keeps the chain). A quoted field-name segment walks the
+/// same (`x.@"field".append(...)`, EPH-I1247).
 fn nameMutableTail(masked: []const u8, after_name: usize) bool {
     var i = skipMaskedWs(masked, after_name);
     while (i < masked.len) {
         if (chainTailMutable(masked, i)) return true;
         if (masked[i] != '.') return false;
         i = skipSegmentMarker(masked, i + 1);
-        if (i >= masked.len or !isIdent(masked[i])) return false;
+        if (i >= masked.len) return false;
+        // A quoted field name (`x.@"field"`) masks to `@` plus the blanked
+        // literal span (blankLiteralContents blanks the quotes and the
+        // content): skip the span and keep walking, so a call or a store
+        // on a later segment still reads as a mutation (EPH-I1247).
+        if (masked[i] == '@') {
+            i = skipMaskedWs(masked, i + 1);
+            continue;
+        }
+        if (!isIdent(masked[i])) return false;
         // Walk the segment name ident-only: identRunEnd swallows dots and
         // would strand the walk on the `?` of a `.?` marker.
         while (i < masked.len and isIdent(masked[i])) i += 1;
@@ -29525,18 +29535,31 @@ fn precededByElse(masked: []const u8, pos: usize) bool {
 /// stays silent (EPH-I1244). The token before the keyword marks the
 /// position: an `=`-ending token (an assignment `=`, a comparison
 /// `==`/`!=`/`<=`/`>=`, or a compound assignment) or a switch prong `=>`
-/// always precedes an if-expression. The set is census-derived: the 119
-/// findings at the 5bf9977 baseline held 4 assignment-RHS sites and 3
-/// switch-prong sites, zero return/paren/comma sites. A statement if
+/// always precedes an if-expression. A `(` wrap marks the paren-wrapped
+/// form (`const x = (if (c) return 1 else 2);`, EPH-I1248): a
+/// paren-wrapped if-expression stays silent — when its value is consumed
+/// the else is load-bearing, and when it is discarded (`(if (c) return 1
+/// else 2);` as a statement) the suggested transform drops only a
+/// discarded value, so the silence is the FP-safe direction (the
+/// accepted FN). The set is census-derived: the 119 findings at the
+/// 5bf9977 baseline held 4 assignment-RHS sites and 3 switch-prong
+/// sites, zero return/paren/comma sites. A statement if without a wrap
 /// always follows `;`, `}`, `{`, or the line start, so no statement
 /// position can match.
 fn ifInExpressionPosition(masked: []const u8, if_pos: usize) bool {
     var w = if_pos;
     while (w > 0 and isMaskedWs(masked[w - 1])) w -= 1;
     if (w == 0) return false;
-    const prev = masked[w - 1];
-    if (prev == '=') return true;
-    return prev == '>' and w >= 2 and masked[w - 2] == '=';
+    return valueMarkerBefore(masked, w) or masked[w - 1] == '(';
+}
+
+/// True when the token ending just before `w` is assignment-shaped: an
+/// `=` byte (an assignment, a comparison, or a compound assignment) or
+/// a `=>` switch prong (EPH-I1244).
+fn valueMarkerBefore(masked: []const u8, w: usize) bool {
+    const last = masked[w - 1];
+    if (last == '=') return true;
+    return last == '>' and w >= 2 and masked[w - 2] == '=';
 }
 
 /// ZA507: an else whose if-branch ends in return/break/continue — the
@@ -129329,6 +129352,54 @@ test "ZA406 walks an optional-unwrap chain (the workspace_edit class)" {
     try expectNoFindings(&run);
 }
 
+test "ZA406 counts a call through a quoted field segment as mutation" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The EPH-I1247 class: the quoted field name masks to `@` plus a
+    // blanked span, and the walk must skip it so the call on the next
+    // segment still reads as a mutation (const here is a compile error —
+    // the pre-fix walk stops at the `@` and the rule fires).
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\const Item = struct {
+        \\    len: u8 = 0,
+        \\    fn append(self: *Item, v: u8) void {
+        \\        self.len += v;
+        \\    }
+        \\};
+        \\const Holder = struct {
+        \\    item: Item = .{},
+        \\};
+        \\fn grow() u8 {
+        \\    var holder: Holder = .{};
+        \\    holder.@"item".append(3);
+        \\    return holder.item.len;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA406 keeps a quoted-field read as a read (the EPH-I1247 control)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // A quoted field name that ends the chain is still a read: the walk
+    // skips the segment and finds nothing, so the var keeps firing.
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\const Item = struct {
+        \\    len: u8 = 0,
+        \\};
+        \\const Holder = struct {
+        \\    item: Item = .{},
+        \\};
+        \\fn peek(h: Holder) u8 {
+        \\    var copy = h;
+        \\    return copy.@"item".len;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_UNNECESSARY_VAR);
+}
+
 test "ZA406 counts an @field store as mutation" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -129691,6 +129762,40 @@ test "ZA507 stays silent when the if-expression is a switch prong value" {
         \\        0 => if (n > 0) return 1 else 2,
         \\        else => 3,
         \\    };
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA507 stays silent when the if-expression is paren-wrapped in a value position" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The EPH-I1248 class: the wrap paren sits between the assignment and
+    // the keyword, and the else carries the value, so dropping it is a
+    // compile error — the predicate reads the paren as a value position.
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn pick(s: u8, n: u8) u8 {
+        \\    const x = (if (n > 0) return 1 else s);
+        \\    _ = x;
+        \\    return 0;
+        \\}
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA507 stays silent on a paren-wrapped statement (the discarded-value FN)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The accepted FN direction (EPH-I1248): a paren-wrapped if-statement
+    // whose value is discarded reads as expression position too. The
+    // suggested transform would drop a discarded value, so the silence is
+    // safe; the unwrapped statement form keeps firing (the controls).
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn pick(s: u8, n: u8) u8 {
+        \\    (if (n > 0) return 1 else 2);
+        \\    return s;
         \\}
     );
     defer run.deinit(allocator);

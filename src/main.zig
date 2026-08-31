@@ -48380,11 +48380,11 @@ fn verifySignedRelease(
     if (!minisignAvailable(diag.io)) return missingMinisignFailure(diag);
 
     const sig_url = signatureUrlFor(allocator, package_url) catch {
-        cliDiag(
-            diag,
-            "error: could not locate the release signature for the requested version.\n",
-            .{},
-        );
+        cliDiag(diag,
+            \\error: could not locate the release signature for the requested version.
+            \\Use a released version tag, then re-run the command.
+            \\
+        , .{});
         return error.UpgradeFailed;
     };
     defer allocator.free(sig_url);

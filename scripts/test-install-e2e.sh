@@ -8,8 +8,10 @@
 # verification states against local HTTP redirect servers, mints a fresh
 # test minisign keypair per run (-W: no password), and includes the
 # file:// byte-cap scenario. WP-7: the embedded release key makes the
-# check active by default, so the no-override scenarios pin the
-# fail-closed outcomes against the embedded key (s1, s7).
+# check active by default, so the no-override scenario pins the
+# fail-closed outcome against the embedded key (s1), and s7 pins the
+# override-ignored warnings with the key-id-mismatch exclusion that
+# holds whether or not the latest release is signed (EPH-I1289).
 # install.ps1 has no companion leg in this suite: its verification states
 # live in the ps1 anchor and hardening suites (test-install-ps1-*.ps1),
 # which gate through scripts/gate.sh. The bounded-read arm pin
@@ -242,11 +244,17 @@ expect_grep "s6 dependency error" "$E2E/s6/err.log" "error: minisign is not inst
 
 # s7 override hygiene + active default: an override set without
 # EPHOR_TEST_MODE is ignored with a warning (EPH-I0205 parity), and the
-# embedded release key then verifies the real v0.14.2 archive, which has
-# no published signature. The install fails closed at the signature
-# download. This scenario needs the live network: the tarball download
-# runs against codeberg.org (a failure there fails at the tarball
-# download with its own message pair).
+# embedded release key then verifies the latest release on its own
+# derived URLs. No assertion depends on whether the latest release is
+# signed (EPH-I1289): pre-release the install fails closed at the
+# signature download, post-release it verifies and installs. The two
+# warning pins prove the ignore branches fired. The exclusion proves
+# the consequence: the override signature is test-key-signed, so an
+# honored sig override surfaces minisign's key-id mismatch verdict under
+# the embedded release key, and that verdict stays absent in both eras
+# of correct behavior (no minisign run pre-release, a matching key
+# post-release). This scenario needs the live network: the tarball
+# download runs against codeberg.org.
 new_project s7
 rc=0
 (cd "$E2E/s7" && env \
@@ -254,11 +262,9 @@ rc=0
     EPHOR_RELEASE_PUBKEY="$PUBKEY" \
     EPHOR_SIG_URL="file://$E2E/valid.tar.gz.minisig" \
     sh "$ROOT/install.sh") > "$E2E/s7/out.log" 2> "$E2E/s7/err.log" || rc=$?
-expect "s7 no-test-mode rc 1" "1" "$rc"
 expect_grep "s7 pubkey override ignored" "$E2E/s7/err.log" "warning: EPHOR_RELEASE_PUBKEY is ignored without EPHOR_TEST_MODE=1."
 expect_grep "s7 sig override ignored" "$E2E/s7/err.log" "warning: EPHOR_SIG_URL is ignored without EPHOR_TEST_MODE=1."
-expect_grep "s7 unsigned old release fails closed" "$E2E/s7/err.log" "error: could not download the release signature."
-expect_not_grep "s7 no Done" "$E2E/s7/out.log" "Done!"
+expect_not_grep "s7 no override-honored key-id verdict" "$E2E/s7/err.log" "Signature key id in"
 
 # --- I1216 parity scenarios (2026-08-27): fetch_bounded's redirect and
 # cap policy, driven through the tags channel. The archive channel

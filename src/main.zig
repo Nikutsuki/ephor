@@ -52450,8 +52450,8 @@ const IssueCounts = struct {
 /// it with headroom for additive lines.
 const summary_text_buf_bytes = 1024;
 
-/// Stack buffer for formatSummaryJson. Worst case: ~490 fixed bytes + 20
-/// usize fields at <=20 digits + the 221-byte suppressed member = ~1110
+/// Stack buffer for formatSummaryJson. Worst case: ~498 fixed bytes + 20
+/// usize fields at <=20 digits + the 221-byte suppressed member = ~1119
 /// bytes. 1536 covers it with headroom for additive members.
 const summary_json_buf_bytes = 1536;
 
@@ -52504,18 +52504,18 @@ fn formatSummaryJson(
     // digits each) = 221 bytes worst case.
     const member = try formatSuppressedJson(&mbuf, suppression);
     // The tail opens with the break the head template's last line would
-    // have carried (the empty first \\ line supplies it), and keeps the
-    // original byte shape: the status and suppressed members share one
-    // rendered line (the original head template ended at the status
-    // placeholder, so no break followed it), and the empty last line
-    // keeps the trailing break. The pruned_dirs member (EPH-I1260)
-    // renders between the quality close and status.
+    // have carried (the empty first \\ line supplies it). The status
+    // member and the suppressed member render on separate lines
+    // (EPH-I1263), and the empty last line keeps the trailing break.
+    // The pruned_dirs member (EPH-I1260) renders between the quality
+    // close and status.
     const tail = try std.fmt.bufPrint(buf[head.len..],
         \\
         \\      "todos": {d}
         \\    }},
         \\    "pruned_dirs": {d},
-        \\    "status": "{s}",    "suppressed": {s}
+        \\    "status": "{s}",
+        \\    "suppressed": {s}
         \\  }}
         \\}}
         \\
@@ -55462,6 +55462,21 @@ test "summary JSON stays ok with zero findings" {
         "ok",
         parsed.value.object.get("summary").?.object.get("status").?.string,
     );
+}
+
+test "summary JSON renders suppressed on its own line (EPH-I1263)" {
+    var buf: [summary_json_buf_bytes]u8 = undefined;
+    // The pin asserts the exact separator bytes between the status
+    // close and the suppressed opener: comma, newline, four-space
+    // indent (EPH-I1263, REL-ZERO-1). Whitespace is contract-
+    // insignificant (spec §6), so the parse-level pins keep covering
+    // the machine shape.
+    const text = try formatSummaryJson(&buf, .{}, .{}, .{});
+    try std.testing.expect(mem.indexOf(
+        u8,
+        text,
+        "\"status\": \"ok\",\n    \"suppressed\"",
+    ) != null);
 }
 
 test "analyzer JSON object shape matches the tally (EPH-I0537)" {

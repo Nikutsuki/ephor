@@ -48415,6 +48415,10 @@ fn verifySignedRelease(
 /// owner-read-only and every verification write fails (install.sh's
 /// t24/t24-class fix, EPH-I0632). The chmod after the create sets the
 /// owner-write bits unconditionally, the make_install_tmp discipline.
+/// The chmod is POSIX-only: umask is a POSIX mechanism, Windows createDir
+/// applies no umask, so the call is semantically unnecessary there, and
+/// std.Io.Threaded's Windows backend has no setFilePermissions
+/// implementation (it panics, std/Io/Threaded.zig:8204).
 fn createVerifyDir(allocator: Allocator, io: std.Io) ![]const u8 {
     var rng_source = std.Random.IoSource{ .io = io };
     const rng = rng_source.interface();
@@ -48425,12 +48429,16 @@ fn createVerifyDir(allocator: Allocator, io: std.Io) ![]const u8 {
     );
     errdefer allocator.free(dir_path);
     try std.Io.Dir.cwd().createDir(io, dir_path, std.Io.File.Permissions.fromMode(0o700));
-    try std.Io.Dir.cwd().setFilePermissions(
-        io,
-        dir_path,
-        std.Io.File.Permissions.fromMode(0o700),
-        .{},
-    );
+    // POSIX-only (see the doc comment): the Windows createDir applies no
+    // umask and the Windows backend panics on setFilePermissions.
+    if (@import("builtin").os.tag != .windows) {
+        try std.Io.Dir.cwd().setFilePermissions(
+            io,
+            dir_path,
+            std.Io.File.Permissions.fromMode(0o700),
+            .{},
+        );
+    }
     return dir_path;
 }
 
@@ -127286,7 +127294,7 @@ test "createVerifyDir keeps mode 0700 under a strict umask (EPH-I1286)" {
     // The chmod-after-create sets the mode bits exactly: the umask
     // cannot strip the owner write from the verification dir. The
     // 0o7777 mask drops the file-type bits the platform stat carries
-    // (S_IFDIR reads 0o40500 on macOS, 0o40500-class elsewhere).
+    // (S_IFDIR reads 0o40700 on macOS, 0o40700-class elsewhere).
     const stat = try std.Io.Dir.cwd().statFile(std.testing.io, dir_path, .{});
     try std.testing.expectEqual(
         @as(std.posix.mode_t, 0o700),

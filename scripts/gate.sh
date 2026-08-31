@@ -2,9 +2,10 @@
 # ephor Layer-1 gate (EPH-I1074; serves REL-GATE-2 and REL-AB-5).
 #
 # Steps: fmt, installer tag resolution, install-sh suite, install-ps1
-# anchor pin, ReleaseSafe build, test ratchet, per-test capture +
-# discovery cross-check, dogfood ratchet (fail_on: warning posture),
-# coverage gate, corpus A/B (zls/ghostty/sig/tigerbeetle).
+# anchor pin, install-ps1 hardening suite, ReleaseSafe build, test
+# ratchet, per-test capture + discovery cross-check, dogfood ratchet
+# (fail_on: warning posture), coverage gate, corpus A/B
+# (zls/ghostty/sig/tigerbeetle).
 #
 # Shape rules (core-rules gate lessons):
 # - Every step writes its command output to a named file under .tmp/gate/.
@@ -208,6 +209,39 @@ if command -v pwsh > /dev/null 2>&1; then
     esac
 else
     note "install-ps1 anchor pin (skipped: pwsh not on PATH)"
+fi
+
+# --- 1f. install-ps1 hardening suite (EPH-I1285; REL-REDTEAM-4) -------------
+# The RED3 re-derivation pins: the suite drives the real install.ps1
+# through the I1272 fingerprint-repair shapes, the I1273 byte caps, and
+# the I1274 terminal sanitization with the same hermetic harness as the
+# 1e anchor leg (a fake zig, a local HTTP tags listener, the
+# EPHOR_TEST_MODE archive override). A regression in any of the three
+# fixes fails this leg instead of shipping silently. Runs only when pwsh
+# is on PATH; machines without pwsh skip the leg without a failure.
+if command -v pwsh > /dev/null 2>&1; then
+    IPH_EXIT=0
+    pwsh -NoProfile -NonInteractive -File "$SCRIPT_DIR/test-install-ps1-hardening.ps1" > "$GATE_DIR/install-ps1-hardening.log" 2>&1 || IPH_EXIT=$?
+    # The tally line is the suite's own verdict ("ps1 hardening: N checks,
+    # M failed"). Its absence means the suite aborted before the verdict
+    # (a fixture break or a missing install.ps1 function), which is a leg
+    # failure, not a pass.
+    IPH_RUN="$(sed -nE 's/^ps1 hardening: ([0-9]+) checks, ([0-9]+) failed$/\1/p' "$GATE_DIR/install-ps1-hardening.log" | tail -1 || true)"
+    IPH_FAILED="$(sed -nE 's/^ps1 hardening: ([0-9]+) checks, ([0-9]+) failed$/\2/p' "$GATE_DIR/install-ps1-hardening.log" | tail -1 || true)"
+    case "$IPH_RUN" in
+        '' | *[!0-9]*)
+            fail "install-ps1 hardening suite (no tally line; see $GATE_DIR/install-ps1-hardening.log)"
+            ;;
+        *)
+            if [ "$IPH_EXIT" -ne 0 ] || [ "$IPH_FAILED" != "0" ]; then
+                fail "install-ps1 hardening suite ($IPH_RUN checks, $IPH_FAILED failed, exit $IPH_EXIT; see $GATE_DIR/install-ps1-hardening.log)"
+            else
+                ok "install-ps1 hardening suite ($IPH_RUN checks, 0 failed)"
+            fi
+            ;;
+    esac
+else
+    note "install-ps1 hardening suite (skipped: pwsh not on PATH)"
 fi
 
 # --- 2. build (ReleaseSafe) ------------------------------------------------

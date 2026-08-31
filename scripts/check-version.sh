@@ -39,8 +39,59 @@ fi
 # EPH-I0193: the API orders tags by date, so limit=1 plus head -1 can select
 # a re-dated older tag. The numeric sort keys are the portable (BSD+GNU)
 # semver compare. sort -V is GNU-only.
+# EPH-I1271: the extraction accepts only "name" values at a key position.
+# A "name" text inside a string value (a tag message that quotes it) must
+# not mint a candidate: the awk byte scan tracks string context with
+# backslash escapes, the Zig-side isJsonKeyPosition model. Kept in sync
+# with install.sh latest_ephor_tag.
 max_stable_version() {
-    grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4 \
+    awk '
+        { body = body $0 "\n" }
+        END {
+            n = length(body)
+            in_str = 0
+            i = 1
+            while (i <= n) {
+                c = substr(body, i, 1)
+                if (in_str) {
+                    if (c == "\\") { i = i + 2; continue }
+                    if (c == "\"") in_str = 0
+                    i = i + 1
+                    continue
+                }
+                if (c != "\"") { i = i + 1; continue }
+                if (substr(body, i + 1, 5) == "name\"") {
+                    j = i + 6
+                    while (j <= n) {
+                        w = substr(body, j, 1)
+                        if (w != " " && w != "\t" && w != "\n" && w != "\r") break
+                        j = j + 1
+                    }
+                    if (j <= n && substr(body, j, 1) == ":") {
+                        j = j + 1
+                        while (j <= n) {
+                            w = substr(body, j, 1)
+                            if (w != " " && w != "\t" && w != "\n" && w != "\r") break
+                            j = j + 1
+                        }
+                        if (j <= n && substr(body, j, 1) == "\"") {
+                            j = j + 1
+                            val = ""
+                            while (j <= n && substr(body, j, 1) != "\"") {
+                                val = val substr(body, j, 1)
+                                j = j + 1
+                            }
+                            print val
+                            i = j + 1
+                            continue
+                        }
+                    }
+                }
+                in_str = 1
+                i = i + 1
+            }
+        }
+        ' \
         | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
         | sed 's/^v//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1
 }

@@ -151,8 +151,63 @@ latest_ephor_tag() {
         https://*) proto_flags="--proto =https --proto-redir =https --max-filesize 1048576" ;;
     esac
     response=$(curl -fsSL --max-time 30 $proto_flags "$TAGS_API" 2>/dev/null) || return 1
-    tag=$(printf '%s\n' "$response" | grep -o '"name": *"[^"]*"' | cut -d'"' -f4 \
-        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | max_stable_tag)
+    # EPH-I1271: extract only "name" values that sit at a key position.
+    # The pre-fix grep minted candidates from "name" text inside a string
+    # value (a tag message that quotes it), so a message-steered v9.9.9
+    # could win the semver max and 404 the install. The awk byte scan
+    # tracks string context with backslash escapes (the Zig-side
+    # isJsonKeyPosition model): a quote at an even unescaped-quote index
+    # opens a string, so a "name" token there is data, not a key. The
+    # body is buffered first so a raw newline inside a malformed string
+    # cannot reset the context. Kept in sync with scripts/check-version.sh
+    # max_stable_version.
+    tag=$(printf '%s\n' "$response" | awk '
+        { body = body $0 "\n" }
+        END {
+            n = length(body)
+            in_str = 0
+            i = 1
+            while (i <= n) {
+                c = substr(body, i, 1)
+                if (in_str) {
+                    if (c == "\\") { i = i + 2; continue }
+                    if (c == "\"") in_str = 0
+                    i = i + 1
+                    continue
+                }
+                if (c != "\"") { i = i + 1; continue }
+                if (substr(body, i + 1, 5) == "name\"") {
+                    j = i + 6
+                    while (j <= n) {
+                        w = substr(body, j, 1)
+                        if (w != " " && w != "\t" && w != "\n" && w != "\r") break
+                        j = j + 1
+                    }
+                    if (j <= n && substr(body, j, 1) == ":") {
+                        j = j + 1
+                        while (j <= n) {
+                            w = substr(body, j, 1)
+                            if (w != " " && w != "\t" && w != "\n" && w != "\r") break
+                            j = j + 1
+                        }
+                        if (j <= n && substr(body, j, 1) == "\"") {
+                            j = j + 1
+                            val = ""
+                            while (j <= n && substr(body, j, 1) != "\"") {
+                                val = val substr(body, j, 1)
+                                j = j + 1
+                            }
+                            print val
+                            i = j + 1
+                            continue
+                        }
+                    }
+                }
+                in_str = 1
+                i = i + 1
+            }
+        }
+        ' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | max_stable_tag)
     [ -n "$tag" ] || return 1
     printf '%s\n' "$tag"
 }
@@ -404,6 +459,14 @@ if [ ! -f "build.zig.zon" ]; then
     # would also match dotted names, because glob * is not limited to
     # the class.
     NAME_EXPR=""
+    # EPH-I1274: sanitize the echoed name before it reaches the terminal.
+    # The warning arm below fires exactly when the name carries
+    # non-identifier bytes, which admits ESC and friends, so the raw name
+    # must not reach any echo. The byte filter replaces C0 controls and
+    # DEL with '?' (the Zig-side sanitizeTerminal placeholder). The
+    # multi-byte hostile format set is not expressible in portable shell:
+    # those bytes stay, but they are valid UTF-8 and render inert.
+    ECHO_NAME=$(printf '%s' "$PROJECT_NAME" | LC_ALL=C tr '[:cntrl:]' '?')
     case "$PROJECT_NAME" in
         ''|*[!a-z0-9_]*|[0-9]*)
             SANITIZED=$(printf '%s' "$PROJECT_NAME" | tr -c 'a-z0-9_' '_')
@@ -411,7 +474,7 @@ if [ ! -f "build.zig.zon" ]; then
                 [0-9]*) SANITIZED="_${SANITIZED}" ;;
             esac
             NAME_EXPR=".${SANITIZED}"
-            echo "warning: '${PROJECT_NAME}' is not a valid Zig identifier for the zon name." >&2
+            echo "warning: '${ECHO_NAME}' is not a valid Zig identifier for the zon name." >&2
             echo "The zon uses the name '${SANITIZED}'. Edit build.zig.zon to rename it." >&2
             ;;
         *)
@@ -438,7 +501,7 @@ ZONEOF
     # EPH-I0192: do not spawn zig build for the fingerprint here. A hostile
     # build.zig would run attacker code. The zig fetch step below repairs
     # the 0x0 fingerprint from the hint zig fetch prints.
-    echo "Created build.zig.zon for project '${PROJECT_NAME}'"
+    echo "Created build.zig.zon for project '${ECHO_NAME}'"
 fi
 
 # EPH-I0284: refuse a symlink at build.zig.zon before the fetch. zig
@@ -586,8 +649,59 @@ if [ "$FETCH_RC" -ne 0 ]; then
         printf '%s\n' "$FETCH_OUT" >&2
         exit "$FETCH_RC"
     fi
-    sed -i.bak "s/\.fingerprint = 0x0/.fingerprint = ${SUGGESTED}/" build.zig.zon
-    rm -f build.zig.zon.bak
+    # EPH-I1272: repair the fingerprint only at a code position. The
+    # pre-fix sed rewrote the first match per line, so a string value
+    # that mentions ".fingerprint = 0x0" on the same line won and the
+    # real field stayed 0x0 (a corrupted zon plus a failed fetch). The
+    # awk walk mirrors find_install_artifact_line: string literals mask
+    # their content, a // comment ends the line's code, and a
+    # \\-led multiline body line is string data. The first code-position
+    # marker wins the repair; no marker in code fails with the clear
+    # message (install.ps1 EPH-I0648 parity).
+    make_install_tmp ./build.zig.zon.tmp.XXXXXXXX
+    if awk -v hint="$SUGGESTED" -f - build.zig.zon > "$INSTALL_TMP" <<'AWKEOF'
+{
+    line = $0
+    n = length(line)
+    i = 1
+    while (i <= n && substr(line, i, 1) == " ") i = i + 1
+    while (i <= n && substr(line, i, 1) == "\t") i = i + 1
+    if (i <= n && substr(line, i, 1) == "\\") { print line; next }
+    if (replaced) { print line; next }
+    in_str = 0
+    while (i <= n) {
+        c = substr(line, i, 1)
+        if (in_str) {
+            if (c == "\\") i = i + 1
+            else if (c == "\"") in_str = 0
+            i = i + 1
+            continue
+        }
+        if (c == "\"") { in_str = 1; i = i + 1; continue }
+        if (c == "/" && substr(line, i + 1, 1) == "/") { print line; next }
+        if (substr(line, i, 18) == ".fingerprint = 0x0") {
+            print substr(line, 1, i - 1) ".fingerprint = " hint substr(line, i + 18)
+            replaced = 1
+            next
+        }
+        i = i + 1
+    }
+    if (!replaced) print line
+}
+END {
+    if (!replaced) exit 1
+}
+AWKEOF
+    then
+        mv "$INSTALL_TMP" build.zig.zon
+        INSTALL_TMP=""
+    else
+        printf '%s\n' "$FETCH_OUT" >&2
+        echo "error: could not repair the fingerprint in build.zig.zon." >&2
+        echo "The .fingerprint field does not match the 0x0 placeholder." >&2
+        echo "Set it to the value zig printed above, then re-run the install." >&2
+        exit 1
+    fi
     # This fetch is authoritative: a failure aborts the install under set -e.
     zig fetch --save=ephor "$EPHOR_URL"
 fi

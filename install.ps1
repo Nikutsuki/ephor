@@ -88,6 +88,33 @@ $installExitCode = & {
     # 282 bytes (verified 2026-08-27).
     $TarballCap = 33554432
     $SigCap = 1048576
+    # EPH-I1273: byte caps for the local build.zig and build.zig.zon
+    # reads (Zig-side parity: build.zig 512 KiB, build.zig.zon 64 KiB).
+    # Get-Content buffers the whole file, so an unbounded read OOMs the
+    # install session on an oversized local file.
+    $BuildZigReadCap = 524288
+    $ZonReadCap = 65536
+
+    # EPH-I1273: refuse to read $Path when it exceeds $MaxBytes. The
+    # length check bounds the read before Get-Content buffers it. The
+    # check-to-read window stays open to a concurrent writer, the same
+    # accepted class the symlink refusal records (EPH-I1165); a hostile
+    # oversized file present at install time is the class this closes.
+    # A refusal prints a clear error and the caller aborts (fail-closed).
+    function Assert-LocalFileWithinCap {
+        param([string]$Path, [long]$MaxBytes)
+        $item = Get-Item $Path -Force -ErrorAction SilentlyContinue
+        if ($null -eq $item -or $item.Length -le $MaxBytes) {
+            return $true
+        }
+        Write-Stderr @"
+error: $Path is larger than $MaxBytes bytes.
+
+  The installer reads local build files through a byte cap.
+  Trim $Path, then re-run the install.
+"@
+        return $false
+    }
 
     # EPH-I0643: refuse when zig is missing before any file is created or
     # changed (install.sh EPH-I0631). Without this guard, a fetch of a
@@ -318,6 +345,14 @@ error: no build.zig found in current directory
         # installer. A PowerShell regex match reads as a truthy array or
         # null, so the arms must cast through -not explicitly.
         $nameExpr = ""
+        # EPH-I1274: sanitize the echoed name before it reaches the
+        # terminal. The warning arm below fires exactly when the name
+        # carries non-identifier bytes, which admits ESC and friends, so
+        # the raw name must not reach any render. \p{Cc} covers C0, DEL,
+        # and C1, the Zig-side sanitizeTerminal control class. The
+        # multi-byte hostile format set stays an accepted residual, like
+        # the sh installer's byte filter.
+        $echoName = $projectName -replace '[\p{Cc}]', '?'
         if (-not ($projectName -match '^[a-z_][a-z0-9_]*$') -or
             ($projectName -match '^[0-9]')) {
             $sanitized = $projectName -replace '[^a-z0-9_]', '_'
@@ -326,7 +361,7 @@ error: no build.zig found in current directory
             if (-not $sanitized) { $sanitized = "project" }
             if ($sanitized -match '^[0-9]') { $sanitized = "_$sanitized" }
             $nameExpr = ".$sanitized"
-            Write-Stderr "warning: '$projectName' is not a valid Zig identifier for the zon name."
+            Write-Stderr "warning: '$echoName' is not a valid Zig identifier for the zon name."
             Write-Stderr "The zon uses the name '$sanitized'. Edit build.zig.zon to rename it."
         } else {
             $nameExpr = ".$projectName"
@@ -350,7 +385,7 @@ error: no build.zig found in current directory
         # hostile build.zig would run attacker code. The zig fetch step
         # below repairs the 0x0 fingerprint from the hint zig fetch
         # prints.
-        Write-Host "Created build.zig.zon for project '$projectName'"
+        Write-Host "Created build.zig.zon for project '$echoName'"
     }
 
     # EPH-I0284: refuse a symlink at build.zig.zon before the fetch. zig
@@ -418,6 +453,12 @@ error: no build.zig found in current directory
     # idiom and the limit.
     $depProbe = '^\s*[^/.\s\\].*dependency\("ephor"'
     $zonDepProbe = '^\s*\.ephor\s*='
+    # EPH-I1273: bound both probe reads before Get-Content buffers them.
+    # The build.zig read feeds the probe and the block splice below, so
+    # the same cap covers both consumers.
+    if (-not (Assert-LocalFileWithinCap -Path "build.zig" -MaxBytes $BuildZigReadCap)) {
+        return 1
+    }
     $buildLines = Get-Content "build.zig" -Encoding UTF8
     $hasDepLine = $false
     foreach ($line in $buildLines) {
@@ -428,6 +469,9 @@ error: no build.zig found in current directory
     }
     $hasZonDep = $false
     if (Test-Path "build.zig.zon") {
+        if (-not (Assert-LocalFileWithinCap -Path "build.zig.zon" -MaxBytes $ZonReadCap)) {
+            return 1
+        }
         foreach ($line in (Get-Content "build.zig.zon" -Encoding UTF8)) {
             if ($line -cmatch $zonDepProbe) {
                 $hasZonDep = $true
@@ -676,6 +720,65 @@ error: minisign is not installed or not on PATH.
         return 1
     }
 
+    # EPH-I1272: repair the fingerprint only at a code position
+    # (install.sh EPH-I1272 parity; the Zig-side indexOfCode model). The
+    # pre-fix -creplace rewrote every occurrence, so a string value that
+    # mentions ".fingerprint = 0x0" got corrupted. The walk mirrors
+    # Find-LastInstallArtifactLine: string and char literals mask their
+    # content, a // comment ends the line's code, and a \\-led
+    # multiline body line is string data. The first code-position marker
+    # wins the repair. Returns the patched zon, or $null when no marker
+    # sits in code (the caller prints the clear error). The match regex
+    # keeps the EPH-I0648 flexibility: any spacing around the
+    # placeholder, and \b stops a real fingerprint that starts with 0x0
+    # from matching as the placeholder prefix.
+    function Repair-ZonFingerprint {
+        param([string]$Zon, [string]$Hint)
+        $repaired = $false
+        $lines = $Zon -split "`n"
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($repaired) { break }
+            $line = $lines[$i]
+            $pos = 0
+            while ($pos -lt $line.Length -and $line[$pos] -eq ' ') { $pos++ }
+            while ($pos -lt $line.Length -and $line[$pos] -eq "`t") { $pos++ }
+            if ($pos -lt $line.Length -and $line[$pos] -eq '\') { continue }
+            $inString = $false
+            $inChar = $false
+            while ($pos -lt $line.Length) {
+                $c = $line[$pos]
+                if ($inString) {
+                    if ($c -eq '\') { $pos++ } elseif ($c -eq '"') { $inString = $false }
+                    $pos++
+                    continue
+                }
+                if ($inChar) {
+                    if ($c -eq '\') { $pos++ } elseif ($c -eq "'") { $inChar = $false }
+                    $pos++
+                    continue
+                }
+                if ($c -eq '"') { $inString = $true; $pos++; continue }
+                if ($c -eq "'") { $inChar = $true; $pos++; continue }
+                if ($c -eq '/' -and ($pos + 1) -lt $line.Length -and
+                    $line[$pos + 1] -eq '/') { break }
+                if ($c -eq '.') {
+                    $tail = $line.Substring($pos)
+                    if ($tail -cmatch '^\.fingerprint[ \t]*=[ \t]*0x0\b') {
+                        $matchLen = $Matches[0].Length
+                        $lines[$i] = $line.Substring(0, $pos) +
+                            ".fingerprint = $Hint" +
+                            $line.Substring($pos + $matchLen)
+                        $repaired = $true
+                        break
+                    }
+                }
+                $pos++
+            }
+        }
+        if (-not $repaired) { return $null }
+        return [string]::Join("`n", $lines)
+    }
+
     Write-Host "Adding ephor dependency..."
     # EPH-I0192: zig fetch reads build.zig.zon but never runs build.zig,
     # so a hostile build.zig still executes no code here. On a fresh zon
@@ -694,16 +797,19 @@ error: minisign is not installed or not on PATH.
     if ($fetchRc -ne 0) {
         if ($fetchOut -match 'use this value: (0x[0-9a-f]+)') {
             $suggested = $Matches[1]
+            # EPH-I1273: bound the repair read like the probe reads. The
+            # probe's zon cap fired earlier for a zon that was already
+            # oversized, so this check covers the window a concurrent
+            # writer opens between the probe and the repair.
+            if (-not (Assert-LocalFileWithinCap -Path "build.zig.zon" -MaxBytes $ZonReadCap)) {
+                return 1
+            }
             $zon = Get-Content "build.zig.zon" -Raw -Encoding UTF8
-            # EPH-I0648: allow any spacing around the placeholder and
-            # verify the patch changed the content. The case-sensitive
-            # replace matches only the canonical lowercase field, and \b
-            # stops a real fingerprint that starts with 0x0 from matching
-            # as the placeholder prefix. A zon whose layout does not match
-            # stops with a clear message instead of failing the next
-            # fetch the same way.
-            $patched = $zon -creplace '\.fingerprint[ \t]*=[ \t]*0x0\b', ".fingerprint = $suggested"
-            if ($patched -eq $zon) {
+            # EPH-I0648: verify the patch changed the content. A zon
+            # whose layout does not match stops with a clear message
+            # instead of failing the next fetch the same way.
+            $patched = Repair-ZonFingerprint -Zon $zon -Hint $suggested
+            if ($null -eq $patched) {
                 Write-Stderr $fetchOut
                 Write-Stderr @"
 error: could not repair the fingerprint in build.zig.zon

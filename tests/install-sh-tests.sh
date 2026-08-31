@@ -1212,5 +1212,65 @@ body_line=$(line_of "$D/build.zig" '\\ one;')
     || fail "comment mention changed"
 pass "t48 quote/comment-aware anchor skips mentions (EPH-I0715)"
 
+# --- t49 (EPH-I1274): a directory name that carries an ESC byte must
+# render sanitized in every echo. The warning arm fires exactly when the
+# name carries non-identifier bytes, which admits ESC, so the raw name
+# must never reach the terminal. The zon name sanitization is unchanged:
+# the ESC becomes an underscore there, while the echoed name shows a '?'.
+D="$TEST_ROOT/$(printf 'my\033proj')"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+run_installer "$D"
+assert_rc 0
+assert_grep "$D/build.zig.zon" '.name = .my_proj,' 'zon name not sanitized'
+assert_grep "$D/err.log" "warning: 'my?proj' is not a valid Zig identifier" \
+    'warning does not carry the sanitized name'
+assert_grep "$D/out.log" "Created build.zig.zon for project 'my?proj'" \
+    'created line does not carry the sanitized name'
+assert_not_grep "$D/err.log" "$(printf '\033')" 'raw ESC in the stderr output'
+assert_not_grep "$D/out.log" "$(printf '\033')" 'raw ESC in the stdout output'
+pass "t49 ESC-bearing dir name renders sanitized (EPH-I1274)"
+
+# --- t50 (EPH-I1272): the fingerprint repair targets the code-position
+# field. The one-line zon carries a string value that mentions the
+# ".fingerprint = 0x0" marker before the real inline field. The pre-fix
+# sed rewrote the first match per line (the string mention), corrupted
+# the string, and left the real field at 0x0, so the authoritative fetch
+# failed. The repair must skip the mention and patch the real field.
+D="$TEST_ROOT/t50"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+ZON_LINE='.{ .name = ".fingerprint = 0x0 mention", .version = "0.0.0",'
+ZON_LINE="${ZON_LINE} .fingerprint = 0x0, .paths = .{} }"
+printf '%s\n' "$ZON_LINE" > "$D/build.zig.zon"
+printf 'error: unable to verify package\nuse this value: 0x1234dead\n' \
+    > "$TEST_ROOT/fail-hint-t50.txt"
+run_installer_with_fetch_fail "$TEST_ROOT/fail-hint-t50.txt" "$D"
+assert_rc 0
+assert_grep "$D/build.zig.zon" '.fingerprint = 0x1234dead' 'code-position field not repaired'
+assert_grep "$D/build.zig.zon" '".fingerprint = 0x0 mention"' 'string mention corrupted'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
+pass "t50 fingerprint repair targets the code-position field (EPH-I1272)"
+
+# --- t51 (EPH-I1272): a zon whose marker exists only inside a string
+# value must refuse the repair with the clear message. The pre-fix sed
+# rewrote the string mention, leaked the hint into the zon, and the
+# authoritative fetch then passed, so the install reported success with
+# a corrupted zon. The repair must leave the string alone and fail.
+D="$TEST_ROOT/t51"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+printf '%s\n' \
+    '.{ .name = ".fingerprint = 0x0 only mention", .version = "0.0.0", .paths = .{} }' \
+    > "$D/build.zig.zon"
+printf 'error: unable to verify package\nuse this value: 0x1234dead\n' \
+    > "$TEST_ROOT/fail-hint-t51.txt"
+run_installer_with_fetch_fail "$TEST_ROOT/fail-hint-t51.txt" "$D"
+assert_rc 1
+assert_grep "$D/err.log" 'could not repair the fingerprint' 'no repair refusal'
+assert_grep "$D/build.zig.zon" '.fingerprint = 0x0 only mention' 'string mention corrupted'
+assert_not_grep "$D/build.zig.zon" '0x1234dead' 'hint leaked into the zon'
+pass "t51 string-only marker refuses the repair (EPH-I1272)"
+
 echo ""
 echo "install-sh tests: $PASS_COUNT passed"

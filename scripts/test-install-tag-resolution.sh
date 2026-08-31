@@ -223,6 +223,34 @@ expect "message tag does not leak into resolution" "v0.14.2" "0"
 ACTUAL_OUT=$(max_stable_version < "$WORK/message-injection.json"); ACTUAL_RC=$?
 expect "check-version message tag does not leak" "0.14.2" "0"
 
+# 13b. EPH-I1271: the discriminating shapes from the Zig-side test
+# (src/main.zig parseVersionFromTagsApi rejects a name match inside a
+# raw string value). A malformed body whose message value carries
+# UNESCAPED quotes places the raw "name": "v9.9.9" sequence at a
+# non-key position, the only shape the pre-fix grep minted a message
+# candidate from. The comma-preceded form is the same class one more
+# character away: a context-character gate would pass it, the
+# string-context gate must not. The newline form splits the string
+# across records, so the gate must buffer the whole body first.
+printf '[{"name": "v0.14.2", "message": "x "name": "v9.9.9" y"}]' \
+    > "$WORK/message-raw-name.json"
+printf '[{"name": "v0.14.2", "message": "x, "name": "v9.9.9" y"}]' \
+    > "$WORK/message-raw-comma.json"
+printf '[{"name": "v0.14.2", "message": "x\n"name": "v9.9.9" y"}]' \
+    > "$WORK/message-raw-newline.json"
+ACTUAL_OUT=$(TAGS_API="file://$WORK/message-raw-name.json"; latest_ephor_tag); ACTUAL_RC=$?
+expect "raw message name does not leak into resolution" "v0.14.2" "0"
+ACTUAL_OUT=$(TAGS_API="file://$WORK/message-raw-comma.json"; latest_ephor_tag); ACTUAL_RC=$?
+expect "comma-preceded message name does not leak" "v0.14.2" "0"
+ACTUAL_OUT=$(TAGS_API="file://$WORK/message-raw-newline.json"; latest_ephor_tag); ACTUAL_RC=$?
+expect "split-line message name does not leak" "v0.14.2" "0"
+ACTUAL_OUT=$(max_stable_version < "$WORK/message-raw-name.json"); ACTUAL_RC=$?
+expect "check-version raw message name does not leak" "0.14.2" "0"
+ACTUAL_OUT=$(max_stable_version < "$WORK/message-raw-comma.json"); ACTUAL_RC=$?
+expect "check-version comma message name does not leak" "0.14.2" "0"
+ACTUAL_OUT=$(max_stable_version < "$WORK/message-raw-newline.json"); ACTUAL_RC=$?
+expect "check-version split-line message name does not leak" "0.14.2" "0"
+
 # 14. EPH-I0661: an https TAGS_API gets the proto clamp and the 1 MiB body
 # cap (install.sh latest_ephor_tag). The fake curl records the arguments.
 # The assignments are statements plus export: a prefix assignment before a

@@ -28681,7 +28681,7 @@ fn advanceFnIfaceMline(in_mline: *bool, open_braces: *isize, t: []const u8, mask
     if (!in_mline.*) {
         if (hasMidLineMultilineOpener(t)) {
             in_mline.* = true;
-            open_braces.* = braceBalance(maskOrRaw(t, mask_buf));
+            open_braces.* = braceBalance(maskLineLiterals(t, mask_buf));
         }
         return false;
     }
@@ -36477,22 +36477,44 @@ fn siteCallArgStart(t: []const u8, pos: usize, needles: []const []const u8) ?usi
     return null;
 }
 
+/// Net paren balance of one line with literal masking (EPH-I1266):
+/// parens inside string/char literals, `\\` tails, and comments never
+/// open or close a group. Null when the line is whole-line string data
+/// (a `\\` body line carries no code position).
+fn maskedParenBalance(t: []const u8) ?isize {
+    var state = types.LiteralState.forLine(t) orelse return null;
+    var balance: isize = 0;
+    for (t, 0..) |c, i| {
+        if (state.updateForChar(t, i) == null) continue;
+        if (c == '(') balance += 1;
+        if (c == ')') balance -= 1;
+    }
+    return balance;
+}
+
 /// True when the paren group closed at `q` (a `)` position) opens on the
 /// same line: a backward, quote-masked walk finds the matching `(`.
 /// When the walk runs off the line start with the group still open, the
 /// opener lives on a preceding line. A net-prefix balance cannot answer
 /// this: the group's own closing `)` nets it to 0 when a second catch
 /// site follows on the line (EPH-I0969).
+/// Implemented as two forward passes over the literal-masked prefix
+/// (EPH-I1266): the pre-fix buffer form masked only the first 256 bytes
+/// and ran raw past that bound, so a paren inside a long-line literal
+/// past the bound could flip the answer (fail open). The forward form
+/// needs no buffer: pass one nets the prefix balance, and pass two finds
+/// a `(` that opens with the balance one below that net — the group
+/// opened there closes exactly at `q`.
 fn groupOpensOnLine(t: []const u8, q: usize) bool {
-    var mbuf: [256]u8 = undefined;
-    const code = maskOrRaw(t[0..q], &mbuf);
-    var depth: isize = 1;
-    var i = q;
-    while (i > 0) {
-        i -= 1;
-        if (code[i] == ')') depth += 1;
-        if (code[i] == '(') depth -= 1;
-        if (depth == 0) return true;
+    const prefix = t[0..q];
+    const final_balance = maskedParenBalance(prefix) orelse return false;
+    var state = types.LiteralState.forLine(prefix) orelse return false;
+    var balance: isize = 0;
+    for (prefix, 0..) |c, i| {
+        if (state.updateForChar(prefix, i) == null) continue;
+        if (c == '(' and balance == final_balance - 1) return true;
+        if (c == '(') balance += 1;
+        if (c == ')') balance -= 1;
     }
     return false;
 }
@@ -42219,7 +42241,7 @@ fn isForRangeIndex(t: []const u8, ident: []const u8) bool {
 /// the trailing comment never establish a proof (band-B12 F26c).
 fn lineBoundsCastValue(t: []const u8, ident: []const u8) bool {
     var mask_buf: [256]u8 = undefined;
-    const code = if (t.len > mask_buf.len) t else maskLineLiterals(t, &mask_buf);
+    const code = maskLineLiterals(t, &mask_buf);
     if (!mentionsIdent(code, ident)) return false;
     if (mem.indexOf(u8, code, "std.math.cast(") != null) return true;
     if (isClampAssignment(code, ident)) return true;
@@ -42338,16 +42360,19 @@ fn assignmentTargetsIdent(t: []const u8, eq: usize, ident: []const u8) bool {
 
 /// Mask string/char literals and the trailing comment with spaces, so the
 /// bounds arms see only code (band-B12 F26c: `const s = "x < 5";` must not
-/// read as a comparison proof). Lines longer than the buffer keep their raw
-/// text — the F26c shape on such lines stays a documented residual.
+/// read as a comparison proof). Lines longer than the buffer drop their
+/// overhang (fail closed, EPH-I1266): literal or comment content past the
+/// bound never reads as a proof, and the head that fits stays masked.
+/// The pre-fix raw fallback for over-cap lines let a comment or string
+/// tail past byte 256 fabricate a bounds proof on a real unguarded cast.
 fn maskLineLiterals(t: []const u8, buf: []u8) []const u8 {
-    const ls = types.LiteralState.forLine(t) orelse return t;
+    const n = @min(t.len, buf.len);
+    const ls = types.LiteralState.forLine(t) orelse return t[0..n];
     var state = ls;
-    for (t, 0..) |c, i| {
-        if (i >= buf.len) return t;
+    for (t[0..n], 0..) |c, i| {
         buf[i] = if (state.updateForChar(t, i) != null) c else ' ';
     }
-    return buf[0..t.len];
+    return buf[0..n];
 }
 
 /// Net brace balance of a line's code. Call with the literal-masked line:
@@ -42376,12 +42401,6 @@ fn isRangeForProof(t: []const u8, ident: []const u8, depth: isize) bool {
     if (!isForRangeIndex(t, ident)) return false;
     const for_pos = mem.indexOf(u8, t, "for (") orelse return false;
     return mem.indexOfScalarPos(u8, t, for_pos + 4, '}') == null;
-}
-
-/// Masked copy of `t` in `buf`, or the raw line when it is too long for
-/// the buffer (band-B12 F26c residual, documented in maskLineLiterals).
-fn maskOrRaw(t: []const u8, buf: []u8) []const u8 {
-    return if (t.len > buf.len) t else maskLineLiterals(t, buf);
 }
 
 /// True when the line opens a multiline string at a code position: a
@@ -42427,12 +42446,16 @@ fn isMultilineStringTerminator(t: []const u8, open_braces: isize) bool {
 /// (`catch`, `orelse`, `else`, `and`, `or`). A tail that runs into
 /// prose (`) } weird`) is a broken continuation in an invalid region
 /// and stays string content (EPH-I0974).
+/// The `}` run strips iteratively (EPH-I1264): the pre-fix recursive
+/// form spent one stack frame per brace, so a giant attacker-shaped
+/// tail crashed Debug builds. Each step strips one brace and re-trims,
+/// exactly like the recursion did.
 fn closerTailIsCode(rest: []const u8) bool {
-    const r = mem.trim(u8, rest, " \t");
+    var r = mem.trim(u8, rest, " \t");
+    while (mem.startsWith(u8, r, "}")) r = mem.trim(u8, r[1..], " \t");
     if (r.len == 0) return true;
     if (mem.startsWith(u8, r, ";") or mem.startsWith(u8, r, ",") or
         mem.startsWith(u8, r, ")") or mem.startsWith(u8, r, "]")) return true;
-    if (mem.startsWith(u8, r, "}")) return closerTailIsCode(r[1..]);
     return tailStartsWithKeyword(r);
 }
 
@@ -42477,7 +42500,7 @@ fn classifyMultilineContent(lines: []const []const u8, start: usize, idx: usize,
             out[i - start] = false;
             if (!hasMidLineMultilineOpener(t)) continue;
             in_string = true;
-            open_braces = braceBalance(maskOrRaw(t, &mask_buf));
+            open_braces = braceBalance(maskLineLiterals(t, &mask_buf));
             continue;
         }
         // The terminator starts with an expression terminator (`;` or
@@ -42522,7 +42545,7 @@ fn hasCastBoundsProof(
     const prefix = mem.trim(u8, lines[idx][0..cast_col], " \t\r");
     if (lineBoundsCastValue(prefix, ident)) return true;
     var pbuf: [256]u8 = undefined;
-    if (isRangeForProof(maskOrRaw(prefix, &pbuf), ident, 0)) return true;
+    if (isRangeForProof(maskLineLiterals(prefix, &pbuf), ident, 0)) return true;
     const lookback = 10;
     const start = if (idx > lookback) idx - lookback else 0;
     var content_mask: [lookback]bool = undefined;
@@ -42536,7 +42559,7 @@ fn hasCastBoundsProof(
         if (isCommentOrMultilineString(t)) continue;
         if (isFuncBoundary(t)) return false;
         var mask_buf: [256]u8 = undefined;
-        const code = maskOrRaw(t, &mask_buf);
+        const code = maskLineLiterals(t, &mask_buf);
         if (isRangeForProof(code, ident, depth)) return true;
         if (lineBoundsCastValue(code, ident)) return true;
         depth += braceBalance(code);
@@ -121549,6 +121572,80 @@ test "ZA904: broken ) } continuations in invalid regions stay masked (EPH-I0974)
     try std.testing.expectEqual(
         @as(usize, 0),
         countRuleIssues(run.issues.items, "app_invalid_cont.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+}
+
+test "closerTailIsCode classifies a 200K-byte } tail without recursion (EPH-I1264)" {
+    const allocator = std.testing.allocator;
+    // The pre-fix recursive form spent one stack frame per brace and
+    // crashed Debug builds on a giant attacker-shaped tail. The loop form
+    // must classify the same shapes identically. The test runs on the
+    // normal test stack, so a passing run IS the no-stack-blow proof.
+    var run = std.ArrayListUnmanaged(u8).empty;
+    defer run.deinit(allocator);
+    while (run.items.len < 200_000) try run.append(allocator, '}');
+    // A bare `}` run after the closer is a nested close (code).
+    try std.testing.expect(closerTailIsCode(run.items));
+    // Punctuation after the run stays a code close.
+    var semi = std.ArrayListUnmanaged(u8).empty;
+    defer semi.deinit(allocator);
+    try semi.appendSlice(allocator, run.items);
+    try semi.append(allocator, ';');
+    try std.testing.expect(closerTailIsCode(semi.items));
+    // A postfix keyword after the run stays a code close.
+    var kw = std.ArrayListUnmanaged(u8).empty;
+    defer kw.deinit(allocator);
+    try kw.appendSlice(allocator, run.items);
+    try kw.appendSlice(allocator, " catch");
+    try std.testing.expect(closerTailIsCode(kw.items));
+    // Prose after the run stays string content.
+    var prose = std.ArrayListUnmanaged(u8).empty;
+    defer prose.deinit(allocator);
+    try prose.appendSlice(allocator, run.items);
+    try prose.appendSlice(allocator, " weird");
+    try std.testing.expect(!closerTailIsCode(prose.items));
+}
+
+test "ZA904: a >256-byte comment tail cannot prove a later cast (EPH-I1266)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // Over the mask bound: the lookback line's `// x < 5` comment sits past
+    // byte 256. The fail-closed mask drops the overhang, so the comment can
+    // never fabricate the comparison proof and the cast warns. Pre-fix the
+    // raw fallback let the comment prove `x` and the cast went silent.
+    var over_line = std.ArrayListUnmanaged(u8).empty;
+    defer over_line.deinit(allocator);
+    try over_line.appendSlice(allocator, "    const pad = 1;");
+    while (over_line.items.len < 300) try over_line.append(allocator, ' ');
+    try over_line.appendSlice(allocator, "// x < 5");
+    var over_content = std.ArrayListUnmanaged(u8).empty;
+    defer over_content.deinit(allocator);
+    try over_content.appendSlice(allocator, "fn f(x: u32) u8 {\n");
+    try over_content.appendSlice(allocator, over_line.items);
+    try over_content.appendSlice(allocator, "\n    return @as(u8, @intCast(x));\n}\n");
+    var run_over = try runIntCastTest(&diag, allocator, "app_over.zig", over_content.items);
+    defer run_over.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run_over.issues.items, "app_over.zig", RULE_INTCAST_NO_BOUNDS),
+    );
+
+    // Under the mask bound: the same shape keeps the comment inside the
+    // mask, so the cast warns the same way — the control leg of the pair.
+    const under_content =
+        \\fn f(x: u32) u8 {
+        \\    const pad = 1;                  // x < 5
+        \\    return @as(u8, @intCast(x));
+        \\}
+    ;
+    var run_under = try runIntCastTest(&diag, allocator, "app_under.zig", under_content);
+    defer run_under.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run_under.issues.items, "app_under.zig", RULE_INTCAST_NO_BOUNDS),
     );
 }
 

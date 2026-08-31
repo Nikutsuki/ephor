@@ -52450,8 +52450,8 @@ const IssueCounts = struct {
 /// it with headroom for additive lines.
 const summary_text_buf_bytes = 1024;
 
-/// Stack buffer for formatSummaryJson. Worst case: ~410 fixed bytes + 19
-/// usize fields at <=20 digits + the 192-byte suppressed member = ~980
+/// Stack buffer for formatSummaryJson. Worst case: ~490 fixed bytes + 20
+/// usize fields at <=20 digits + the 221-byte suppressed member = ~1110
 /// bytes. 1536 covers it with headroom for additive members.
 const summary_json_buf_bytes = 1536;
 
@@ -52464,7 +52464,10 @@ const summary_json_buf_bytes = 1536;
 /// and "status" reflects that total, so a notes-only run never reports
 /// ok (EPH-I0535). The head shares its value run with the text summary
 /// (formatSummaryCore, EPH-I1232 C7). The tail keeps the JSON-only
-/// todos/status/suppressed members.
+/// pruned_dirs/todos/status/suppressed members. pruned_dirs (EPH-I1260)
+/// rides the ast_skipped pattern: the .check flow merges the walk's
+/// pruned-directory count in, and the member is the JSON mode's only
+/// pruned-subtree signal (the note skips in JSON mode).
 fn formatSummaryJson(
     buf: []u8,
     counts: IssueCounts,
@@ -52497,25 +52500,28 @@ fn formatSummaryJson(
         \\      "not_implemented": {d},
     , buf, counts, s);
     var mbuf: [256]u8 = undefined;
-    // Overflow is impossible: 92 fixed bytes + 5 usize values (<=20 digits
-    // each) = 192 bytes worst case.
+    // Overflow is impossible: 101 fixed bytes + 6 usize values (<=20
+    // digits each) = 221 bytes worst case.
     const member = try formatSuppressedJson(&mbuf, suppression);
     // The tail opens with the break the head template's last line would
     // have carried (the empty first \\ line supplies it), and keeps the
     // original byte shape: the status and suppressed members share one
     // rendered line (the original head template ended at the status
     // placeholder, so no break followed it), and the empty last line
-    // keeps the trailing break.
+    // keeps the trailing break. The pruned_dirs member (EPH-I1260)
+    // renders between the quality close and status.
     const tail = try std.fmt.bufPrint(buf[head.len..],
         \\
         \\      "todos": {d}
         \\    }},
+        \\    "pruned_dirs": {d},
         \\    "status": "{s}",    "suppressed": {s}
         \\  }}
         \\}}
         \\
     , .{
         s.todo_count,
+        s.pruned_dirs,
         if (counts.total() == 0) "ok" else "issues_found",
         member,
     });
@@ -52712,7 +52718,9 @@ fn noteAstTierSkips(
     if (stats.skipped == 0 or diag.json_stream) return;
     diag.ast_skip_note_count += 1;
     var buf: [skip_note_path_buf_bytes]u8 = undefined;
-    // A sanitize OOM degrades to the count-only note form below.
+    // A sanitize OOM degrades to the partial-path note: formatSkipPaths
+    // keeps the rendered head, and the count-only form below covers an
+    // empty path log.
     const paths = formatSkipPaths(allocator, &buf, log, stats.skipped) catch "";
     const plural = if (stats.skipped == 1) @as([]const u8, "") else "s";
     if (paths.len == 0) {
@@ -53864,9 +53872,10 @@ fn printCheckReports(
     };
 }
 
-/// The --summary block: merge the AST-tier counters into the scan stats
-/// (EPH-I0200: getStats walks content only and cannot observe parse
-/// outcomes), then print in the configured format.
+/// The --summary block: merge the AST-tier and pruned-dir counters into
+/// the scan stats (EPH-I0200, EPH-I1260: getStats walks content only and
+/// cannot observe parse outcomes or walk pruning), then print in the
+/// configured format.
 fn printCheckSummary(
     ctx: *const RunCtx,
     g: *ImportGraph,
@@ -53876,6 +53885,7 @@ fn printCheckSummary(
     var stats = g.getStats();
     stats.ast_parsed = findings.ast_stats.parsed;
     stats.ast_skipped = findings.ast_stats.skipped;
+    stats.pruned_dirs = ctx.diag.skipped_dir_count;
     // Note-severity findings ride one summary member, not per-category
     // buckets: the buckets keep the historical warnings-only meaning
     // (EPH-I0535).
@@ -55364,6 +55374,28 @@ test "summary JSON parses with the AST tier members" {
     // EPH-I0200: additive members. Existing members stay (files pinned).
     try std.testing.expectEqual(@as(i64, 7), summary.get("ast_parsed").?.integer);
     try std.testing.expectEqual(@as(i64, 2), summary.get("ast_skipped").?.integer);
+    try std.testing.expect(summary.get("files") != null);
+}
+
+test "summary JSON carries the pruned-dirs member (EPH-I1261)" {
+    const allocator = std.testing.allocator;
+    var buf: [summary_json_buf_bytes]u8 = undefined;
+    const text = try formatSummaryJson(&buf, .{}, .{
+        .pruned_dirs = 3,
+    }, .{});
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        text,
+        .{},
+    );
+    defer parsed.deinit();
+    const summary = parsed.value.object.get("summary").?.object;
+    // EPH-I1261: the pruned-dir count rides the ast_skipped pattern, so a
+    // machine consumer keeps the pruned-subtree signal. Existing members
+    // stay (files pinned).
+    try std.testing.expectEqual(@as(i64, 3), summary.get("pruned_dirs").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), summary.get("ast_skipped").?.integer);
     try std.testing.expect(summary.get("files") != null);
 }
 

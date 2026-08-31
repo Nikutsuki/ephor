@@ -52450,9 +52450,10 @@ const IssueCounts = struct {
 /// it with headroom for additive lines.
 const summary_text_buf_bytes = 1024;
 
-/// Stack buffer for formatSummaryJson. Worst case: ~498 fixed bytes + 20
-/// usize fields at <=20 digits + the 221-byte suppressed member = ~1119
-/// bytes. 1536 covers it with headroom for additive members.
+/// Stack buffer for formatSummaryJson. Worst case: ~490 fixed bytes + 20
+/// usize fields at <=20 digits + the 13-byte status + the 221-byte
+/// suppressed member = ~1124 bytes. 1536 covers it with headroom for
+/// additive members.
 const summary_json_buf_bytes = 1536;
 
 /// Format the JSON summary into `buf`. The suppression accounting rides as

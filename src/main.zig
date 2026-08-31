@@ -52996,8 +52996,9 @@ fn notePrunedDirs(diag: *DiagCtx) void {
     if (links > 0) {
         cliDiag(
             diag,
-            "note: {d} symlink{s} skipped. Files behind them are not analyzed.\n",
-            .{ links, if (links == 1) "" else "s" },
+            "note: {d} special entr{s} skipped (symlinks, fifos, sockets). " ++
+                "Files behind them are not analyzed.\n",
+            .{ links, if (links == 1) "y" else "ies" },
         );
     }
 }
@@ -128610,7 +128611,7 @@ test "prune note prints each skip class's count (EPH-I1260, EPH-I1267)" {
         diag.skipped_link_count = 2;
         notePrunedDirs(&diag);
         try std.testing.expectEqualStrings(
-            "note: 2 symlinks skipped. Files behind them are not analyzed.\n",
+            "note: 2 special entries skipped (symlinks, fifos, sockets). Files behind them are not analyzed.\n",
             capture.slice(),
         );
     }
@@ -128625,7 +128626,7 @@ test "prune note prints each skip class's count (EPH-I1260, EPH-I1267)" {
         try std.testing.expectEqualStrings(
             "note: 1 directory skipped (hidden, known-cache, or unopenable). " ++
                 "Files inside them are not analyzed.\n" ++
-                "note: 1 symlink skipped. Files behind them are not analyzed.\n",
+                "note: 1 special entry skipped (symlinks, fifos, sockets). Files behind them are not analyzed.\n",
             capture.slice(),
         );
     }

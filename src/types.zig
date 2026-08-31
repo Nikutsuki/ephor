@@ -498,11 +498,13 @@ pub const ProjectStats = struct {
     /// as a parse run the command never performed.
     ast_parsed: usize = 0,
     ast_skipped: usize = 0,
-    /// Pruned-directory count (EPH-I1260): hidden and known-cache dirs the
-    /// walk skipped. Zero unless the .check flow merges DiagCtx's
-    /// skipped_dir_count in: getStats counts graph content only and cannot
-    /// observe walk pruning. The stats command prints getStats directly,
-    /// so its JSON omits the member alongside the AST pair (EPH-I0588).
+    /// Pruned-entry count (EPH-I1260, I1267, I1276, I1277): hidden and
+    /// known-cache dirs, unopenable dirs, symlink-kind entries, and
+    /// depth-cap truncations the walk skipped. Zero unless the .check
+    /// flow merges the DiagCtx counters in (prunedDirsTotal in
+    /// main.zig): getStats counts graph content only and cannot observe
+    /// walk pruning. The stats command prints getStats directly, so its
+    /// JSON omits the member alongside the AST pair (EPH-I0588).
     pruned_dirs: usize = 0,
 };
 

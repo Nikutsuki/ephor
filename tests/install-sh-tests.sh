@@ -108,6 +108,10 @@ PATH="$TEST_ROOT/bin:$PATH"
 export PATH
 export EPHOR_TAGS_API="file://$TEST_ROOT/tags.json"
 export EPHOR_ARCHIVE_URL="file://$TEST_ROOT/archive.tar.gz"
+# WP-7: the derived signature URL points at the live raw-branch route,
+# so the signature override rides the same file:// channel to keep every
+# default run hermetic. t54 pins the derived URL itself.
+export EPHOR_SIG_URL="file://$TEST_ROOT/archive.tar.gz.minisig"
 # EPH-I0205: the URL overrides are test hooks gated behind an explicit
 # test-mode marker. The suite is the sanctioned test channel, so it sets
 # the marker for every run. t38 covers the no-marker production shape.
@@ -1390,6 +1394,60 @@ assert_not_grep "$D/.minisign-pubkey" 'RWS+PtUzLvwpvc7nVJ8t8MKTpo4/8UdOqoxuLGXhf
     'the embedded key leaked into the override run'
 assert_empty "$D/err.log" 'stderr not empty'
 pass "t53b EPHOR_RELEASE_PUBKEY replaces the embedded key (WP-7 seam)"
+
+# --- t54 (WP-7): the derived signature URL is the repo-tree raw route.
+# A tag release's signature lives at signatures/<tag>.tar.gz.minisig in
+# the repo tree (committed by the post-tag commit, served via the raw
+# route), not next to the archive tarball: the archive route 404s. A run
+# without EPHOR_SIG_URL must fetch the raw-branch URL, so the fake curl
+# records every call and serves the fixtures to keep the run hermetic.
+D="$TEST_ROOT/t54"
+BINDIR="$TEST_ROOT/t54-bin"
+mkdir -p "$D" "$BINDIR"
+cat > "$BINDIR/curl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$CURL_ARGS_FILE"
+out=""
+url=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) shift; out="$1" ;;
+        -*) ;;
+        *) url="$1" ;;
+    esac
+    shift
+done
+case "$url" in
+    *.tar.gz.minisig) body="$SIG_FIXTURE" ;;
+    *.tar.gz) body="$ARCHIVE_FIXTURE" ;;
+    *tags.json) body="$TAGS_FIXTURE" ;;
+    *) exit 1 ;;
+esac
+if [ -n "$out" ]; then
+    cat "$body" > "$out"
+else
+    cat "$body"
+fi
+exit 0
+EOF
+chmod +x "$BINDIR/curl"
+write_fresh_build_zig "$D"
+CURL_ARGS_FILE="$D/curl-args"
+SIG_FIXTURE="$TEST_ROOT/archive.tar.gz.minisig"
+ARCHIVE_FIXTURE="$TEST_ROOT/archive.tar.gz"
+TAGS_FIXTURE="$TEST_ROOT/tags.json"
+export CURL_ARGS_FILE SIG_FIXTURE ARCHIVE_FIXTURE TAGS_FIXTURE
+OLD_SIG_URL=$EPHOR_SIG_URL
+unset EPHOR_SIG_URL
+run_installer_with_bin "$BINDIR" "$D"
+export EPHOR_SIG_URL="$OLD_SIG_URL"
+unset CURL_ARGS_FILE SIG_FIXTURE ARCHIVE_FIXTURE TAGS_FIXTURE
+assert_rc 0
+assert_grep "$D/curl-args" \
+    'codeberg.org/RhyosLabs/ephor/raw/branch/main/signatures/v0.99.1.tar.gz.minisig' \
+    'the derived signature URL is not the repo-tree raw route'
+assert_grep "$D/out.log" 'Release signature verified.' 'no verification line'
+pass "t54 derived signature URL is the raw-branch signatures path (WP-7)"
 
 echo ""
 echo "install-sh tests: $PASS_COUNT passed"

@@ -642,7 +642,12 @@ case "$EPHOR_URL" in
         echo "The installer skips signature verification for the pinned commit archive: it is immutable and SHA-addressed."
         ;;
     *)
-        SIG_URL="${EPHOR_URL}.minisig"
+        # WP-7: the signature lives in the repo tree at
+        # signatures/<tag>.tar.gz.minisig, committed by the post-tag
+        # commit for each release and served via the raw route.
+        # Codeberg's archive route serves only real refs, so
+        # ${EPHOR_URL}.minisig would 404 in production.
+        SIG_URL="${REPO}/raw/branch/main/signatures/${EPHOR_TAG}.tar.gz.minisig"
         if test_mode_active; then
             SIG_URL="${EPHOR_SIG_URL:-$SIG_URL}"
         elif [ -n "${EPHOR_SIG_URL:-}" ]; then

@@ -106,9 +106,10 @@ $archiveUrl = "file://" + $archivePath
 
 # WP-7: the embedded release key activates Test-EphorReleaseSignature, so
 # every run injects EPHOR_RELEASE_PUBKEY (the fixture-key seam) and a
-# fake minisign on PATH accepts the signature. The default SIG_URL is the
-# archive URL plus .minisig, so the signature file sits next to the
-# archive.
+# fake minisign on PATH accepts the signature. The derived SIG_URL points
+# at the live raw-branch route, so every run sets EPHOR_SIG_URL to the
+# local signature file to stay hermetic (the override replaces the
+# derived URL wholesale).
 $sigPath = "$archivePath.minisig"
 Set-Content -Path $sigPath -Value 'dummy signature' -Encoding ASCII
 $fakeMinisign = Join-Path $binDir "minisign"
@@ -196,6 +197,7 @@ function runInstall {
     $psi.Environment["EPHOR_TEST_MODE"] = "1"
     $psi.Environment["EPHOR_TAGS_API"] = "http://127.0.0.1:$port/tags.json"
     $psi.Environment["EPHOR_ARCHIVE_URL"] = $archiveUrl
+    $psi.Environment["EPHOR_SIG_URL"] = "file://" + $sigPath
     $psi.Environment["EPHOR_RELEASE_PUBKEY"] = "untrusted comment: ps1 hardening pin (fake)"
     if ($FailFetchOnce) {
         $psi.Environment["FETCH_FAIL_ONCE"] = $FailFetchOnce

@@ -730,7 +730,12 @@ error: minisign is not installed or not on PATH.
     if ($EPHOR_URL -eq $eraPinUrl) {
         Write-Host "The installer skips signature verification for the pinned commit archive: it is immutable and SHA-addressed."
     } else {
-        $SIG_URL = "$EPHOR_URL.minisig"
+        # WP-7: the signature lives in the repo tree at
+        # signatures/<tag>.tar.gz.minisig, committed by the post-tag
+        # commit for each release and served via the raw route.
+        # Codeberg's archive route serves only real refs, so
+        # "$EPHOR_URL.minisig" would 404 in production.
+        $SIG_URL = "$REPO/raw/branch/main/signatures/$EPHOR_TAG.tar.gz.minisig"
         if ($testModeActive -and $env:EPHOR_SIG_URL) {
             $SIG_URL = $env:EPHOR_SIG_URL
         } elseif ($env:EPHOR_SIG_URL) {

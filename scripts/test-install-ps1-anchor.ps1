@@ -134,10 +134,11 @@ Set-Content -Path $archivePath -Value 'dummy archive' -Encoding ASCII
 $archiveUrl = "file://" + $archivePath
 
 # WP-7: the embedded release key activates Test-EphorReleaseSignature, so
-# the scenarios inject EPHOR_RELEASE_PUBKEY (the fixture-key seam) and
-# serve a signature next to the archive: the default SIG_URL is the
-# archive URL plus .minisig. The fake minisign on PATH accepts every
-# signature, so the runs stay hermetic.
+# the scenarios inject EPHOR_RELEASE_PUBKEY (the fixture-key seam) and a
+# fake minisign on PATH accepts the signature. The derived SIG_URL points
+# at the live raw-branch route, so every run sets EPHOR_SIG_URL to the
+# local signature file to stay hermetic (the override replaces the
+# derived URL wholesale).
 $sigPath = "$archivePath.minisig"
 Set-Content -Path $sigPath -Value 'dummy signature' -Encoding ASCII
 $fakeMinisign = Join-Path $binDir "minisign"
@@ -197,6 +198,7 @@ $psi.Environment["PATH"] = $binDir + [System.IO.Path]::PathSeparator + $env:PATH
 $psi.Environment["EPHOR_TEST_MODE"] = "1"
 $psi.Environment["EPHOR_TAGS_API"] = "http://127.0.0.1:$tagsPort/tags.json"
 $psi.Environment["EPHOR_ARCHIVE_URL"] = $archiveUrl
+$psi.Environment["EPHOR_SIG_URL"] = "file://" + $sigPath
 # WP-7: any non-empty key reaches the active branch; the fake minisign
 # never reads it, so the pin needs no real keypair.
 $psi.Environment["EPHOR_RELEASE_PUBKEY"] = "untrusted comment: ephor ps1 anchor pin (fake)"

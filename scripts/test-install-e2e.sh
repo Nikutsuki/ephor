@@ -166,13 +166,16 @@ run_scenario() { # dir ...
         sh "$ROOT/install.sh") > "$E2E/$dir/out.log" 2> "$E2E/$dir/err.log" || rc=$?
 }
 
-# s1 active default: no override, so the embedded release key verifies
-# the release. The valid.tar.gz carries the test keypair's signature,
-# which the release key rejects: the unsigned old release fails closed
-# before zig fetch.
+# s1 active default: no pubkey override, so the embedded release key
+# verifies the release. The valid.tar.gz carries the test keypair's
+# signature, which the release key rejects: the unsigned old release
+# fails closed before zig fetch. The signature rides the EPHOR_SIG_URL
+# channel, so the derived raw-branch URL stays untested here (the
+# install-sh t54 pin covers it).
 new_project s1
 run_scenario s1 \
-    EPHOR_ARCHIVE_URL="$E2E/valid.tar.gz"
+    EPHOR_ARCHIVE_URL="$E2E/valid.tar.gz" \
+    EPHOR_SIG_URL="$E2E/valid.tar.gz.minisig"
 expect "s1 active-default rc 1" "1" "$rc"
 expect_grep "s1 key-id mismatch surfaced" "$E2E/s1/err.log" "Signature key id in"
 expect_grep "s1 fail-closed error" "$E2E/s1/err.log" "error: the release signature check failed."

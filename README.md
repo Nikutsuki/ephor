@@ -92,7 +92,9 @@ installer or the ephor binary (EPH-I0287). The tarball download is
 capped at 32 MiB and the signature download at 1 MiB. Each fetch times
 out after 30 s. On a signed release, the install or upgrade fails closed
 when the signature download fails, when minisign is not installed, or
-when the check fails.
+when the check fails. Each release's signature lives in the repository
+tree at `signatures/<tag>.tar.gz.minisig`. The post-tag commit publishes
+it, and the raw route (`/raw/branch/main/...`) serves it.
 
 Signature verification is active. The installer and the binary embed the
 release public key, and every release must be signed with the release

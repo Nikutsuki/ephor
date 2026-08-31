@@ -48305,12 +48305,28 @@ var tool_minisign_path: []const u8 = "minisign";
 const release_tarball_cap_bytes = "33554432"; // 32 MiB
 const release_sig_cap_bytes = "1048576"; // 1 MiB
 
-/// The signature URL for a package URL (EPH-I0287): the release pipeline
-/// publishes the .minisig next to the tarball, and minisign reads
-/// <file>.minisig beside the file. Same channel shape as install.sh's
-/// SIG_URL.
+/// The signature URL for a package URL (EPH-I0287, WP-7): the .minisig
+/// lives in the repo tree at signatures/<tag>.tar.gz.minisig, committed
+/// to main by the WP-7 post-tag commit for each release, and served via
+/// the raw branch route ({EPHOR_REPO_BASE}/raw/branch/main/...).
+/// Codeberg's archive route serves only real refs, so appending .minisig
+/// to the tarball URL 404s (live-probed 2026-08-31). buildPackageUrl is
+/// the only package-URL producer, so the tag (with its v prefix, the
+/// installer's EPHOR_TAG shape) is the segment between "/archive/" and
+/// ".tar.gz"; a non-canonical URL fails closed.
 fn signatureUrlFor(allocator: Allocator, package_url: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}.minisig", .{package_url});
+    const marker = "/archive/";
+    const marker_pos = std.mem.indexOf(u8, package_url, marker) orelse
+        return error.UnexpectedPackageUrl;
+    const tag_and_suffix = package_url[marker_pos + marker.len ..];
+    if (!std.mem.endsWith(u8, tag_and_suffix, ".tar.gz"))
+        return error.UnexpectedPackageUrl;
+    const tag = tag_and_suffix[0 .. tag_and_suffix.len - ".tar.gz".len];
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/raw/branch/main/signatures/{s}.tar.gz.minisig",
+        .{ EPHOR_REPO_BASE, tag },
+    );
 }
 
 /// EPH-I0287 (WP-6.5): verify the signed release before the zig fetch,
@@ -48363,7 +48379,14 @@ fn verifySignedRelease(
 ) !void {
     if (!minisignAvailable(diag.io)) return missingMinisignFailure(diag);
 
-    const sig_url = try signatureUrlFor(allocator, package_url);
+    const sig_url = signatureUrlFor(allocator, package_url) catch {
+        cliDiag(
+            diag,
+            "error: could not locate the release signature for the requested version.\n",
+            .{},
+        );
+        return error.UpgradeFailed;
+    };
     defer allocator.free(sig_url);
 
     const verify_dir = createVerifyDir(allocator, diag.io) catch {
@@ -127195,13 +127218,26 @@ test "install verifies the release signature before the fetch (EPH-I1225)" {
     try std.testing.expect(tmpHasEntry(&tmp, "minisign-ran"));
 }
 
-test "signatureUrlFor appends .minisig to the package URL (EPH-I0287)" {
+test "signatureUrlFor derives the raw-branch signatures URL (EPH-I0287, WP-7)" {
     const allocator = std.testing.allocator;
-    const sig = try signatureUrlFor(allocator, "https://example.invalid/x/v0.14.2.tar.gz");
+    // The production shape: buildPackageUrl's canonical output yields
+    // the repo-tree signature URL served via the raw route. The archive
+    // route 404s on {package}.minisig (live-probed 2026-08-31).
+    const sig = try signatureUrlFor(
+        allocator,
+        "https://codeberg.org/RhyosLabs/ephor/archive/v0.14.2.tar.gz",
+    );
     defer allocator.free(sig);
     try std.testing.expectEqualStrings(
-        "https://example.invalid/x/v0.14.2.tar.gz.minisig",
+        "https://codeberg.org/RhyosLabs/ephor/raw/branch/main/signatures/v0.14.2.tar.gz.minisig",
         sig,
+    );
+    // A non-canonical package URL fails closed: the helper only ever
+    // sees buildPackageUrl output, and a silent fallback would revive
+    // the 404 shape.
+    try std.testing.expectError(
+        error.UnexpectedPackageUrl,
+        signatureUrlFor(allocator, "https://example.invalid/x/v0.14.2.tar.gz"),
     );
 }
 
@@ -127220,7 +127256,7 @@ test "upgrade release verification succeeds with a valid signature (EPH-I0287)" 
         &diag,
         allocator,
         test_release_pubkey,
-        "https://example.invalid/ephor/archive/v0.14.2.tar.gz",
+        "https://codeberg.org/RhyosLabs/ephor/archive/v0.14.2.tar.gz",
     );
     try std.testing.expect(
         std.mem.indexOf(u8, capture.slice(), "Release signature verified.") != null,
@@ -127262,7 +127298,7 @@ test "release verification succeeds under a strict umask (EPH-I1286)" {
         &diag,
         allocator,
         test_release_pubkey,
-        "https://example.invalid/ephor/archive/v0.14.2.tar.gz",
+        "https://codeberg.org/RhyosLabs/ephor/archive/v0.14.2.tar.gz",
     );
     try std.testing.expect(
         std.mem.indexOf(u8, capture.slice(), "Release signature verified.") != null,
@@ -127322,7 +127358,7 @@ test "upgrade release verification fails closed when minisign is missing (EPH-I0
             &diag,
             allocator,
             test_release_pubkey,
-            "https://example.invalid/ephor/archive/v0.14.2.tar.gz",
+            "https://codeberg.org/RhyosLabs/ephor/archive/v0.14.2.tar.gz",
         ),
     );
     try std.testing.expect(
@@ -127348,7 +127384,7 @@ test "upgrade release verification fails closed on a bad signature (EPH-I0287)" 
             &diag,
             allocator,
             test_release_pubkey,
-            "https://example.invalid/ephor/archive/v0.14.2.tar.gz",
+            "https://codeberg.org/RhyosLabs/ephor/archive/v0.14.2.tar.gz",
         ),
     );
     // minisign's own verdict line surfaces first (install.sh's
@@ -127378,7 +127414,7 @@ test "upgrade release verification fails closed on a failed tarball download (EP
             &diag,
             allocator,
             test_release_pubkey,
-            "https://example.invalid/ephor/archive/v0.14.2.tar.gz",
+            "https://codeberg.org/RhyosLabs/ephor/archive/v0.14.2.tar.gz",
         ),
     );
     try std.testing.expect(

@@ -45872,22 +45872,51 @@ fn thresholdCliLocked(cli_mask: u8, key: []const u8) bool {
     return false;
 }
 
-/// A threshold's identity and documented cap, looked up once by the caller.
+/// One clamp request: a threshold's table identity (key), its documented
+/// cap, and the candidate value. clampThreshold clamps the candidate at
+/// the cap and warns once per clamp.
 const ThresholdClamp = struct {
     key: []const u8,
     cap: usize,
+    value: usize,
 };
 
-/// Clamp a threshold value at its documented cap, warning once per clamp.
-fn clampThreshold(diag: *DiagCtx, source: []const u8, spec: ThresholdClamp, num: usize) usize {
-    if (num <= spec.cap) return num;
+/// Clamp a threshold value at its documented cap, warning once per clamp
+/// (B13-11, EPH-I0518). The key is a comptime table member; the source
+/// (config path or CLI arg) crosses the terminal sanitizer (EPH-I0147).
+fn clampThreshold(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    source: []const u8,
+    spec: ThresholdClamp,
+) usize {
+    if (spec.value <= spec.cap) return spec.value;
     diag.threshold_clamp_count += 1;
-    cliDiag(
-        diag,
-        "warning: clamping threshold '{s}' from {d} to the maximum {d} ({s})\n",
-        .{ spec.key, num, spec.cap, source },
-    );
+    var out = types.OutBuf{ .allocator = allocator };
+    defer out.deinit();
+    formatThresholdClamp(&out, source, spec) catch {
+        // OOM: keep the warning, drop the source (B13-11 shape).
+        cliDiag(
+            diag,
+            "warning: clamping threshold '{s}' to the maximum {d}\n",
+            .{ spec.key, spec.cap },
+        );
+        return spec.cap;
+    };
+    cliDiag(diag, "{s}", .{out.buf.items});
     return spec.cap;
+}
+
+/// Render the clamp warning into `out`. The key and cap are comptime
+/// table members; the source crosses the terminal sanitizer (EPH-I0147).
+fn formatThresholdClamp(out: *types.OutBuf, source: []const u8, spec: ThresholdClamp) !void {
+    var safe = try types.sanitizeTerminal(out.allocator, source);
+    defer safe.deinit(out.allocator);
+    try out.buf.print(
+        out.allocator,
+        "warning: clamping threshold '{s}' from {d} to the maximum {d} ({s})\n",
+        .{ spec.key, spec.value, spec.cap, safe.slice },
+    );
 }
 
 /// Render the invalid-threshold warning into `out` (B13-11, EPH-I0518).
@@ -46172,9 +46201,9 @@ fn parseThresholdPair(ctx: ConfigParseCtx, start: usize) usize {
     }
     const num = clampThreshold(
         ctx.diag,
+        ctx.allocator,
         ctx.source.path,
-        .{ .key = pair.val, .cap = cap },
-        raw,
+        .{ .key = pair.val, .cap = cap, .value = raw },
     );
     setThresholdValue(&ctx.cfg.thresholds, ctx.cfg.threshold_cli_mask, pair.val, num);
     return i;
@@ -46243,13 +46272,43 @@ fn checkConfigListValue(ctx: ConfigParseCtx, key: []const u8, val: []const u8) !
     if (!is_exclude_list) return true;
     if (val.len == 0) return error.EmptyExcludePattern;
     if (!isOverbroadExcludePattern(val, scanRootFirstComponent(ctx.cfg.path))) return true;
-    cliDiag(
-        ctx.diag,
+    warnOverbroadExclude(ctx, val);
+    return false;
+}
+
+/// Render the over-broad exclude warning into `out`. The pattern and the
+/// path are undecoded config content and cross the terminal sanitizer
+/// (EPH-I0147).
+fn formatOverbroadExclude(
+    out: *types.OutBuf,
+    config_path: []const u8,
+    val: []const u8,
+) !void {
+    var safe = try sanitizeConfigPair(out, config_path, val);
+    defer safe.deinit(out.allocator);
+    try out.buf.print(
+        out.allocator,
         "warning: ignoring over-broad exclude pattern '{s}' in {s}. " ++
             "Use a more specific pattern.\n",
-        .{ val, ctx.source.path },
+        .{ safe.value.slice, safe.path.slice },
     );
-    return false;
+}
+
+/// B13-11 shape (EPH-I0518): warn on an over-broad exclude pattern with
+/// both untrusted values sanitized. On OOM the warning keeps its text
+/// but drops the values (warnPathDirRejected's fallback).
+fn warnOverbroadExclude(ctx: ConfigParseCtx, val: []const u8) void {
+    var out = types.OutBuf{ .allocator = ctx.allocator };
+    defer out.deinit();
+    formatOverbroadExclude(&out, ctx.source.path, val) catch {
+        cliDiag(
+            ctx.diag,
+            "warning: ignoring over-broad exclude pattern. Use a more specific pattern.\n",
+            .{},
+        );
+        return;
+    };
+    cliDiag(ctx.diag, "{s}", .{out.buf.items});
 }
 
 /// Append one validated array value to the config list its key selects.
@@ -48415,7 +48474,7 @@ fn minisignVerdictOutcome(
         .stderr_limit = .limited(minisign_output_limit_bytes),
     }) catch |err| switch (err) {
         error.FileNotFound => return missingMinisignFailure(diag),
-        else => return reportSignatureFailure(diag, ""),
+        else => return reportSignatureFailure(diag, allocator, ""),
     };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -48427,13 +48486,25 @@ fn minisignVerdictOutcome(
         cliDiag(diag, "Release signature verified.\n", .{});
         return;
     }
-    return reportSignatureFailure(diag, result.stderr);
+    return reportSignatureFailure(diag, allocator, result.stderr);
 }
 
 /// Report a failed verification with minisign's own verdict line, then
 /// fail the upgrade closed (EPH-I0287, install.sh's VERIFY_OUT shape).
-fn reportSignatureFailure(diag: *DiagCtx, verdict: []const u8) error{UpgradeFailed} {
-    if (verdict.len > 0) cliDiag(diag, "{s}", .{verdict});
+/// The verdict is minisign's stderr, which a hostile PATH minisign owns,
+/// so it crosses the terminal sanitizer before the render (EPH-I0147).
+/// On OOM the verdict line drops; the error pair below still names the
+/// failure.
+fn reportSignatureFailure(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    verdict: []const u8,
+) error{UpgradeFailed} {
+    if (verdict.len > 0) {
+        var safe = types.sanitizeTerminal(allocator, verdict) catch null;
+        defer if (safe) |*s| s.deinit(allocator);
+        if (safe) |s| cliDiag(diag, "{s}", .{s.slice});
+    }
     cliDiag(diag,
         \\error: the release signature check failed.
         \\The downloaded artifact may be tampered with. The command stops.
@@ -49246,9 +49317,14 @@ fn requireStrictExplicitVersion(
 /// Parse the newest stable version from a Codeberg tags API JSON response.
 /// Scans EVERY "name" field and returns the semver-max of strict vX.Y.Z /
 /// X.Y.Z tags. WHY max and not first: the API orders tags by date, and tag
-/// dates are attacker-influenceable (a re-dated old tag sorts first), while
-/// the semver maximum is not (EPH-I0193). Prerelease tags are rejected by
-/// isStrictSemverTag. Caller owns the returned slice.
+/// dates are attacker-influenceable (a re-dated old tag sorts first). The
+/// semver maximum itself is also attacker-influenceable by a tag-push
+/// actor: a pushed v99.0.0 mints a higher maximum and nothing bounds above
+/// (EPH-I1275). The binding defenses are repo-write-is-game-over (a tag
+/// pusher owns the repo content anyway) and M-2 signature verification,
+/// which activates when WP-7 fills release_pubkey (empty today).
+/// Prerelease tags are rejected by isStrictSemverTag. Caller owns the
+/// returned slice.
 fn parseVersionFromTagsApi(allocator: Allocator, json: []const u8) ?[]const u8 {
     const name_marker = "\"name\":";
     var best: ?[3]u32 = null;
@@ -50494,17 +50570,21 @@ comptime {
 /// cannot overwrite it (RED3-6: CLI thresholds always win). Values clamp at
 /// the documented maxima, same as config-file values. A matched flag with
 /// an unparseable value is a hard usage error (EPH-I0237).
-fn parseThresholdArg(diag: *DiagCtx, arg: []const u8, cfg: *Config) !bool {
+fn parseThresholdArg(ctx: CliParseCtx, arg: []const u8) !bool {
     for (cli_threshold_flags) |flag| {
         const meta = thresholdFieldMeta(flag.field);
-        const spec: ThresholdClamp = .{ .key = flag.key, .cap = meta.cap };
         switch (parseThreshold(arg, flag.prefix)) {
             .no_match => continue,
-            .invalid => return reportInvalidThreshold(diag, arg, flag.prefix),
+            .invalid => return reportInvalidThreshold(ctx.diag, arg, flag.prefix),
             .value => |num| {
-                const clamped = clampThreshold(diag, arg, spec, num);
-                applyThresholdField(&cfg.thresholds, flag.field, clamped);
-                cfg.threshold_cli_mask |= meta.bit;
+                const clamped = clampThreshold(
+                    ctx.diag,
+                    ctx.allocator,
+                    arg,
+                    .{ .key = flag.key, .cap = meta.cap, .value = num },
+                );
+                applyThresholdField(&ctx.cfg.thresholds, flag.field, clamped);
+                ctx.cfg.threshold_cli_mask |= meta.bit;
                 return true;
             },
         }
@@ -50721,7 +50801,7 @@ fn parseCliArg(ctx: CliParseCtx, arg: []const u8) !void {
         return handleEntryArg(ctx.allocator, arg, ctx.cfg, ctx.cli_entries);
     }
     if (try parseSimpleFlag(ctx.diag, arg, ctx.cfg)) return;
-    if (try parseThresholdArg(ctx.diag, arg, ctx.cfg)) return;
+    if (try parseThresholdArg(ctx, arg)) return;
     if (try handleListArg(ctx, arg)) return;
     if (try handleOptionalPathArg(ctx.diag, ctx.allocator, arg, ctx.cfg)) return;
     if (arg[0] != '-') {
@@ -53802,7 +53882,7 @@ fn markEntryScanned(
 /// outside reads are the documented RED4-3 orphan feature.
 fn scanOutOfRootEntry(ctx: *const RunCtx, g: *ImportGraph, entry: []const u8) void {
     if (entryCoveredByScan(ctx.diag.io, ctx.cfg.path, entry)) return;
-    g.scanSingleFile(entry) catch |err| noteMissingEntry(ctx.cfg, entry, err);
+    g.scanSingleFile(entry) catch |err| noteMissingEntry(ctx, entry, err);
 }
 
 /// True when `entry` sits inside the scan path's tree. When both sides
@@ -53823,10 +53903,19 @@ fn entryCoveredByScan(io: std.Io, scan_path: []const u8, entry: []const u8) bool
 }
 
 /// Verbose-only note for an entry file that could not be scanned. A
-/// missing entry file is not an error.
-fn noteMissingEntry(cfg: *const Config, entry: []const u8, err: anyerror) void {
-    if (!cfg.verbose) return;
-    std.debug.print("note: entry {s} not found: {}\n", .{ entry, err });
+/// missing entry file is not an error. The entry crosses the terminal
+/// sanitizer (EPH-I0147); the error name is a compiler symbol, safe.
+/// cliDiag carries the note, so the JSON machine latch keeps it off the
+/// stream (EPH-I0213).
+fn noteMissingEntry(ctx: *const RunCtx, entry: []const u8, err: anyerror) void {
+    if (!ctx.cfg.verbose) return;
+    var safe = types.sanitizeTerminal(ctx.alloc, entry) catch {
+        // OOM: keep the note, drop the entry text.
+        cliDiag(ctx.diag, "note: entry not found: {}\n", .{err});
+        return;
+    };
+    defer safe.deinit(ctx.alloc);
+    cliDiag(ctx.diag, "note: entry {s} not found: {}\n", .{ safe.slice, err });
 }
 
 /// Count the out-of-root .zig entry strings for the scan-shape note
@@ -56171,6 +56260,54 @@ test "countOutOfRootEntries counts only .zig entries outside the scan path (EPH-
         "src",
         &.{ "tools/gen.zig", "tools/gen.zig" },
     ));
+}
+
+test "missing-entry note sanitizes the entry and stays inside the JSON latch (EPH-I1282)" {
+    const allocator = std.testing.allocator;
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    cfg.verbose = true;
+    var ignore_cache = IgnoreCache.init(allocator);
+    defer ignore_cache.deinit();
+    var ctx = RunCtx{
+        .alloc = allocator,
+        .cfg = &cfg,
+        .diag = &diag,
+        .base_path = ".",
+        .ignore_cache = &ignore_cache,
+    };
+    // The raw ESC byte renders as '?' before the capture (EPH-I0147).
+    noteMissingEntry(&ctx, "evil\x1b[31m.zig", error.FileNotFound);
+    try std.testing.expect(std.mem.indexOf(u8, capture.slice(), "\x1b") == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        capture.slice(),
+        "note: entry evil?[31m.zig not found: error.FileNotFound",
+    ) != null);
+    try std.testing.expect(!capture.truncated);
+    // JSON mode: the machine latch mutes the note instead of letting it
+    // interleave into the stream (EPH-I0213).
+    capture = .{};
+    diag.diag_sink = capture.sink();
+    diag.json_stream = true;
+    noteMissingEntry(&ctx, "gone.zig", error.FileNotFound);
+    try std.testing.expectEqual(@as(usize, 0), capture.len);
+    // The stashed form carries the note for the abort path (EPH-I1067).
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        diag.last_muted_diag[0..diag.last_muted_diag_len],
+        "note: entry gone.zig not found: error.FileNotFound",
+    ) != null);
+    // The verbose gate still applies.
+    cfg.verbose = false;
+    diag.json_stream = false;
+    capture = .{};
+    diag.diag_sink = capture.sink();
+    noteMissingEntry(&ctx, "gone.zig", error.FileNotFound);
+    try std.testing.expectEqual(@as(usize, 0), capture.len);
 }
 
 test "entryCoveredByScan folds alternate spellings of one file (EPH-I0812)" {
@@ -124898,6 +125035,25 @@ test "config threshold zero warns and keeps the default (EPH-I1135)" {
     try std.testing.expectEqual(@as(usize, 2), diag.threshold_invalid_count);
 }
 
+test "threshold clamp warning sanitizes the source (EPH-I1281)" {
+    const allocator = std.testing.allocator;
+    var out = types.OutBuf{ .allocator = allocator };
+    defer out.deinit();
+    try formatThresholdClamp(&out, "ephor.json\x1b[31m", .{
+        .key = "max_lines",
+        .cap = 50,
+        .value = 5000,
+    });
+    // The raw ESC byte renders as '?'; the comptime key and the numbers
+    // stay intact (EPH-I0147).
+    try std.testing.expect(mem.indexOfScalar(u8, out.buf.items, 0x1B) == null);
+    try std.testing.expect(mem.indexOf(
+        u8,
+        out.buf.items,
+        "clamping threshold 'max_lines' from 5000 to the maximum 50 (ephor.json?[31m)",
+    ) != null);
+}
+
 test "config path_dir rejection warning sanitizes hostile value bytes" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -124995,6 +125151,19 @@ test "over-broad exclude patterns warn and are skipped (RED3-2, RED3-3)" {
     // Only the specific pattern survives.
     try std.testing.expectEqual(@as(usize, 1), cfg.exclude.items.len);
     try std.testing.expectEqualStrings("vendor", cfg.exclude.items[0]);
+}
+
+test "over-broad exclude warning sanitizes the pattern and the path (EPH-I1280)" {
+    const allocator = std.testing.allocator;
+    var out = types.OutBuf{ .allocator = allocator };
+    defer out.deinit();
+    try formatOverbroadExclude(&out, "ephor.json\xc2\x9b31m", "src\x1b]2;evil\x07");
+    // The raw ESC byte and the UTF-8-encoded C1 CSI form each render as
+    // one '?' (EPH-I0147).
+    try std.testing.expect(mem.indexOfScalar(u8, out.buf.items, 0x1B) == null);
+    try std.testing.expect(mem.indexOf(u8, out.buf.items, "\xc2\x9b") == null);
+    try std.testing.expect(mem.indexOf(u8, out.buf.items, "src?]2;evil?") != null);
+    try std.testing.expect(mem.indexOf(u8, out.buf.items, "ephor.json?31m") != null);
 }
 
 test "scanRootFirstComponent reads the first scan-root path segment (EPH-I0208)" {

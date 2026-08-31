@@ -51318,9 +51318,9 @@ fn printHelp() void {
         \\
         \\INSTALL/UPGRADE EXAMPLES:
         \\  ephor install                    # Install current binary version
-        \\  ephor install --version=0.14.3   # Install specific version
+        \\  ephor install --version=0.15.0   # Install specific version
         \\  ephor upgrade                    # Upgrade to current binary version
-        \\  ephor upgrade --version=0.14.3   # Upgrade to specific version
+        \\  ephor upgrade --version=0.15.0   # Upgrade to specific version
         \\
         \\RUNTIME COMMAND EXAMPLES:
         \\  ephor runtime .                         # Run 'zig build test'

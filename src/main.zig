@@ -4245,12 +4245,16 @@ fn loopBodyStartCol(t: []const u8) ?usize {
 }
 
 /// Column just past the closing `)` of the loop line's condition, or null
-/// when the condition does not close on this line.
+/// when the condition does not close on this line. A mid-line `\\` opener
+/// cuts the scan (EPH-I1269, serves REL-REDTEAM-4): its tail is string
+/// data, so a `)` there never closes the group (an invalid-Zig shape —
+/// valid Zig closes the group on a later line).
 fn loopCondCloseCol(t: []const u8) ?usize {
     var depth: usize = 0;
     var walk = QuoteWalk.init(t);
     while (walk.next()) |i| : (walk.advance()) {
         const c = t[i];
+        if (types.isMultilineOpenerAt(t, i)) break;
         if (c == '(') depth += 1;
         if (c != ')') continue;
         if (depth == 0) continue;
@@ -13024,17 +13028,23 @@ fn collectCFGAllocations(
 /// inside strings or comments are text, never statement structure
 /// (EPH-I0675 makes the span verdict-bearing, and an unbalanced `(` inside
 /// a string would otherwise inflate the span past the real statement).
-/// Lines longer than the 16 KiB mask buffer drop their overhang, so
-/// structure past the bound never reads as statement structure (fail
-/// closed, EPH-I1258: generated or giant lines only).
+/// The mask covers 16 KiB per line (EPH-I1258). Past the bound the
+/// overhang scan (EPH-I1265) counts the code-position braces and `;`
+/// with the same string/comment masking, so a real statement end in the
+/// overhang still closes the statement and literal tail content never
+/// does.
 fn findAllocStatementEnd(lines: []const []const u8, start: usize) usize {
     var brace_depth: i32 = 0;
     var blank_buf: [16 * 1024]u8 = undefined;
     for (start..lines.len) |idx| {
-        const masked = maskedCodeLine(lines[idx], &blank_buf);
+        const line = lines[idx];
+        const masked = maskedCodeLine(line, &blank_buf);
         brace_depth += countBraceBalance(masked);
-        if (mem.indexOf(u8, masked, ";") != null and brace_depth <= 0)
-            return idx;
+        const overhang = scanOverhangStatement(line, blank_buf.len);
+        brace_depth += overhang.brace_balance;
+        const has_semicolon = mem.indexOf(u8, masked, ";") != null or
+            overhang.has_semicolon;
+        if (has_semicolon and brace_depth <= 0) return idx;
     }
     return start;
 }
@@ -13046,6 +13056,34 @@ fn countBraceBalance(line: []const u8) i32 {
         if (c == '}' or c == ')') balance -= 1;
     }
     return balance;
+}
+
+/// What the overhang of one giant line contributes to the statement scan
+/// (EPH-I1265): the code-position brace balance and whether a code `;`
+/// appears. The mask buffer drops the overhang (EPH-I1258), so this scan
+/// is the tail's only statement visibility.
+const OverhangStatementScan = struct {
+    brace_balance: i32,
+    has_semicolon: bool,
+};
+
+/// Scan the overhang of `line` past `bound` for statement structure in
+/// code position (EPH-I1265). The classifier walks the whole line, so a
+/// literal opened before the bound (a string, a char literal, or a `\\`
+/// tail) still masks the overhang: its braces and `;` are data. One
+/// ascending walk, O(line) total, only on over-bound lines.
+fn scanOverhangStatement(line: []const u8, bound: usize) OverhangStatementScan {
+    var result: OverhangStatementScan = .{ .brace_balance = 0, .has_semicolon = false };
+    if (line.len <= bound) return result;
+    var cls = LineClassifier.init(line);
+    const comment_start = findCommentStart(line);
+    for (line[bound..], bound..) |c, pos| {
+        if (overhangDataPos(&cls, comment_start, pos)) continue;
+        if (c == '{' or c == '(') result.brace_balance += 1;
+        if (c == '}' or c == ')') result.brace_balance -= 1;
+        if (c == ';') result.has_semicolon = true;
+    }
+    return result;
 }
 
 /// True when a candidate defer line at the alloc's indent actually cleans
@@ -14414,11 +14452,12 @@ fn exitFreeSpanHasExitKeyword(
 }
 
 /// True when a masked line in `start_line..end_line` (inclusive) carries
-/// an exit keyword (EPH-I0116). Lines longer than the mask buffer drop
-/// their overhang (fail closed, EPH-I1258), so prose past the bound never
-/// reads as an exit keyword. The two exit-keyword range probes
-/// (spanHasExitKeyword's former walk, conditionSpanHasExitKeyword's
-/// second walk) share the scan.
+/// an exit keyword (EPH-I0116). The masked head of a line longer than
+/// the mask buffer drops its overhang (fail closed, EPH-I1258), and the
+/// overhang scan (EPH-I1265) adds code-position exits past the bound —
+/// prose never reads as an exit keyword in either half. The two
+/// exit-keyword range probes (spanHasExitKeyword's former walk,
+/// conditionSpanHasExitKeyword's second walk) share the scan.
 fn scanRangeHasExitKeyword(
     lines: []const []const u8,
     func_line: usize,
@@ -14480,10 +14519,44 @@ fn conditionSpanHasExitKeyword(
 /// try` with the operand wrapped) and a bare `return;` in a
 /// multi-statement line — the two shapes that let the exit-free
 /// relaxation suppress a genuine ZA101.
+/// The masked head drops the overhang past the 16 KiB bound
+/// (EPH-I1258). The overhang scan (EPH-I1265, serves REL-REDTEAM-4)
+/// keeps a real exit past the bound visible: code-position keywords
+/// there count, literal tail content never does.
 fn maskedLineHasExitKeyword(line: []const u8, blank_buf: *[16 * 1024]u8) bool {
     const code = maskedCodeLine(line, blank_buf);
     return hasRealWordKeyword(code, "return") or hasRealWordKeyword(code, "try") or
-        hasRealWordKeyword(code, "break") or hasRealWordKeyword(code, "continue");
+        hasRealWordKeyword(code, "break") or hasRealWordKeyword(code, "continue") or
+        overhangHasExitKeyword(line, blank_buf.len);
+}
+
+/// True when the byte at `pos` on a giant line is data, not code
+/// (EPH-I1265): inside any literal (the classifier carries the whole
+/// line, so a literal opened before the mask bound still masks the
+/// overhang) or at/after the line's comment start. Queries ascend.
+fn overhangDataPos(cls: *LineClassifier, comment_start: ?usize, pos: usize) bool {
+    return cls.isInsideLiteral(pos) or (comment_start != null and pos >= comment_start.?);
+}
+
+/// True when the overhang of a giant line (past `bound`) carries a
+/// word-bounded return/try/break/continue at a code position
+/// (EPH-I1265). The mask buffer drops the overhang (EPH-I1258), so this
+/// scan is the tail's only exit visibility: a real exit past the bound
+/// still blocks the exit-free relaxation, and literal tail content never
+/// reads as one. The walk starts seven bytes before the bound, so a
+/// keyword split by the bound still matches. One ascending classifier
+/// walk, O(line) total, only on over-bound lines.
+fn overhangHasExitKeyword(line: []const u8, bound: usize) bool {
+    if (line.len <= bound) return false;
+    const scan_start = bound -| 7;
+    var cls = LineClassifier.init(line);
+    const comment_start = findCommentStart(line);
+    for (scan_start..line.len) |pos| {
+        if (overhangDataPos(&cls, comment_start, pos)) continue;
+        if (wordAt(line, pos, "return") or wordAt(line, pos, "try") or
+            wordAt(line, pos, "break") or wordAt(line, pos, "continue")) return true;
+    }
+    return false;
 }
 
 /// True when a word-bounded `kw` sits at a code position: identifier
@@ -23327,8 +23400,11 @@ fn maskLiteralContents(line: []const u8, buf: []u8, mode: QuotedNameMode) []cons
 /// identifier opener (a real string literal — the caller falls through
 /// to the string skip) or when the name never closes on this line (the
 /// caller's string skip blanks it the classic way). `.keep` copies a
-/// brace-free name verbatim and blanks a brace-bearing one (its brace
-/// never reaches brace tracking); `.blank` blanks the span outright.
+/// brace-free name with its `;` and `//` bytes masked (EPH-I1270,
+/// serves REL-REDTEAM-4: the copied stream is a masked body, and those
+/// bytes are name data, never statement or comment structure) and
+/// blanks a brace-bearing one (its brace never reaches brace tracking);
+/// `.blank` blanks the span outright.
 fn maskQuotedIdent(line: []const u8, buf: []u8, i: usize, mode: QuotedNameMode) ?usize {
     if (mode != .keep or line[i] != '"' or i == 0 or line[i - 1] != '@') return null;
     const end = skipQuotedIdent(line, i + 2);
@@ -23341,7 +23417,7 @@ fn maskQuotedIdent(line: []const u8, buf: []u8, i: usize, mode: QuotedNameMode) 
     if (spanHasBrace(line, i, end)) {
         blankRange(buf, i, stop);
     } else {
-        @memcpy(buf[i..stop], line[i..stop]);
+        _ = copyMaskedQuotedName(buf[i..stop], line[i..stop]);
     }
     return stop;
 }
@@ -23354,6 +23430,35 @@ fn spanHasBrace(text: []const u8, start: usize, end: usize) bool {
         if (ch == '{' or ch == '}') return true;
     }
     return false;
+}
+
+/// Write `name` into `dst` with the structural bytes of a quoted name
+/// masked (EPH-I1270): each `;` and each `/` of a `//` pair becomes a
+/// space, every other byte copies. The output keeps the input length
+/// (substitutions only), so the caller bounds `dst` to the name. The
+/// masked stream never carries a fake statement terminator or comment
+/// opener, and the ZA405 membership probe masks the search word the
+/// same way.
+fn copyMaskedQuotedName(dst: []u8, name: []const u8) []const u8 {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < name.len) {
+        if (name[i] == ';') {
+            dst[w] = ' ';
+            i += 1;
+            w += 1;
+        } else if (name[i] == '/' and i + 1 < name.len and name[i + 1] == '/') {
+            dst[w] = ' ';
+            dst[w + 1] = ' ';
+            i += 2;
+            w += 2;
+        } else {
+            dst[w] = name[i];
+            i += 1;
+            w += 1;
+        }
+    }
+    return dst[0..w];
 }
 
 /// Blank `buf[start..end]` to spaces (literal content never reaches brace
@@ -29270,8 +29375,10 @@ fn checkUnusedParams(
         if (containsIdentWord(bodies.masked, p.name)) continue;
         // A `@"name"` reference blanks on the classic surface: the
         // keep-quoted surface preserves it, so the escaped-identifier
-        // param still counts as used (EPH-I1249).
-        if (p.name[0] == '@' and containsIdentWord(bodies.keep_quoted, p.name)) continue;
+        // param still counts as used (EPH-I1249). The keep stream masks
+        // the `;` and `//` bytes inside kept names (EPH-I1270), so the
+        // probe word masks the same way.
+        if (p.name[0] == '@' and keepQuotedParamUsed(bodies.keep_quoted, p.name)) continue;
         const msg = try std.fmt.allocPrint(
             c.allocator,
             "function '{s}' never uses parameter '{s}'",
@@ -29284,6 +29391,30 @@ fn checkUnusedParams(
             .help = "remove the unused parameter or reference it",
         });
     }
+}
+
+/// True when the keep-quoted stream references `name` (EPH-I1249). The
+/// stream masks the `;` and `//` bytes inside kept quoted names
+/// (EPH-I1270), so the probe word masks the same way. A name whose
+/// masked bytes overflow the word buffer reads as used: the probe skips
+/// instead of firing a false positive (the 128-byte quoted-name bound).
+fn keepQuotedParamUsed(keep_quoted: []const u8, name: []const u8) bool {
+    var buf: [128]u8 = undefined;
+    const word = maskedQuotedWord(name, &buf) orelse return true;
+    return containsIdentWord(keep_quoted, word);
+}
+
+/// The probe word for `name` on the keep-quoted stream (EPH-I1270), or
+/// null when the name carries `;`/`//` bytes past the buffer bound.
+/// A name without those bytes returns itself. Names that differ only in
+/// `;`/`//`-vs-space runs share the masked form: a reference to one
+/// reads as the other — an accepted false-negative bound on a shape real
+/// signatures never carry.
+fn maskedQuotedWord(name: []const u8, buf: []u8) ?[]const u8 {
+    if (mem.indexOfScalar(u8, name, ';') == null and
+        mem.indexOf(u8, name, "//") == null) return name;
+    if (name.len > buf.len) return null;
+    return copyMaskedQuotedName(buf[0..name.len], name);
 }
 
 // --- ZA406/ZA507/ZA508: body-shape detectors (EPH-I1085/I1079/I1078) ---------
@@ -36875,12 +37006,16 @@ fn guardLineHasSameLineExit(line: []const u8, pred_col: usize) bool {
 /// Position of the `)` that closes the `(` at `open` (quote-aware from
 /// the open position), or null when the group is unterminated. The quote
 /// mode starts in code position at open + 1, like the pre-migration
-/// `i = open + 1` walk (EPH-I1232 C2b).
+/// `i = open + 1` walk (EPH-I1232 C2b). A mid-line `\\` opener cuts the
+/// scan (EPH-I1269): its tail is string data, so the group reads
+/// unterminated instead of closing at a fake `)` (an invalid-Zig shape —
+/// valid Zig closes the group on a later line).
 fn parenCloseAt(t: []const u8, open: usize) ?usize {
     var depth: usize = 1;
     var walk = QuoteWalk.initAt(t, open + 1);
     while (walk.next()) |i| : (walk.advance()) {
         const c = t[i];
+        if (types.isMultilineOpenerAt(t, i)) break;
         if (c == '(') {
             depth += 1;
             continue;
@@ -61142,6 +61277,62 @@ test "ZA101: end-of-line try and bare return inside the loop stay loud (EPH-I117
     );
 }
 
+test "ZA101: an end-of-line try in the 16 KiB overhang still blocks the relaxation (EPH-I1265)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The fail-closed mask drop (EPH-I1258) hid a real end-of-line try
+    // past byte 16384 (the EPH-I1179 shape with the keyword in the
+    // overhang): the CFG models no edge for it, the masked head carried
+    // no keyword, and the loop read exit-free — the free covered and a
+    // genuine ZA101 stayed silent. The overhang scan restores the exit.
+    // The sub-bound control pins the same verdict on the pre-existing
+    // head path (the exit counts once either way).
+    var content = std.ArrayListUnmanaged(u8).empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator,
+        \\fn giant_eol_try(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    var j: u32 = 0;
+        \\    while (j < 3) : (j += 1) {
+        \\        if (c) {
+        \\
+    );
+    // Pad the guarded statement past the 16 KiB mask bound, then end the
+    // line with the try.
+    try content.appendNTimes(allocator, ' ', 16 * 1024 + 1);
+    try content.appendSlice(allocator,
+        \\ try
+        \\            fail();
+        \\        }
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn sub_eol_try(allocator: std.mem.Allocator, c: bool) !void {
+        \\    const buf = try allocator.alloc(u8, 10);
+        \\    var j: u32 = 0;
+        \\    while (j < 3) : (j += 1) {
+        \\        if (c) try
+        \\            fail();
+        \\    }
+        \\    allocator.free(buf);
+        \\}
+        \\fn fail() !void {
+        \\    return error.Bad;
+        \\}
+    );
+    var run = try runCFGMemoryTest(&diag, allocator, "test_giant_eol_try_101.zig", content.items);
+    defer run.deinit(allocator);
+
+    // Both tries block the relaxation: the free does not always run.
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countRuleIssues(run.issues.items, "test_giant_eol_try_101.zig", RULE_ALLOC_NO_DEFER),
+    );
+}
+
 test "ZA101: defer after the only return stays silent (EPH-I0348 lock)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -74908,6 +75099,46 @@ test "statement-end mask fails closed past the 16 KiB bound (EPH-I1258)" {
     try std.testing.expectEqual(@as(usize, 2), findAllocStatementEnd(&lines, 0));
 }
 
+test "statement end sees a code-position ; in the 16 KiB overhang (EPH-I1265)" {
+    const allocator = std.testing.allocator;
+    // One giant continuation line: padding then `);` past the bound.
+    // Pre-fix the overhang dropped, so the code `;` never closed the
+    // alloc statement and the scan fell through to the start line.
+    // Post-fix the depth-0 `;` ends the statement on the giant line.
+    var giant = std.ArrayListUnmanaged(u8).empty;
+    defer giant.deinit(allocator);
+    while (giant.items.len < 16 * 1024 + 1) try giant.append(allocator, 'a');
+    try giant.appendSlice(allocator, ");");
+    const lines = [_][]const u8{
+        "const buf = try allocator.alloc(",
+        giant.items,
+        "_ = buf;",
+    };
+    try std.testing.expectEqual(@as(usize, 1), findAllocStatementEnd(&lines, 0));
+}
+
+test "exit scan sees a code-position break in the 16 KiB overhang (EPH-I1265)" {
+    const allocator = std.testing.allocator;
+    // A giant code line whose tail carries ` break; }` past the bound.
+    // Pre-fix the overhang dropped and the break was invisible; post-fix
+    // the overhang scan sees it.
+    var giant = std.ArrayListUnmanaged(u8).empty;
+    defer giant.deinit(allocator);
+    try giant.appendSlice(allocator, "if (c) { ");
+    while (giant.items.len < 16 * 1024 + 1) try giant.append(allocator, ' ');
+    try giant.appendSlice(allocator, " break; }");
+    var blank_buf: [16 * 1024]u8 = undefined;
+    try std.testing.expect(maskedLineHasExitKeyword(giant.items, &blank_buf));
+    // Fail-closed control: the same tail inside a string is data, so the
+    // overhang scan reports no exit.
+    var stringy = std.ArrayListUnmanaged(u8).empty;
+    defer stringy.deinit(allocator);
+    try stringy.appendSlice(allocator, "const s = \"");
+    while (stringy.items.len < 16 * 1024 + 1) try stringy.append(allocator, ' ');
+    try stringy.appendSlice(allocator, " break; }\";");
+    try std.testing.expect(!maskedLineHasExitKeyword(stringy.items, &blank_buf));
+}
+
 test "analyzeNaming: error{ in comments and strings does not open an error block" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -76359,6 +76590,23 @@ test "LineWalk.nextClosure paren scan stops at a multiline opener (EPH-I0751)" {
         @as(?usize, 5),
         walk.nextClosure(bracketGroupClosed, &depth, &mode),
     );
+}
+
+test "loopCondCloseCol cuts a multiline opener tail (EPH-I1269)" {
+    // A `\\` opener swallows the rest of the line: the fake `)` in the
+    // tail never closes the condition group (an invalid-Zig shape —
+    // valid Zig closes the group on a later line).
+    try std.testing.expect(loopCondCloseCol("for (\\\\ ) |x| {") == null);
+    // Control: a real close still resolves.
+    try std.testing.expectEqual(@as(?usize, 9), loopCondCloseCol("for (0..9) |x| {"));
+}
+
+test "parenCloseAt cuts a multiline opener tail (EPH-I1269)" {
+    // The tail `)` is string data: the group reads unterminated instead
+    // of closing at a fake column (an invalid-Zig shape).
+    try std.testing.expect(parenCloseAt("if (x \\\\ ) {", 3) == null);
+    // Control: a real close still resolves.
+    try std.testing.expectEqual(@as(?usize, 5), parenCloseAt("if (x) return", 3));
 }
 
 test "LineWalk.nextChar yields code chars and cuts at openers (EPH-I1232 C3)" {
@@ -129571,6 +129819,58 @@ test "ZA405 counts an escaped-identifier body reference as a use (EPH-I1249)" {
     // `@"callconv"` is the control that the pass ran.
     try std.testing.expectEqual(@as(usize, 1), run.unused.items.len);
     try std.testing.expect(mem.indexOf(u8, run.unused.items[0].message, "@\"callconv\"") != null);
+}
+
+test "keep-quoted stream masks ; and // bytes inside kept names (EPH-I1270)" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var keep: std.ArrayListUnmanaged(u8) = .empty;
+    try appendMaskedBodyKeepQuoted(arena.allocator(), &keep,
+        \\    _ = @"a;b";
+        \\    _ = @"a//b";
+    );
+    // The stream is a masked body: the structural bytes of the kept
+    // names never survive (pre-fix they copied verbatim), and the real
+    // statement terminators stay.
+    try std.testing.expectEqualStrings(
+        "    _ = @\"a b\";\n    _ = @\"a  b\";\n",
+        keep.items,
+    );
+    // The masked forms stay searchable for the membership probe.
+    try std.testing.expect(containsIdentWord(keep.items, "@\"a b\""));
+    try std.testing.expect(containsIdentWord(keep.items, "@\"a  b\""));
+}
+
+test "ZA405 treats a ;-carrying quoted name like a clean one (EPH-I1270)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\fn used(@"a;b": u32) u32 {
+        \\    return @"a;b";
+        \\}
+        \\fn unused(@"a;b": u32) void {
+        \\    _ = 1;
+        \\}
+        \\fn slash_used(@"a//b": u32) u32 {
+        \\    return @"a//b";
+        \\}
+        \\fn slash_unused(@"a//b": u32) void {
+        \\    _ = 1;
+        \\}
+    );
+    defer run.deinit(allocator);
+    // The referenced names stay silent (the mask keeps them probeable);
+    // the two genuinely unused names are the control that the pass ran.
+    try std.testing.expectEqual(@as(usize, 2), run.unused.items.len);
+    var saw_semi = false;
+    var saw_slash = false;
+    for (run.unused.items) |issue| {
+        if (mem.indexOf(u8, issue.message, "@\"a;b\"") != null) saw_semi = true;
+        if (mem.indexOf(u8, issue.message, "@\"a//b\"") != null) saw_slash = true;
+    }
+    try std.testing.expect(saw_semi);
+    try std.testing.expect(saw_slash);
 }
 
 test "ZA405 reads the trailing initializer block of a struct-return fn (EPH-I1250)" {

@@ -684,6 +684,12 @@ error: minisign is not installed or not on PATH.
             # the platform newline (CRLF on Windows), which would break
             # the two-line pubkey wire shape minisign parses, so the
             # bytes go through WriteAllText with an explicit LF tail.
+            # Recorded limitation (EPH-I1287): no test discriminates this
+            # write on the POSIX dev host (a POSIX pin is masked). The
+            # discriminator design: a fake minisign records the written
+            # pubkey bytes, and a Windows-run suite asserts zero CR bytes
+            # plus exactly one trailing LF. The WP-7 live pwsh leg runs
+            # that check manually and records it in the release evidence.
             [System.IO.File]::WriteAllText($pubkeyPath, $ReleasePubkey + [char]10)
             # EPH-I0645: capture the exit code under "Continue" like the
             # fetch steps, or PowerShell 7.4+ throws before this code

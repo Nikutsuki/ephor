@@ -47601,11 +47601,13 @@ const InstallFetchTarget = struct {
 /// Install-side fetch with the 0x0-fingerprint repair (EPH-I0718). A
 /// hand-made build.zig.zon (install.sh creates one) carries
 /// `.fingerprint = 0x0`, and zig fetch answers with a "use this value"
-/// hint naming the computed fingerprint after the package fetch. The
-/// first attempt captures the output. A failure whose output carries the
-/// hint patches the zon and refetches once, matching install.sh's repair
-/// (install.sh:443-461). A failure without the hint relays the captured
-/// error, then fails the install. The second fetch is authoritative.
+/// hint naming the computed fingerprint after the package fetch. A zon
+/// without the field draws the sibling "suggested value" hint, and the
+/// repair adds the field (EPH-I1291). The first attempt captures the
+/// output. A failure whose output carries a hint patches the zon and
+/// refetches once, matching install.sh's repair (install.sh:443-461). A
+/// failure without the hint relays the captured error, then fails the
+/// install. The second fetch is authoritative.
 fn runInstallFetch(
     diag: *DiagCtx,
     allocator: Allocator,
@@ -47666,9 +47668,10 @@ fn relayFetchStderr(diag: *DiagCtx, allocator: Allocator, stderr: []const u8) vo
 }
 
 /// Fingerprint hint from a failed zig fetch, searching stderr first then
-/// stdout (EPH-I0718). zig prints "use this value: 0x<hex>" on the error
-/// stream. The stdout arm covers a toolchain that prints diagnostics on
-/// the merged stream. Caller frees the result.
+/// stdout (EPH-I0718). zig prints "use this value: 0x<hex>" or
+/// "suggested value: 0x<hex>" (EPH-I1291) on the error stream. The
+/// stdout arm covers a toolchain that prints diagnostics on the merged
+/// stream. Caller frees the result.
 fn parseFingerprintHintFromResult(
     allocator: Allocator,
     stdout: []const u8,
@@ -47677,15 +47680,28 @@ fn parseFingerprintHintFromResult(
     return parseFingerprintHint(allocator, stderr) orelse parseFingerprintHint(allocator, stdout);
 }
 
-/// Parse the first fingerprint hint in one stream (EPH-I0718). The value
-/// must carry at least one hex digit after the "0x" prefix (a bare "0x"
-/// would write a broken zon — the install.sh EPH-I0634 guard). Returns
-/// the "0x"-prefixed hex value zig names, so the patched zon carries the
-/// value byte-for-byte as zig computed it. Caller frees the result.
+/// Parse the first fingerprint hint in one stream (EPH-I0718, EPH-I1291).
+/// zig 0.16.0 emits two hint shapes: "use this value: 0x<hex>" for the
+/// 0x0 placeholder and "suggested value: 0x<hex>" for the missing field.
+/// The value must carry at least one hex digit after the "0x" prefix (a
+/// bare "0x" would write a broken zon — the install.sh EPH-I0634 guard).
+/// The earliest hint in the stream wins, whichever shape it carries
+/// (the install.sh grep -m1 parity). Returns the "0x"-prefixed hex value
+/// zig names, so the patched zon carries the value byte-for-byte as zig
+/// computed it. Caller frees the result.
 fn parseFingerprintHint(allocator: Allocator, output: []const u8) ?[]u8 {
-    const marker = "use this value: ";
-    const idx = mem.indexOf(u8, output, marker) orelse return null;
-    const start = idx + marker.len;
+    const markers = [_][]const u8{ "suggested value: ", "use this value: " };
+    var hint_idx: ?usize = null;
+    var hint_marker: []const u8 = "";
+    for (markers) |marker| {
+        const found = mem.indexOf(u8, output, marker) orelse continue;
+        if (hint_idx == null or found < hint_idx.?) {
+            hint_idx = found;
+            hint_marker = marker;
+        }
+    }
+    const idx = hint_idx orelse return null;
+    const start = idx + hint_marker.len;
     if (start + 2 > output.len or !mem.eql(u8, output[start .. start + 2], "0x")) return null;
     var end = start + 2;
     while (end < output.len and std.ascii.isHex(output[end])) end += 1;
@@ -47706,11 +47722,16 @@ fn readBuildZigZon(io: std.Io, allocator: Allocator, project_dir: std.Io.Dir) ?[
     ) catch null;
 }
 
-/// Patch `.fingerprint = 0x0` to the hinted value in build.zig.zon
-/// (EPH-I0718). The marker is masked to code positions like every
-/// install/upgrade zon splice: a mention inside a comment or a string
-/// must not be rewritten. Returns true only when the marker sat in code
-/// and the write succeeded.
+/// Patch `.fingerprint = 0x0` to the hinted value in build.zig.zon, or
+/// add the field when it is missing (EPH-I0718, EPH-I1291). The marker
+/// is masked to code positions like every install/upgrade zon splice: a
+/// mention inside a comment or a string must not be rewritten. A zon
+/// without any code-position fingerprint field gains one right after the
+/// root struct opener — zig 0.16.0 answers that shape with "missing
+/// top-level 'fingerprint' field; suggested value: 0x<hex>". A nonzero
+/// code-position fingerprint fails closed: it is not the 0x0 placeholder
+/// this repair owns. Returns true only when the patch or the add
+/// succeeded and the write succeeded.
 fn patchZonFingerprint(
     io: std.Io,
     allocator: Allocator,
@@ -47719,16 +47740,76 @@ fn patchZonFingerprint(
 ) bool {
     const content = readBuildZigZon(io, allocator, project_dir) orelse return false;
     defer allocator.free(content);
-    const marker = ".fingerprint = 0x0";
-    const pos = indexOfCode(content, 0, marker) orelse return false;
-    var new_content: std.ArrayListUnmanaged(u8) = .empty;
-    defer new_content.deinit(allocator);
-    new_content.appendSlice(allocator, content[0..pos]) catch return false;
-    new_content.appendSlice(allocator, ".fingerprint = ") catch return false;
-    new_content.appendSlice(allocator, hint) catch return false;
-    new_content.appendSlice(allocator, content[pos + marker.len ..]) catch return false;
-    writeFileAtomic(io, project_dir, "build.zig.zon", new_content.items) catch return false;
+    const patched = buildPatchedZon(allocator, content, hint) orelse return false;
+    defer allocator.free(patched);
+    writeFileAtomic(io, project_dir, "build.zig.zon", patched) catch return false;
     return true;
+}
+
+/// Build the repaired zon content (EPH-I0718, EPH-I1291): the 0x0 patch
+/// or the added field. Null means the repair refuses — a nonzero
+/// code-position fingerprint is not the placeholder, or the zon shape
+/// defeats the splice (the caller relays the fetch error). Caller frees
+/// the result.
+fn buildPatchedZon(allocator: Allocator, content: []const u8, hint: []const u8) ?[]u8 {
+    const marker = ".fingerprint = 0x0";
+    if (indexOfCode(content, 0, marker)) |pos| {
+        const patch = std.fmt.allocPrint(allocator, ".fingerprint = {s}", .{hint}) catch
+            return null;
+        defer allocator.free(patch);
+        return spliceZonText(allocator, content[0..pos], content[pos + marker.len ..], patch);
+    }
+    if (indexOfCode(content, 0, ".fingerprint") != null) return null;
+    return insertZonFingerprintText(allocator, content, hint);
+}
+
+/// Splice `text` between `before` and `after` and return the rebuilt
+/// content (EPH-I0718). Caller frees the result.
+fn spliceZonText(
+    allocator: Allocator,
+    before: []const u8,
+    after: []const u8,
+    text: []const u8,
+) ?[]u8 {
+    const out_len = before.len + text.len + after.len;
+    const out = allocator.alloc(u8, out_len) catch return null;
+    @memcpy(out[0..before.len], before);
+    @memcpy(out[before.len .. before.len + text.len], text);
+    @memcpy(out[before.len + text.len ..], after);
+    return out;
+}
+
+/// EPH-I1291: the zon has no code-position fingerprint field, so zig
+/// 0.16.0 printed "missing top-level 'fingerprint' field; suggested
+/// value: 0x<hex>". Build the zon with the field added right after the
+/// root struct opener, the first code-position brace (a zon that reached
+/// the fingerprint error has a valid root struct, so the brace always
+/// exists). An opener that owns its line takes a new indented field line
+/// after it; a one-line zon takes the inline form. Caller frees the
+/// result.
+fn insertZonFingerprintText(allocator: Allocator, content: []const u8, hint: []const u8) ?[]u8 {
+    const open = indexOfCode(content, 0, "{") orelse return null;
+    const line_start = if (mem.lastIndexOfScalar(u8, content[0..open], '\n')) |nl| nl + 1 else 0;
+    const line_end = mem.indexOfScalarPos(u8, content, open, '\n') orelse content.len;
+    if (mem.trim(u8, content[open + 1 .. line_end], " \t\r").len != 0) {
+        const field_inline = std.fmt.allocPrint(allocator, " .fingerprint = {s}, ", .{hint}) catch
+            return null;
+        defer allocator.free(field_inline);
+        return spliceZonText(allocator, content[0 .. open + 1], content[open + 1 ..], field_inline);
+    }
+    const after_open_line: usize = if (line_end < content.len) line_end + 1 else line_end;
+    const field_line = std.fmt.allocPrint(
+        allocator,
+        "{s}    .fingerprint = {s},\n",
+        .{ content[line_start..open], hint },
+    ) catch return null;
+    defer allocator.free(field_line);
+    return spliceZonText(
+        allocator,
+        content[0..after_open_line],
+        content[after_open_line..],
+        field_line,
+    );
 }
 
 /// Patch the project's build.zig after a successful fetch (EPH-I0235). A
@@ -127782,25 +127863,35 @@ test "install refuses a detected Zig below 0.16.0 before the fetch (EPH-I0239)" 
     );
 }
 
-test "parseFingerprintHint takes the first hint and needs hex digits (EPH-I0718)" {
+test "parseFingerprintHint takes the first hint and needs hex digits (EPH-I0718, EPH-I1291)" {
     const allocator = std.testing.allocator;
-    const real_line =
+    // The two real zig 0.16.0 error texts (EPH-I1291): the missing-field
+    // shape and the 0x0-placeholder shape. Both must parse.
+    const missing_line =
+        "build.zig.zon:1:2: error: missing top-level 'fingerprint' field; suggested value: 0xd75e6f2a0588dd40\n";
+    const zero_line =
         "build.zig.zon:1:2: error: invalid fingerprint: 0x0; if this is a new or forked " ++
         "package, use this value: 0xd75e6f2a0588dd40\n";
-    const hint = parseFingerprintHint(allocator, real_line) orelse
+    const hint_missing = parseFingerprintHint(allocator, missing_line) orelse
         return error.TestUnexpectedResult;
-    defer allocator.free(hint);
-    try std.testing.expectEqualStrings("0xd75e6f2a0588dd40", hint);
+    defer allocator.free(hint_missing);
+    try std.testing.expectEqualStrings("0xd75e6f2a0588dd40", hint_missing);
+    const hint_zero = parseFingerprintHint(allocator, zero_line) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(hint_zero);
+    try std.testing.expectEqualStrings("0xd75e6f2a0588dd40", hint_zero);
 
-    // The first hint wins, mirroring install.sh's grep -m1 (EPH-I0634).
-    const two_hints = "use this value: 0xaaa\nuse this value: 0xbbb\n";
+    // The first hint wins across shapes, mirroring install.sh's grep -m1
+    // (EPH-I0634, EPH-I1291).
+    const two_hints = "suggested value: 0xaaa\nuse this value: 0xbbb\n";
     const first = parseFingerprintHint(allocator, two_hints) orelse
         return error.TestUnexpectedResult;
     defer allocator.free(first);
     try std.testing.expectEqualStrings("0xaaa", first);
 
-    // A bare "0x" would write a broken zon: rejected.
+    // A bare "0x" would write a broken zon: rejected, both shapes.
     try std.testing.expect(parseFingerprintHint(allocator, "use this value: 0x ") == null);
+    try std.testing.expect(parseFingerprintHint(allocator, "suggested value: 0x ") == null);
     try std.testing.expect(parseFingerprintHint(allocator, "no hint here") == null);
 }
 
@@ -127826,17 +127917,44 @@ test "patchZonFingerprint patches code positions only (EPH-I0718)" {
     try std.testing.expect(mem.indexOf(u8, after, ".fingerprint = 0xd75e6f2a0588dd40") != null);
     try std.testing.expect(mem.indexOf(u8, after, "0x0") == null);
 
-    // A comment-only mention is not a fingerprint: the patch refuses.
+    // EPH-I1291: a comment-only mention is not a field, so the field is
+    // genuinely missing and the patch adds it; the comment stays intact.
     var tmp_comment = std.testing.tmpDir(.{});
     defer tmp_comment.cleanup();
     try tmp_comment.dir.writeFile(std.testing.io, .{
         .sub_path = "build.zig.zon",
         .data = ".{ .name = .demo, .paths = .{ \"build.zig\" } } // .fingerprint = 0x0\n",
     });
-    try std.testing.expect(!patchZonFingerprint(
+    try std.testing.expect(patchZonFingerprint(
         std.testing.io,
         allocator,
         tmp_comment.dir,
+        "0xd75e6f2a0588dd40",
+    ));
+    const after_comment = try tmp_comment.dir.readFileAlloc(
+        std.testing.io,
+        "build.zig.zon",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(after_comment);
+    const added_field = ".fingerprint = 0xd75e6f2a0588dd40";
+    try std.testing.expect(mem.indexOf(u8, after_comment, added_field) != null);
+    try std.testing.expect(mem.indexOf(u8, after_comment, "// .fingerprint = 0x0") != null);
+
+    // EPH-I1291: a nonzero code-position fingerprint is not the 0x0
+    // placeholder this repair owns: the patch refuses (the caller relays
+    // the fetch error instead of overwriting a stale value).
+    var tmp_stale = std.testing.tmpDir(.{});
+    defer tmp_stale.cleanup();
+    try tmp_stale.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig.zon",
+        .data = ".{ .name = .demo, .fingerprint = 0x1234, .paths = .{ \"build.zig\" } }\n",
+    });
+    try std.testing.expect(!patchZonFingerprint(
+        std.testing.io,
+        allocator,
+        tmp_stale.dir,
         "0xd75e6f2a0588dd40",
     ));
 }
@@ -127891,6 +128009,55 @@ test "runInstallFetch repairs a 0x0 fingerprint and refetches (EPH-I0718)" {
     defer allocator.free(after);
     try std.testing.expect(mem.indexOf(u8, after, ".fingerprint = 0xabc123def") != null);
     try std.testing.expect(mem.indexOf(u8, after, ".fingerprint = 0x0") == null);
+}
+
+test "runInstallFetch adds a missing fingerprint field and refetches (EPH-I1291)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // The WP-7 live-leg shape: a pre-existing zon without a fingerprint
+    // field. zig 0.16.0 answers "missing top-level 'fingerprint' field;
+    // suggested value: 0x<hex>" and the repair must add the field.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig.zon",
+        .data = ".{ .name = .demo, .version = \"0.0.0\", .paths = .{ \"build.zig\" } }\n",
+    });
+    const script =
+        "#!/bin/sh\n" ++
+        "n=0\n" ++
+        "[ -f fetchcount ] && n=$(cat fetchcount)\n" ++
+        "n=$((n+1)); echo $n > fetchcount\n" ++
+        "if [ \"$n\" -eq 1 ]; then\n" ++
+        "  echo \"build.zig.zon:1:2: error: missing top-level 'fingerprint' field; " ++
+        "suggested value: 0xabc123def\" >&2\n" ++
+        "  exit 2\n" ++
+        "fi\n" ++
+        "exit 0\n";
+    const fake_path = try installFakeZig(&tmp, allocator, script);
+    defer allocator.free(fake_path);
+    const saved_zig_path = tool_zig_path;
+    defer tool_zig_path = saved_zig_path;
+    tool_zig_path = fake_path;
+    const url_z = try allocator.dupeZ(u8, "https://example.invalid/ephor.tar.gz");
+    defer allocator.free(url_z);
+
+    try runInstallFetch(&diag, allocator, tmp.dir, .{
+        .url_z = url_z,
+        .package_url = "https://example.invalid/ephor.tar.gz",
+    });
+
+    const after = try tmp.dir.readFileAlloc(
+        std.testing.io,
+        "build.zig.zon",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(after);
+    try std.testing.expect(mem.indexOf(u8, after, ".fingerprint = 0xabc123def") != null);
+    try std.testing.expect(mem.indexOf(u8, after, ".name = .demo") != null);
 }
 
 test "setOwnedPath OOM keeps the old path freeable exactly once" {

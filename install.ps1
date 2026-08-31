@@ -754,22 +754,30 @@ error: minisign is not installed or not on PATH.
     # content, a // comment ends the line's code, a \\-led multiline
     # body line is string data, and a mid-line \\ opener consumes the
     # rest of the line as string data (EPH-I1283, the Zig-side EPH-I0671
-    # semantics). The first code-position marker wins the repair. Returns
-    # the patched zon, or $null when no marker sits in code (the caller
-    # prints the clear error). The match regex keeps the EPH-I0648
-    # flexibility: any spacing around the placeholder, and \b stops a
-    # real fingerprint that starts with 0x0 from matching as the
-    # placeholder prefix.
+    # semantics). The first code-position marker wins the repair. A
+    # code-position fingerprint with any other value fails closed (the
+    # caller prints the clear error); a zon with no code-position
+    # fingerprint field gains one right after the root struct opener,
+    # the shape zig 0.16.0 answers with "missing top-level 'fingerprint'
+    # field; suggested value: 0x<hex>" (EPH-I1291). Returns the patched
+    # zon, or $null when a nonzero field sits in code or no root opener
+    # exists. The match regex keeps the EPH-I0648 flexibility: any
+    # spacing around the placeholder, and \b stops a real fingerprint
+    # that starts with 0x0 from matching as the placeholder prefix.
     function Repair-ZonFingerprint {
         param([string]$Zon, [string]$Hint)
         $repaired = $false
+        $hasFingerprintField = $false
+        $rootOpenLine = -1
+        $rootOpenCol = -1
+        $rootOpenIndent = ""
         $lines = $Zon -split "`n"
         for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($repaired) { break }
             $line = $lines[$i]
             $pos = 0
             while ($pos -lt $line.Length -and $line[$pos] -eq ' ') { $pos++ }
             while ($pos -lt $line.Length -and $line[$pos] -eq "`t") { $pos++ }
+            $lineIndent = $line.Substring(0, $pos)
             if ($pos -lt $line.Length -and $line[$pos] -eq '\') { continue }
             $inString = $false
             $inChar = $false
@@ -791,6 +799,11 @@ error: minisign is not installed or not on PATH.
                     $line[$pos + 1] -eq '/') { break }
                 if ($c -eq '\' -and ($pos + 1) -lt $line.Length -and
                     $line[$pos + 1] -eq '\') { break }
+                if ($c -eq '{' -and $rootOpenLine -lt 0) {
+                    $rootOpenLine = $i
+                    $rootOpenCol = $pos
+                    $rootOpenIndent = $lineIndent
+                }
                 if ($c -eq '.') {
                     $tail = $line.Substring($pos)
                     if ($tail -cmatch '^\.fingerprint[ \t]*=[ \t]*0x0\b') {
@@ -801,11 +814,38 @@ error: minisign is not installed or not on PATH.
                         $repaired = $true
                         break
                     }
+                    if ($tail -cmatch '^\.fingerprint\b') {
+                        $hasFingerprintField = $true
+                    }
                 }
                 $pos++
             }
+            if ($repaired) { break }
         }
-        if (-not $repaired) { return $null }
+        if (-not $repaired) {
+            if ($hasFingerprintField -or $rootOpenLine -lt 0) { return $null }
+            $openLine = $lines[$rootOpenLine]
+            $restOfLine = $openLine.Substring($rootOpenCol + 1)
+            $newLines = New-Object System.Collections.Generic.List[string]
+            if ($restOfLine.Trim().Length -eq 0) {
+                # The opener owns its line: insert an indented field line
+                # after it.
+                for ($j = 0; $j -le $rootOpenLine; $j++) { $newLines.Add($lines[$j]) }
+                $newLines.Add($rootOpenIndent + "    " + ".fingerprint = $Hint" + ",")
+                for ($j = $rootOpenLine + 1; $j -lt $lines.Count; $j++) {
+                    $newLines.Add($lines[$j])
+                }
+            } else {
+                # A one-line zon: insert the field inline after the opener.
+                $newLines.Add(($openLine.Substring(0, $rootOpenCol + 1) +
+                    " .fingerprint = $Hint" + ", " +
+                    $openLine.Substring($rootOpenCol + 1)))
+                for ($j = $rootOpenLine + 1; $j -lt $lines.Count; $j++) {
+                    $newLines.Add($lines[$j])
+                }
+            }
+            $lines = $newLines.ToArray()
+        }
         return [string]::Join("`n", $lines)
     }
 
@@ -813,8 +853,9 @@ error: minisign is not installed or not on PATH.
     # EPH-I0192: zig fetch reads build.zig.zon but never runs build.zig,
     # so a hostile build.zig still executes no code here. On a fresh zon
     # with fingerprint 0x0, zig fetch fails and prints a "use this value"
-    # hint with the computed fingerprint. Patch the hint in and fetch
-    # again.
+    # hint with the computed fingerprint. A zon without the field draws
+    # the sibling "suggested value" hint (EPH-I1291). Patch the hint in
+    # and fetch again.
     # PowerShell 7.4+ turns a nonzero native exit into a terminating
     # error under "Stop". Relax the preference so this code can inspect
     # the failure.
@@ -825,8 +866,12 @@ error: minisign is not installed or not on PATH.
     $ErrorActionPreference = $prevEAP
     if ($null -eq $fetchRc) { $fetchRc = 1 }
     if ($fetchRc -ne 0) {
-        if ($fetchOut -match 'use this value: (0x[0-9a-f]+)') {
-            $suggested = $Matches[1]
+        # EPH-I1291: zig 0.16.0 emits two hint shapes — "use this value"
+        # for the 0x0 placeholder and "suggested value" for the missing
+        # field — so the pattern accepts both. $Matches[2] is the hex
+        # value; $Matches[1] is the prefix alternation.
+        if ($fetchOut -match '(use this value|suggested value): (0x[0-9a-f]+)') {
+            $suggested = $Matches[2]
             # EPH-I1273: bound the repair read like the probe reads. The
             # probe's zon cap fired earlier for a zon that was already
             # oversized, so this check covers the window a concurrent

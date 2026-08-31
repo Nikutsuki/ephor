@@ -1,7 +1,9 @@
 # Regression pins for the RED3 re-derivation wave fixes in install.ps1:
 # EPH-I1272 (fingerprint repair targets the code-position field),
 # EPH-I1273 (byte caps on the local build.zig and build.zig.zon reads),
-# and EPH-I1274 (the echoed project dir name is terminal-sanitized).
+# EPH-I1274 (the echoed project dir name is terminal-sanitized), and
+# EPH-I1291 (both real zig 0.16.0 hint shapes parse; a missing field is
+# added, a nonzero field fails closed).
 # Serves REL-REDTEAM-4. Same harness shape as test-install-ps1-anchor.ps1:
 # the real installer runs as a subprocess against hermetic fixtures. A
 # fake zig on PATH answers version, fetch, and ast-check; a local HTTP
@@ -19,7 +21,9 @@
 # inline code-position field must still repair, so the fix must not
 # degrade to line-start anchoring. A third pin (EPH-I1283) puts the
 # mention inside a mid-line \\ multiline tail: the tail is string data,
-# so the mention must stay intact and the real field must repair.
+# so the mention must stay intact and the real field must repair. A
+# fourth pin (EPH-I1291) drops the real field entirely: the repair adds
+# it inline and a nonzero stale field fails closed.
 #
 # The cap pins create an oversized local file and assert the installer
 # fails closed with the named cap message before Get-Content buffers it.
@@ -77,8 +81,11 @@ New-Item -ItemType Directory -Path $binDir | Out-Null
 
 # The fake zig answers version, and serves every fetch and ast-check with
 # success. When FETCH_FAIL_ONCE names an existing file, the next fetch
-# consumes it, prints a "use this value" hint on stderr, and exits 1 (the
-# fingerprint-repair runs).
+# consumes it, prints its content (the fetch-failure text) on stderr, and
+# exits 1 (the fingerprint-repair runs). The file content carries the
+# hint shape, so each pin selects the real zig 0.16.0 text it pairs with
+# (EPH-I1291: "use this value" for the 0x0 placeholder, "suggested
+# value" for the missing field).
 $fakeZig = Join-Path $binDir "zig"
 Set-Content -Path $fakeZig -Encoding ASCII -Value @(
     '#!/bin/sh'
@@ -89,7 +96,7 @@ Set-Content -Path $fakeZig -Encoding ASCII -Value @(
     'fi'
     'if [ -n "${FETCH_FAIL_ONCE:-}" ] && [ -e "$FETCH_FAIL_ONCE" ]; then'
     '    printf "%s\n" "error: unable to verify package" >&2'
-    '    printf "%s\n" "use this value: 0x1234dead" >&2'
+    '    cat "$FETCH_FAIL_ONCE" >&2'
     '    rm -f "$FETCH_FAIL_ONCE"'
     '    exit 1'
     'fi'
@@ -262,7 +269,7 @@ New-Item -ItemType Directory -Path $D1 | Out-Null
 writeBuildZig $D1
 [System.IO.File]::WriteAllText((Join-Path $D1 "build.zig.zon"), $oneLineZon + "`n")
 $failMarker = Join-Path $D1 "fail-once"
-[System.IO.File]::WriteAllText($failMarker, "")
+[System.IO.File]::WriteAllText($failMarker, "use this value: 0x1234dead`n")
 $fpRun = runInstall -Tag "fpcode" -WorkDir $D1 -FailFetchOnce $failMarker
 
 check "fpcode run exits 0" { $fpRun.rc -eq 0 }
@@ -289,7 +296,7 @@ New-Item -ItemType Directory -Path $D2 | Out-Null
 writeBuildZig $D2
 [System.IO.File]::WriteAllText((Join-Path $D2 "build.zig.zon"), $oneLineZonClean + "`n")
 $failMarker2 = Join-Path $D2 "fail-once"
-[System.IO.File]::WriteAllText($failMarker2, "")
+[System.IO.File]::WriteAllText($failMarker2, "use this value: 0x1234dead`n")
 $fpCleanRun = runInstall -Tag "fpbenign" -WorkDir $D2 -FailFetchOnce $failMarker2
 
 check "fpbenign run exits 0" { $fpCleanRun.rc -eq 0 }
@@ -314,7 +321,7 @@ writeBuildZig $D2b
     ''
 ) -join "`n")
 $failMarker2b = Join-Path $D2b "fail-once"
-[System.IO.File]::WriteAllText($failMarker2b, "")
+[System.IO.File]::WriteAllText($failMarker2b, "use this value: 0x1234dead`n")
 $fpTemplateRun = runInstall -Tag "fptemplate" -WorkDir $D2b -FailFetchOnce $failMarker2b
 
 check "fptemplate run exits 0" { $fpTemplateRun.rc -eq 0 }
@@ -325,29 +332,54 @@ check "fptemplate run leaves the paths mention intact" {
     (readZon $D2b).Contains('"note: .fingerprint = 0x0"')
 }
 
-# The string-only shape: the marker exists only inside a string value.
-# The pre-fix -creplace rewrote the string mention, leaked the hint into
-# the zon, and the second fetch passed, so the install reported success
-# with a corrupted zon. The repair must leave the string alone and fail
-# with the clear message.
+# The string-only shape (EPH-I1291): the ".fingerprint = 0x0" text exists
+# only inside a string value, so the zon has no real field and zig 0.16.0
+# answers "missing top-level 'fingerprint' field; suggested value:
+# 0x<hex>". The pre-fix -creplace rewrote the string mention and leaked
+# the hint into the zon; the I1272-only fix refused the repair entirely.
+# The repair must leave the string alone and add the real field inline
+# after the root struct opener.
 $D2c = Join-Path $testRoot "fpnomarker"
 New-Item -ItemType Directory -Path $D2c | Out-Null
 writeBuildZig $D2c
 [System.IO.File]::WriteAllText((Join-Path $D2c "build.zig.zon"),
     '.{ .name = ".fingerprint = 0x0 only mention", .version = "0.0.0", .paths = .{} }' + "`n")
 $failMarker2c = Join-Path $D2c "fail-once"
-[System.IO.File]::WriteAllText($failMarker2c, "")
+[System.IO.File]::WriteAllText($failMarker2c, "suggested value: 0x1234dead`n")
 $fpNoMarkerRun = runInstall -Tag "fpnomarker" -WorkDir $D2c -FailFetchOnce $failMarker2c
 
-check "fpnomarker run exits 1" { $fpNoMarkerRun.rc -eq 1 }
-check "fpnomarker run refuses the repair" {
-    $fpNoMarkerRun.err -match 'error: could not repair the fingerprint in build\.zig\.zon'
+check "fpnomarker run exits 0" { $fpNoMarkerRun.rc -eq 0 }
+check "fpnomarker run adds the real field" {
+    (readZon $D2c).Contains('.fingerprint = 0x1234dead')
 }
 check "fpnomarker run leaves the string mention intact" {
     (readZon $D2c).Contains('.fingerprint = 0x0 only mention')
 }
-check "fpnomarker run leaks no hint into the zon" {
-    -not (readZon $D2c).Contains('0x1234dead')
+check "fpnomarker run inserts inline, not as a new line" {
+    ((readZon $D2c) -split "`n").Count -eq 2
+}
+
+# The stale-field shape (EPH-I1291): a nonzero code-position fingerprint
+# is not the 0x0 placeholder this repair owns. The repair must fail
+# closed with the clear message and leave the field untouched.
+$D2e = Join-Path $testRoot "fpstale"
+New-Item -ItemType Directory -Path $D2e | Out-Null
+writeBuildZig $D2e
+[System.IO.File]::WriteAllText((Join-Path $D2e "build.zig.zon"),
+    '.{ .name = .fpstale, .version = "0.0.0", .fingerprint = 0xdeadbeef, .paths = .{} }' + "`n")
+$failMarker2e = Join-Path $D2e "fail-once"
+[System.IO.File]::WriteAllText($failMarker2e, "suggested value: 0x1234dead`n")
+$fpStaleRun = runInstall -Tag "fpstale" -WorkDir $D2e -FailFetchOnce $failMarker2e
+
+check "fpstale run exits 1" { $fpStaleRun.rc -eq 1 }
+check "fpstale run refuses the repair" {
+    $fpStaleRun.err -match 'error: could not repair the fingerprint in build\.zig\.zon'
+}
+check "fpstale run leaves the nonzero field untouched" {
+    (readZon $D2e).Contains('.fingerprint = 0xdeadbeef')
+}
+check "fpstale run leaks no hint into the zon" {
+    -not (readZon $D2e).Contains('0x1234dead')
 }
 
 # The mid-line multiline-opener shape (EPH-I1283): a \\ opener inside a
@@ -368,7 +400,7 @@ writeBuildZig $D2d
     ''
 ) -join "`n")
 $failMarker2d = Join-Path $D2d "fail-once"
-[System.IO.File]::WriteAllText($failMarker2d, "")
+[System.IO.File]::WriteAllText($failMarker2d, "use this value: 0x1234dead`n")
 $fpMlRun = runInstall -Tag "fpml" -WorkDir $D2d -FailFetchOnce $failMarker2d
 
 check "fpml run exits 0" { $fpMlRun.rc -eq 0 }

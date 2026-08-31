@@ -660,16 +660,21 @@ esac
 echo "Adding ephor dependency..."
 # EPH-I0192: zig fetch reads build.zig.zon but never runs build.zig, so a
 # hostile build.zig still executes no code here. On a fresh zon with
-# fingerprint 0x0, zig fetch fails and prints a "use this value" hint with
-# the computed fingerprint. Patch the hint in and fetch again.
+# fingerprint 0x0, zig fetch fails and prints a "use this value" hint
+# with the computed fingerprint. A zon without the field draws the
+# sibling "suggested value" hint (EPH-I1291). Patch the hint in and
+# fetch again.
 FETCH_OUT=$(zig fetch --save=ephor "$EPHOR_URL" 2>&1) && FETCH_RC=0 || FETCH_RC=$?
 if [ "$FETCH_RC" -ne 0 ]; then
     # EPH-I0634: take the first hint only (a multi-line SUGGESTED breaks
     # the sed script below) and require at least one hex digit (a bare 0x
     # would write a broken zon). BSD grep supports -m1 as GNU grep does.
+    # EPH-I1291: zig 0.16.0 emits two hint shapes — "use this value" for
+    # the 0x0 placeholder and "suggested value" for the missing field —
+    # so the pattern accepts both.
     SUGGESTED=$(printf '%s\n' "$FETCH_OUT" \
-        | grep -m1 -o 'use this value: 0x[0-9a-f][0-9a-f]*' \
-        | sed 's/use this value: //')
+        | grep -m1 -oE '(use this value|suggested value): 0x[0-9a-f][0-9a-f]*' \
+        | sed -E 's/(use this value|suggested value): //')
     if [ -z "$SUGGESTED" ]; then
         # No hint means a real fetch failure (network, hash, server). Show
         # the captured error and keep the original exit code.
@@ -685,41 +690,73 @@ if [ "$FETCH_RC" -ne 0 ]; then
     # multiline body line is string data, and a mid-line \\ opener
     # consumes the rest of the line as string data (EPH-I1283, the
     # Zig-side EPH-I0671 semantics). The first code-position marker wins
-    # the repair; no marker in code fails with the clear message
-    # (install.ps1 EPH-I0648 parity).
+    # the repair; a code-position fingerprint with any other value fails
+    # with the clear message (install.ps1 EPH-I0648 parity).
+    # EPH-I1291: a zon with no code-position fingerprint field gains one
+    # right after the root struct opener (the first code-position brace),
+    # the shape zig 0.16.0 answers with "missing top-level 'fingerprint'
+    # field; suggested value: 0x<hex>". The live WP-7 leg failed on this
+    # shape before the arm landed.
     make_install_tmp ./build.zig.zon.tmp.XXXXXXXX
     if awk -v hint="$SUGGESTED" -f - build.zig.zon > "$INSTALL_TMP" <<'AWKEOF'
 {
-    line = $0
-    n = length(line)
-    i = 1
-    while (i <= n && substr(line, i, 1) == " ") i = i + 1
-    while (i <= n && substr(line, i, 1) == "\t") i = i + 1
-    if (i <= n && substr(line, i, 1) == "\\") { print line; next }
-    if (replaced) { print line; next }
-    in_str = 0
-    while (i <= n) {
-        c = substr(line, i, 1)
-        if (in_str) {
-            if (c == "\\") i = i + 1
-            else if (c == "\"") in_str = 0
-            i = i + 1
-            continue
-        }
-        if (c == "\"") { in_str = 1; i = i + 1; continue }
-        if (c == "/" && substr(line, i + 1, 1) == "/") { print line; next }
-        if (c == "\\" && substr(line, i + 1, 1) == "\\") { print line; next }
-        if (substr(line, i, 18) == ".fingerprint = 0x0") {
-            print substr(line, 1, i - 1) ".fingerprint = " hint substr(line, i + 18)
-            replaced = 1
-            next
-        }
-        i = i + 1
-    }
-    if (!replaced) print line
+    lines[++nr] = $0
 }
 END {
-    if (!replaced) exit 1
+    replaced = 0
+    has_fp = 0
+    open_line = 0
+    open_col = 0
+    open_indent = ""
+    for (ln = 1; ln <= nr && !replaced; ln++) {
+        line = lines[ln]
+        n = length(line)
+        i = 1
+        while (i <= n && substr(line, i, 1) == " ") i = i + 1
+        while (i <= n && substr(line, i, 1) == "\t") i = i + 1
+        line_indent = substr(line, 1, i - 1)
+        if (i <= n && substr(line, i, 1) == "\\") continue
+        in_str = 0
+        while (i <= n) {
+            c = substr(line, i, 1)
+            if (in_str) {
+                if (c == "\\") i = i + 1
+                else if (c == "\"") in_str = 0
+                i = i + 1
+                continue
+            }
+            if (c == "\"") { in_str = 1; i = i + 1; continue }
+            if (c == "/" && substr(line, i + 1, 1) == "/") break
+            if (c == "\\" && substr(line, i + 1, 1) == "\\") break
+            if (c == "{" && open_line == 0) {
+                open_line = ln
+                open_col = i
+                open_indent = line_indent
+            }
+            if (substr(line, i, 18) == ".fingerprint = 0x0") {
+                lines[ln] = substr(line, 1, i - 1) ".fingerprint = " hint substr(line, i + 18)
+                replaced = 1
+                break
+            }
+            if (substr(line, i, 12) == ".fingerprint" &&
+                substr(line, i + 12, 1) !~ /[A-Za-z0-9_]/) has_fp = 1
+            i = i + 1
+        }
+    }
+    if (!replaced) {
+        if (has_fp || open_line == 0) exit 1
+        rest = substr(lines[open_line], open_col + 1)
+        blank = rest
+        gsub(/[[:space:]]/, "", blank)
+        if (blank == "") {
+            for (ln = nr; ln > open_line; ln--) lines[ln + 1] = lines[ln]
+            lines[open_line + 1] = open_indent "    .fingerprint = " hint ","
+            nr = nr + 1
+        } else {
+            lines[open_line] = substr(lines[open_line], 1, open_col) " .fingerprint = " hint ", " rest
+        }
+    }
+    for (ln = 1; ln <= nr; ln++) print lines[ln]
 }
 AWKEOF
     then

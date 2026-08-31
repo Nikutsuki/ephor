@@ -745,12 +745,14 @@ leftovers=$(ls "$D"/build.zig.zon.tmp.* 2>/dev/null || true)
 [ -z "$leftovers" ] || fail "temp file left after TERM"
 pass "t25 TERM runs the EXIT trap (F-9)"
 
-# --- t26 (EPH-I0634): two hint lines in one fetch failure must take the
-# first hint, not abort sed with a multi-line replacement.
+# --- t26 (EPH-I0634, EPH-I1291): two hint lines in one fetch failure
+# must take the first hint, not abort sed with a multi-line replacement.
+# zig 0.16.0 emits two shapes — "suggested value" for the missing field
+# and "use this value" for the 0x0 placeholder — and both must parse.
 D="$TEST_ROOT/t26"
 mkdir -p "$D"
 write_fresh_build_zig "$D"
-printf 'error: unable to verify package\nuse this value: 0x1234dead\nuse this value: 0xbeefcafe\n' \
+printf 'error: unable to verify package\nsuggested value: 0x1234dead\nuse this value: 0xbeefcafe\n' \
     > "$TEST_ROOT/fail-hints.txt"
 run_installer_with_fetch_fail "$TEST_ROOT/fail-hints.txt" "$D"
 assert_rc 0
@@ -760,18 +762,18 @@ if [ -e "$D/build.zig.zon.bak" ]; then
     fail "sed backup left behind"
 fi
 assert_empty "$D/err.log" 'stderr not empty'
-pass "t26 first fingerprint hint wins (F-10)"
+pass "t26 first fingerprint hint wins (F-10, EPH-I1291 dual shape)"
 
 # --- t27 (EPH-I0634): a hint with a bare 0x (no hex digits) must refuse
 # instead of writing a broken fingerprint.
 D="$TEST_ROOT/t27"
 mkdir -p "$D"
 write_fresh_build_zig "$D"
-printf 'use this value: 0x\n' > "$TEST_ROOT/fail-bare.txt"
+printf 'suggested value: 0x\n' > "$TEST_ROOT/fail-bare.txt"
 run_installer_with_fetch_fail "$TEST_ROOT/fail-bare.txt" "$D"
 assert_rc 1
 assert_grep "$D/build.zig.zon" '.fingerprint = 0x0,' 'fingerprint changed'
-assert_grep "$D/err.log" 'use this value: 0x' 'fetch error not shown'
+assert_grep "$D/err.log" 'suggested value: 0x' 'fetch error not shown'
 assert_not_grep "$D/out.log" 'Done!' 'Done! printed after refusal'
 pass "t27 bare 0x hint refuses (F-10)"
 
@@ -1314,25 +1316,27 @@ assert_grep "$D/build.zig.zon" '".fingerprint = 0x0 mention"' 'string mention co
 assert_empty "$D/err.log" 'stderr not empty'
 pass "t50 fingerprint repair targets the code-position field (EPH-I1272)"
 
-# --- t51 (EPH-I1272): a zon whose marker exists only inside a string
-# value must refuse the repair with the clear message. The pre-fix sed
-# rewrote the string mention, leaked the hint into the zon, and the
-# authoritative fetch then passed, so the install reported success with
-# a corrupted zon. The repair must leave the string alone and fail.
+# --- t51 (EPH-I1272, EPH-I1291): a zon whose ".fingerprint = 0x0" text
+# exists only inside a string value has no real field, so zig 0.16.0
+# answers "missing top-level 'fingerprint' field; suggested value:
+# 0x<hex>". The repair must leave the string alone and add the real
+# field after the root struct opener. The pre-fix sed rewrote the string
+# mention and leaked the hint into the zon; the I1272-only fix refused
+# the repair entirely and the live WP-7 leg then failed at EXIT=2.
 D="$TEST_ROOT/t51"
 mkdir -p "$D"
 write_fresh_build_zig "$D"
 printf '%s\n' \
     '.{ .name = ".fingerprint = 0x0 only mention", .version = "0.0.0", .paths = .{} }' \
     > "$D/build.zig.zon"
-printf 'error: unable to verify package\nuse this value: 0x1234dead\n' \
+printf "build.zig.zon:1:2: error: missing top-level 'fingerprint' field; suggested value: 0x1234dead\n" \
     > "$TEST_ROOT/fail-hint-t51.txt"
 run_installer_with_fetch_fail "$TEST_ROOT/fail-hint-t51.txt" "$D"
-assert_rc 1
-assert_grep "$D/err.log" 'could not repair the fingerprint' 'no repair refusal'
-assert_grep "$D/build.zig.zon" '.fingerprint = 0x0 only mention' 'string mention corrupted'
-assert_not_grep "$D/build.zig.zon" '0x1234dead' 'hint leaked into the zon'
-pass "t51 string-only marker refuses the repair (EPH-I1272)"
+assert_rc 0
+assert_grep "$D/build.zig.zon" '.fingerprint = 0x1234dead' 'the missing field was not added'
+assert_grep "$D/build.zig.zon" '".fingerprint = 0x0 only mention"' 'string mention corrupted'
+assert_empty "$D/err.log" 'stderr not empty'
+pass "t51 string-only mention gains the real field (EPH-I1291)"
 
 # --- t52 (EPH-I1283): a mid-line \\ opener consumes the rest of the
 # line as string data (Zig-side EPH-I0671 parity), so a decoy mention
@@ -1359,6 +1363,31 @@ assert_grep "$D/build.zig.zon" '.fingerprint = 0x1234dead,' 'code-position field
 assert_grep "$D/build.zig.zon" '\\ .fingerprint = 0x0 decoy' 'multiline tail mention corrupted'
 assert_empty "$D/err.log" 'stderr not empty'
 pass "t52 fingerprint repair cuts on the mid-line multiline opener (EPH-I1283)"
+
+# --- t55 (EPH-I1291): a pre-existing zon without a fingerprint field
+# (the shape a fresh hand-made project carries) gains the field from the
+# real zig 0.16.0 "suggested value" hint. The WP-7 live leg hit exactly
+# this shape: the pre-fix grep keyed only on "use this value", so the
+# hint never parsed and the install died at EXIT=2 after the verified
+# signature. The added field must sit inside the root struct.
+D="$TEST_ROOT/t55"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+cat > "$D/build.zig.zon" <<'EOF'
+.{
+    .name = .t55,
+    .version = "0.0.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
+EOF
+printf "build.zig.zon:1:2: error: missing top-level 'fingerprint' field; suggested value: 0x1234dead\n" \
+    > "$TEST_ROOT/fail-hint-t55.txt"
+run_installer_with_fetch_fail "$TEST_ROOT/fail-hint-t55.txt" "$D"
+assert_rc 0
+assert_grep "$D/build.zig.zon" '.fingerprint = 0x1234dead,' 'missing field not added'
+assert_grep "$D/build.zig.zon" '.name = .t55,' 'the name field moved'
+assert_empty "$D/err.log" 'stderr not empty'
+pass "t55 missing fingerprint field gains the hinted field (EPH-I1291)"
 
 # --- t53a (WP-7): install.sh embeds the exact two-line .pub wire form
 # the release key mint produced. Both lines ship: minisign 0.12 rejects

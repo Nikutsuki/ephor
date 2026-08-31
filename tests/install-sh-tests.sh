@@ -1272,5 +1272,31 @@ assert_grep "$D/build.zig.zon" '.fingerprint = 0x0 only mention' 'string mention
 assert_not_grep "$D/build.zig.zon" '0x1234dead' 'hint leaked into the zon'
 pass "t51 string-only marker refuses the repair (EPH-I1272)"
 
+# --- t52 (EPH-I1283): a mid-line \\ opener consumes the rest of the
+# line as string data (Zig-side EPH-I0671 parity), so a decoy mention
+# inside the tail must stay intact and the real field on the next line
+# must repair. The pre-fix walk read the tail as code: the decoy won
+# the repair, the string corrupted, and the real field stayed 0x0, so
+# the authoritative fetch failed.
+D="$TEST_ROOT/t52"
+mkdir -p "$D"
+write_fresh_build_zig "$D"
+cat > "$D/build.zig.zon" <<'EOF'
+.{
+    .name = .fpml,
+    .version = "0.0.0",
+    .paths = .{ \\ .fingerprint = 0x0 decoy, "build.zig" },
+    .fingerprint = 0x0,
+}
+EOF
+printf 'error: unable to verify package\nuse this value: 0x1234dead\n' \
+    > "$TEST_ROOT/fail-hint-t52.txt"
+run_installer_with_fetch_fail "$TEST_ROOT/fail-hint-t52.txt" "$D"
+assert_rc 0
+assert_grep "$D/build.zig.zon" '.fingerprint = 0x1234dead,' 'code-position field not repaired'
+assert_grep "$D/build.zig.zon" '\\ .fingerprint = 0x0 decoy' 'multiline tail mention corrupted'
+assert_stderr_trio "$D/err.log" 'unexpected stderr content'
+pass "t52 fingerprint repair cuts on the mid-line multiline opener (EPH-I1283)"
+
 echo ""
 echo "install-sh tests: $PASS_COUNT passed"

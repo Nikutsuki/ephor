@@ -14,7 +14,9 @@
 # occurrence, so the mention was corrupted and the real field stayed 0x0.
 # A second pin runs the same one-line shape without the mention: the
 # inline code-position field must still repair, so the fix must not
-# degrade to line-start anchoring.
+# degrade to line-start anchoring. A third pin (EPH-I1283) puts the
+# mention inside a mid-line \\ multiline tail: the tail is string data,
+# so the mention must stay intact and the real field must repair.
 #
 # The cap pins create an oversized local file and assert the installer
 # fails closed with the named cap message before Get-Content buffers it.
@@ -321,6 +323,35 @@ check "fpnomarker run leaves the string mention intact" {
 }
 check "fpnomarker run leaks no hint into the zon" {
     -not (readZon $D2c).Contains('0x1234dead')
+}
+
+# The mid-line multiline-opener shape (EPH-I1283): a \\ opener inside a
+# line consumes the rest of the line as string data (Zig-side EPH-I0671
+# parity), so the decoy mention inside the tail must stay intact and the
+# real field on the next line must repair. The pre-fix walk read the
+# tail as code, repaired the decoy, and left the real field at 0x0.
+$D2d = Join-Path $testRoot "fpml"
+New-Item -ItemType Directory -Path $D2d | Out-Null
+writeBuildZig $D2d
+[System.IO.File]::WriteAllText((Join-Path $D2d "build.zig.zon"), @(
+    '.{'
+    '    .name = .fpml,'
+    '    .version = "0.0.0",'
+    '    .paths = .{ \\ .fingerprint = 0x0 decoy, "build.zig" },'
+    '    .fingerprint = 0x0,'
+    '}'
+    ''
+) -join "`n")
+$failMarker2d = Join-Path $D2d "fail-once"
+[System.IO.File]::WriteAllText($failMarker2d, "")
+$fpMlRun = runInstall -Tag "fpml" -WorkDir $D2d -FailFetchOnce $failMarker2d
+
+check "fpml run exits 0" { $fpMlRun.rc -eq 0 }
+check "fpml run repairs the real field" {
+    (readZon $D2d).Contains('.fingerprint = 0x1234dead,')
+}
+check "fpml run leaves the multiline tail mention intact" {
+    (readZon $D2d).Contains('\\ .fingerprint = 0x0 decoy')
 }
 
 # --- EPH-I1273: byte caps on the local reads ---------------------------

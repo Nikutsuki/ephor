@@ -4,10 +4,11 @@
 
 # pipefail is not portable to POSIX sh (dash), so each fallible command
 # handles its own exit status explicitly.
-# EPH-I0638: mktemp, grep -o, and sed -i.bak go beyond POSIX. macOS and
+# EPH-I0638: mktemp, grep -o, and stat go beyond POSIX. macOS and
 # Linux ship all three, and an exotic system fails loudly at the first
 # use instead of misbehaving silently, so the dependency is accepted
-# and documented here. stat gets the same treatment at preserve_mode.
+# and documented here. sed -i.bak left the script with the EPH-I1272
+# repair rewrite. The stat acceptance note lives at preserve_mode.
 set -eu
 
 # EPH-I0194: a cloned repo can plant a symlink at a fixed temp name such as
@@ -464,8 +465,12 @@ if [ ! -f "build.zig.zon" ]; then
     # non-identifier bytes, which admits ESC and friends, so the raw name
     # must not reach any echo. The byte filter replaces C0 controls and
     # DEL with '?' (the Zig-side sanitizeTerminal placeholder). The
-    # multi-byte hostile format set is not expressible in portable shell:
-    # those bytes stay, but they are valid UTF-8 and render inert.
+    # residual is live, not inert: the encoded C1 set (0xC2 0x80..0x9F)
+    # and the Cf format set pass the portable byte filter, and a
+    # UTF-8-decoding terminal dispatches the encoded C1 bytes as CSI or
+    # OSC. Portable shell cannot express the code-point filter the
+    # Zig-side sanitizeTerminal applies; the PowerShell installer's
+    # \p{Cc} form covers the C1 half there.
     ECHO_NAME=$(printf '%s' "$PROJECT_NAME" | LC_ALL=C tr '[:cntrl:]' '?')
     case "$PROJECT_NAME" in
         ''|*[!a-z0-9_]*|[0-9]*)
@@ -654,10 +659,12 @@ if [ "$FETCH_RC" -ne 0 ]; then
     # that mentions ".fingerprint = 0x0" on the same line won and the
     # real field stayed 0x0 (a corrupted zon plus a failed fetch). The
     # awk walk mirrors find_install_artifact_line: string literals mask
-    # their content, a // comment ends the line's code, and a
-    # \\-led multiline body line is string data. The first code-position
-    # marker wins the repair; no marker in code fails with the clear
-    # message (install.ps1 EPH-I0648 parity).
+    # their content, a // comment ends the line's code, a \\-led
+    # multiline body line is string data, and a mid-line \\ opener
+    # consumes the rest of the line as string data (EPH-I1283, the
+    # Zig-side EPH-I0671 semantics). The first code-position marker wins
+    # the repair; no marker in code fails with the clear message
+    # (install.ps1 EPH-I0648 parity).
     make_install_tmp ./build.zig.zon.tmp.XXXXXXXX
     if awk -v hint="$SUGGESTED" -f - build.zig.zon > "$INSTALL_TMP" <<'AWKEOF'
 {
@@ -679,6 +686,7 @@ if [ "$FETCH_RC" -ne 0 ]; then
         }
         if (c == "\"") { in_str = 1; i = i + 1; continue }
         if (c == "/" && substr(line, i + 1, 1) == "/") { print line; next }
+        if (c == "\\" && substr(line, i + 1, 1) == "\\") { print line; next }
         if (substr(line, i, 18) == ".fingerprint = 0x0") {
             print substr(line, 1, i - 1) ".fingerprint = " hint substr(line, i + 18)
             replaced = 1

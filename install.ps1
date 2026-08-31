@@ -725,13 +725,15 @@ error: minisign is not installed or not on PATH.
     # pre-fix -creplace rewrote every occurrence, so a string value that
     # mentions ".fingerprint = 0x0" got corrupted. The walk mirrors
     # Find-LastInstallArtifactLine: string and char literals mask their
-    # content, a // comment ends the line's code, and a \\-led
-    # multiline body line is string data. The first code-position marker
-    # wins the repair. Returns the patched zon, or $null when no marker
-    # sits in code (the caller prints the clear error). The match regex
-    # keeps the EPH-I0648 flexibility: any spacing around the
-    # placeholder, and \b stops a real fingerprint that starts with 0x0
-    # from matching as the placeholder prefix.
+    # content, a // comment ends the line's code, a \\-led multiline
+    # body line is string data, and a mid-line \\ opener consumes the
+    # rest of the line as string data (EPH-I1283, the Zig-side EPH-I0671
+    # semantics). The first code-position marker wins the repair. Returns
+    # the patched zon, or $null when no marker sits in code (the caller
+    # prints the clear error). The match regex keeps the EPH-I0648
+    # flexibility: any spacing around the placeholder, and \b stops a
+    # real fingerprint that starts with 0x0 from matching as the
+    # placeholder prefix.
     function Repair-ZonFingerprint {
         param([string]$Zon, [string]$Hint)
         $repaired = $false
@@ -761,6 +763,8 @@ error: minisign is not installed or not on PATH.
                 if ($c -eq "'") { $inChar = $true; $pos++; continue }
                 if ($c -eq '/' -and ($pos + 1) -lt $line.Length -and
                     $line[$pos + 1] -eq '/') { break }
+                if ($c -eq '\' -and ($pos + 1) -lt $line.Length -and
+                    $line[$pos + 1] -eq '\') { break }
                 if ($c -eq '.') {
                     $tail = $line.Substring($pos)
                     if ($tail -cmatch '^\.fingerprint[ \t]*=[ \t]*0x0\b') {

@@ -6,7 +6,10 @@
 # the real installer runs as a subprocess against hermetic fixtures. A
 # fake zig on PATH answers version, fetch, and ast-check; a local HTTP
 # listener serves the tags API; and EPHOR_TEST_MODE unlocks the file://
-# archive override. No network is touched.
+# archive override. WP-7: the embedded release key activates the
+# signature check, so every run injects EPHOR_RELEASE_PUBKEY (the
+# fixture-key seam) and a fake minisign accepts the signature. No network
+# is touched.
 #
 # The fingerprint pins use the discriminating one-line zon from the
 # redteam evidence: a string value that mentions ".fingerprint = 0x0"
@@ -101,6 +104,22 @@ $archivePath = Join-Path $testRoot "archive.tar.gz"
 Set-Content -Path $archivePath -Value 'dummy archive' -Encoding ASCII
 $archiveUrl = "file://" + $archivePath
 
+# WP-7: the embedded release key activates Test-EphorReleaseSignature, so
+# every run injects EPHOR_RELEASE_PUBKEY (the fixture-key seam) and a
+# fake minisign on PATH accepts the signature. The default SIG_URL is the
+# archive URL plus .minisig, so the signature file sits next to the
+# archive.
+$sigPath = "$archivePath.minisig"
+Set-Content -Path $sigPath -Value 'dummy signature' -Encoding ASCII
+$fakeMinisign = Join-Path $binDir "minisign"
+Set-Content -Path $fakeMinisign -Encoding ASCII -Value @(
+    '#!/bin/sh'
+    '# fake minisign: every signature verifies'
+    'exit 0'
+)
+$null = & chmod +x $fakeMinisign
+if ($LASTEXITCODE -ne 0) { throw "chmod failed for the fake minisign" }
+
 # Bind one local HTTP port (the anchor suite's listener shape). The
 # suite's main thread serves the one tags request while the child runs.
 function startLocalListener {
@@ -125,10 +144,10 @@ function startLocalListener {
 $tagsJson = '[{"name":"v0.99.2"},{"name":"v0.99.1"}]'
 $serveDeadlineMs = 90000
 
-# The strict-stderr pin for a clean run (install.sh parity, EPH-I1220).
-$trio = "warning: release signature verification is inactive.`n" +
-    "This installer embeds no release public key yet.`n" +
-    "The first signed release activates the check.`n"
+# The strict-stderr pin for a clean run (WP-7): the active verification
+# prints nothing to stderr on success, so the clean runs expect an empty
+# err surface.
+$cleanStderr = ""
 
 # Write the fresh build.zig fixture (one installArtifact call) for a
 # work dir.
@@ -177,6 +196,7 @@ function runInstall {
     $psi.Environment["EPHOR_TEST_MODE"] = "1"
     $psi.Environment["EPHOR_TAGS_API"] = "http://127.0.0.1:$port/tags.json"
     $psi.Environment["EPHOR_ARCHIVE_URL"] = $archiveUrl
+    $psi.Environment["EPHOR_RELEASE_PUBKEY"] = "untrusted comment: ps1 hardening pin (fake)"
     if ($FailFetchOnce) {
         $psi.Environment["FETCH_FAIL_ONCE"] = $FailFetchOnce
     }
@@ -251,8 +271,11 @@ check "fpcode run repairs the code-position field" {
 check "fpcode run leaves the string mention intact" {
     (readZon $D1).Contains('".fingerprint = 0x0 mention"')
 }
-check "fpcode run stderr is the inactive-verification trio" {
-    ($fpRun.err -replace "`r`n", "`n") -ceq $trio
+check "fpcode run stderr stays empty on the active verification" {
+    ($fpRun.err -replace "`r`n", "`n") -ceq $cleanStderr
+}
+check "fpcode run prints the verification line" {
+    $fpRun.out.Contains("Release signature verified.")
 }
 
 # The no-regression control: the same one-line shape without the

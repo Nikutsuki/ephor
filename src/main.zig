@@ -47548,11 +47548,11 @@ fn runInstallCommand(
     std.debug.print("Installing ephor v{s}...\n", .{ver});
 
     // EPH-I1225: verify the release signature before the first fetch,
-    // the same check the upgrade path runs (EPH-I0287, WP-6.5). With
-    // the empty embedded key the check is inactive: it warns and
-    // continues with no network I/O, so the hermetic install tests
-    // stay offline (band-T05 F5, EPH-I0572). A failure maps to
-    // InstallFailed like every install error (EPH-I0235).
+    // the same check the upgrade path runs (EPH-I0287, WP-6.5). The
+    // embedded release key (WP-7) makes the check active: the tarball
+    // and its signature download into a fresh temp dir, and minisign
+    // checks the pair. A failure maps to InstallFailed like every
+    // install error (EPH-I0235).
     verifyReleaseSignature(diag, allocator, release_pubkey, package_url) catch
         return error.InstallFailed;
 
@@ -48227,9 +48227,9 @@ const UpgradeRun = struct {
         std.debug.print("Upgrading ephor to v{s}...\n", .{ver});
 
         // EPH-I0287 (WP-6.5): verify the signed release before the zig
-        // fetch (install.sh's order). Inactive while the embedded key is
-        // empty: warns and continues with no network I/O, so the hermetic
-        // upgrade tests stay offline (band-T05 F5, EPH-I0572).
+        // fetch (install.sh's order). The embedded release key (WP-7)
+        // keeps the check active: a missing minisign, a failed
+        // download, or a bad signature fails the upgrade closed.
         try verifyReleaseSignature(self.diag, self.allocator, release_pubkey, package_url);
 
         const url_z = try self.allocator.dupeZ(u8, package_url);
@@ -48271,15 +48271,20 @@ fn upgradeFetchOutcome(diag: *DiagCtx, exited: u8, ver: []const u8) !void {
     return error.UpgradeFailed;
 }
 
-/// Embedded release-signing public key (EPH-I0287, WP-6.5). Two states,
-/// mirroring install.sh's RELEASE_PUBKEY:
-/// - Empty (today): no release is signed. The install and upgrade paths
-///   warn that signature verification is inactive and continue on the
-///   recorded-hash model.
-/// - Set: the WP-7 release pipeline fills this constant when it mints
-///   the release keypair. Every install and upgrade then verifies the
-///   signed tarball before the zig fetch and fails closed on any miss.
-const release_pubkey: []const u8 = "";
+/// Embedded release-signing public key (EPH-I0287, WP-6.5), the public
+/// half of the WP-7 release keypair. The exact two-line content of the
+/// minted .pub file (.tmp/keymint/ephor.pub). Both lines are wire shape,
+/// not prose: minisign 0.12 rejects a file whose key line is the first
+/// line ("Error while loading the public key file"), verified on the
+/// release machine. Every install and upgrade verifies the signed
+/// tarball against this key before the zig fetch and fails closed on
+/// any miss. An empty key (the pre-release fallback state) warns and
+/// continues; the tests drive that branch by passing "".
+const release_pubkey: []const u8 =
+    \\untrusted comment: minisign public key BD29FC2E33D53EBE
+    \\RWS+PtUzLvwpvc7nVJ8t8MKTpo4/8UdOqoxuLGXhfJQI+qvTyn82Dfit
+    \\
+;
 
 /// Temp base for the release-verification files (EPH-I0287): install.sh's
 /// mktemp -d "${TMPDIR:-/tmp}" choice. initToolPaths sets it from the
@@ -48312,13 +48317,21 @@ fn signatureUrlFor(allocator: Allocator, package_url: []const u8) ![]const u8 {
 /// mirroring install.sh's verify_ephor_release. Install and upgrade
 /// share the one check (EPH-I1225). Two states:
 /// - Inactive (empty key): warn and continue with no network I/O. The
-///   hermetic install and upgrade tests rest on this (band-T05 F5,
-///   EPH-I0572).
+///   pre-release fallback state; the hermetic tests drive it by passing
+///   "" explicitly (band-T05 F5, EPH-I0572).
 /// - Active (key set): the tarball and its signature download into a
 ///   fresh temp dir, minisign checks the pair, and a missing binary, a
 ///   failed download, or a bad signature fails the command closed. The
 ///   zig fetch keeps the canonical https URL, so zig never receives a
 ///   local file or a file:// URL (EPH-I1215).
+/// WP-7 era-pin carve boundary (M-2): this binary only ever constructs
+/// TAG URLs (buildPackageUrl), and every tag verifies because a tag is
+/// a mutable pointer. The pinned 0.15-era commit archive is served by
+/// install.sh and install.ps1, which skip the check for it: the commit
+/// archive is SHA-addressed and immutable on the remote, and https
+/// transport plus the recorded package fingerprint carry its integrity.
+/// No commit-archive URL reaches this function, so no skip arm exists
+/// here.
 fn verifyReleaseSignature(
     diag: *DiagCtx,
     allocator: Allocator,
@@ -48397,6 +48410,11 @@ fn verifySignedRelease(
 /// Create a fresh verification dir under the temp base (EPH-I0287). The
 /// name carries 16 random hex digits: the EPH-I0194 fixed-name plant
 /// cannot predict it, and a name collision fails closed at the caller.
+/// EPH-I1286: the POSIX mkdir applies the process umask to its 0700
+/// request, so a umask that strips owner write (0277) leaves the dir
+/// owner-read-only and every verification write fails (install.sh's
+/// t24/t24-class fix, EPH-I0632). The chmod after the create sets the
+/// owner-write bits unconditionally, the make_install_tmp discipline.
 fn createVerifyDir(allocator: Allocator, io: std.Io) ![]const u8 {
     var rng_source = std.Random.IoSource{ .io = io };
     const rng = rng_source.interface();
@@ -48407,6 +48425,12 @@ fn createVerifyDir(allocator: Allocator, io: std.Io) ![]const u8 {
     );
     errdefer allocator.free(dir_path);
     try std.Io.Dir.cwd().createDir(io, dir_path, std.Io.File.Permissions.fromMode(0o700));
+    try std.Io.Dir.cwd().setFilePermissions(
+        io,
+        dir_path,
+        std.Io.File.Permissions.fromMode(0o700),
+        .{},
+    );
     return dir_path;
 }
 
@@ -48951,7 +48975,7 @@ fn updateBuildZigIntegration(diag: *DiagCtx, allocator: Allocator) !void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.14.3";
+const EPHOR_VERSION = "0.15.0";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://codeberg.org/RhyosLabs/ephor/raw/branch/main/build.zig.zon";
@@ -49322,7 +49346,7 @@ fn requireStrictExplicitVersion(
 /// actor: a pushed v99.0.0 mints a higher maximum and nothing bounds above
 /// (EPH-I1275). The binding defenses are repo-write-is-game-over (a tag
 /// pusher owns the repo content anyway) and M-2 signature verification,
-/// which activates when WP-7 fills release_pubkey (empty today).
+/// active since WP-7 filled release_pubkey.
 /// Prerelease tags are rejected by isStrictSemverTag. Caller owns the
 /// returned slice.
 fn parseVersionFromTagsApi(allocator: Allocator, json: []const u8) ?[]const u8 {
@@ -127073,17 +127097,39 @@ test "upgrade zig-fetch failure maps to UpgradeFailed (EPH-I0235)" {
     try upgradeFetchOutcome(&diag, 0, "0.14.3");
 }
 
-test "upgrade release verification is inactive without an embedded key (EPH-I0287)" {
+test "embedded release pubkey pins the minted release key (EPH-I0287, WP-7)" {
+    try std.testing.expect(release_pubkey.len > 0);
+    // The exact two-line wire form the WP-7 key mint produced
+    // (.tmp/keymint/ephor.pub). Both lines are wire shape: minisign
+    // 0.12 rejects a file whose key line is the first line, so the
+    // comment line ships with the key (verified on the release
+    // machine).
+    try std.testing.expectEqualStrings(
+        "untrusted comment: minisign public key BD29FC2E33D53EBE\n" ++
+            "RWS+PtUzLvwpvc7nVJ8t8MKTpo4/8UdOqoxuLGXhfJQI+qvTyn82Dfit\n",
+        release_pubkey,
+    );
+    // Shape pins on the embedded value itself: the RWS signature-scheme
+    // prefix and the key-line wire length. The slice from the prefix
+    // carries the trailing newline, so the 56-char line reads 57.
+    const key_start = std.mem.lastIndexOf(u8, release_pubkey, "RWS+") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 57), release_pubkey.len - key_start);
+}
+
+test "upgrade release verification stays inactive for an empty key (EPH-I0287)" {
     var diag = testDiagCtx();
     var capture = CaptureSink{};
     diag.diag_sink = capture.sink();
-    // The empty embedded key is the inactive state: the run warns and
-    // continues with no network I/O and no spawns, so the hermetic
-    // upgrade tests stay offline (band-T05 F5, EPH-I0572).
+    // The empty-key branch is the pre-release fallback state: the run
+    // warns and continues with no network I/O and no spawns, so the
+    // hermetic upgrade tests stay offline (band-T05 F5, EPH-I0572).
+    // The embedded release key (WP-7) never reaches this branch; the
+    // test passes the empty key explicitly to pin it.
     try verifyReleaseSignature(
         &diag,
         std.testing.allocator,
-        release_pubkey,
+        "",
         "https://codeberg.org/RhyosLabs/ephor/archive/v9.9.9.tar.gz",
     );
     try std.testing.expect(
@@ -127111,12 +127157,14 @@ test "install verifies the release signature before the fetch (EPH-I1225)" {
         .data = ".{ .name = .demo, .version = \"0.1.0\" }\n",
     });
     // The fake curl and minisign record any spawn in marker files: the
-    // empty embedded key must keep the verification away from both.
+    // embedded release key (WP-7) activates the verification, so both
+    // tools must run before the fetch.
+    try writeVerifyFixtures(&tmp);
     const fakes = try installVerifyFakes(&tmp, allocator, .ok);
     defer fakes.deinit(allocator);
     // The fake zig reports a floor-compliant version and fails the
-    // fetch, so the run reaches the verification, then fails after the
-    // inactive warning printed (EPH-I0235 maps it to InstallFailed).
+    // fetch, so the run reaches the verification, passes it, then fails
+    // the fetch (EPH-I0235 maps it to InstallFailed).
     const fake_path = try installFakeZig(
         &tmp,
         allocator,
@@ -127130,15 +127178,13 @@ test "install verifies the release signature before the fetch (EPH-I1225)" {
         error.InstallFailed,
         runInstallCommand(&diag, allocator, tmp.dir, null),
     );
-    // The inactive warning printed before the fetch, and the
-    // verification made no tool spawns, so the hermetic install tests
-    // stay offline (band-T05 F5, EPH-I0572). The test covers the
-    // empty-key state the WP-7 pipeline later replaces with the key.
+    // The verification ran with the embedded key and passed before the
+    // fetch: the success verdict printed, and both tools made spawns.
     try std.testing.expect(
-        std.mem.indexOf(u8, capture.slice(), "release signature verification is inactive") != null,
+        std.mem.indexOf(u8, capture.slice(), "Release signature verified.") != null,
     );
-    try std.testing.expect(!tmpHasEntry(&tmp, "curl-ran"));
-    try std.testing.expect(!tmpHasEntry(&tmp, "minisign-ran"));
+    try std.testing.expect(tmpHasEntry(&tmp, "curl-ran"));
+    try std.testing.expect(tmpHasEntry(&tmp, "minisign-ran"));
 }
 
 test "signatureUrlFor appends .minisig to the package URL (EPH-I0287)" {
@@ -127179,6 +127225,73 @@ test "upgrade release verification succeeds with a valid signature (EPH-I0287)" 
     while (try it.next(std.testing.io)) |entry| {
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, "ephor-verify-"));
     }
+}
+
+test "release verification succeeds under a strict umask (EPH-I1286)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // The umask seam needs libc's umask(2). macOS links libSystem by
+    // default; a Linux build without linkLibC skips instead of leaking
+    // the seam into an unlinkable binary. install.sh's t24 pins the
+    // same class in the shell suite.
+    if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
+    var diag = testDiagCtx();
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeVerifyFixtures(&tmp);
+    const fakes = try installVerifyFakes(&tmp, allocator, .ok);
+    defer fakes.deinit(allocator);
+    // The strict umask strips owner write from every mkdir below
+    // (0277): the pre-fix createVerifyDir then left the verify dir
+    // owner-read-only and the pubkey write failed closed. The fix keeps
+    // the dir owner-writable, so the full flow completes under the
+    // umask exactly like the default-umask run above.
+    const old_umask = std.c.umask(0o277);
+    defer _ = std.c.umask(old_umask);
+    try verifyReleaseSignature(
+        &diag,
+        allocator,
+        test_release_pubkey,
+        "https://example.invalid/ephor/archive/v0.14.2.tar.gz",
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, capture.slice(), "Release signature verified.") != null,
+    );
+    // No removal warning: the dir keeps its owner write, so the
+    // cleanup deletes it instead of warning.
+    try std.testing.expect(
+        std.mem.indexOf(u8, capture.slice(), "could not remove the verification temp dir") == null,
+    );
+    try std.testing.expect(tmpHasEntry(&tmp, "curl-ran"));
+}
+
+test "createVerifyDir keeps mode 0700 under a strict umask (EPH-I1286)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(base);
+    const saved_base = verify_tmp_base;
+    defer verify_tmp_base = saved_base;
+    verify_tmp_base = base;
+    const old_umask = std.c.umask(0o277);
+    defer _ = std.c.umask(old_umask);
+    const dir_path = try createVerifyDir(allocator, std.testing.io);
+    defer allocator.free(dir_path);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, dir_path) catch {};
+    // The chmod-after-create sets the mode bits exactly: the umask
+    // cannot strip the owner write from the verification dir. The
+    // 0o7777 mask drops the file-type bits the platform stat carries
+    // (S_IFDIR reads 0o40500 on macOS, 0o40500-class elsewhere).
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, dir_path, .{});
+    try std.testing.expectEqual(
+        @as(std.posix.mode_t, 0o700),
+        stat.permissions.toMode() & @as(std.posix.mode_t, 0o7777),
+    );
 }
 
 test "upgrade release verification fails closed when minisign is missing (EPH-I0287)" {
@@ -127400,9 +127513,10 @@ fn fakeCurlBody(allocator: Allocator, marker: []const u8, base: []const u8) ![]c
 /// the marker file, answers the -v presence probe, parses -Vm/-p like
 /// the real tool, checks the files the real minisign requires, and
 /// prints the verdict to the stream the real tool uses, then exits 0
-/// or 1 per the scenario. The scenario mode replaces the former fail
-/// flag (ZA506 D7, EPH-I1081). Only .bad_signature selects the failure
-/// arm.
+/// or 1 per the scenario. The pubkey gate accepts the fixture key and
+/// the embedded release key (WP-7), the two keys the verification tests
+/// hand over. The scenario mode replaces the former fail flag (ZA506
+/// D7, EPH-I1081). Only .bad_signature selects the failure arm.
 fn fakeMinisignBody(allocator: Allocator, marker: []const u8, mode: FakeVerifyMode) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
@@ -127420,7 +127534,12 @@ fn fakeMinisignBody(allocator: Allocator, marker: []const u8, mode: FakeVerifyMo
             "[ -f \"$tarball\" ] || {{ echo missing-tarball; exit 1; }}\n" ++
             "[ -f \"$tarball.minisig\" ] || {{ echo missing-signature; exit 1; }}\n" ++
             "[ -f \"$pubkey\" ] || {{ echo missing-pubkey; exit 1; }}\n" ++
-            "grep -qF \"RWTESTKEYBASE64PLACEHOLDER\" \"$pubkey\" || {{ echo unexpected-pubkey; exit 1; }}\n" ++
+            "if grep -qF \"RWTESTKEYBASE64PLACEHOLDER\" \"$pubkey\" || " ++
+            "grep -qF \"RWS+PtUzLvwpvc7nVJ8t8MKTpo4/8UdOqoxuLGXhfJQI+qvTyn82Dfit\" \"$pubkey\"; then\n" ++
+            "  :\n" ++
+            "else\n" ++
+            "  echo unexpected-pubkey; exit 1\n" ++
+            "fi\n" ++
             "if [ \"{s}\" = 1 ]; then\n" ++
             "  echo \"Signature verification failed\" >&2\n" ++
             "  exit 1\n" ++

@@ -12,8 +12,10 @@
 # real installer as a subprocess against hermetic fixtures. This suite
 # takes the same shape: a fake zig on PATH answers version, fetch, and
 # ast-check, a local HTTP listener serves the tags API, and
-# EPHOR_TEST_MODE unlocks the file:// archive override. No network is
-# touched.
+# EPHOR_TEST_MODE unlocks the file:// archive override. WP-7: the
+# embedded release key activates the signature check, so every run
+# injects EPHOR_RELEASE_PUBKEY (the fixture-key seam) and a fake
+# minisign on PATH accepts the signature. No network is touched.
 #
 # The control line carries a case-variant token in code position plus a
 # lowercase mention in a trailing comment. The bare r1 example
@@ -131,6 +133,22 @@ $archivePath = Join-Path $testRoot "archive.tar.gz"
 Set-Content -Path $archivePath -Value 'dummy archive' -Encoding ASCII
 $archiveUrl = "file://" + $archivePath
 
+# WP-7: the embedded release key activates Test-EphorReleaseSignature, so
+# the scenarios inject EPHOR_RELEASE_PUBKEY (the fixture-key seam) and
+# serve a signature next to the archive: the default SIG_URL is the
+# archive URL plus .minisig. The fake minisign on PATH accepts every
+# signature, so the runs stay hermetic.
+$sigPath = "$archivePath.minisig"
+Set-Content -Path $sigPath -Value 'dummy signature' -Encoding ASCII
+$fakeMinisign = Join-Path $binDir "minisign"
+Set-Content -Path $fakeMinisign -Encoding ASCII -Value @(
+    '#!/bin/sh'
+    '# fake minisign: every signature verifies'
+    'exit 0'
+)
+$null = & chmod +x $fakeMinisign
+if ($LASTEXITCODE -ne 0) { throw "chmod failed for the fake minisign" }
+
 # Bind one local HTTP port. Both Invoke-RestMethod and HttpClient reject
 # file:// URLs on this pwsh, so local HTTP is the hermetic network
 # channel for the tags API and the pubkey-channel downloads.
@@ -179,6 +197,9 @@ $psi.Environment["PATH"] = $binDir + [System.IO.Path]::PathSeparator + $env:PATH
 $psi.Environment["EPHOR_TEST_MODE"] = "1"
 $psi.Environment["EPHOR_TAGS_API"] = "http://127.0.0.1:$tagsPort/tags.json"
 $psi.Environment["EPHOR_ARCHIVE_URL"] = $archiveUrl
+# WP-7: any non-empty key reaches the active branch; the fake minisign
+# never reads it, so the pin needs no real keypair.
+$psi.Environment["EPHOR_RELEASE_PUBKEY"] = "untrusted comment: ephor ps1 anchor pin (fake)"
 $child = [System.Diagnostics.Process]::new()
 $child.StartInfo = $psi
 # The suite's main thread serves the one tags request while the child
@@ -226,18 +247,18 @@ try { $listener.Stop() } catch { }
 
 check "install exits 0" { $installRc -eq 0 }
 # The channel proof: the child must have consumed the served tags (a run
-# that takes the fallback path instead would also trip the trio check,
+# that takes the fallback path instead would also trip the stderr check,
 # but this check names the mechanism directly).
 check "tags fixture served" { $served }
 
-# The strict-stderr pin: a successful run prints exactly the
-# inactive-verification trio (install.sh parity, EPH-I1220). A changed
-# stderr surface fails the pin instead of drifting past it.
+# The strict-stderr pin (WP-7): the active verification prints nothing
+# to stderr on success, and the completion line lands on stdout. A
+# changed installer stderr surface fails the pin instead of drifting
+# past it.
 $errNorm = ([System.IO.File]::ReadAllText($errLog)) -replace "`r`n", "`n"
-$trio = "warning: release signature verification is inactive.`n" +
-    "This installer embeds no release public key yet.`n" +
-    "The first signed release activates the check.`n"
-check "stderr is the inactive-verification trio" { $errNorm -ceq $trio }
+check "stderr stays empty on the active verification" { $errNorm -ceq "" }
+$outText = [System.IO.File]::ReadAllText($outLog)
+check "the verification line prints" { $outText.Contains("Release signature verified.") }
 
 # The composed build.zig: the anchor walk result is read back from the
 # spliced file, exactly like t48's line/count assertions.
@@ -289,9 +310,10 @@ check "case-variant control line sits below the block" { $controlIdx -gt $marker
 # --- EPH-I1231 (B136a): the Get-BoundedFile HTTP-arm emission pin --------
 # The pubkey channel activates Test-EphorReleaseSignature's active branch
 # (the only Get-BoundedFile caller): EPHOR_RELEASE_PUBKEY supplies the
-# key and a fake minisign verifies everything. Two subprocess runs point
-# the archive and signature URLs at a local HTTP listener, so the
-# bounded download takes its HTTP arm twice per run.
+# key and the setup fake minisign (created above) verifies everything.
+# Two subprocess runs point the archive and signature URLs at a local
+# HTTP listener, so the bounded download takes its HTTP arm twice per
+# run.
 #
 # On .NET 5+ a bare EnsureSuccessStatusCode() emits the response into
 # the function output (probed on this pwsh: the call returns the message
@@ -303,14 +325,6 @@ check "case-variant control line sits below the block" { $controlIdx -gt $marker
 # truncated signature verifies and the install exits 0). The over-cap
 # run pins exit 1 plus the named download failure, which discriminates
 # the defect on a .NET 5+ pwsh (7.6.5 here).
-$fakeMinisign = Join-Path $binDir "minisign"
-Set-Content -Path $fakeMinisign -Encoding ASCII -Value @(
-    '#!/bin/sh'
-    '# fake minisign for the pubkey-channel pin: every signature verifies'
-    'exit 0'
-)
-$null = & chmod +x $fakeMinisign
-if ($LASTEXITCODE -ne 0) { throw "chmod failed for the fake minisign" }
 
 # Any non-empty key reaches the active branch: the fake minisign never
 # reads it, so the pin needs no real keypair.
@@ -468,7 +482,7 @@ $ovRun = runPubkeyInstall -Tag "overcap" -WorkDir $D3 -SigBodyLength 1048577
 
 # The success pin: a green install downloads the tarball and the
 # signature through the bounded HTTP arm, verifies, and exits 0 with an
-# empty stderr (no trio: the key is set).
+# empty stderr (the active verification prints nothing to stderr).
 check "pubkey run exits 0" { $pubRun.rc -eq 0 }
 check "pubkey run reports verified signature" {
     $pubRun.out -match 'Release signature verified\.'

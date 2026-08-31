@@ -155,9 +155,9 @@ esac
 # --- 1d. install-sh regression suite (EPH-I1220; REL-ZERO-1, REL-RELEASE-6) -
 # The suite drives the real installer through the splice/refusal scenarios
 # with a fake zig and file:// fixtures, shell-only, in seconds (16s
-# measured at wiring, 2026-08-28). EPH-I1220: the WP-6.5
-# inactive-verification trio means every successful run warns on stderr, so
-# the strict-stderr tests expect exactly that trio. A changed installer
+# measured at wiring, 2026-08-28). EPH-I1220: the embedded release key
+# (WP-7) makes the verification active and silent on success, so the
+# strict-stderr tests expect an empty err.log. A changed installer
 # stderr surface fails this leg without a suite edit — the drift this leg
 # exists to catch. The 1e anchor leg pins one scenario on the ps1 side;
 # the full splice/refusal suite has no ps1 companion.

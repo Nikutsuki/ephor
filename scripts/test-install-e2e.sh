@@ -7,10 +7,14 @@
 # gates in install.sh. The suite drives the real install.sh through the
 # verification states against local HTTP redirect servers, mints a fresh
 # test minisign keypair per run (-W: no password), and includes the
-# file:// byte-cap scenario.
-# install.ps1 has no companion leg: pwsh is absent on the dev machine, so
-# its bounded-read arm (EPH-I0207) stays manual — the recorded
-# limitation (EPH-I1194).
+# file:// byte-cap scenario. WP-7: the embedded release key makes the
+# check active by default, so the no-override scenarios pin the
+# fail-closed outcomes against the embedded key (s1, s7).
+# install.ps1 has no companion leg in this suite: its verification states
+# live in the ps1 anchor and hardening suites (test-install-ps1-*.ps1),
+# which gate through scripts/gate.sh. The bounded-read arm pin
+# (EPH-I0207) lives in the ps1 anchor suite's pubkey-channel runs —
+# the recorded limitation (EPH-I1194) covers the manual residue.
 #
 # Needs: sh, curl, minisign, openssl, python3, and the pinned zig on
 # PATH (or in .zenv/bin). A missing tool aborts with a FATAL line.
@@ -162,14 +166,19 @@ run_scenario() { # dir ...
         sh "$ROOT/install.sh") > "$E2E/$dir/out.log" 2> "$E2E/$dir/err.log" || rc=$?
 }
 
-# s1 inactive: no pubkey. Warn + full install succeeds.
+# s1 active default: no override, so the embedded release key verifies
+# the release. The valid.tar.gz carries the test keypair's signature,
+# which the release key rejects: the unsigned old release fails closed
+# before zig fetch.
 new_project s1
 run_scenario s1 \
     EPHOR_ARCHIVE_URL="$E2E/valid.tar.gz"
-expect "s1 inactive rc 0" "0" "$rc"
-expect_grep "s1 inactive warns" "$E2E/s1/err.log" "release signature verification is inactive"
-expect_grep "s1 install completes" "$E2E/s1/out.log" "Done!"
-expect_grep "s1 zon has the dependency" "$E2E/s1/build.zig.zon" ".ephor = .{"
+expect "s1 active-default rc 1" "1" "$rc"
+expect_grep "s1 key-id mismatch surfaced" "$E2E/s1/err.log" "Signature key id in"
+expect_grep "s1 fail-closed error" "$E2E/s1/err.log" "error: the release signature check failed."
+expect_not_grep "s1 no inactive warning" "$E2E/s1/err.log" "release signature verification is inactive"
+expect_not_grep "s1 no Done" "$E2E/s1/out.log" "Done!"
+expect_grep "s1 zon untouched" "$E2E/s1/build.zig.zon" ".fingerprint = 0x0,"
 
 # s2 active + valid signature: verify + full install succeeds.
 new_project s2
@@ -228,8 +237,13 @@ rc=0
 expect "s6 missing-minisign rc 1" "1" "$rc"
 expect_grep "s6 dependency error" "$E2E/s6/err.log" "error: minisign is not installed or not on PATH."
 
-# s7 override hygiene: an override set without EPHOR_TEST_MODE is
-# ignored with a warning (EPH-I0205 parity).
+# s7 override hygiene + active default: an override set without
+# EPHOR_TEST_MODE is ignored with a warning (EPH-I0205 parity), and the
+# embedded release key then verifies the real v0.14.2 archive, which has
+# no published signature. The install fails closed at the signature
+# download. This scenario needs the live network: the tarball download
+# runs against codeberg.org (a failure there fails at the tarball
+# download with its own message pair).
 new_project s7
 rc=0
 (cd "$E2E/s7" && env \
@@ -237,9 +251,11 @@ rc=0
     EPHOR_RELEASE_PUBKEY="$PUBKEY" \
     EPHOR_SIG_URL="file://$E2E/valid.tar.gz.minisig" \
     sh "$ROOT/install.sh") > "$E2E/s7/out.log" 2> "$E2E/s7/err.log" || rc=$?
-expect "s7 no-test-mode rc 0" "0" "$rc"
+expect "s7 no-test-mode rc 1" "1" "$rc"
 expect_grep "s7 pubkey override ignored" "$E2E/s7/err.log" "warning: EPHOR_RELEASE_PUBKEY is ignored without EPHOR_TEST_MODE=1."
 expect_grep "s7 sig override ignored" "$E2E/s7/err.log" "warning: EPHOR_SIG_URL is ignored without EPHOR_TEST_MODE=1."
+expect_grep "s7 unsigned old release fails closed" "$E2E/s7/err.log" "error: could not download the release signature."
+expect_not_grep "s7 no Done" "$E2E/s7/out.log" "Done!"
 
 # --- I1216 parity scenarios (2026-08-27): fetch_bounded's redirect and
 # cap policy, driven through the tags channel. The archive channel
@@ -346,7 +362,9 @@ rc=0
     EPHOR_TEST_MODE=1 \
     EPHOR_TAGS_API="https://127.0.0.1:$TLS_PORT/redir-tags" \
     ZIG_GLOBAL_CACHE_DIR="$E2E/cache" \
+    EPHOR_RELEASE_PUBKEY="$PUBKEY" \
     EPHOR_ARCHIVE_URL="$E2E/valid.tar.gz" \
+    EPHOR_SIG_URL="$E2E/valid.tar.gz.minisig" \
     CURL_CA_BUNDLE="$E2E/server.crt" \
     sh "$ROOT/install.sh") > "$E2E/s8/out.log" 2> "$E2E/s8/err.log" || rc=$?
 expect "s8 https-to-https redirect rc 0" "0" "$rc"
@@ -363,7 +381,9 @@ rc=0
     EPHOR_TEST_MODE=1 \
     EPHOR_TAGS_API="https://127.0.0.1:$TLS_PORT/redir-tags-http" \
     ZIG_GLOBAL_CACHE_DIR="$E2E/cache" \
+    EPHOR_RELEASE_PUBKEY="$PUBKEY" \
     EPHOR_ARCHIVE_URL="$E2E/valid.tar.gz" \
+    EPHOR_SIG_URL="$E2E/valid.tar.gz.minisig" \
     CURL_CA_BUNDLE="$E2E/server.crt" \
     sh "$ROOT/install.sh") > "$E2E/s9/out.log" 2> "$E2E/s9/err.log" || rc=$?
 expect "s9 downgrade refusal falls back rc 0" "0" "$rc"

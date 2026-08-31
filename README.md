@@ -94,10 +94,11 @@ out after 30 s. On a signed release, the install or upgrade fails closed
 when the signature download fails, when minisign is not installed, or
 when the check fails.
 
-Signature verification is inactive while the installer and the binary
-embed no release public key. No signed release exists yet. The first
-signed release activates the check. Signed releases need the minisign
-binary on PATH.
+Signature verification is active. The installer and the binary embed the
+release public key, and every release must be signed with the release
+keypair. Signed releases need the minisign binary on PATH. The installer
+test suites exercise the check through `EPHOR_RELEASE_PUBKEY`, which
+replaces the embedded key when `EPHOR_TEST_MODE=1` is set.
 
 The installers and the binary keep zig fetch on the canonical `https`
 archive URL. They never hand a local file to zig fetch (EPH-I1215): zig
@@ -300,7 +301,7 @@ built-in threshold defaults apply when the thresholds block is absent.
 
 ```json
 {
-  "version": "0.14.3",
+  "version": "0.15.0",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -1512,7 +1513,7 @@ Ephor uses three testing layers:
 
 ## Changelog
 
-### v0.15.0 — Directive Anchoring, ZA1xx Accuracy, Print-Path Cache (unreleased)
+### v0.15.0 — Directive Anchoring, ZA1xx Accuracy, Print-Path Cache (2026-08-31)
 
 **Changed (ZA703 default flip):** Error set members now default to
 `TitleCase` (`error{ FileNotFound }`), matching the stdlib and virtually
@@ -1648,12 +1649,12 @@ Every ephor release is validated against five scenarios before tagging:
 
 | Scenario | Zig Version | Starting State | Expected Result |
 |----------|-------------|----------------|-----------------|
-| Fresh install | 0.16.0 | No ephor | Installs v0.14.x, `zig build ephor` passes |
+| Fresh install | 0.16.0 | No ephor | Installs v0.15.0, `zig build ephor` passes |
 | Fresh install | 0.15.2 | No ephor | Installs v0.11.13, `zig build ephor` passes |
-| Upgrade | 0.16.0 | v0.11.x snippet | Upgrades to v0.14.x, old snippet replaced with canonical block |
+| Upgrade | 0.16.0 | v0.11.x snippet | Upgrades to v0.15.0, old snippet replaced with canonical block |
 | Upgrade | 0.15.2 | v0.11.x snippet | Upgrades to v0.11.13, old snippet replaced with canonical block |
 | Build-step upgrade | 0.15.2 | ephor dependency present | Refuses with a named error; install.sh pins v0.11.13 |
-| Re-run | 0.16.0 | v0.14.3 canonical | Idempotent — block replaced with identical content, zon pin unchanged |
+| Re-run | 0.16.0 | v0.15.0 canonical | Idempotent — block replaced with identical content, zon pin unchanged |
 
 ### Running the Tests Locally
 

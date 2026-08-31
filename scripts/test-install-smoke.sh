@@ -14,6 +14,9 @@
 #   - 0644 modes (fresh files carry the umask-022 default)
 #   - idempotent re-run (a second run converges with no file growth)
 #   - failure rc propagation (no installArtifact fails the install)
+#   - release-signature verification (WP-7: a fixture keypair signs the
+#     served tarball, and EPHOR_RELEASE_PUBKEY drives the active check
+#     through the real minisign before the fetch)
 # Not wired into hooks.
 #
 # Run:
@@ -48,6 +51,14 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
+# WP-7: the embedded release key activates the verification, so the
+# smoke verifies the served tarball with the real minisign against a
+# fixture keypair minted fresh per run (the e2e suite's pattern).
+if ! command -v curl >/dev/null 2>&1 || ! command -v minisign >/dev/null 2>&1; then
+    echo "error: curl and minisign are required for the release-signature verification." >&2
+    exit 1
+fi
+
 rm -rf "$SMOKE_ROOT"
 mkdir -p "$SMOKE_ROOT/bin" "$SMOKE_ROOT/cache"
 
@@ -78,6 +89,22 @@ pub fn build(b: *std.Build) void {
 }
 EOF
 tar -czf "$SMOKE_ROOT/ephor.tar.gz" -C "$PKG" build.zig build.zig.zon
+
+# WP-7: sign the package tarball with a fresh fixture keypair and serve
+# the signature next to it. The installer's default SIG_URL
+# ($EPHOR_URL.minisig) then downloads it from the local server, and the
+# EPHOR_RELEASE_PUBKEY override below replaces the embedded key for the
+# hermetic run (the fixture-key seam, EPH-I0205).
+minisign -G -W -p "$SMOKE_ROOT/test.pub" -s "$SMOKE_ROOT/test.key" < /dev/null >/dev/null 2>&1 || {
+    echo "error: minisign key generation failed." >&2
+    exit 1
+}
+minisign -S -m "$SMOKE_ROOT/ephor.tar.gz" -s "$SMOKE_ROOT/test.key" \
+    -t "install smoke" -x "$SMOKE_ROOT/ephor.tar.gz.minisig" < /dev/null 2>/dev/null || {
+    echo "error: signing the smoke tarball failed." >&2
+    exit 1
+}
+SMOKE_PUBKEY=$(cat "$SMOKE_ROOT/test.pub")
 
 # The local HTTP server binds an ephemeral port and prints it, so no
 # fixed port can collide with another process.
@@ -126,6 +153,7 @@ export ZIG_BIN
 export EPHOR_TEST_MODE=1
 export EPHOR_TAGS_API="file://$SMOKE_ROOT/tags.json"
 export EPHOR_ARCHIVE_URL="http://127.0.0.1:$PORT/ephor.tar.gz"
+export EPHOR_RELEASE_PUBKEY="$SMOKE_PUBKEY"
 export ZIG_GLOBAL_CACHE_DIR="$SMOKE_ROOT/cache"
 OLD_PATH=$PATH
 PATH="$SMOKE_ROOT/bin:$PATH"
@@ -210,6 +238,7 @@ EOF
 run_installer "$D"
 assert_rc 0
 assert_grep "$D/out.log" 'Done!' 'no Done! summary'
+assert_grep "$D/out.log" 'Release signature verified.' 'no verification line'
 assert_grep "$D/build.zig" '    // Ephor static analysis' 'block not added'
 install_line=$(line_of "$D/build.zig" 'b.installArtifact(exe)')
 marker_line=$(line_of "$D/build.zig" '    // Ephor static analysis')

@@ -69,12 +69,14 @@ $installExitCode = & {
     $EPHOR_0_15_COMMIT = "60145fe05a2b91e7dd32d1c671d98239cd19aea6"
 
     # EPH-I0287 (WP-6.5): the minisign public key of the ephor release
-    # signing keypair. The release pipeline fills this constant when the
-    # keypair is minted; it is empty until then, and the signature check
-    # stays inactive. EPH-I0205: tests override it through
+    # signing keypair, the exact two-line .pub file the WP-7 key mint
+    # produced. Both lines are wire shape, not prose: minisign 0.12
+    # rejects a file whose key line is the first line, so the comment
+    # line ships with the key. EPH-I0205: tests override it through
     # EPHOR_RELEASE_PUBKEY, gated by EPHOR_TEST_MODE like the other
     # trust-anchor overrides (install.sh parity).
-    $ReleasePubkey = ""
+    $ReleasePubkey = "untrusted comment: minisign public key BD29FC2E33D53EBE`n" +
+        "RWS+PtUzLvwpvc7nVJ8t8MKTpo4/8UdOqoxuLGXhfJQI+qvTyn82Dfit"
     if ($testModeActive -and $env:EPHOR_RELEASE_PUBKEY) {
         $ReleasePubkey = $env:EPHOR_RELEASE_PUBKEY
     } elseif ($env:EPHOR_RELEASE_PUBKEY) {
@@ -638,12 +640,11 @@ error: no build.zig found in current directory
     # EPH-I0287 (WP-6.5): download the release tarball and its minisign
     # signature, and verify the signature before zig fetch downloads
     # the artifact again (install.sh parity). Two states:
-    # - Inactive: no release public key is embedded yet (no release is
-    #   signed). The check warns and the install continues on the
-    #   recorded-hash model.
-    # - Active: the key is embedded, so every release must be signed. A
-    #   missing minisign binary, a failed download, or a bad signature
-    #   fails the install closed.
+    # - Active (the shipped state): the release key is embedded, so
+    #   every release must be signed. A missing minisign binary, a
+    #   failed download, or a bad signature fails the install closed.
+    # - Inactive (empty key): the pre-release fallback state. The check
+    #   warns and the install continues on the recorded-hash model.
     function Test-EphorReleaseSignature {
         if (-not $ReleasePubkey) {
             Write-Stderr "warning: release signature verification is inactive."
@@ -679,7 +680,11 @@ error: minisign is not installed or not on PATH.
                 Write-Stderr "Check the network connection, then re-run the install."
                 return $false
             }
-            Set-Content -Path $pubkeyPath -Value $ReleasePubkey -Encoding ASCII
+            # WP-7: write the key file byte-verbatim. Set-Content appends
+            # the platform newline (CRLF on Windows), which would break
+            # the two-line pubkey wire shape minisign parses, so the
+            # bytes go through WriteAllText with an explicit LF tail.
+            [System.IO.File]::WriteAllText($pubkeyPath, $ReleasePubkey + [char]10)
             # EPH-I0645: capture the exit code under "Continue" like the
             # fetch steps, or PowerShell 7.4+ throws before this code
             # reads $LASTEXITCODE.
@@ -708,16 +713,26 @@ error: minisign is not installed or not on PATH.
     # EPH-I0287 (WP-6.5): verify the release signature before zig fetch.
     # EPH-I0205: tests override the signature URL through EPHOR_SIG_URL,
     # gated by EPHOR_TEST_MODE like the other trust-anchor overrides.
-    # The check covers every $EPHOR_URL shape, the pinned 0.15-era
-    # commit archive included.
-    $SIG_URL = "$EPHOR_URL.minisig"
-    if ($testModeActive -and $env:EPHOR_SIG_URL) {
-        $SIG_URL = $env:EPHOR_SIG_URL
-    } elseif ($env:EPHOR_SIG_URL) {
-        Write-Stderr "warning: EPHOR_SIG_URL is ignored without EPHOR_TEST_MODE=1."
-    }
-    if (-not (Test-EphorReleaseSignature)) {
-        return 1
+    # WP-7 era-pin carve (M-2): the check covers every TAG URL. The
+    # pinned 0.15-era commit archive skips it. A tag is a mutable
+    # pointer, and a moved tag is the M-2 threat, so a tag URL must
+    # verify. The commit archive is SHA-addressed and immutable on the
+    # remote: the commit cannot move, and https transport plus the
+    # package fingerprint that zig fetch records in build.zig.zon
+    # carry its integrity.
+    $eraPinUrl = "$REPO/archive/$EPHOR_0_15_COMMIT.tar.gz"
+    if ($EPHOR_URL -eq $eraPinUrl) {
+        Write-Host "The installer skips signature verification for the pinned commit archive: it is immutable and SHA-addressed."
+    } else {
+        $SIG_URL = "$EPHOR_URL.minisig"
+        if ($testModeActive -and $env:EPHOR_SIG_URL) {
+            $SIG_URL = $env:EPHOR_SIG_URL
+        } elseif ($env:EPHOR_SIG_URL) {
+            Write-Stderr "warning: EPHOR_SIG_URL is ignored without EPHOR_TEST_MODE=1."
+        }
+        if (-not (Test-EphorReleaseSignature)) {
+            return 1
+        }
     }
 
     # EPH-I1272: repair the fingerprint only at a code position

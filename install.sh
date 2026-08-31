@@ -92,12 +92,14 @@ EPHOR_FALLBACK_TAG="v0.14.2"
 EPHOR_0_15_COMMIT="60145fe05a2b91e7dd32d1c671d98239cd19aea6"
 
 # EPH-I0287 (WP-6.5): the minisign public key of the ephor release
-# signing keypair. The release pipeline fills this constant when the
-# keypair is minted; it is empty until then, and the signature check
-# stays inactive. EPH-I0205: tests override it through
+# signing keypair, the exact two-line .pub file the WP-7 key mint
+# produced. Both lines are wire shape, not prose: minisign 0.12 rejects
+# a file whose key line is the first line, so the comment line ships
+# with the key. EPH-I0205: tests override it through
 # EPHOR_RELEASE_PUBKEY, gated by EPHOR_TEST_MODE like the other
 # trust-anchor overrides.
-RELEASE_PUBKEY=""
+RELEASE_PUBKEY='untrusted comment: minisign public key BD29FC2E33D53EBE
+RWS+PtUzLvwpvc7nVJ8t8MKTpo4/8UdOqoxuLGXhfJQI+qvTyn82Dfit'
 if test_mode_active; then
     RELEASE_PUBKEY="${EPHOR_RELEASE_PUBKEY:-$RELEASE_PUBKEY}"
 elif [ -n "${EPHOR_RELEASE_PUBKEY:-}" ]; then
@@ -255,12 +257,11 @@ fetch_bounded() {
 # EPH-I0287 (WP-6.5): download the release tarball and its minisign
 # signature, and verify the signature before zig fetch downloads the
 # artifact again. Two states:
-# - Inactive: no release public key is embedded yet (no release is
-#   signed). The check warns and the install continues on the
-#   recorded-hash model.
-# - Active: the key is embedded, so every release must be signed. A
-#   missing minisign binary, a failed download, or a bad signature
-#   fails the install closed.
+# - Active (the shipped state): the release key is embedded, so every
+#   release must be signed. A missing minisign binary, a failed
+#   download, or a bad signature fails the install closed.
+# - Inactive (empty key): the pre-release fallback state. The check
+#   warns and the install continues on the recorded-hash model.
 verify_ephor_release() {
     if [ -z "$RELEASE_PUBKEY" ]; then
         echo "warning: release signature verification is inactive." >&2
@@ -277,6 +278,11 @@ verify_ephor_release() {
     # files live in a fresh mktemp dir. The EXIT trap removes it. Under
     # set -e a failed mktemp aborts the install before any download.
     VERIFY_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ephor-verify.XXXXXXXX")
+    # EPH-I0632 (WP-7 fill exposure): the BSD mktemp applies the umask to
+    # its 0700, so a umask that strips owner write (0277) leaves the dir
+    # unwritable and every download fails. Keep it owner-writable like
+    # make_install_tmp keeps its temp files.
+    chmod u+w "$VERIFY_DIR"
     fetch_bounded "$EPHOR_URL" "$VERIFY_DIR/ephor.tar.gz" "$TARBALL_CAP" || {
         echo "error: could not download the release tarball for verification." >&2
         echo "Check the network connection, then re-run the install." >&2
@@ -624,16 +630,27 @@ fi
 
 # EPH-I0287 (WP-6.5): verify the release signature before zig fetch.
 # EPH-I0205: tests override the signature URL through EPHOR_SIG_URL,
-# gated by EPHOR_TEST_MODE like the other trust-anchor overrides. The
-# check covers every EPHOR_URL shape, the pinned 0.15-era commit
-# archive included.
-SIG_URL="${EPHOR_URL}.minisig"
-if test_mode_active; then
-    SIG_URL="${EPHOR_SIG_URL:-$SIG_URL}"
-elif [ -n "${EPHOR_SIG_URL:-}" ]; then
-    echo "warning: EPHOR_SIG_URL is ignored without EPHOR_TEST_MODE=1." >&2
-fi
-verify_ephor_release
+# gated by EPHOR_TEST_MODE like the other trust-anchor overrides.
+# WP-7 era-pin carve (M-2): the check covers every TAG URL. The pinned
+# 0.15-era commit archive skips it. A tag is a mutable pointer, and a
+# moved tag is the M-2 threat, so a tag URL must verify. The commit
+# archive is SHA-addressed and immutable on the remote: the commit
+# cannot move, and https transport plus the package fingerprint that
+# zig fetch records in build.zig.zon carry its integrity.
+case "$EPHOR_URL" in
+    "${REPO}/archive/${EPHOR_0_15_COMMIT}.tar.gz")
+        echo "The installer skips signature verification for the pinned commit archive: it is immutable and SHA-addressed."
+        ;;
+    *)
+        SIG_URL="${EPHOR_URL}.minisig"
+        if test_mode_active; then
+            SIG_URL="${EPHOR_SIG_URL:-$SIG_URL}"
+        elif [ -n "${EPHOR_SIG_URL:-}" ]; then
+            echo "warning: EPHOR_SIG_URL is ignored without EPHOR_TEST_MODE=1." >&2
+        fi
+        verify_ephor_release
+        ;;
+esac
 
 echo "Adding ephor dependency..."
 # EPH-I0192: zig fetch reads build.zig.zon but never runs build.zig, so a

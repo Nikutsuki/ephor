@@ -1515,11 +1515,54 @@ Ephor uses three testing layers:
 
 ### v0.15.0 — Directive Anchoring, ZA1xx Accuracy, Print-Path Cache (2026-08-31)
 
+**New default-ON rules:**
+
+- ZA404 unused private functions — a fn declared without `pub` that no
+  code position references anywhere in the project. Test decls count as
+  callers. C-ABI decls and `main` stay exempt (EPH-I1084).
+- ZA405 unused parameters — a private fn declares a parameter its body
+  never references. Pub fns, the `self` receiver, `_`-prefixed names,
+  generic fns, and C-ABI decls stay exempt (EPH-I1080).
+- ZA406 unnecessary var — a `var` never mutated in its body, so `const`
+  suffices. Compound assignments, field and element stores, address-taken
+  views, pointer captures, destructuring, and inline-asm operands count as
+  mutations (EPH-I1085).
+- ZA504 duplicated block — a run of six or more normalized lines that
+  repeats within one file or across files, the copy-paste duplication
+  detector (EPH-I1076).
+- ZA505 passthrough wrapper — a body that is a single call statement whose
+  argument list is exactly the parameter list in order (EPH-I1077).
+- ZA506 boolean flag parameter — a `bool`-typed parameter whose name
+  appears inside an `if`/`switch` condition, the selector that hides two
+  functions in one signature (EPH-I1081).
+- ZA507 redundant else (note) — an else whose if-branch ends in return,
+  break, or continue. The guard-clause style removes the else and one
+  nesting level (EPH-I1079).
+- ZA508 simplifiable boolean return (note) — `if (x) return true else
+  return false;` where `return x;` suffices (EPH-I1078).
+- ZT106 invocationless test block (note) — a test block whose body carries
+  no call site, so the runner counts it as passing while it covers no
+  function body (EPH-I1089).
+
+**Complexity:** the complexity defaults are unified at cyclomatic 10 and
+cognitive 15 (EPH-I0992). ZA305 and ZA306 stay off by default. Enable them
+in `ephor.json`.
+
+**Signed releases (minisign):** the installers and the `ephor install` and
+`ephor upgrade` commands verify the release signature before zig fetch
+(EPH-I0287). They download the tarball and its signature and check the
+pair against the embedded release public key. The tarball download caps at
+32 MiB and the signature at 1 MiB, each with a 30 s timeout. On a signed
+release the install or upgrade fails closed when the signature download
+fails, when minisign is not installed, or when the check fails. The pinned
+0.15-era commit archive skips the check: it is SHA-addressed and immutable
+on the remote. Every tag URL verifies, because a tag is a mutable pointer.
+
 **Changed (ZA703 default flip):** Error set members now default to
 `TitleCase` (`error{ FileNotFound }`), matching the stdlib and virtually
 all community code — the old `snake_case` default false-positived on
 idiomatic Zig (Codeberg issue #1, EPH-I0092). Set `"error_naming":
-"snake_case"` in `ephor.json` to keep the old behavior; `"PascalCase"` is
+"snake_case"` in `ephor.json` to keep the old behavior. `"PascalCase"` is
 accepted as an alias for `TitleCase`. Unknown values warn and fall back to
 the default.
 
@@ -1557,33 +1600,61 @@ only plain `//` comments whose first token is `ephor:ignore`,
 - `//ephor:ignore` (no space) now works
 - a trailing-space bare directive now suppresses (was inert)
 
-**Removed:** ZA902 — its only emitter was dead code; it never emitted.
-`disable`/`enable` entries naming ZA902 become inert no-ops.
+**Removed:** ZA902 — its only emitter sat in the dead legacy panic-analyzer
+cluster, so it never emitted. `disable`/`enable` entries naming ZA902
+become inert no-ops.
 
 **Added (new detections — genuine leaks, expect new warnings):**
 
-- ZA103 on multi-line-signature error-returning fns and on error exits
-  preceding an ownership transfer (+15 across the
-  zls/ghostty/sig/tigerbeetle validation corpus). Disclosed FP classes:
-  arena alias via method call, `try` inside call args, negation substrings
-  on signature lines.
-- ZA101 inside fns with container-typed parameters (enum/struct/union/
-  default `.{}` params no longer truncate the body).
+- ZA103 on multi-line-signature error-returning fns — the return type on a
+  later signature line no longer silently disables ZA103 (EPH-I0072) — and
+  on error exits preceding an ownership transfer (EPH-I0005).
+- ZA101/ZA103 coverage family: embedded returns, container handoff,
+  realloc, block-span errdefer, and per-site no-free shapes (EPH-I0273,
+  EPH-I066, EPH-I067, EPH-I070).
+- ZT105 cross-file two-hop call graph — a test-target candidate can sit
+  two hops from the test site (EPH-I0429, EPH-I0031).
 
-**Fixed (false positives):** ZA103 return-transfers; ZA101/ZA103
-orelse-return allocs; ZA101 allocator-first-arg shapes; ZA102 `.prepend`
-ownership; ZA105 sibling-switch-arm UAF.
+**Fixed (false positives):** ZA103 return-transfers, ZA101/ZA103
+orelse-return allocs (EPH-I0009), ZA101 allocator-first-arg shapes
+(EPH-I0008), ZA102 `.prepend` ownership (EPH-I0007), ZA105
+sibling-switch-arm UAF (EPH-I0010), ZA205 compound-annotation resolution
+(EPH-I0057).
+
+**Containment and disclosure:** symlink and open-failure prunes and
+depth-cap truncations count into `pruned_dirs` in the summary output, so a
+skipped subtree is visible in the JSON summary (EPH-I1261, EPH-I1267,
+EPH-I1268). Hidden-dir skips carry a count note (EPH-I1260). The export
+open and the snippet read go no-follow: a planted symlink fails the open
+instead of redirecting the read. A symlinked scan root fails closed.
+
+**Output sanitization:** the config-diagnostic channels (the
+over-broad-exclude and threshold-clamp warnings), the AST-skip notes, the
+list-tests text mode, the runtime prompt and banner, and the minisign
+stderr sanitize hostile control and bidi/invisible characters before the
+terminal (EPH-I1256, EPH-I1257, EPH-I1275, EPH-I1280-I1282).
+
+**Redteam #3 hardening:** the run-3 findings (EPH-I1254-I1260) and the
+re-derivation wave (EPH-I1264-I1282) fixed every filed finding across the
+five attack areas: parser/input, supply chain, suppression, containment,
+and output. Headlines: the cimport filename skip now needs a code-position
+marker, so a filename-only substring no longer blinds six analyzer
+families (EPH-I1254). The version fetchers check the curl exit status
+(EPH-I1255). The 16 KiB statement-end mask fails closed: past the bound an
+overhang scan counts code-position braces and semicolons with the same
+string/comment masking (EPH-I1258, EPH-I1265). The installer hardening
+suites joined the Layer-1 gate (EPH-I1285).
 
 **Performance:** print path 16x on issue-bound projects (libqt6zig 50-60
-min → 3:10) via a per-(file, rule) suppression cache.
+min → 3:10) via a per-(file, rule) suppression cache (EPH-I0061).
 
 **Operations:** the update check now honors the documented 24h cache
-(`~/.ephor_update_check`); set `EPHOR_NO_UPDATE_CHECK` (any value) to skip
+(`~/.ephor_update_check`). Set `EPHOR_NO_UPDATE_CHECK` (any value) to skip
 it entirely (deterministic CI). See [Update Check](#update-check).
 
-**Internal:** dead legacy panic-analyzer cluster removed (272 lines); 16
-self-leaks fixed (allocPrint → try-append OOM); ZA205 compound-annotation
-resolution corrected; tests 635 → 734.
+**Internal:** dead legacy panic-analyzer cluster removed (272 lines,
+EPH-I0015, EPH-I0041). The dogfood ratchet holds at zero warnings and zero
+notes, and the gate ships 2958 tests.
 
 ### v0.14.2 — Dogfood Complexity Debt Cleared (2026-07-27)
 

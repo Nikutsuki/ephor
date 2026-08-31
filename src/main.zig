@@ -404,9 +404,20 @@ const DiagCtx = struct {
     /// per run, the first time any directory-depth cap truncates a subtree.
     depth_cap_note_count: usize = 0,
     /// Directories the main walk pruned as hidden or known-cache names
-    /// (EPH-I1260). The run-end note surfaces the count so a pruned
-    /// subtree never leaves the analyzed set silently.
+    /// (EPH-I1260) or failed to open (EPH-I1276). The run-end note
+    /// surfaces the count so a pruned subtree never leaves the analyzed
+    /// set silently.
     skipped_dir_count: usize = 0,
+    /// Non-file, non-directory walk entries the main walk skipped
+    /// (EPH-I1267): symlinks dominate, specials (fifos, sockets) ride
+    /// the same count. The walk never follows links, so a link's target
+    /// leaves the analyzed set and the disclosure must name the drop.
+    skipped_link_count: usize = 0,
+    /// Depth-cap truncation events across every walk (EPH-I1277). Each
+    /// truncated subtree increments once, in every output mode: the
+    /// pruned_dirs summary member carries the total into JSON mode,
+    /// where the truncation note stays silent (EPH-I0213).
+    depth_cap_trunc_count: usize = 0,
     /// Entries-widen-scan notes (EPH-I0784).
     entries_widen_note_count: usize = 0,
     /// Resident-content budget for the corpus warning (EPH-I0199). Real
@@ -16396,8 +16407,13 @@ const ImportGraph = struct {
                 // point outside the scan root and can form cycles, so
                 // following would need containment re-checks per hop. The
                 // skip keeps the walk inside the requested tree (band-B03
-                // F20, EPH-I0380).
-                else => self.allocator.free(path),
+                // F20, EPH-I0380) and counts into the run-end disclosure
+                // (EPH-I1267, serves REL-REDTEAM-4): the link's target
+                // left the analyzed set.
+                else => {
+                    self.allocator.free(path);
+                    self.diag.skipped_link_count += 1;
+                },
             }
         }
     }
@@ -16418,18 +16434,25 @@ const ImportGraph = struct {
     /// skip it (skip-list name) or cannot open it (EPH-I0761). The main
     /// walk prunes with the same predicate as the nested discovery walks
     /// (band-B03 F23, EPH-I0377): one skip set keeps coverage consistent.
-    /// A prune counts into the run-end note (EPH-I1260): a hidden or
-    /// known-cache subtree leaving the analyzed set silently was the
-    /// pre-fix gap. RED4-7 (EPH-I0210): no-follow on the final component —
-    /// a directory swapped for a symlink after the dirent kind check
-    /// fails the open and reads as a skip, never as a descent into its
-    /// target.
+    /// Every prune counts into the run-end note (EPH-I1260, EPH-I1276):
+    /// a hidden or known-cache subtree, and an unopenable one alike,
+    /// leaves the analyzed set and must never do so silently. RED4-7
+    /// (EPH-I0210): no-follow on the final component — a directory
+    /// swapped for a symlink after the dirent kind check fails the open
+    /// and reads as a skip, never as a descent into its target.
     fn openSubdir(self: *ImportGraph, io: std.Io, dir: std.Io.Dir, name: []const u8) ?std.Io.Dir {
         if (isSkippableDir(name)) {
             self.diag.skipped_dir_count += 1;
             return null;
         }
-        return dir.openDir(io, name, .{ .iterate = true, .follow_symlinks = false }) catch null;
+        return dir.openDir(io, name, .{ .iterate = true, .follow_symlinks = false }) catch {
+            // EPH-I1276 (serves REL-REDTEAM-4): an open failure
+            // (permission-denied, a swapped symlink, a raced delete)
+            // drops the subtree the same way a name prune does, so it
+            // must count the same way.
+            self.diag.skipped_dir_count += 1;
+            return null;
+        };
     }
 
     /// Edge-triggered corpus-size warning (EPH-I0199). The graph holds
@@ -17231,6 +17254,10 @@ const ImportGraph = struct {
     }
 
     /// Handle a subdirectory found during nested build.zig scanning
+    /// (EPH-I1279, serves REL-REDTEAM-4: the mark gates on the scan
+    /// root, like the b.path and single-file channels — a nested
+    /// build.zig resolving outside the root must not mark outside files
+    /// reachable).
     fn handleNestedSubdir(self: *ImportGraph, subdir: []const u8) void {
         const build_path = std.fmt.allocPrint(
             self.allocator,
@@ -17239,14 +17266,16 @@ const ImportGraph = struct {
         ) catch return;
         defer self.allocator.free(build_path);
 
-        if (Fs.cwd(self.diag.io).access(build_path, .{})) |_| {
-            var buf2: [Fs.max_path_bytes]u8 = undefined;
-            if (Fs.cwd(self.diag.io).realpath(build_path, &buf2)) |resolved| {
-                if (!self.reachable.contains(resolved))
-                    self.markReachableResolved(resolved) catch return;
-            } else |_| {}
+        Fs.cwd(self.diag.io).access(build_path, .{}) catch return;
+        var buf2: [Fs.max_path_bytes]u8 = undefined;
+        const resolved = Fs.cwd(self.diag.io).realpath(build_path, &buf2) catch {
             self.markAllZigFilesReachable(subdir);
-        } else |_| {}
+            return;
+        };
+        if (!self.isWithinScanRoot(resolved)) return;
+        if (!self.reachable.contains(resolved))
+            self.markReachableResolved(resolved) catch return;
+        self.markAllZigFilesReachable(subdir);
     }
 
     /// A no-follow directory open plus its iterator (openWalkDir): the
@@ -51657,7 +51686,11 @@ fn writeCodeSnippet(
     if (!resolvesInRoot(paths.io, issue.file, paths.scan_root_real)) return;
     // max_source_file_bytes (EPH-I0150): the same cap the graph read
     // under, so a skipped file cannot re-enter through the snippet path.
-    const content = Fs.cwd(paths.io).readFileAlloc(
+    // EPH-I1278 (serves REL-REDTEAM-4): the read is no-follow, matching
+    // the graph read — a file swapped for a symlink between the root
+    // gate and this read fails the open instead of embedding the link
+    // target's lines.
+    const content = Fs.cwd(paths.io).readFileAllocNoFollow(
         allocator,
         issue.file,
         max_source_file_bytes,
@@ -51863,13 +51896,34 @@ fn writeExportHeader(
     try output.print(allocator, "# Total issues: {d}\n\n", .{filtered_count});
 }
 
+/// Open the export target with no-follow semantics (EPH-I1268, serves
+/// REL-REDTEAM-4): an existing regular file opens no-follow and
+/// truncates; a missing path gets an exclusive create; a symlink at the
+/// final component fails the open instead of redirecting the write into
+/// the link's victim. The exclusive-create window fails closed too: if
+/// anything (a planted symlink included) appears between the open miss
+/// and the create, the create errors and the export fails rather than
+/// follow it.
+fn openExportFile(io: std.Io, export_path: []const u8) !std.Io.File {
+    var file = Fs.cwd(io).openFile(export_path, .{
+        .mode = .write_only,
+        .follow_symlinks = false,
+        .allow_directory = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    } orelse return Fs.cwd(io).createFile(export_path, .{ .exclusive = true });
+    try file.setLength(io, 0);
+    return file;
+}
+
 fn exportIssues(
     allocator: Allocator,
     export_path: []const u8,
     all_issues: []const Issue,
     out: ReportOutCtx,
 ) !usize {
-    var file = try Fs.cwd(out.diag.io).createFile(export_path, .{});
+    var file = try openExportFile(out.diag.io, export_path);
     defer file.close(out.diag.io);
 
     var output = std.ArrayListUnmanaged(u8).empty;
@@ -52625,8 +52679,10 @@ const summary_json_buf_bytes = 1536;
 /// (formatSummaryCore, EPH-I1232 C7). The tail keeps the JSON-only
 /// pruned_dirs/todos/status/suppressed members. pruned_dirs (EPH-I1260)
 /// rides the ast_skipped pattern: the .check flow merges the walk's
-/// pruned-directory count in, and the member is the JSON mode's only
-/// pruned-subtree signal (the note skips in JSON mode).
+/// prune counts in — hidden or known-cache dirs, unopenable dirs
+/// (EPH-I1276), symlink-kind entries (EPH-I1267), and depth-cap
+/// truncations (EPH-I1277) — and the member is the JSON mode's only
+/// pruned-subtree signal (the notes skip in JSON mode).
 fn formatSummaryJson(
     buf: []u8,
     counts: IssueCounts,
@@ -52902,8 +52958,12 @@ fn noteAstTierSkips(
 /// Surface scan-depth truncation (EPH-I0667, trust-model F-5): a depth cap
 /// silently stops the analyzed set otherwise. Fires once per run, the
 /// first time any cap truncates a subtree, and names that cap's depth.
-/// JSON mode skips the note so the machine stream stays pure (EPH-I0213).
+/// Every call counts into depth_cap_trunc_count first, in every mode
+/// (EPH-I1277, serves REL-REDTEAM-4): the pruned_dirs summary member
+/// carries the total, so JSON mode keeps the disclosure while the note
+/// itself stays silent to keep the machine stream pure (EPH-I0213).
 fn noteDepthCapTruncation(diag: *DiagCtx, cap: usize) void {
+    diag.depth_cap_trunc_count += 1;
     if (diag.depth_cap_note_count > 0 or diag.json_stream) return;
     diag.depth_cap_note_count += 1;
     cliDiag(
@@ -52914,20 +52974,32 @@ fn noteDepthCapTruncation(diag: *DiagCtx, cap: usize) void {
     );
 }
 
-/// Surface pruned hidden or known-cache directories (EPH-I1260): the walk
-/// skips dot-prefixed dirs and the shared skip list, and a path hidden in
-/// one never enters the analyzed set. Fires once per run when the main
-/// walk pruned at least one, with the count. JSON mode skips the note so
-/// the machine stream stays pure (EPH-I0213).
-fn noteHiddenDirSkips(diag: *DiagCtx) void {
+/// Surface walk prunes (EPH-I1260, EPH-I1267, EPH-I1276, serves
+/// REL-REDTEAM-4): hidden or known-cache directories, unopenable
+/// directories, and symlink-kind entries all leave the analyzed set
+/// when the walk drops them. One line per class, with the count, when
+/// that class pruned at least one. JSON mode skips the notes so the
+/// machine stream stays pure (EPH-I0213); the pruned_dirs summary
+/// member carries the total there.
+fn notePrunedDirs(diag: *DiagCtx) void {
+    if (diag.json_stream) return;
     const skipped = diag.skipped_dir_count;
-    if (skipped == 0 or diag.json_stream) return;
-    cliDiag(
-        diag,
-        "note: {d} director{s} skipped (hidden or known-cache names). " ++
-            "Files inside them are not analyzed.\n",
-        .{ skipped, if (skipped == 1) "y" else "ies" },
-    );
+    if (skipped > 0) {
+        cliDiag(
+            diag,
+            "note: {d} director{s} skipped (hidden, known-cache, or unopenable). " ++
+                "Files inside them are not analyzed.\n",
+            .{ skipped, if (skipped == 1) "y" else "ies" },
+        );
+    }
+    const links = diag.skipped_link_count;
+    if (links > 0) {
+        cliDiag(
+            diag,
+            "note: {d} symlink{s} skipped. Files behind them are not analyzed.\n",
+            .{ links, if (links == 1) "" else "s" },
+        );
+    }
 }
 
 /// Print the summary block in the requested format.
@@ -53662,7 +53734,7 @@ fn handleCheck(ctx: *RunCtx) !void {
     if (ctx.should_exit_error) return;
     var findings = try collectCheckFindings(ctx, &g);
     defer findings.deinit(ctx.alloc);
-    noteHiddenDirSkips(ctx.diag);
+    notePrunedDirs(ctx.diag);
     try reportCheckFindings(ctx, &g, &findings);
 }
 
@@ -54031,6 +54103,15 @@ fn printCheckReports(
     };
 }
 
+/// The pruned_dirs summary value (EPH-I1260, EPH-I1267, EPH-I1276,
+/// EPH-I1277, serves REL-REDTEAM-4): every subtree the walk dropped —
+/// hidden or known-cache dirs, unopenable dirs, symlink-kind entries,
+/// and depth-cap truncations. One number, so a JSON machine consumer
+/// keeps the pruned-subtree signal the text notes give.
+fn prunedDirsTotal(diag: *const DiagCtx) usize {
+    return diag.skipped_dir_count + diag.skipped_link_count + diag.depth_cap_trunc_count;
+}
+
 /// The --summary block: merge the AST-tier and pruned-dir counters into
 /// the scan stats (EPH-I0200, EPH-I1260: getStats walks content only and
 /// cannot observe parse outcomes or walk pruning), then print in the
@@ -54044,7 +54125,7 @@ fn printCheckSummary(
     var stats = g.getStats();
     stats.ast_parsed = findings.ast_stats.parsed;
     stats.ast_skipped = findings.ast_stats.skipped;
-    stats.pruned_dirs = ctx.diag.skipped_dir_count;
+    stats.pruned_dirs = prunedDirsTotal(ctx.diag);
     // Note-severity findings ride one summary member, not per-category
     // buckets: the buckets keep the historical warnings-only meaning
     // (EPH-I0535).
@@ -55457,12 +55538,50 @@ test "scanForNestedBuildZig stops at the depth cap" {
     defer graph.deinit();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root);
+    // Production shape (EPH-I0172): handlers set the containment root
+    // before the nested-discovery walk. The EPH-I1279 gate keys on it.
+    graph.scan_root = root;
     try graph.scanForNestedBuildZig(root, 0);
 
     const shallow = try tmpFilePath(allocator, &tmp, "proj/build.zig");
     defer allocator.free(shallow);
     try std.testing.expect(graph.reachable.contains(shallow));
     try std.testing.expectEqual(@as(u32, 1), graph.reachable.count());
+}
+
+test "a nested build.zig resolving outside the scan root is not marked reachable (EPH-I1279)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    // The outside tree: its build.zig and x.zig must stay out of the
+    // reachable set when the nested-subdir channel sees them through a
+    // link planted inside the scan root.
+    var outside = std.testing.tmpDir(.{});
+    defer outside.cleanup();
+    const outside_path = try tmpDirPath(allocator, &outside);
+    defer allocator.free(outside_path);
+    try outside.dir.writeFile(std.testing.io, .{
+        .sub_path = "build.zig",
+        .data = "pub fn build(b: *std.Build) void {}\n",
+    });
+    try outside.dir.writeFile(std.testing.io, .{
+        .sub_path = "x.zig",
+        .data = "pub fn x() void {}\n",
+    });
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    try tmp.dir.symLink(std.testing.io, outside_path, "link", .{ .is_directory = true });
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    graph.scan_root = tmp_path;
+    const link_path = try tmpFilePath(allocator, &tmp, "link");
+    defer allocator.free(link_path);
+    graph.handleNestedSubdir(link_path);
+    try std.testing.expectEqual(@as(u32, 0), graph.reachable.count());
 }
 
 /// One failing-allocator iteration over addChainNode: build the graph
@@ -125821,6 +125940,113 @@ test "a successful export leaves the exit flag clear (EPH-I0741)" {
     try std.testing.expect(!ctx.should_exit_error);
 }
 
+test "the snippet read is no-follow past the root gate (EPH-I1278)" {
+    // The export snippet read followed symlinks after the realpath
+    // gate: a link swapped in between embedded the target's lines. The
+    // no-follow read refuses the swapped link, so no snippet block
+    // lands. Both paths resolve inside the root, so the gate itself
+    // passes and only the read's follow behavior decides.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "a.zig",
+        .data = "pub fn a() void {}\n// line two\n// line three\n",
+    });
+    try tmp.dir.symLink(std.testing.io, "a.zig", "b.zig", .{});
+
+    const link_path = try tmpFilePath(allocator, &tmp, "b.zig");
+    defer allocator.free(link_path);
+    var root_buf: [Fs.max_path_bytes]u8 = undefined;
+    const root_real = scanRootRealpath(std.testing.io, tmp_path, &root_buf).?;
+    const issue = Issue{
+        .file = link_path,
+        .line = 1,
+        .col = 1,
+        .severity = .warning,
+        .rule = RULE_ORPHAN_FILE,
+        .message = "unused",
+        .help = null,
+    };
+    var output = std.ArrayListUnmanaged(u8).empty;
+    defer output.deinit(allocator);
+    try writeCodeSnippet(allocator, &output, issue, .{
+        .io = std.testing.io,
+        .base_path = tmp_path,
+        .scan_root_real = root_real,
+    });
+    try std.testing.expectEqual(@as(usize, 0), output.items.len);
+}
+
+test "a symlink export path refuses the write and the victim stays intact (EPH-I1268)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(dir_path);
+    // The victim: a regular file whose content must survive the export.
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "victim.md",
+        .data = "victim content\n",
+    });
+    // The planted link: report.md -> victim.md. A following create
+    // truncates the victim; the no-follow open refuses instead.
+    try tmp.dir.symLink(std.testing.io, "victim.md", "report.md", .{});
+    const link_path = try tmpFilePath(allocator, &tmp, "report.md");
+    defer allocator.free(link_path);
+
+    var cfg = testConfig();
+    defer cfg.deinit(allocator);
+    _ = try setOptionalPath(allocator, &cfg.export_path, link_path);
+    var ignore_cache = IgnoreCache.init(allocator);
+    defer ignore_cache.deinit();
+    var findings = CheckFindings{
+        .orphan_issues = .empty,
+        .cfg_mem_issues = .empty,
+        .err_issues = .empty,
+        .ignored_err_issues = .empty,
+        .unused_issues = .empty,
+        .cx_issues = .empty,
+        .fmt_issues = .empty,
+        .style_issues = .empty,
+        .naming_issues = .empty,
+        .test_issues = .empty,
+        .conc_issues = .empty,
+        .ast_stats = .{},
+    };
+    defer findings.deinit(allocator);
+    var filtered = FilteredMemIssues{
+        .mem_only = .empty,
+        .null_safety = .empty,
+        .panic = .empty,
+    };
+    defer filtered.deinit(allocator);
+    var ctx = RunCtx{
+        .alloc = allocator,
+        .cfg = &cfg,
+        .diag = &diag,
+        .base_path = ".",
+        .ignore_cache = &ignore_cache,
+    };
+    try exportCheckIssues(&ctx, ctx.reportOut(null), &findings, &filtered);
+    // The symlinked export path refuses the write: the run fails, and
+    // the victim file keeps its content.
+    try std.testing.expect(ctx.should_exit_error);
+    const victim_path = try tmpFilePath(allocator, &tmp, "victim.md");
+    defer allocator.free(victim_path);
+    const victim = try Fs.cwd(std.testing.io).readFileAlloc(
+        allocator,
+        victim_path,
+        max_source_file_bytes,
+    );
+    defer allocator.free(victim);
+    try std.testing.expectEqualStrings("victim content\n", victim);
+}
+
 test "file-level findings render with a position (EPH-I0739)" {
     // The chosen I0739 guarantee: every finding line carries :line:col,
     // file-level findings included, so the single documented VS Code
@@ -128283,42 +128509,136 @@ test "hidden-directory skip counts and the file stays out (EPH-I1260)" {
     try std.testing.expectEqual(@as(usize, 1), graph.files.count());
 }
 
-test "hidden-directory skip note prints the count (EPH-I1260)" {
-    // The singular form.
+test "an unopenable directory prune counts (EPH-I1276)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    // The open-failure prune was the last silent channel: a chmod-000
+    // subtree dropped from the analyzed set with a zero prune count and
+    // no note. The failure must count like a hidden-dir prune.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "visible.zig",
+        .data = "pub fn f() void {}\n",
+    });
+    try tmp.dir.createDirPath(std.testing.io, "locked");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "locked/secret.zig",
+        .data = "pub fn g() void {}\n",
+    });
+    try tmp.dir.setFilePermissions(
+        std.testing.io,
+        "locked",
+        std.Io.File.Permissions.fromMode(0),
+        .{ .follow_symlinks = false },
+    );
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    try graph.scanDirectory(tmp_path);
+    // Restore before the assertions so the fixture cleanup can delete
+    // the locked subtree either way.
+    try tmp.dir.setFilePermissions(
+        std.testing.io,
+        "locked",
+        std.Io.File.Permissions.fromMode(0o755),
+        .{ .follow_symlinks = false },
+    );
+    try std.testing.expectEqual(@as(usize, 1), diag.skipped_dir_count);
+    try std.testing.expectEqual(@as(usize, 1), graph.files.count());
+}
+
+test "symlink walk entries count into the prune disclosure (EPH-I1267)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    // The link itself is the skip: the walk never follows it, and the
+    // disclosure must name the drop. The target file still analyzes
+    // once through its own dirent.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "real.zig",
+        .data = "pub fn real() void {}\n",
+    });
+    try tmp.dir.symLink(std.testing.io, "real.zig", "shim.zig", .{});
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    try graph.scanDirectory(tmp_path);
+    try std.testing.expectEqual(@as(usize, 1), diag.skipped_link_count);
+    try std.testing.expectEqual(@as(usize, 1), graph.files.count());
+}
+
+test "prune note prints each skip class's count (EPH-I1260, EPH-I1267)" {
+    // The directory line, singular and plural.
     {
         var diag = testDiagCtx();
         var capture = CaptureSink{};
         diag.diag_sink = capture.sink();
         diag.skipped_dir_count = 1;
-        noteHiddenDirSkips(&diag);
+        notePrunedDirs(&diag);
         try std.testing.expectEqualStrings(
-            "note: 1 directory skipped (hidden or known-cache names). " ++
+            "note: 1 directory skipped (hidden, known-cache, or unopenable). " ++
                 "Files inside them are not analyzed.\n",
             capture.slice(),
         );
     }
-    // The plural form.
     {
         var diag = testDiagCtx();
         var capture = CaptureSink{};
         diag.diag_sink = capture.sink();
         diag.skipped_dir_count = 4;
-        noteHiddenDirSkips(&diag);
+        notePrunedDirs(&diag);
         try std.testing.expectEqualStrings(
-            "note: 4 directories skipped (hidden or known-cache names). " ++
+            "note: 4 directories skipped (hidden, known-cache, or unopenable). " ++
                 "Files inside them are not analyzed.\n",
+            capture.slice(),
+        );
+    }
+    // The symlink line rides its own class line (EPH-I1267): a tree
+    // whose payload sits behind links must not read clean.
+    {
+        var diag = testDiagCtx();
+        var capture = CaptureSink{};
+        diag.diag_sink = capture.sink();
+        diag.skipped_link_count = 2;
+        notePrunedDirs(&diag);
+        try std.testing.expectEqualStrings(
+            "note: 2 symlinks skipped. Files behind them are not analyzed.\n",
+            capture.slice(),
+        );
+    }
+    // Both classes render both lines when both pruned.
+    {
+        var diag = testDiagCtx();
+        var capture = CaptureSink{};
+        diag.diag_sink = capture.sink();
+        diag.skipped_dir_count = 1;
+        diag.skipped_link_count = 1;
+        notePrunedDirs(&diag);
+        try std.testing.expectEqualStrings(
+            "note: 1 directory skipped (hidden, known-cache, or unopenable). " ++
+                "Files inside them are not analyzed.\n" ++
+                "note: 1 symlink skipped. Files behind them are not analyzed.\n",
             capture.slice(),
         );
     }
 }
 
-test "hidden-directory skip note stays off the JSON machine stream (EPH-I1260)" {
+test "prune note stays off the JSON machine stream (EPH-I1260, EPH-I1267)" {
     var diag = testDiagCtx();
     diag.json_stream = true;
     var capture = CaptureSink{};
     diag.diag_sink = capture.sink();
     diag.skipped_dir_count = 2;
-    noteHiddenDirSkips(&diag);
+    diag.skipped_link_count = 3;
+    notePrunedDirs(&diag);
     try std.testing.expectEqualStrings("", capture.slice());
 }
 
@@ -128357,6 +128677,67 @@ test "entry-discovery depth cap truncation notes once per run (EPH-I0667, F-5)" 
     try scanDirForEntries(ctx, tmp_path);
     try std.testing.expectEqual(@as(usize, 1), diag.depth_cap_note_count);
     try std.testing.expectEqual(@as(usize, 0), cfg.entries.items.len);
+}
+
+test "the depth-cap counter increments in JSON mode with the note silent (EPH-I1277)" {
+    var diag = testDiagCtx();
+    diag.json_stream = true;
+    var capture = CaptureSink{};
+    diag.diag_sink = capture.sink();
+    // The note stays off the machine stream, but every truncation event
+    // still counts into the pruned_dirs summary member.
+    noteDepthCapTruncation(&diag, 32);
+    noteDepthCapTruncation(&diag, 32);
+    try std.testing.expectEqual(@as(usize, 0), capture.len);
+    try std.testing.expectEqual(@as(usize, 2), diag.depth_cap_trunc_count);
+    try std.testing.expectEqual(@as(usize, 0), diag.depth_cap_note_count);
+}
+
+test "prunedDirsTotal sums every walk-prune class (EPH-I1267, EPH-I1276, EPH-I1277)" {
+    var diag = testDiagCtx();
+    diag.skipped_dir_count = 3;
+    diag.skipped_link_count = 2;
+    diag.depth_cap_trunc_count = 4;
+    try std.testing.expectEqual(@as(usize, 9), prunedDirsTotal(&diag));
+}
+
+test "the JSON summary carries the depth-cap truncation (EPH-I1277)" {
+    var diag = testDiagCtx();
+    diag.cli_diagnostics_enabled = false;
+    const allocator = std.testing.allocator;
+    // A 34-deep chain truncates at the 32 cap: the buried file leaves
+    // the analyzed set, and the JSON summary must signal the drop
+    // through the pruned-dirs member (the note skips in JSON mode).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmpDirPath(allocator, &tmp);
+    defer allocator.free(tmp_path);
+    const deep = try deepTreePath(allocator, tmp_path, 34);
+    defer allocator.free(deep);
+    try tmp.dir.createDirPath(std.testing.io, deep[tmp_path.len + 1 ..]);
+    const buried_rel = try std.fmt.allocPrint(allocator, "{s}/x.zig", .{deep[tmp_path.len + 1 ..]});
+    defer allocator.free(buried_rel);
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = buried_rel,
+        .data = "pub fn f() void {}\n",
+    });
+
+    var graph = ImportGraph.init(allocator, &diag);
+    defer graph.deinit();
+    try graph.scanDirectory(tmp_path);
+    try std.testing.expectEqual(@as(usize, 1), diag.depth_cap_trunc_count);
+    try std.testing.expectEqual(@as(usize, 0), graph.files.count());
+
+    var buf: [summary_json_buf_bytes]u8 = undefined;
+    const text = try formatSummaryJson(&buf, .{}, .{
+        .pruned_dirs = prunedDirsTotal(&diag),
+    }, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(
+        @as(i64, 1),
+        parsed.value.object.get("summary").?.object.get("pruned_dirs").?.integer,
+    );
 }
 
 test "suppression: known-issues load works outside check and only once" {

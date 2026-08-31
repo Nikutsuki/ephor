@@ -7,4 +7,4 @@
 #   (the test ratchet). Update this line only in the commit that changes
 #   the test count (tests added or legitimately deleted).
 dogfood 0
-tests 2944
+tests 2952

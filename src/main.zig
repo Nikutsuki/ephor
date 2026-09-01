@@ -51451,7 +51451,7 @@ fn updateBuildZigIntegration(diag: *DiagCtx, allocator: Allocator) !void {
 }
 
 /// Current ephor version (set at compile time)
-const EPHOR_VERSION = "0.15.1";
+const EPHOR_VERSION = "0.15.2";
 
 /// URL to check for latest version
 const EPHOR_VERSION_URL = "https://codeberg.org/RhyosLabs/ephor/raw/branch/main/build.zig.zon";

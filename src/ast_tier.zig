@@ -112,21 +112,24 @@ fn countSkip(stats: ?*Stats, class: SkipClass) void {
 }
 
 /// Stack for the parse worker thread (EPH-I0191, EPH-I0268, EPH-I1300).
-/// The byte cap bounds the input, and the worst verified density is ten
-/// parser frames per byte pair (the paren recursion chain in the pinned
-/// Parse.zig): a file of N bytes can drive at most N/2 nesting levels,
-/// so the worst case is 5 × N frames. The shipped 64 KiB/512 MiB pair
-/// budgeted 1,638 B per frame at that density. The 256 KiB cap
-/// (EPH-I1300) quadruples the input, so this stack quadruples to
-/// 2 GiB: the identical per-frame budget, with the identical margin
-/// over the pinned empirical frame-size range (200-500 B per frame,
-/// the 20k-paren measurement in the tests below). The pair re-derives
-/// together: a cap raise without the stack raise reopens the SIGSEGV
-/// class, and a config-driven cap with no safety ceiling is the same
-/// defect. The OS commits stack pages lazily, so resident cost tracks
-/// real use; the caller joins before the next spawn, so the
-/// reservation is transient. The 2 GiB reservation assumes a 64-bit
-/// target.
+/// The byte cap bounds the input. The ten-frame density is the grouped-
+/// type paren recursion chain (parseExpr → ... → expectExpr in the
+/// pinned Parse.zig); the expr-paren chain costs ~5 frames per level.
+/// A file of N bytes can drive at most N/2 nesting levels, so the worst
+/// case is 5 × N frames and the pair budgets 1,638 B per frame
+/// (2 GiB / (5 × 262,144)). Both chains fit 2 GiB at the worst legal
+/// nesting: the 131,072-level grouped-type probe parses this stack in
+/// both build modes (PROBE_OK), and the expr-paren bisection tops out
+/// at 1.47 GiB in Debug. Per-frame (the ten-frame convention):
+/// ReleaseSafe 297.6-314.6 B, Debug 1,206.4-1,216.3 B — the Debug
+/// margin is 1.35×, not the 3.28× the earlier 200-500 B range implied.
+/// Attribution-free per level: the budget is 16,384 B per level against
+/// a Debug-measured ~12.1 KB per level. The pair re-derives together: a
+/// cap raise without the stack raise reopens the SIGSEGV class, and a
+/// config-driven cap with no safety ceiling is the same defect. The OS
+/// commits stack pages lazily, so resident cost tracks real use; the
+/// caller joins before the next spawn, so the reservation is transient.
+/// The 2 GiB reservation assumes a 64-bit target.
 const parse_stack_bytes: usize = 2 * 1024 * 1024 * 1024;
 
 /// Worker payload for the threaded parse. The result slot moves the

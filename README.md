@@ -303,7 +303,7 @@ built-in threshold defaults apply when the thresholds block is absent.
 
 ```json
 {
-  "version": "0.15.1",
+  "version": "0.15.2",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -1569,6 +1569,41 @@ Ephor uses three testing layers:
 - Community baseline regression testing against key projects
 
 ## Changelog
+
+### v0.15.2 — ZA607 Expression Arms, 256 KiB AST Re-Entry, Stand-In Exclusions (2026-09-02)
+
+**Fixed:**
+
+- ZA607 extends its counter-bounded suppressor to the five
+  expression-index reverse-copy forms: the i-1 read, the c-1-i while and
+  for-range, min-derived and compound bounds. The read-loop increment now
+  fires when the bound var differs from the counter (the min-derived
+  shape), and the I0826 pin flips to the silent verdict. Failed checks
+  stay in the fail-safe over-warn direction (EPH-I1299, EPH-I1311).
+- ZA607 walks the conditional prefix of a braceless `if`/`while`, so an
+  errdefer increment inside one credits the fill-then-read run instead of
+  escaping the arm (EPH-I1305).
+- ZA504 excludes same-root whole-type stand-in mirrors where one side is
+  the else arm of a comptime-if/@import stand-in resolving to the
+  witness's file, the RhyOS OpenFlags shape. The v0.15.1 residual goes
+  silent with zero collateral (EPH-I1308).
+
+**Re-admission:**
+
+- The AST tier re-admits files up to 256 KiB with the parse stack raised
+  to 2 GiB in the same step. The measured pair (REL-P2-VERIFY-3):
+  ReleaseSafe frames 297.6-314.6 B and Debug frames 1,206.4-1,216.3 B
+  under the ten-frame convention (Debug margin 1.35×), and the
+  131,072-level grouped-type-paren probe parses the shipped stack in both
+  build modes. The 78 re-admitted corpus files add zero findings and
+  remove one before-side false positive (EPH-I1300).
+
+**Deferred:**
+
+- The ZA106 block-scoped-defer false-positive fix (EPH-I1310) is in
+  flight in another lane at release prep. It joins this release only if
+  its fix lands and passes review before the release gate; otherwise it
+  ships in a later patch.
 
 ### v0.15.1 — AST-Tier Skip Signal, ZA607 Suppressor, Analyzer Arm Fixes (2026-09-01)
 

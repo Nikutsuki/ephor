@@ -16,7 +16,8 @@
 //! out so each half stays under the 64 KiB AST-tier input cap
 //! (EPH-I0601). This file owns the parse, the nesting pre-scan, and the
 //! per-file pipeline. EPH-I0046 extension tests live in
-//! ast_tier_za111_tests.zig for the same cap.
+//! ast_tier_za111_tests.zig and the I1297 tier-pipeline battery in
+//! ast_tier_pipeline_tests.zig for the same cap.
 
 const std = @import("std");
 const mem = std.mem;
@@ -24,6 +25,7 @@ const Allocator = mem.Allocator;
 const types = @import("types.zig");
 const za111 = @import("ast_tier_za111.zig");
 const za111_tests = @import("ast_tier_za111_tests.zig");
+const pipeline_tests = @import("ast_tier_pipeline_tests.zig");
 
 const Issue = types.Issue;
 const Ast = std.zig.Ast;
@@ -46,13 +48,11 @@ pub const AstContext = struct {
     /// Parses on a worker thread with a `parse_stack_bytes` stack: the
     /// hard half of the EPH-I0191 guarantee (EPH-I0268). Parser stack
     /// need grows with input size, so the byte cap plus this stack bound
-    /// the worst case by construction, with no grammar assumptions. The
-    /// caller blocks in join while the worker allocates, so no concurrent
-    /// allocator access. Direct use on untrusted input above
-    /// `max_ast_file_bytes` still reopens the crash class. Production
-    /// callers must go through `analyzeFileAstTier`. A refused worker
-    /// thread surfaces as `error.ThreadSpawnFailed`. The tier counts it
-    /// as a skip (EPH-I0597).
+    /// the worst case by construction. The caller joins the worker, so
+    /// no concurrent allocator access. Direct use on input above
+    /// `max_ast_file_bytes` reopens the crash class: production callers
+    /// must go through `analyzeFileAstTier`. A refused worker surfaces
+    /// as `error.ThreadSpawnFailed` and counts as a skip (EPH-I0597).
     pub fn init(allocator: Allocator, source: []const u8) !AstContext {
         return switch (runGuardedParse(allocator, source, spawnParseWorker)) {
             .ok => |ctx| ctx,
@@ -78,15 +78,42 @@ pub const Stats = struct {
     /// Files whose AST analysis completed. A file that fails mid-analysis
     /// (allocation) is not counted here (EPH-I0600).
     parsed: usize = 0,
-    /// Files degraded to line-tier coverage: parse errors, deep nesting,
-    /// a size past the byte cap, or a refused thread (EPH-I0597).
+    /// Files degraded to line-tier coverage: the sum of the four class
+    /// counters. The classes make a skip diagnosable without
+    /// instrumentation (EPH-I1297, REL-P1-VERIFY-3).
     skipped: usize = 0,
+    /// Degraded because the file exceeds `max_ast_file_bytes`.
+    skipped_cap: usize = 0,
+    /// Degraded because the nesting pre-scan crossed the budget.
+    skipped_nesting: usize = 0,
+    /// Degraded because the host parser reported errors (ZA503).
+    skipped_parse: usize = 0,
+    /// Degraded because the parse worker thread refused to spawn.
+    skipped_spawn: usize = 0,
 };
 
-/// Stack for the parse worker thread. The byte cap bounds the input and
-/// the worst verified density is ten frames per byte pair, so 64 KiB of
-/// source needs well under 512 MB even with chunky Parse.zig frames.
-/// The OS commits stack pages lazily, so resident cost tracks real use.
+/// The four AST-tier skip classes (EPH-I1297): one counter per class
+/// makes a degraded file diagnosable without instrumentation.
+const SkipClass = enum { cap, nesting, parse, spawn };
+
+/// Count one skip in the total and in its class. The pairing lives here
+/// so the sum invariant (skipped == the four classes) holds by
+/// construction (EPH-I1297).
+fn countSkip(stats: ?*Stats, class: SkipClass) void {
+    const s = stats orelse return;
+    s.skipped += 1;
+    switch (class) {
+        .cap => s.skipped_cap += 1,
+        .nesting => s.skipped_nesting += 1,
+        .parse => s.skipped_parse += 1,
+        .spawn => s.skipped_spawn += 1,
+    }
+}
+
+/// Stack for the parse worker thread. The worst verified density is ten
+/// frames per byte pair, so a 64 KiB input needs well under 512 MB even
+/// with chunky Parse.zig frames. The OS commits pages lazily, so
+/// resident cost tracks real use.
 const parse_stack_bytes: usize = 512 * 1024 * 1024;
 
 /// Worker payload for the threaded parse. The result slot moves the
@@ -165,7 +192,7 @@ fn resolveParseOutcome(outcome: ParseOutcome, stats: ?*Stats) !?AstContext {
     return switch (outcome) {
         .ok => |ctx| ctx,
         .spawn_refused => {
-            if (stats) |s| s.skipped += 1;
+            countSkip(stats, .spawn);
             return null;
         },
         .err => |err| err,
@@ -198,46 +225,42 @@ pub const max_nesting_depth: usize = 512;
 
 /// AST-tier input byte cap (EPH-I0268). Parser stack need grows with
 /// input size, so this cap plus `parse_stack_bytes` bounds the worst
-/// case by construction: the pre-scan and the grammar audit table are
-/// the cheap first gate, the guarantee that needs no grammar
-/// assumptions. 64 KiB sits past ZA702's exceptional-file threshold
-/// (50 KB default), so real code is unaffected. Over-cap files degrade
-/// to line-tier coverage like parse errors.
+/// case by construction. This bound is the tier's own: the config key
+/// `max_file_bytes` (the ZA702 threshold) does not widen it, which
+/// silently dropped ZA111 coverage on 34 zig-pulse files in 0.15.0
+/// (EPH-I1297, REL-P1-VERIFY-3). Raising the cap needs a matching
+/// `parse_stack_bytes` re-derivation at the same frame-density budget.
+/// Over-cap files degrade to line-tier coverage like parse errors.
 pub const max_ast_file_bytes: usize = 64 * 1024;
 
-/// Carried state for the pre-scan: two counters that estimate live
-/// parser frames, plus the pending-arrow watch for `anyframe->` and the
-/// pending-fn watch for the fn-type paren (EPH-I0598).
+/// Carried state for the pre-scan: the live-frame counters, the
+/// `anyframe->` arrow watch, and the fn-type paren watch (EPH-I0598).
 const NestingScan = struct {
     depth: usize = 0,
     run: usize = 0,
-    /// Set while an `anyframe` keyword waits for its `->`. The word alone
-    /// is a type operand, so the run parks here until the arrow decides.
+    /// A bare `anyframe` operand parks the run until its `->` decides.
     arrow_run: ?usize = null,
-    /// Set while a `fn` waits for its `(`: the type form's paren may sit
-    /// on a later line, so the next non-blank code char decides
-    /// (EPH-I0598).
+    /// A `fn` waits for its `(`: the type form's paren may sit on a
+    /// later line, so the next non-blank code char decides (EPH-I0598).
     pending_fn: bool = false,
 };
 
 /// True when `source` would push the recursive host parser past `budget`.
 /// One iterative pass with no allocation keeps two counters: delimiter
-/// nesting and sequential right-recursion runs. The run counter
-/// increments on `! - ~ & ? *`, on `-%`, on `[`, on `anyframe->`, and on
-/// the right-recursive keywords (grammar-audit table below). It resets
-/// only at statement boundaries (`;`, `,`, a bare assignment `=`), where
-/// the frames of a prefix chain provably return. Two-char `=` tokens
-/// (`+=`, `==`, `=>`, `<=`, ...) are not boundaries (EPH-I0269): the
-/// while-continue shape keeps its while frame live across the `+=`, and
-/// a reset there would under-count live parser frames. It never resets
-/// on whitespace, identifiers, or delimiters: prefix frames stay live
-/// across the operand, and error-union chains interleave operators with
-/// operands. Over-counting is deliberate and fail-safe. Infix chains of
-/// `- & *`, deep index chains, and keyword-dense statements can force a
-/// skip. A skip degrades one file to line-tier coverage. An under-count
-/// defeats only this gate. The byte cap and the parse stack absorb it
-/// (EPH-I0268). Operators inside strings, char literals, `\\`
-/// multiline bodies, and `//` comments are data and do not count.
+/// nesting and sequential right-recursion runs. The run increments on
+/// `! - ~ & ? *`, `-%`, `[`, `anyframe->`, and the right-recursive
+/// keywords (grammar-audit table below). It resets only at statement
+/// boundaries (`;`, `,`, a bare `=`), where the frames of a prefix chain
+/// provably return. Two-char `=` tokens are not boundaries (EPH-I0269):
+/// the while-continue shape keeps its while frame live across the `+=`,
+/// and a reset there under-counts live frames. It never resets on
+/// whitespace, identifiers, or delimiters: prefix frames stay live
+/// across the operand. Over-counting is deliberate and fail-safe.
+/// Infix `- & *` chains, deep index chains, and keyword-dense statements
+/// can force a skip (line-tier coverage only). An under-count defeats
+/// only this gate; the byte cap and the parse stack absorb it
+/// (EPH-I0268). Operators inside strings, chars, `\\` bodies, and `//`
+/// comments are data and do not count.
 ///
 /// Grammar-audit table (zig 0.16.0 Parse.zig, EPH-I0268). Every
 /// production classified by how it consumes stack: nested (the depth
@@ -323,8 +346,8 @@ fn scanCodeChar(line: []const u8, i: *usize, scan: *NestingScan) void {
 }
 
 /// The anyframe arrow watch (EPH-I0599): true while `c` stays inside
-/// the watch (the completing `>` or a keeper). A break restores the
-/// parked frames and returns false so the char still counts.
+/// the watch. A break restores the parked frames and returns false so
+/// the char still counts.
 fn scanArrowWatchChar(c: u8, scan: *NestingScan) bool {
     const saved = scan.arrow_run orelse return false;
     if (c == '>') {
@@ -364,11 +387,11 @@ fn scanOtherChar(line: []const u8, i: *usize, scan: *NestingScan, c: u8) void {
     }
 }
 
-/// Identifiers keep the run: error-union chains interleave operands with
-/// `!`, and infix `- & *` sequences over-count toward a safe skip. Only
-/// statement boundaries (`;`, `,`, a bare `=`) reset: other non-word
-/// chars can sit inside an operand where parent frames are still live
-/// (audit table, hole A). Two-char `=` tokens keep the run (EPH-I0269).
+/// Identifiers keep the run: error-union chains interleave operands
+/// with `!`, and infix `- & *` sequences over-count toward a safe skip.
+/// Only statement boundaries (`;`, `,`, a bare `=`) reset — other
+/// non-word chars can sit inside an operand with live parent frames
+/// (hole A). Two-char `=` tokens keep the run (EPH-I0269).
 /// Right-recursive keywords increment. `anyframe` arms the arrow watch.
 fn scanWordOrReset(line: []const u8, i: *usize, scan: *NestingScan) void {
     if (!types.isIdent(line[i.*])) {
@@ -432,8 +455,8 @@ fn nextNonSpaceIsParen(line: []const u8, i: usize) bool {
 /// Keywords whose productions recurse into the following expression or
 /// type without a delimiter (grammar-audit table, EPH-I0268). `fn` is
 /// handled apart: only its type form recurses. `await` is absent (async
-/// removed in 0.15. The 0.16.0 stdlib has no await keyword, EPH-I0591).
-/// `suspend` is statement-level — the defer/errdefer class, not a chain.
+/// removed in 0.15; the 0.16.0 stdlib has no await keyword, EPH-I0591).
+/// `suspend` is statement-level — the defer/errdefer class.
 fn isRightRecursiveKeyword(word: []const u8) bool {
     const keywords = [_][]const u8{
         "try",    "comptime", "nosuspend", "resume", "break",
@@ -444,10 +467,10 @@ fn isRightRecursiveKeyword(word: []const u8) bool {
     } else false;
 }
 
-/// Run every AST-tier rule over one file. Files with parse errors, deep
-/// nesting, a size past `max_ast_file_bytes`, or a refused parse thread
-/// are skipped and counted. The line tier still covers them. Allocation
-/// errors propagate (EPH-I0597).
+/// Run every AST-tier rule over one file. The four skip classes — cap,
+/// nesting, parse errors, spawn refusal — are counted separately so a
+/// skip is diagnosable (EPH-I1297). The line tier still covers skipped
+/// files. Allocation errors propagate (EPH-I0597).
 pub fn analyzeFileAstTier(
     a: Allocator,
     out: AstTierOut,
@@ -458,21 +481,21 @@ pub fn analyzeFileAstTier(
     // bounds it by construction. The parse thread's big stack
     // (parse_stack_bytes) holds the rest.
     if (content.len > max_ast_file_bytes) {
-        if (out.stats) |s| s.skipped += 1;
+        countSkip(out.stats, .cap);
         return;
     }
     // Deep delimiter or operator nesting SIGSEGVs the recursive host
     // parser mid-run (EPH-I0191). Degrade to line-tier coverage like
     // parse errors.
     if (exceedsNestingBudget(content, max_nesting_depth)) {
-        if (out.stats) |s| s.skipped += 1;
+        countSkip(out.stats, .nesting);
         return;
     }
     const outcome = runGuardedParse(a, content, spawnParseWorker);
     var parsed = try resolveParseOutcome(outcome, out.stats) orelse return;
     defer parsed.deinit(a);
     if (!parsed.ok) {
-        if (out.stats) |s| s.skipped += 1;
+        countSkip(out.stats, .parse);
         try types.noteParseError(out.parse_issues, a, path, &parsed.tree);
         return;
     }
@@ -507,6 +530,7 @@ test {
     // (EPH-I0046).
     _ = za111;
     _ = za111_tests;
+    _ = pipeline_tests;
 }
 
 pub fn runZa111(a: Allocator, content: []const u8) !std.ArrayListUnmanaged(Issue) {
@@ -572,6 +596,7 @@ test "spawn refusal degrades the file to a counted skip (EPH-I0597)" {
     try std.testing.expect(parsed == null);
     try std.testing.expectEqual(@as(usize, 0), stats.parsed);
     try std.testing.expectEqual(@as(usize, 1), stats.skipped);
+    try std.testing.expectEqual(@as(usize, 1), stats.skipped_spawn);
 }
 
 test "guarded parse runs the worker and yields the context (EPH-I0597)" {
@@ -594,6 +619,7 @@ test "F12 guard: both AST-tier halves stay under the ZA111 byte cap (EPH-I0601)"
     try std.testing.expect(@embedFile("sanitize.zig").len <= max_ast_file_bytes);
     try std.testing.expect(@embedFile("ast_tier_za111_tests.zig").len <= max_ast_file_bytes);
     try std.testing.expect(@embedFile("ast_tier_za111_walk.zig").len <= max_ast_file_bytes);
+    try std.testing.expect(@embedFile("ast_tier_pipeline_tests.zig").len <= max_ast_file_bytes);
 }
 
 test "ZA111: field of local var fires" {
@@ -943,84 +969,6 @@ test "ZA111: optional pointer payload address fires (EPH-I0590)" {
     try expectZa111(issues.items, 2, "'opt'");
 }
 
-test "ZA111: slice slot fields fire, backing memory stays silent (EPH-I1122)" {
-    const a = std.testing.allocator;
-    // &v.len / &v.ptr on a by-value slice address the len/ptr components
-    // of the fat-pointer stack copy — real stack UB. The pre-fix
-    // short-circuit (bind.is_pointer => silent) missed every slot shape
-    // while correctly keeping the backing-memory neighbors silent: &v[i]
-    // addresses caller-owned memory, &v[i].len addresses an element's own
-    // field, &p.len on a *R addresses the pointee's field, and an
-    // inferred local's type is unprovable (FN-only). The many_len_slot
-    // row pins the defensive .many arm: Zig [*]T carries no .len/.ptr
-    // field access, so that fixture cannot compile — the scanner sees
-    // its text regardless and the arm fires defensively.
-    var issues = try runZa111(a,
-        \\fn len_slot(v: []u32) *usize {
-        \\    return &v.len;
-        \\}
-        \\fn ptr_slot(v: []u32) *[*]u32 {
-        \\    return &v.ptr;
-        \\}
-        \\fn many_len_slot(p: [*]u32) *usize {
-        \\    return &p.len;
-        \\}
-        \\fn backing(v: []u32) *u32 {
-        \\    return &v[0];
-        \\}
-        \\fn element_field(v: [][]u32) *usize {
-        \\    return &v[0].len;
-        \\}
-        \\fn alias_form(v: []u32) *usize {
-        \\    const q = &v.len;
-        \\    return q;
-        \\}
-        \\const R = struct { len: usize };
-        \\fn pointee_field(p: *R) *usize {
-        \\    return &p.len;
-        \\}
-        \\fn inferred(v: []u32) *usize {
-        \\    var w = v;
-        \\    return &w.len;
-        \\}
-    );
-    defer types.deinitIssues(&issues, a);
-    // The four slot-address shapes fire (the alias reports on its return
-    // line). The four neighbor shapes stay silent.
-    try std.testing.expectEqual(@as(usize, 4), issues.items.len);
-    var lines: [4]usize = undefined;
-    for (issues.items, 0..) |issue, i| {
-        try std.testing.expectEqualStrings("ZA111", issue.rule);
-        try std.testing.expect(issue.severity == .err);
-        lines[i] = issue.line;
-    }
-    try std.testing.expect(std.mem.indexOfScalar(usize, &lines, 2) != null);
-    try std.testing.expect(std.mem.indexOfScalar(usize, &lines, 5) != null);
-    try std.testing.expect(std.mem.indexOfScalar(usize, &lines, 8) != null);
-    try std.testing.expect(std.mem.indexOfScalar(usize, &lines, 18) != null);
-}
-
-test "ZA111: fn-local type collision resolves per fn (EPH-I0592)" {
-    const a = std.testing.allocator;
-    // Two disjoint fn-local types share the name S. A last-wins index
-    // resolves one fn's chain against the other's type: the slice S
-    // would silence the array fn (false negative) or the array S would
-    // fire in the slice fn (false positive). Per-fn scoping keeps the
-    // slice fn silent and fires only the array fn.
-    var issues = try runZa111(a,
-        \\fn slice_shape(v: S) *u32 {
-        \\    const S = struct { s: []u32 };
-        \\    return &v.s[0];
-        \\}
-        \\fn array_shape(v: S) *u32 {
-        \\    const S = struct { s: [4]u32 };
-        \\    return &v.s[0];
-        \\}
-    );
-    defer types.deinitIssues(&issues, a);
-    try expectZa111(issues.items, 7, "'v'");
-}
-
 test "ZA111: array-field chain fires (resolved unsafe)" {
     const a = std.testing.allocator;
     var issues = try runZa111(a,
@@ -1284,11 +1232,20 @@ test "parsed counts only fully analyzed files (EPH-I0600)" {
     }
 }
 
-test "EPH-I0191: over-budget nesting skips the AST tier, counted in stats" {
+test "EPH-I0191: over-budget nesting skips with the nesting class" {
     const a = std.testing.allocator;
     const src = try buildNestedParens(a, max_nesting_depth + 1);
     defer a.free(src);
-    try expectTierCounters(src, 0, 1);
+    var issues: std.ArrayListUnmanaged(Issue) = .empty;
+    defer types.deinitIssues(&issues, a);
+    var stats = Stats{};
+    try analyzeFileAstTier(a, .{ .issues = &issues, .stats = &stats }, "run.zig", src);
+    try std.testing.expectEqual(@as(usize, 0), stats.parsed);
+    try std.testing.expectEqual(@as(usize, 1), stats.skipped);
+    try std.testing.expectEqual(@as(usize, 1), stats.skipped_nesting);
+    try std.testing.expectEqual(@as(usize, 0), stats.skipped_cap);
+    try std.testing.expectEqual(@as(usize, 0), stats.skipped_parse);
+    try std.testing.expectEqual(@as(usize, 0), stats.skipped_spawn);
 }
 
 test "EPH-I0191: within-budget nesting parses and counts as parsed" {
@@ -1575,8 +1532,10 @@ test "EPH-I0191: within-budget fn-type chain parses" {
     try expectTierCounters("const x: fn() fn() void = undefined;", 1, 0);
 }
 
-/// Valid Zig padded with comment bytes to exactly `total` bytes.
-fn buildPaddedSource(a: Allocator, total: usize) ![]u8 {
+/// Valid Zig padded with comment bytes to exactly `total` bytes. Pub so
+/// the split-out test batteries reuse it without a duplicated block
+/// (ZA504, EPH-I1297).
+pub fn buildPaddedSource(a: Allocator, total: usize) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(a);
     const head = "fn f() void {}\n//";

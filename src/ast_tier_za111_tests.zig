@@ -492,3 +492,81 @@ test "ZA111: bare &var break at the out-param store sink fires (EPH-I1210)" {
     try std.testing.expect(mem.indexOf(u8, issues.items[1].message, "'v'") != null);
     try std.testing.expect(mem.indexOf(u8, issues.items[2].message, "'s'") != null);
 }
+
+test "ZA111: slice slot fields fire, backing memory stays silent (EPH-I1122)" {
+    const a = std.testing.allocator;
+    // &v.len / &v.ptr on a by-value slice address the len/ptr components
+    // of the fat-pointer stack copy — real stack UB. The pre-fix
+    // short-circuit (bind.is_pointer => silent) missed every slot shape
+    // while correctly keeping the backing-memory neighbors silent: &v[i]
+    // addresses caller-owned memory, &v[i].len addresses an element's own
+    // field, &p.len on a *R addresses the pointee's field, and an
+    // inferred local's type is unprovable (FN-only). The many_len_slot
+    // row pins the defensive .many arm: Zig [*]T carries no .len/.ptr
+    // field access, so that fixture cannot compile — the scanner sees
+    // its text regardless and the arm fires defensively.
+    var issues = try runZa111(a,
+        \\fn len_slot(v: []u32) *usize {
+        \\    return &v.len;
+        \\}
+        \\fn ptr_slot(v: []u32) *[*]u32 {
+        \\    return &v.ptr;
+        \\}
+        \\fn many_len_slot(p: [*]u32) *usize {
+        \\    return &p.len;
+        \\}
+        \\fn backing(v: []u32) *u32 {
+        \\    return &v[0];
+        \\}
+        \\fn element_field(v: [][]u32) *usize {
+        \\    return &v[0].len;
+        \\}
+        \\fn alias_form(v: []u32) *usize {
+        \\    const q = &v.len;
+        \\    return q;
+        \\}
+        \\const R = struct { len: usize };
+        \\fn pointee_field(p: *R) *usize {
+        \\    return &p.len;
+        \\}
+        \\fn inferred(v: []u32) *usize {
+        \\    var w = v;
+        \\    return &w.len;
+        \\}
+    );
+    defer types.deinitIssues(&issues, a);
+    // The four slot-address shapes fire (the alias reports on its return
+    // line). The four neighbor shapes stay silent.
+    try std.testing.expectEqual(@as(usize, 4), issues.items.len);
+    var lines: [4]usize = undefined;
+    for (issues.items, 0..) |issue, i| {
+        try std.testing.expectEqualStrings("ZA111", issue.rule);
+        try std.testing.expect(issue.severity == .err);
+        lines[i] = issue.line;
+    }
+    try std.testing.expect(std.mem.indexOfScalar(usize, &lines, 2) != null);
+    try std.testing.expect(std.mem.indexOfScalar(usize, &lines, 5) != null);
+    try std.testing.expect(std.mem.indexOfScalar(usize, &lines, 8) != null);
+    try std.testing.expect(std.mem.indexOfScalar(usize, &lines, 18) != null);
+}
+
+test "ZA111: fn-local type collision resolves per fn (EPH-I0592)" {
+    const a = std.testing.allocator;
+    // Two disjoint fn-local types share the name S. A last-wins index
+    // resolves one fn's chain against the other's type: the slice S
+    // would silence the array fn (false negative) or the array S would
+    // fire in the slice fn (false positive). Per-fn scoping keeps the
+    // slice fn silent and fires only the array fn.
+    var issues = try runZa111(a,
+        \\fn slice_shape(v: S) *u32 {
+        \\    const S = struct { s: []u32 };
+        \\    return &v.s[0];
+        \\}
+        \\fn array_shape(v: S) *u32 {
+        \\    const S = struct { s: [4]u32 };
+        \\    return &v.s[0];
+        \\}
+    );
+    defer types.deinitIssues(&issues, a);
+    try expectZa111(issues.items, 7, "'v'");
+}

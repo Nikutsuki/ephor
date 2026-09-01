@@ -244,6 +244,35 @@ else
     note "install-ps1 hardening suite (skipped: pwsh not on PATH)"
 fi
 
+# --- 1g. install-sh smoke (EPH-I1292; REL-P1-SCOPE-1) ------------------------
+# The real-zig leg: the smoke drives the real installer against the real
+# zig with a locally served package tarball and pins the behaviors the
+# fake-zig suites cannot reach — the fingerprint self-heal through the
+# real zig fetch hint (exactly two fetches), the no-zig-build-spawn pin,
+# fresh-file 0644 modes, the idempotent re-run, and failure rc
+# propagation. The sig-path state leg stays 1c's; this leg pins the
+# real-zig behaviors that broke silently while the suite sat unwired
+# (EPH-I1292). Fetch-only scenarios under a redirected cache, so no
+# repo build runs here. Runs once per gate.
+ISM_EXIT=0
+sh "$SCRIPT_DIR/test-install-smoke.sh" > "$GATE_DIR/install-smoke.log" 2>&1 || ISM_EXIT=$?
+# The tally line is the suite's own verdict ("install smoke: N passed").
+# Its absence means the suite aborted before the verdict (a missing tool
+# or a scenario failure), which is a leg failure, not a pass.
+ISM_PASSED="$(sed -nE 's/^install smoke: ([0-9]+) passed$/\1/p' "$GATE_DIR/install-smoke.log" | tail -1 || true)"
+case "$ISM_PASSED" in
+    '' | *[!0-9]*)
+        fail "install-sh smoke (no tally line; see $GATE_DIR/install-smoke.log)"
+        ;;
+    *)
+        if [ "$ISM_EXIT" -ne 0 ]; then
+            fail "install-sh smoke (aborted, exit $ISM_EXIT; see $GATE_DIR/install-smoke.log)"
+        else
+            ok "install-sh smoke ($ISM_PASSED scenarios passed)"
+        fi
+        ;;
+esac
+
 # --- 2. build (ReleaseSafe) ------------------------------------------------
 # Fail-fast: every later leg runs the freshly built binary. A failed build
 # must not let the dogfood or corpus legs scan a stale binary.

@@ -6414,6 +6414,9 @@ const ReadScanCtx = struct {
     /// Per-variable early-return memo (EPH-I0335): the suppressor query
     /// is O(1) instead of a per-read rescan.
     early_returns: *const EarlyReturnMemo,
+    /// The tracked var's declaration body-line (EPH-I1293): the
+    /// counter-bounded suppressor verifies the fill loop sits after it.
+    var_line: usize,
 };
 
 /// True when the read of var_name on body-line idx is potentially
@@ -6444,6 +6447,12 @@ fn readIsUncovered(sc: *const ReadScanCtx, var_name: []const u8, idx: usize) boo
     // covers the read: `if (count == 0) return;` after a loop that fills
     // the var per trip and increments count (EPH-I0131).
     if (isZeroTripGuardCovered(sc.da.lines, idx, var_name)) return false;
+    // Check if a counter-bounded fill-then-read pair covers the read
+    // (EPH-I1293): a fill loop stores var[counter] per trip, and the
+    // read loop reads var[ri] under `ri` decremented from the counter.
+    // The read then observes only written elements, and a zero-trip
+    // fill leaves the counter zero, so the read loop never runs.
+    if (isCounterBoundedRead(sc, idx, read_col, var_name)) return false;
     // Check if the read is inside a null-guard on a variable that is only
     // set non-null in blocks that also assign the flagged variable.
     if (isNullGuardCorrelatedRead(sc.da.lines, idx, read_col, var_name)) return false;
@@ -6529,6 +6538,7 @@ fn checkVarDefiniteAssignment(
         .def_entry = def_entry,
         .first_effect = gen_sets.first_effect,
         .early_returns = &er_memo,
+        .var_line = win.line,
     };
     try scanVarReads(ctx, win, &sc, issues);
 }
@@ -6707,6 +6717,508 @@ fn isZeroTripGuardCovered(
     if (!loopBodyFillsVar(lines, loop, var_name)) return false;
     return guardDominatesRead(lines, guard_idx, read_idx);
 }
+
+/// True when a counter-bounded fill-then-read pair covers the read at
+/// (idx, read_col) — the system_monitor.zig:1216 writeDecimal shape
+/// (EPH-I1293, the 0.15.0 RhyOS ZA607 surge's dominant class). A fill
+/// loop stores var[counter] on every trip and increments the counter
+/// once per storing trip. A read loop reads var[ri], with ri declared
+/// from the counter and decremented before every read under `while (ri
+/// > 0)`. Every path to the read then observes a stored element: the
+/// read loop trips only when the counter recorded at least one storing
+/// trip, and an element store assigns the whole var under the EPH-I0132
+/// strictness semantic. The expression-index sibling (tmp[count - 1 -
+/// i]) stays the EPH-I0826 documented residual. Every failed check is
+/// the fail-safe over-warn direction. The windows match the guard
+/// family (EPH-I0225).
+fn isCounterBoundedRead(
+    sc: *const ReadScanCtx,
+    idx: usize,
+    read_col: usize,
+    var_name: []const u8,
+) bool {
+    const lines = sc.da.lines;
+    const t = mem.trim(u8, lines[idx], " \t\r");
+    const ri = elementReadIndexName(t, read_col, var_name) orelse return false;
+    const opener = enclosingLoopOpenerLine(lines, idx) orelse return false;
+    const ot = mem.trim(u8, lines[opener], " \t\r");
+    if (!whileConditionIsNameGtZero(ot, ri)) return false;
+    const read_walk = ReadLoopWalk{
+        .lines = lines,
+        .opener = opener,
+        .read_idx = idx,
+        .read_col = read_col,
+        .ri = ri,
+    };
+    if (!read_walk.provesBound()) return false;
+    const decl = findCounterInitDecl(lines, opener, ri) orelse return false;
+    if (writesBetween(lines, decl.idx + 1, opener, ri)) return false;
+    const loop = findCounterLoop(lines, opener, decl.counter) orelse return false;
+    if (sc.var_line >= loop.loop_idx) return false;
+    if (!declaredZeroBefore(lines, loop.loop_idx, decl.counter)) return false;
+    if (!fillLoopStoresVar(lines, loop, decl.counter, var_name)) return false;
+    if (counterWrittenOutsideLoop(lines, loop, decl.idx, decl.counter)) return false;
+    // No counter write may sit outside the fill loop between the counter
+    // decl and the read loop: another loop's increment would break the
+    // trip-to-store correlation.
+    const outside = OutsideFillScan{
+        .lines = lines,
+        .c_decl = decl.idx,
+        .loop = loop,
+        .read_opener = opener,
+    };
+    return !outside.writesCounter(decl.counter);
+}
+
+/// The bare-identifier index of the flagged read when the read at
+/// `read_col` is the direct-index element form var[ri], else null
+/// (EPH-I1293). An expression index (digits[count - 1 - i]) returns
+/// null: that bound proof stays the EPH-I0826 documented residual.
+fn elementReadIndexName(t: []const u8, read_col: usize, var_name: []const u8) ?[]const u8 {
+    if (read_col + var_name.len >= t.len) return null;
+    const open = read_col + var_name.len;
+    if (t[open] != '[') return null;
+    const close = skipBracketed(t, open) orelse return null;
+    const contents = mem.trim(u8, t[open + 1 .. close - 1], " \t");
+    if (contents.len == 0 or !isAllIdent(contents)) return null;
+    return contents;
+}
+
+/// The nearest enclosing loop opener line of `idx` within the guard
+/// window, else null (EPH-I1293). The walk collects enclosing
+/// conditional openers nearest-first and returns the first loop. An if
+/// arm between the read and its loop (the usb_write read inside `if
+/// (pos < MAX)`) is skipped, and the loop is found further out. A loop
+/// beyond the window or deeper than the collector's four slots is
+/// missed — accepted FN.
+fn enclosingLoopOpenerLine(lines: []const []const u8, idx: usize) ?usize {
+    var openers: [4]usize = undefined;
+    const stop = idx -| guard_candidate_window;
+    const n = enclosingConditionalLines(lines, idx, stop, &openers);
+    for (openers[0..n]) |line| {
+        const t = mem.trim(u8, lines[line], " \t\r");
+        if (isLoopOpenerLine(t)) return line;
+    }
+    return null;
+}
+
+/// True when the opener line is a `while` whose condition is exactly
+/// `<name> > 0`, spacing-insensitive (EPH-I1293). `while (ri >= 1)` is
+/// equally safe but not admitted: the suppressor stays on the one form
+/// the sites carry (FN direction).
+fn whileConditionIsNameGtZero(t: []const u8, name: []const u8) bool {
+    const rest = stripLabel(t);
+    if (!mem.startsWith(u8, rest, "while(") and
+        !mem.startsWith(u8, rest, "while "))
+        return false;
+    const open = mem.indexOf(u8, rest, "(") orelse return false;
+    const close = loopCondCloseCol(rest) orelse return false;
+    if (close <= open) return false;
+    const cond = mem.trim(u8, rest[open + 1 .. close], " \t");
+    var c_i: usize = 0;
+    var n_i: usize = 0;
+    while (n_i < name.len) : (n_i += 1) {
+        c_i = skipHorizontalSpace(cond, c_i);
+        if (c_i >= cond.len or cond[c_i] != name[n_i]) return false;
+        c_i += 1;
+    }
+    c_i = skipHorizontalSpace(cond, c_i);
+    if (c_i + 1 >= cond.len or cond[c_i] != '>') return false;
+    c_i = skipHorizontalSpace(cond, c_i + 1);
+    if (c_i >= cond.len or cond[c_i] != '0') return false;
+    return skipHorizontalSpace(cond, c_i + 1) == cond.len;
+}
+
+/// The read-loop bound walk (EPH-I1293): proves the read loop body
+/// decrements `ri` by one at top level before the read and never writes
+/// `ri` any other way before the read. The decrement is what bounds the
+/// read index to the written elements: the read loop enters with ri
+/// equal to the counter, so a read before any decrement observes the
+/// unwritten element at index counter. A conditional decrement (`if (x)
+/// ri -= 1;`) fails the walk — the read may then run without it (FN
+/// direction). A read past the body's close (a while-else arm) fails
+/// too: it runs on the zero-trip path.
+const ReadLoopWalk = struct {
+    lines: []const []const u8,
+    opener: usize,
+    read_idx: usize,
+    read_col: usize,
+    ri: []const u8,
+
+    fn provesBound(self: *const ReadLoopWalk) bool {
+        const t = mem.trim(u8, self.lines[self.opener], " \t\r");
+        const body_start = loopBodyStartCol(t) orelse return false;
+        var state = ReadWalkState{};
+        var i = self.opener;
+        while (i <= self.read_idx) : (i += 1) {
+            const line = mem.trim(u8, self.lines[i], " \t\r");
+            const from = if (i == self.opener) bodyCodeStartCol(t, body_start) else 0;
+            const to = if (i == self.read_idx) self.read_col else line.len;
+            if (!self.scanLine(line, from, to, &state)) return false;
+        }
+        return !state.closed and state.decrements >= 1;
+    }
+
+    /// One body line of the bound walk: fold braces into the carried
+    /// depth (whole-line, quote-masked) and classify the `ri`
+    /// occurrences inside [from, to). A depth-0 one-step decrement in a
+    /// plain statement counts. Any other write in the window fails the
+    /// walk. A close at body depth ends the body: a later read (a
+    /// while-else arm) runs on the zero-trip path and fails.
+    fn scanLine(
+        self: *const ReadLoopWalk,
+        line: []const u8,
+        from: usize,
+        to: usize,
+        state: *ReadWalkState,
+    ) bool {
+        var walk = QuoteWalk.init(line);
+        while (walk.next()) |pos| : (walk.advance()) {
+            if (types.isMultilineOpenerAt(line, pos)) break;
+            if (pos < from or pos >= to) continue;
+            if (!self.foldBraceAt(line, pos, state)) return false;
+            if (!self.applyReadOccurrence(line, pos, state)) return false;
+        }
+        return true;
+    }
+
+    /// One code byte of the bound walk: fold the brace into the carried
+    /// depth. A close at body depth ends the body (EPH-I1293).
+    fn foldBraceAt(
+        self: *const ReadLoopWalk,
+        line: []const u8,
+        pos: usize,
+        state: *ReadWalkState,
+    ) bool {
+        _ = self;
+        const c = line[pos];
+        if (c != '{' and c != '}') return true;
+        if (c == '{') {
+            state.depth += 1;
+            return true;
+        }
+        if (state.depth == 0) {
+            state.closed = true;
+            return false;
+        }
+        state.depth -= 1;
+        return true;
+    }
+
+    /// One occurrence of the bound walk (EPH-I1293): only a top-level
+    /// one-step decrement in a plain statement credits the bound. A
+    /// conditional decrement writes nothing on some paths, so the read
+    /// may observe the unwritten element at index counter.
+    fn applyReadOccurrence(
+        self: *const ReadLoopWalk,
+        line: []const u8,
+        pos: usize,
+        state: *ReadWalkState,
+    ) bool {
+        if (!wordOccursAt(line, pos, self.ri)) return true;
+        const after = mem.trimStart(u8, line[pos + self.ri.len ..], " \t");
+        if (!occurrenceWritesName(after)) return true;
+        if (!isOneStepDecrement(after)) return false;
+        if (state.depth != 0) return false;
+        if (segmentHasConditionalHeader(line, pos)) return false;
+        state.decrements += 1;
+        return true;
+    }
+};
+
+/// Carried state of the read-loop bound walk (EPH-I1293).
+const ReadWalkState = struct {
+    depth: usize = 0,
+    decrements: usize = 0,
+    closed: bool = false,
+};
+
+/// Start column of a loop body's code: past the `{` for a braced body,
+/// at the body start otherwise (EPH-I1293).
+fn bodyCodeStartCol(t: []const u8, body_start: usize) usize {
+    if (body_start < t.len and t[body_start] == '{') return body_start + 1;
+    return body_start;
+}
+
+/// True when the statement segment before `pos` on the line carries a
+/// conditional header (if/else/while/for/switch) — a braceless guarded
+/// statement (EPH-I1293). The segment runs from the line start or the
+/// last statement boundary (`;`, `{`, `}`) before `pos`. A decrement
+/// inside such a segment is conditional and must not credit the bound.
+fn segmentHasConditionalHeader(line: []const u8, pos: usize) bool {
+    var seg_start: usize = 0;
+    var j: usize = 0;
+    while (j < pos) : (j += 1) {
+        if (line[j] == ';' or line[j] == '{' or line[j] == '}') seg_start = j + 1;
+    }
+    const segment = mem.trim(u8, line[seg_start..pos], " \t");
+    if (isConditionalStart(segment)) return true;
+    if (isLoopOpenerLine(segment)) return true;
+    return mem.startsWith(u8, segment, "switch ") or
+        mem.startsWith(u8, segment, "switch(");
+}
+
+/// True when `name` starts at `pos` with word boundaries on both sides
+/// (EPH-I1293). The shared per-occurrence form of the VarOccurrenceIter
+/// boundary rule (EPH-I0100).
+fn wordOccursAt(line: []const u8, pos: usize, name: []const u8) bool {
+    if (pos + name.len > line.len) return false;
+    if (pos > 0 and (isIdent(line[pos - 1]) or hasLeftDot(line, pos))) return false;
+    if (pos + name.len < line.len and isIdent(line[pos + name.len])) return false;
+    return mem.eql(u8, line[pos .. pos + name.len], name);
+}
+
+/// True when the text right after a name occurrence writes it — a plain
+/// or a compound assignment (EPH-I1293). The single-occurrence form of
+/// lineWritesName.
+fn occurrenceWritesName(after: []const u8) bool {
+    if (isAssignmentOp(after)) return true;
+    const compounds = [_][]const u8{
+        "+=",  "-=", "*=", "/=", "%=",  "+%=", "-%=",
+        "*%=", "&=", "|=", "^=", "<<=", ">>=",
+    };
+    for (compounds) |op| {
+        if (mem.startsWith(u8, after, op)) return true;
+    }
+    return false;
+}
+
+/// True when the write is the one-step decrement `-= 1` (EPH-I1293).
+/// Only the literal one matches: `-= 2` or `-= x` stays excluded (FN).
+fn isOneStepDecrement(after: []const u8) bool {
+    if (!mem.startsWith(u8, after, "-=")) return false;
+    const rhs = mem.trimStart(u8, after[2..], " \t");
+    return rhs.len > 0 and rhs[0] == '1' and (rhs.len == 1 or !isIdent(rhs[1]));
+}
+
+/// True when the write is the one-step increment `+= 1` or `+%= 1`
+/// (EPH-I1293). Mirrors lineHasIncrement for the single-occurrence form.
+fn isOneStepIncrement(after: []const u8) bool {
+    const op_len = oneStepOpLen(after) orelse return false;
+    const rhs = mem.trimStart(u8, after[op_len..], " \t");
+    return rhs.len > 0 and rhs[0] == '1' and (rhs.len == 1 or !isIdent(rhs[1]));
+}
+
+/// The `var <ri> = <counter>;` decl nearest before `opener` within the
+/// guard window, else null (EPH-I1293). The initializer must be the
+/// bare counter identifier: a typed decl (`var di: u8 = dlen;`) and the
+/// bare form both qualify, an offset (`var di = dlen + 1`) stays
+/// excluded (FN).
+const CounterInitDecl = struct {
+    idx: usize,
+    counter: []const u8,
+};
+
+fn findCounterInitDecl(
+    lines: []const []const u8,
+    opener: usize,
+    ri: []const u8,
+) ?CounterInitDecl {
+    const stop = opener -| guard_candidate_window;
+    var i = opener;
+    while (i > stop) {
+        i -= 1;
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        const decl_name = extractVarDeclName(t) orelse continue;
+        if (!mem.eql(u8, decl_name, ri)) continue;
+        const after = declInitializerStart(t) orelse continue;
+        const rhs = trimTrailingSemicolon(mem.trim(u8, t[after..], " \t"));
+        if (rhs.len == 0 or !isAllIdent(rhs)) continue;
+        return .{ .idx = i, .counter = rhs };
+    }
+    return null;
+}
+
+/// The initializer text with one trailing `;` removed (EPH-I1293): the
+/// decl's terminator is not part of the initializer.
+fn trimTrailingSemicolon(rhs: []const u8) []const u8 {
+    const trimmed = mem.trim(u8, rhs, " \t");
+    if (trimmed.len > 0 and trimmed[trimmed.len - 1] == ';') {
+        return mem.trim(u8, trimmed[0 .. trimmed.len - 1], " \t");
+    }
+    return trimmed;
+}
+
+/// True when a word-bounded write of `name` occurs on any code line in
+/// the open range (from, to) (EPH-I1293). The decl line itself stays
+/// outside: its `= init` is the decl's own write.
+fn writesBetween(
+    lines: []const []const u8,
+    from: usize,
+    to: usize,
+    name: []const u8,
+) bool {
+    var i = from;
+    while (i < to) : (i += 1) {
+        const t = mem.trim(u8, lines[i], " \t\r");
+        if (isCommentOrMultilineString(t)) continue;
+        if (lineWritesName(t, name)) return true;
+    }
+    return false;
+}
+
+/// True when the fill loop stores var[counter] on every trip and
+/// increments the counter once per storing trip (EPH-I1293). The
+/// continuation form (`while (v > 0) : (c += 1)`) rejects a body
+/// `continue` — it skips the store while the continuation still runs, a
+/// real hole — and any body counter write. The body form accepts one
+/// one-step increment after the store and no other counter write. The
+/// store must sit at the body's top level with the counter as its
+/// index: a conditional store breaks the per-trip store.
+fn fillLoopStoresVar(
+    lines: []const []const u8,
+    loop: CounterLoop,
+    counter: []const u8,
+    var_name: []const u8,
+) bool {
+    const t = mem.trim(u8, lines[loop.loop_idx], " \t\r");
+    const body_start = loopBodyStartCol(t) orelse return false;
+    const cont = loopContinuationSpan(t);
+    const cont_increments = cont != null and
+        lineHasIncrement(t[cont.?.start..cont.?.end], counter);
+    if (fillConditionWritesCounter(t, body_start, counter)) return false;
+    var state = FillLoopState{ .counter = counter, .var_name = var_name };
+    var i = loop.loop_idx;
+    while (i < loop.body_end) : (i += 1) {
+        const line = mem.trim(u8, lines[i], " \t\r");
+        if (cont_increments and hasRealWordKeyword(line, "continue")) return false;
+        state.cur_line = i;
+        const from = if (i == loop.loop_idx) bodyCodeStartCol(t, body_start) else 0;
+        if (!scanFillLoopLine(line, from, &state)) return false;
+    }
+    if (!state.has_store) return false;
+    if (cont_increments) return state.inc_count == 0;
+    if (state.inc_count != 1) return false;
+    // The body-form increment must follow the store: an increment before
+    // it shifts the store index past the first element.
+    return state.inc_line > state.store_line or
+        (state.inc_line == state.store_line and state.inc_col > state.store_col);
+}
+
+/// True when the fill loop's condition region writes the counter
+/// (EPH-I1293): a condition assignment would shift every store index.
+fn fillConditionWritesCounter(t: []const u8, body_start: usize, counter: []const u8) bool {
+    const open = mem.indexOf(u8, t, "(") orelse return false;
+    const close = loopCondCloseCol(t) orelse return false;
+    if (close <= open or close >= body_start) return false;
+    return lineWritesName(t[open + 1 .. close], counter);
+}
+
+/// Carried state of the fill-loop body walk (EPH-I1293): the tracked
+/// names, the first top-level store, the counter-write tally, the
+/// depth, and the line.
+const FillLoopState = struct {
+    counter: []const u8,
+    var_name: []const u8,
+    has_store: bool = false,
+    store_line: usize = 0,
+    store_col: usize = 0,
+    inc_count: usize = 0,
+    inc_line: usize = 0,
+    inc_col: usize = 0,
+    depth: usize = 0,
+    cur_line: usize = 0,
+};
+
+/// One fill-loop body line (EPH-I1293): fold braces into the carried
+/// depth (whole-line, quote-masked) and classify the counter and var
+/// occurrences inside [from, line end). Every counter write must be the
+/// one-step increment. A depth-0 store of var[counter] records the
+/// store; deeper stores stay uncredited (FN direction).
+fn scanFillLoopLine(
+    line: []const u8,
+    from: usize,
+    state: *FillLoopState,
+) bool {
+    var walk = QuoteWalk.init(line);
+    while (walk.next()) |pos| : (walk.advance()) {
+        if (types.isMultilineOpenerAt(line, pos)) break;
+        if (pos < from) continue;
+        if (!applyFillOccurrence(line, pos, state)) return false;
+    }
+    return true;
+}
+
+/// One occurrence of the fill-loop body walk (EPH-I1293): fold the
+/// brace byte into the carried depth, then apply the occurrence's
+/// verdict.
+fn applyFillOccurrence(
+    line: []const u8,
+    pos: usize,
+    state: *FillLoopState,
+) bool {
+    const c = line[pos];
+    if (c == '{') state.depth += 1;
+    if (c == '}') state.depth -|= 1;
+    const occ = fillBodyOccurrenceAt(state, line, pos);
+    if (occ == .none) return true;
+    if (occ == .counter_other) return false;
+    if (occ == .counter_inc) {
+        state.inc_count += 1;
+        state.inc_line = state.cur_line;
+        state.inc_col = pos;
+        return true;
+    }
+    if (state.depth != 0) return false;
+    // A braceless guarded store (`if (x) digits[c] = 1;`) is
+    // conditional: some trips store nothing, so the store must sit in a
+    // plain statement (FN direction otherwise).
+    if (segmentHasConditionalHeader(line, pos)) return false;
+    if (state.has_store) return false;
+    state.has_store = true;
+    state.store_line = state.cur_line;
+    state.store_col = pos;
+    return true;
+}
+
+/// What one body position means for the fill-loop walk (EPH-I1293): a
+/// counter write (the one-step increment or any other write), a depth-0
+/// store of var[counter], or none of these.
+const FillBodyOccurrence = enum { none, counter_inc, counter_other, store };
+
+fn fillBodyOccurrenceAt(
+    state: *const FillLoopState,
+    line: []const u8,
+    pos: usize,
+) FillBodyOccurrence {
+    if (wordOccursAt(line, pos, state.counter)) {
+        const after = mem.trimStart(u8, line[pos + state.counter.len ..], " \t");
+        if (!occurrenceWritesName(after)) return .none;
+        if (isOneStepIncrement(after)) return .counter_inc;
+        return .counter_other;
+    }
+    if (!wordOccursAt(line, pos, state.var_name)) return .none;
+    const end = pos + state.var_name.len;
+    if (end >= line.len or line[end] != '[') return .none;
+    const close = skipBracketed(line, end) orelse return .none;
+    const contents = mem.trim(u8, line[end + 1 .. close - 1], " \t");
+    if (!mem.eql(u8, contents, state.counter)) return .none;
+    if (classifyBracketUse(line, end) != .fill) return .none;
+    return .store;
+}
+
+/// The between-loops span check (EPH-I1293): a counter write outside
+/// the fill loop's span between the counter decl and the read loop
+/// breaks the trip-to-store correlation — another loop's increment
+/// would let the read loop observe elements the fill never wrote.
+const OutsideFillScan = struct {
+    lines: []const []const u8,
+    c_decl: usize,
+    loop: CounterLoop,
+    read_opener: usize,
+
+    fn writesCounter(self: *const OutsideFillScan, counter: []const u8) bool {
+        var i = self.c_decl + 1;
+        while (i < self.read_opener) : (i += 1) {
+            if (i >= self.loop.loop_idx and i < self.loop.body_end) continue;
+            const t = mem.trim(u8, self.lines[i], " \t\r");
+            if (isCommentOrMultilineString(t)) continue;
+            if (lineWritesName(t, counter)) return true;
+        }
+        return false;
+    }
+};
 
 /// Span of the loop whose trip counter `counter` increments: the opener
 /// line and the first line AFTER its body (the body end is exclusive —
@@ -7149,14 +7661,7 @@ fn lineWritesName(t: []const u8, name: []const u8) bool {
     var iter = VarOccurrenceIter{ .t = t, .name = name };
     while (iter.next()) |pos| {
         const after = mem.trimStart(u8, t[pos + name.len ..], " \t");
-        if (isAssignmentOp(after)) return true;
-        const compounds = [_][]const u8{
-            "+=",  "-=", "*=", "/=", "%=",  "+%=", "-%=",
-            "*%=", "&=", "|=", "^=", "<<=", ">>=",
-        };
-        for (compounds) |op| {
-            if (mem.startsWith(u8, after, op)) return true;
-        }
+        if (occurrenceWritesName(after)) return true;
     }
     return false;
 }
@@ -82391,6 +82896,339 @@ test "ZA607: loop-carried counter guard over-warns (EPH-I0826, documented residu
     try std.testing.expectEqual(
         1,
         countRuleIssues(run.issues.items, "da_i0826_rh.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: counter-bounded fill-then-read stays silent (EPH-I1293, system_monitor shape)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The RhyOS system_monitor.zig:1216 writeDecimal shape: the fill
+    // loop stores digits[dlen] per trip behind an early return, and the
+    // read loop reads digits[di] with di declared from dlen and
+    // decremented before every read. Safe on every path: the read loop
+    // trips only when the fill loop stored at least one element. The
+    // counter-bounded suppressor (isCounterBoundedRead) proves the
+    // bound, so the site stays silent. This pin is the issue's
+    // regression lock.
+    const content =
+        \\fn writeDecimal(buf: []u8, val: u64) u8 {
+        \\    var v = val;
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: u8 = 0;
+        \\    if (v == 0) {
+        \\        buf[0] = '0';
+        \\        return 1;
+        \\    }
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var pos: u8 = 0;
+        \\    var di: u8 = dlen;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[pos] = '0' + digits[di];
+        \\        pos += 1;
+        \\    }
+        \\    return pos;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1293_sm.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1293_sm.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: counter-bounded read with body increment stays silent (EPH-I1293, usb_write shape)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The RhyOS usb_write.zig:379 shape: the increment sits in the body
+    // after the store, no early-return guard, and the read sits inside
+    // an if inside the read loop. The bound proof holds the same way.
+    const content =
+        \\fn writeDigits(buf: []u8, value: u64, pos0: usize) usize {
+        \\    var digits: [10]u8 = undefined;
+        \\    var count: usize = 0;
+        \\    var v = value;
+        \\    while (v > 0) {
+        \\        digits[count] = @intCast('0' + (v % 10));
+        \\        v /= 10;
+        \\        count += 1;
+        \\    }
+        \\    var pos = pos0;
+        \\    var i = count;
+        \\    while (i > 0) {
+        \\        i -= 1;
+        \\        if (pos < 10) {
+        \\            buf[pos] = digits[i];
+        \\            pos += 1;
+        \\        }
+        \\    }
+        \\    return pos;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1293_usb.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1293_usb.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: read-loop continuation decrement still fires (EPH-I1293 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The decrement in the while continuation runs after the body: the
+    // first trip reads digits[dlen], one past the last written element.
+    // A genuine unassigned read the suppressor must not silence.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) : (di -= 1) {
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1293_contdec.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1293_contdec.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: conditional fill store still fires (EPH-I1293 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A conditional store skips elements while the counter still
+    // advances: the read loop then observes unwritten elements. The
+    // suppressor must not credit the fill.
+    const content =
+        \\fn fmt(buf: []u8, val: u64, skip: bool) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        if (!skip) digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1293_cond.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1293_cond.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: fill-loop continue in continuation form still fires (EPH-I1293 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A continue skips the store while the continuation still
+    // increments the counter: the skipped trip leaves a hole the read
+    // loop then observes.
+    const content =
+        \\fn fmt(buf: []u8, val: u64, skip: bool) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        if (skip) continue;
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1293_fcont.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1293_fcont.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: offset read-index init still fires (EPH-I1293 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // An offset initializer (`var di = dlen + 1`) lets the read loop
+    // observe the element one past the last written index.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var di: usize = dlen + 1;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1293_off.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1293_off.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: conditional decrement still fires (EPH-I1293 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A braceless guarded decrement (`if (x) di -= 1;`) runs only on
+    // some trips: the read then observes the element at index dlen,
+    // one past the last written index.
+    const content =
+        \\fn fmt(buf: []u8, val: u64, x: bool) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) {
+        \\        if (x) di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1293_conddec.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1293_conddec.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: counter write outside the fill span still fires (EPH-I1293 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A second loop that increments the counter between the fill loop
+    // and the read loop breaks the trip-to-store correlation: the read
+    // loop then observes elements the fill never wrote.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    while (dlen < 20) : (dlen += 1) {
+        \\        digits[dlen] = 0;
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1293_span.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1293_span.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: body-form increment before the store still fires (EPH-I1293 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // An increment before the store shifts every store index: the first
+    // element is never written, and the read loop observes it.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) {
+        \\        dlen += 1;
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1293_preinc.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1293_preinc.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

@@ -15,9 +15,13 @@
 #   - idempotent re-run (a second run converges with no file growth)
 #   - failure rc propagation (no installArtifact fails the install)
 #   - release-signature verification (WP-7: a fixture keypair signs the
-#     served tarball, and EPHOR_RELEASE_PUBKEY drives the active check
-#     through the real minisign before the fetch)
-# Not wired into hooks.
+#     served tarball, EPHOR_SIG_URL serves the signature locally, and
+#     EPHOR_RELEASE_PUBKEY drives the active check through the real
+#     minisign before the fetch)
+# Wired into scripts/gate.sh (EPH-I1292): the real-zig legs here — the
+# fingerprint self-heal and the no-build-spawn pin — are the behaviors
+# the fake-zig suites cannot reach, and they broke silently while the
+# suite sat unwired.
 #
 # Run:
 #   sh scripts/test-install-smoke.sh
@@ -91,9 +95,10 @@ EOF
 tar -czf "$SMOKE_ROOT/ephor.tar.gz" -C "$PKG" build.zig build.zig.zon
 
 # WP-7: sign the package tarball with a fresh fixture keypair and serve
-# the signature next to it. The installer's default SIG_URL
-# ($EPHOR_URL.minisig) then downloads it from the local server, and the
-# EPHOR_RELEASE_PUBKEY override below replaces the embedded key for the
+# the signature next to it. The installer's default SIG_URL points at
+# the real remote (raw/branch/main/signatures/<tag>.tar.gz.minisig), so
+# the exports below override it with EPHOR_SIG_URL (the e2e suite's
+# pattern), and EPHOR_RELEASE_PUBKEY replaces the embedded key for the
 # hermetic run (the fixture-key seam, EPH-I0205).
 minisign -G -W -p "$SMOKE_ROOT/test.pub" -s "$SMOKE_ROOT/test.key" < /dev/null >/dev/null 2>&1 || {
     echo "error: minisign key generation failed." >&2
@@ -153,6 +158,7 @@ export ZIG_BIN
 export EPHOR_TEST_MODE=1
 export EPHOR_TAGS_API="file://$SMOKE_ROOT/tags.json"
 export EPHOR_ARCHIVE_URL="http://127.0.0.1:$PORT/ephor.tar.gz"
+export EPHOR_SIG_URL="http://127.0.0.1:$PORT/ephor.tar.gz.minisig"
 export EPHOR_RELEASE_PUBKEY="$SMOKE_PUBKEY"
 export ZIG_GLOBAL_CACHE_DIR="$SMOKE_ROOT/cache"
 OLD_PATH=$PATH

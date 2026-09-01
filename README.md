@@ -344,6 +344,37 @@ built-in threshold defaults apply when the thresholds block is absent.
 
 Keys parse in file order. A repeated scalar key (`path_dir`, `strict`, `fail_on`, `error_naming`) resolves last-wins. A repeated list key (`entries`, `exclude`, `orphan_exclude`, `disable`, `enable`) accumulates. `fail_on` outranks `strict` regardless of key order (see Exit Codes). Threshold keys are `max_lines` (alias `max_function_lines`), `max_nesting`, `max_params`, `max_branches`, `max_line_length`, `max_file_bytes`, `max_cyclomatic`, and `max_cognitive`.
 
+### Config changes by version
+
+`install` and `upgrade` stamp the `version` field and never rewrite the
+other keys. An unchanged config from an older release keeps its shape
+and picks up the behavior changes below. The full release notes live in
+[Changelog](#changelog).
+
+**0.13.x → 0.14.x (v0.14.0):**
+
+- New keys: `strict` and `fail_on` (CI exit gates).
+- New default-ON rules: the ZT1xx test-quality band (ZT101-ZT105), the
+  ZC1xx concurrency band (ZC101-ZC104), ZA110, ZA111, ZA209, and ZA210.
+  ZA904 ships off by default (`--enable=ZA904`).
+- ZA704 is removed. `disable` and `enable` entries naming ZA704 become
+  inert.
+
+**0.14.x → 0.15.x (v0.15.0):**
+
+- New key: `error_naming`. The ZA703 error-name default flips from
+  `snake_case` to `TitleCase`. Set `"error_naming": "snake_case"` to
+  keep the old behavior.
+- New key: `coverage` (the ZT105 unreached-pub-fn ratio gate).
+- Nine new default-ON rules: ZA404, ZA405, ZA406, ZA504, ZA505, ZA506,
+  ZA507, ZA508, and ZT106.
+- The `max_cyclomatic` default drops from 15 to 10 (the unified
+  complexity standard).
+- `exclude` matching changes from substring to component-wise (see the
+  Config Options table).
+- ZA902 is removed. `disable` and `enable` entries naming ZA902 become
+  inert.
+
 ### Config trust model
 
 A config file is trusted when its directory is the working directory or an ancestor of it (realpath compare). Every other config is untrusted. `--trust-target-config` declares a scanned target's config trusted.
@@ -619,7 +650,7 @@ Based on the [Zig Style Guide](https://ziglang.org/documentation/0.15.2/#Names):
 | Imports | (not checked) | `const std = @import("std");` |
 | Names starting with `_` | (exempt) | `fn _helper() void {}` |
 
-**Error naming:** `TitleCase` is the default because the stdlib and virtually all community code declare TitleCase error names (the pre-0.14.4 ZA703 default of `snake_case` produced false positives on idiomatic Zig). Set `"error_naming": "snake_case"` in `ephor.json` to keep the old behavior.
+**Error naming:** `TitleCase` is the default because the stdlib and virtually all community code declare TitleCase error names (the pre-0.15.0 ZA703 default of `snake_case` produced false positives on idiomatic Zig). Set `"error_naming": "snake_case"` in `ephor.json` to keep the old behavior.
 
 **ZA703 fire surface:** ZA703 fires on error-set member declarations only — the body of an `error{...}` set, whether a named const or an inline set in a signature or type. Use sites of an error value are never flagged: a used error value cannot be restyled per site, and renaming the set is a cross-tree refactor unrelated to the change that triggered the hit (EPH-I1075).
 

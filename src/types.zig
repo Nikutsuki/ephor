@@ -498,6 +498,17 @@ pub const ProjectStats = struct {
     /// as a parse run the command never performed.
     ast_parsed: usize = 0,
     ast_skipped: usize = 0,
+    /// The four AST-tier skip classes (EPH-I1302): byte cap, grammar
+    /// pre-scan, parse errors, and spawn refusals. The counters ride the
+    /// same merge as ast_skipped (printCheckSummary merges the
+    /// ast_tier.Stats fields in), and the stats command omits them the
+    /// same way (EPH-I0588). JSON mode silences the skip note
+    /// (EPH-I0213), so these members are the machine stream's only
+    /// per-class signal.
+    ast_skipped_cap: usize = 0,
+    ast_skipped_nesting: usize = 0,
+    ast_skipped_parse: usize = 0,
+    ast_skipped_spawn: usize = 0,
     /// Pruned-entry count (EPH-I1260, I1267, I1276, I1277): hidden and
     /// known-cache dirs, unopenable dirs, symlink-kind entries, and
     /// depth-cap truncations the walk skipped. Zero unless the .check

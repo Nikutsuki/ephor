@@ -6908,7 +6908,9 @@ const ReadLoopWalk = struct {
     /// One occurrence of the bound walk (EPH-I1293): only a top-level
     /// one-step decrement in a plain statement credits the bound. A
     /// conditional decrement writes nothing on some paths, so the read
-    /// may observe the unwritten element at index counter.
+    /// may observe the unwritten element at index counter. A deferred
+    /// decrement (braceless `defer ri -= 1;`) runs at scope exit, after
+    /// the read, so it never credits either (EPH-I1301).
     fn applyReadOccurrence(
         self: *const ReadLoopWalk,
         line: []const u8,
@@ -6920,7 +6922,7 @@ const ReadLoopWalk = struct {
         if (!occurrenceWritesName(after)) return true;
         if (!isOneStepDecrement(after)) return false;
         if (state.depth != 0) return false;
-        if (segmentHasConditionalHeader(line, pos)) return false;
+        if (segmentHasConditionalOrDeferredHeader(line, pos)) return false;
         state.decrements += 1;
         return true;
     }
@@ -6941,11 +6943,15 @@ fn bodyCodeStartCol(t: []const u8, body_start: usize) usize {
 }
 
 /// True when the statement segment before `pos` on the line carries a
-/// conditional header (if/else/while/for/switch) — a braceless guarded
-/// statement (EPH-I1293). The segment runs from the line start or the
-/// last statement boundary (`;`, `{`, `}`) before `pos`. A decrement
-/// inside such a segment is conditional and must not credit the bound.
-fn segmentHasConditionalHeader(line: []const u8, pos: usize) bool {
+/// conditional header (if/else/while/for/switch) or a defer/errdefer
+/// prefix (EPH-I1293, EPH-I1301). The segment runs from the line start
+/// or the last statement boundary (`;`, `{`, `}`) before `pos`. A write
+/// inside such a segment does not run at its source position on this
+/// trip — a conditional statement skips some trips, and a deferred
+/// statement runs at scope exit — so it must not credit the bound. A
+/// braced `defer { ... }` never reaches this check: the `{` resets the
+/// segment start, and the carried depth excludes the body.
+fn segmentHasConditionalOrDeferredHeader(line: []const u8, pos: usize) bool {
     var seg_start: usize = 0;
     var j: usize = 0;
     while (j < pos) : (j += 1) {
@@ -6954,8 +6960,26 @@ fn segmentHasConditionalHeader(line: []const u8, pos: usize) bool {
     const segment = mem.trim(u8, line[seg_start..pos], " \t");
     if (isConditionalStart(segment)) return true;
     if (isLoopOpenerLine(segment)) return true;
+    if (isDeferStart(segment)) return true;
     return mem.startsWith(u8, segment, "switch ") or
         mem.startsWith(u8, segment, "switch(");
+}
+
+/// True when the trimmed text starts a defer or errdefer statement
+/// (EPH-I1301). The segment is trimmed, so the common `defer ` form
+/// arrives as the bare keyword: the check matches the keyword as the
+/// whole segment or followed by any non-identifier char (a space, a
+/// paren). A multi-line braceless defer (the keyword on its own line)
+/// stays unseen — accepted FN.
+fn isDeferStart(t: []const u8) bool {
+    return startsWithKeyword(t, "defer") or startsWithKeyword(t, "errdefer");
+}
+
+/// True when `t` starts with the keyword `kw` at a word boundary: the
+/// keyword is the whole text or the next char is not an identifier part.
+fn startsWithKeyword(t: []const u8, kw: []const u8) bool {
+    if (!mem.startsWith(u8, t, kw)) return false;
+    return t.len == kw.len or !isIdent(t[kw.len]);
 }
 
 /// True when `name` starts at `pos` with word boundaries on both sides
@@ -7163,8 +7187,11 @@ fn applyFillOccurrence(
     if (state.depth != 0) return false;
     // A braceless guarded store (`if (x) digits[c] = 1;`) is
     // conditional: some trips store nothing, so the store must sit in a
-    // plain statement (FN direction otherwise).
-    if (segmentHasConditionalHeader(line, pos)) return false;
+    // plain statement (FN direction otherwise). A deferred store
+    // (`defer digits[c] = v;`) writes at scope exit with the exit-time
+    // index, past the stored elements, so it never credits either
+    // (EPH-I1301).
+    if (segmentHasConditionalOrDeferredHeader(line, pos)) return false;
     if (state.has_store) return false;
     state.has_store = true;
     state.store_line = state.cur_line;
@@ -53383,10 +53410,11 @@ const IssueCounts = struct {
 /// it with headroom for additive lines.
 const summary_text_buf_bytes = 1024;
 
-/// Stack buffer for formatSummaryJson. Worst case: ~490 fixed bytes + 20
+/// Stack buffer for formatSummaryJson. Worst case: ~594 fixed bytes + 24
 /// usize fields at <=20 digits + the 13-byte status + the 221-byte
-/// suppressed member = ~1124 bytes. 1536 covers it with headroom for
-/// additive members.
+/// suppressed member = ~1308 bytes. 1536 covers it with headroom for
+/// additive members. The worst-case pin (summary JSON worst-case values
+/// fit the proven buffer, EPH-I1302) executes this proof.
 const summary_json_buf_bytes = 1536;
 
 /// Format the JSON summary into `buf`. The suppression accounting rides as
@@ -53398,12 +53426,15 @@ const summary_json_buf_bytes = 1536;
 /// and "status" reflects that total, so a notes-only run never reports
 /// ok (EPH-I0535). The head shares its value run with the text summary
 /// (formatSummaryCore, EPH-I1232 C7). The tail keeps the JSON-only
-/// pruned_dirs/todos/status/suppressed members. pruned_dirs (EPH-I1260)
+/// pruned_dirs/todos/status/suppressed members plus the four AST skip
+/// classes (EPH-I1302). pruned_dirs (EPH-I1260)
 /// rides the ast_skipped pattern: the .check flow merges the walk's
 /// prune counts in — hidden or known-cache dirs, unopenable dirs
 /// (EPH-I1276), symlink-kind entries (EPH-I1267), and depth-cap
 /// truncations (EPH-I1277) — and the member is the JSON mode's only
-/// pruned-subtree signal (the notes skip in JSON mode).
+/// pruned-subtree signal (the notes skip in JSON mode). The skip-class
+/// members ride the same pattern: JSON mode silences the skip note, so
+/// they carry the per-class disclosure the text note gives.
 fn formatSummaryJson(
     buf: []u8,
     counts: IssueCounts,
@@ -53443,13 +53474,17 @@ fn formatSummaryJson(
     // have carried (the empty first \\ line supplies it). The status
     // member and the suppressed member render on separate lines
     // (EPH-I1263), and the empty last line keeps the trailing break.
-    // The pruned_dirs member (EPH-I1260) renders between the quality
-    // close and status.
+    // The pruned_dirs member (EPH-I1260) and the four AST skip classes
+    // (EPH-I1302) render between the quality close and status.
     const tail = try std.fmt.bufPrint(buf[head.len..],
         \\
         \\      "todos": {d}
         \\    }},
         \\    "pruned_dirs": {d},
+        \\    "ast_skipped_cap": {d},
+        \\    "ast_skipped_nesting": {d},
+        \\    "ast_skipped_parse": {d},
+        \\    "ast_skipped_spawn": {d},
         \\    "status": "{s}",
         \\    "suppressed": {s}
         \\  }}
@@ -53458,6 +53493,10 @@ fn formatSummaryJson(
     , .{
         s.todo_count,
         s.pruned_dirs,
+        s.ast_skipped_cap,
+        s.ast_skipped_nesting,
+        s.ast_skipped_parse,
+        s.ast_skipped_spawn,
         if (counts.total() == 0) "ok" else "issues_found",
         member,
     });
@@ -53594,6 +53633,10 @@ const skip_note_path_bytes: usize = 96;
 /// paths plus the separators and the cap suffix fit with room to spare
 /// (EPH-I1197).
 const skip_note_path_buf_bytes: usize = 1024;
+/// Fixed render buffer for the skip note's per-class count fragment
+/// (EPH-I1302): 64 fixed bytes plus four usize values at <=20 digits
+/// bound the render at 144 bytes; 192 leaves headroom.
+const class_note_buf_bytes: usize = 192;
 
 /// Render the skip note's path segment into `buf`: "a.zig, b.zig", or
 /// "a.zig, ..., h.zig, ... (12 total)" when the log capped. Empty when
@@ -53641,10 +53684,11 @@ fn writeOneSkipPath(allocator: Allocator, w: *std.Io.Writer, p: []const u8) !voi
 /// Surface partial AST-tier coverage (EPH-I0200): a version-skew or
 /// over-cap file loses ZA111 coverage, and the line tier has no equivalent
 /// signal. Fires whenever the tier skipped at least one file, and names
-/// the skipped paths (capped) so the skip is diagnosable without debug
-/// instrumentation (EPH-I1197). JSON mode skips the note so the machine
-/// stream stays pure (EPH-I0213). With --summary the ast_skipped member
-/// carries the same fact.
+/// the skipped paths (capped) and the per-class counts (EPH-I1302) so
+/// the skip is diagnosable without debug instrumentation (EPH-I1197).
+/// JSON mode skips the note so the machine stream stays pure
+/// (EPH-I0213); the summary's ast_skipped_* members carry the same
+/// facts there.
 fn noteAstTierSkips(
     diag: *DiagCtx,
     allocator: Allocator,
@@ -53659,21 +53703,36 @@ fn noteAstTierSkips(
     // empty path log.
     const paths = formatSkipPaths(allocator, &buf, log, stats.skipped) catch "";
     const plural = if (stats.skipped == 1) @as([]const u8, "") else "s";
+    var class_buf: [class_note_buf_bytes]u8 = undefined;
+    const classes = formatSkipClasses(&class_buf, stats);
     if (paths.len == 0) {
         cliDiag(
             diag,
-            "note: {d} file{s} skipped by the AST tier (parse errors, byte " ++
-                "cap, or grammar pre-scan). ZA111 coverage is partial for those files.\n",
-            .{ stats.skipped, plural },
+            "note: {d} file{s} skipped by the AST tier ({s}). " ++
+                "ZA111 coverage is partial for those files.\n",
+            .{ stats.skipped, plural, classes },
         );
         return;
     }
     cliDiag(
         diag,
-        "note: {d} file{s} skipped by the AST tier (parse errors, byte " ++
-            "cap, or grammar pre-scan): {s}. ZA111 coverage is partial for those files.\n",
-        .{ stats.skipped, plural, paths },
+        "note: {d} file{s} skipped by the AST tier ({s}): {s}. " ++
+            "ZA111 coverage is partial for those files.\n",
+        .{ stats.skipped, plural, classes, paths },
     );
+}
+
+/// The four per-class skip counts as one note fragment (EPH-I1302). The
+/// 64 fixed bytes plus four usize values at <=20 digits bound the render
+/// at 144 bytes; the 192-byte buffer covers it. On the impossible
+/// overflow the fragment degrades to the bare "skips" word so the note
+/// keeps its head.
+fn formatSkipClasses(buf: []u8, stats: ast_tier.Stats) []const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "byte cap: {d}, grammar pre-scan: {d}, parse errors: {d}, spawn refusals: {d}",
+        .{ stats.skipped_cap, stats.skipped_nesting, stats.skipped_parse, stats.skipped_spawn },
+    ) catch "skips";
 }
 
 /// Surface scan-depth truncation (EPH-I0667, trust-model F-5): a depth cap
@@ -54856,6 +54915,13 @@ fn printCheckSummary(
     var stats = g.getStats();
     stats.ast_parsed = findings.ast_stats.parsed;
     stats.ast_skipped = findings.ast_stats.skipped;
+    // The four skip classes (EPH-I1302) ride the same merge: JSON mode
+    // silences the skip note, so the summary members are the machine
+    // stream's only per-class signal.
+    stats.ast_skipped_cap = findings.ast_stats.skipped_cap;
+    stats.ast_skipped_nesting = findings.ast_stats.skipped_nesting;
+    stats.ast_skipped_parse = findings.ast_stats.skipped_parse;
+    stats.ast_skipped_spawn = findings.ast_stats.skipped_spawn;
     stats.pruned_dirs = prunedDirsTotal(ctx.diag);
     // Note-severity findings ride one summary member, not per-category
     // buckets: the buckets keep the historical warnings-only meaning
@@ -56408,6 +56474,91 @@ test "summary JSON carries the pruned-dirs member (EPH-I1261)" {
     try std.testing.expect(summary.get("files") != null);
 }
 
+test "summary JSON carries the AST-tier skip classes (EPH-I1302)" {
+    const allocator = std.testing.allocator;
+    var buf: [summary_json_buf_bytes]u8 = undefined;
+    const text = try formatSummaryJson(&buf, .{}, .{
+        .ast_skipped = 5,
+        .ast_skipped_cap = 1,
+        .ast_skipped_nesting = 1,
+        .ast_skipped_parse = 2,
+        .ast_skipped_spawn = 1,
+    }, .{});
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        text,
+        .{},
+    );
+    defer parsed.deinit();
+    const summary = parsed.value.object.get("summary").?.object;
+    // EPH-I1302: JSON mode silences the skip note (EPH-I0213), so the
+    // four class members are the machine stream's only per-class signal.
+    try std.testing.expectEqual(@as(i64, 5), summary.get("ast_skipped").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), summary.get("ast_skipped_cap").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), summary.get("ast_skipped_nesting").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), summary.get("ast_skipped_parse").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), summary.get("ast_skipped_spawn").?.integer);
+}
+
+test "summary JSON worst-case values fit the proven buffer (EPH-I1302)" {
+    var buf: [summary_json_buf_bytes]u8 = undefined;
+    const max = std.math.maxInt(usize);
+    // The render path sums the IssueCounts fields (total) and the
+    // SuppressionStats fields (total), so those fields stay at max/12
+    // and max/5: the sums land at 20 digits without an overflow panic,
+    // and each field still renders 19 digits. ProjectStats is never
+    // summed in the render path, so its fields stay at maxInt. The
+    // per-field 19-vs-20-digit gap costs at most 24 bytes total, well
+    // inside the documented headroom.
+    const wide = max / 12;
+    const counts = IssueCounts{
+        .orphan = wide,
+        .memory = wide,
+        .err = wide,
+        .unused = wide,
+        .complexity = wide,
+        .fmt = wide,
+        .style = wide,
+        .null_safety = wide,
+        .panic = wide,
+        .tests = wide,
+        .concurrency = wide,
+        .notes = wide,
+    };
+    const s = ProjectStats{
+        .total_files = max,
+        .total_lines = max,
+        .code_lines = max,
+        .comment_lines = max,
+        .blank_lines = max,
+        .test_count = max,
+        .pub_fn_count = max,
+        .not_implemented_count = max,
+        .todo_count = max,
+        .files_with_tests = max,
+        .ast_parsed = max,
+        .ast_skipped = max,
+        .ast_skipped_cap = max,
+        .ast_skipped_nesting = max,
+        .ast_skipped_parse = max,
+        .ast_skipped_spawn = max,
+        .pruned_dirs = max,
+    };
+    const suppression = SuppressionStats{
+        .inline_directive = max / 5,
+        .known_issues = max / 5,
+        .config_disable = max / 5,
+        .config_exclude = max / 5,
+        .orphan_exclude = max / 5,
+    };
+    // The buffer math (summary_json_buf_bytes) proves the render cannot
+    // overflow; this pin executes the proof on the maximum render. An
+    // under-sized buffer returns error.NoSpaceLeft here.
+    const text = try formatSummaryJson(&buf, counts, s, suppression);
+    try std.testing.expect(mem.indexOf(u8, text, "\"ast_skipped_spawn\":") != null);
+}
+
 test "summary text carries the notes bucket and status reflects it (EPH-I0535)" {
     var buf: [summary_text_buf_bytes]u8 = undefined;
     // Pre-fix shape (B15 F2): a notes-only run reported TOTAL 0 and
@@ -56620,17 +56771,23 @@ test "AST skip note stays off the JSON machine stream (EPH-I0213)" {
     try std.testing.expectEqual(@as(usize, 0), diag.ast_skip_note_count);
 }
 
-test "AST skip note names the skipped paths (EPH-I1197)" {
+test "AST skip note names the skipped paths and classes (EPH-I1197, EPH-I1302)" {
     var diag = testDiagCtx();
     var capture = CaptureSink{};
     diag.diag_sink = capture.sink();
     var log = SkipPathLog{};
     log.record("src/main.zig");
     log.record("src/compat/v0_16.zig");
-    noteAstTierSkips(&diag, std.testing.allocator, .{ .parsed = 1, .skipped = 2 }, log);
+    noteAstTierSkips(&diag, std.testing.allocator, .{
+        .parsed = 1,
+        .skipped = 2,
+        .skipped_cap = 1,
+        .skipped_parse = 1,
+    }, log);
     try std.testing.expectEqual(@as(usize, 1), diag.ast_skip_note_count);
     try std.testing.expectEqualStrings(
-        "note: 2 files skipped by the AST tier (parse errors, byte cap, or grammar pre-scan): " ++
+        "note: 2 files skipped by the AST tier (byte cap: 1, grammar pre-scan: 0, " ++
+            "parse errors: 1, spawn refusals: 0): " ++
             "src/main.zig, src/compat/v0_16.zig. ZA111 coverage is partial for those files.\n",
         capture.slice(),
     );
@@ -56677,8 +56834,8 @@ test "AST skip note with no recorded paths keeps the bare form (EPH-I1197)" {
     noteAstTierSkips(&diag, std.testing.allocator, .{ .parsed = 1, .skipped = 2 }, .{});
     try std.testing.expectEqual(@as(usize, 1), diag.ast_skip_note_count);
     try std.testing.expectEqualStrings(
-        "note: 2 files skipped by the AST tier (parse errors, byte cap, or grammar pre-scan). " ++
-            "ZA111 coverage is partial for those files.\n",
+        "note: 2 files skipped by the AST tier (byte cap: 0, grammar pre-scan: 0, " ++
+            "parse errors: 0, spawn refusals: 0). ZA111 coverage is partial for those files.\n",
         capture.slice(),
     );
 }
@@ -83230,6 +83387,129 @@ test "ZA607: body-form increment before the store still fires (EPH-I1293 control
         1,
         countRuleIssues(run.issues.items, "da_i1293_preinc.zig", RULE_DEFINITE_ASSIGNMENT),
     );
+}
+
+test "ZA607: braceless defer decrement in the read loop still fires (EPH-I1301)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // `defer di -= 1;` runs at scope exit, after the read: the first
+    // trip reads digits[dlen], one past the last written element. The
+    // suppressor credited the defer pre-fix (segmentHasConditionalHeader
+    // matched no defer prefix) and silenced the genuine read (F1).
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) {
+        \\        defer di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1301_deferdec.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1301_deferdec.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: braceless defer store in the fill loop still fires (EPH-I1301)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // `defer digits[dlen] = v;` stores at scope exit with the exit-time
+    // index: trip k stores index k+1, and index 0 stays unwritten. The
+    // suppressor credited the store pre-fix and silenced the genuine
+    // read (F1).
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) {
+        \\        defer digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\        dlen += 1;
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1301_deferstore.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1301_deferstore.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: deferred fill increment after the store stays silent (EPH-I1301)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // `defer dlen += 1;` fires at each trip's scope exit, after the
+    // store: trip k stores index k, then the deferred increment moves
+    // to k+1. The bound holds, so this shape must stay silent — the
+    // defer-store fix must not reject the sound defer-increment form.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        defer dlen += 1;
+        \\        v /= 10;
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1301_deferinc.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1301_deferinc.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "isDeferStart matches the defer and errdefer statement forms (EPH-I1301)" {
+    // The segment check trims, so the bare keyword is the common form.
+    try std.testing.expect(isDeferStart("defer"));
+    try std.testing.expect(isDeferStart("defer x"));
+    try std.testing.expect(isDeferStart("defer(x)"));
+    try std.testing.expect(isDeferStart("errdefer"));
+    try std.testing.expect(isDeferStart("errdefer x"));
+    try std.testing.expect(!isDeferStart("deferred"));
+    try std.testing.expect(!isDeferStart("mydefer"));
+    try std.testing.expect(!isDeferStart(""));
+    try std.testing.expect(!isDeferStart("if (x)"));
 }
 
 test "ZA607: loop guard-continue before same-scope assignment is silent" {

@@ -366,8 +366,8 @@ and picks up the behavior changes below. The full release notes live in
   `snake_case` to `TitleCase`. Set `"error_naming": "snake_case"` to
   keep the old behavior.
 - New key: `coverage` (the ZT105 unreached-pub-fn ratio gate).
-- Nine new default-ON rules: ZA404, ZA405, ZA406, ZA504, ZA505, ZA506,
-  ZA507, ZA508, and ZT106.
+- Eleven new default-ON rules: ZA404, ZA405, ZA406, ZA502, ZA503, ZA504,
+  ZA505, ZA506, ZA507, ZA508, and ZT106.
 - The `max_cyclomatic` default drops from 15 to 10 (the unified
   complexity standard).
 - `exclude` matching changes from substring to component-wise (see the

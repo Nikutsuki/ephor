@@ -6952,17 +6952,39 @@ fn bodyCodeStartCol(t: []const u8, body_start: usize) usize {
 /// braced `defer { ... }` never reaches this check: the `{` resets the
 /// segment start, and the carried depth excludes the body.
 fn segmentHasConditionalOrDeferredHeader(line: []const u8, pos: usize) bool {
-    var seg_start: usize = 0;
-    var j: usize = 0;
-    while (j < pos) : (j += 1) {
-        if (line[j] == ';' or line[j] == '{' or line[j] == '}') seg_start = j + 1;
-    }
-    const segment = mem.trim(u8, line[seg_start..pos], " \t");
+    const segment = statementSegmentBefore(line, pos);
     if (isConditionalStart(segment)) return true;
     if (isLoopOpenerLine(segment)) return true;
     if (isDeferStart(segment)) return true;
     return mem.startsWith(u8, segment, "switch ") or
         mem.startsWith(u8, segment, "switch(");
+}
+
+/// The trimmed statement segment before `pos` on the line: from the
+/// line start or the last statement boundary (`;`, `{`, `}`) before
+/// `pos` (EPH-I1293).
+fn statementSegmentBefore(line: []const u8, pos: usize) []const u8 {
+    var seg_start: usize = 0;
+    var j: usize = 0;
+    while (j < pos) : (j += 1) {
+        if (line[j] == ';' or line[j] == '{' or line[j] == '}') seg_start = j + 1;
+    }
+    return mem.trim(u8, line[seg_start..pos], " \t");
+}
+
+/// The deferred class of a counter increment at `pos` (EPH-I1304): a
+/// `defer` increment runs at each trip's scope exit, an `errdefer`
+/// increment runs only on error trips, and a plain or conditional
+/// increment carries no deferred class. A braced `defer { ... }`
+/// increment never reaches this check: the `{` resets the segment
+/// start (accepted FN, shared with EPH-I1301).
+const FillIncrementDeferClass = enum { none, defer_stmt, errdefer_stmt };
+
+fn fillIncrementDeferClass(line: []const u8, pos: usize) FillIncrementDeferClass {
+    const segment = statementSegmentBefore(line, pos);
+    if (startsWithKeyword(segment, "errdefer")) return .errdefer_stmt;
+    if (isDeferStart(segment)) return .defer_stmt;
+    return .none;
 }
 
 /// True when the trimmed text starts a defer or errdefer statement
@@ -7087,9 +7109,12 @@ fn writesBetween(
 /// continuation form (`while (v > 0) : (c += 1)`) rejects a body
 /// `continue` — it skips the store while the continuation still runs, a
 /// real hole — and any body counter write. The body form accepts one
-/// one-step increment after the store and no other counter write. The
-/// store must sit at the body's top level with the counter as its
-/// index: a conditional store breaks the per-trip store.
+/// one-step increment after the store and no other counter write. A
+/// body `continue` or `break` with a deferred increment fails too: the
+/// increment fires at scope exit on the skipped trip, so the counter
+/// runs ahead of the stores (EPH-I1304). The store must sit at the
+/// body's top level with the counter as its index: a conditional store
+/// breaks the per-trip store.
 fn fillLoopStoresVar(
     lines: []const []const u8,
     loop: CounterLoop,
@@ -7103,15 +7128,26 @@ fn fillLoopStoresVar(
         lineHasIncrement(t[cont.?.start..cont.?.end], counter);
     if (fillConditionWritesCounter(t, body_start, counter)) return false;
     var state = FillLoopState{ .counter = counter, .var_name = var_name };
+    var has_continue = false;
+    var has_break = false;
     var i = loop.loop_idx;
     while (i < loop.body_end) : (i += 1) {
         const line = mem.trim(u8, lines[i], " \t\r");
-        if (cont_increments and hasRealWordKeyword(line, "continue")) return false;
+        has_continue = has_continue or hasRealWordKeyword(line, "continue");
+        has_break = has_break or hasRealWordKeyword(line, "break");
         state.cur_line = i;
         const from = if (i == loop.loop_idx) bodyCodeStartCol(t, body_start) else 0;
         if (!scanFillLoopLine(line, from, &state)) return false;
     }
     if (!state.has_store) return false;
+    // A continue skips the store while a continuation-form increment
+    // still runs, and a continue or break trip still runs a deferred
+    // increment: the counter runs ahead of the stores and the read loop
+    // reads never-written elements (EPH-I1304). The deferred flag lands
+    // during the walk, so the guards combine after the body scan — a
+    // continue or break can precede the defer line.
+    if (has_continue and (cont_increments or state.inc_deferred)) return false;
+    if (has_break and state.inc_deferred) return false;
     if (cont_increments) return state.inc_count == 0;
     if (state.inc_count != 1) return false;
     // The body-form increment must follow the store: an increment before
@@ -7141,6 +7177,10 @@ const FillLoopState = struct {
     inc_count: usize = 0,
     inc_line: usize = 0,
     inc_col: usize = 0,
+    /// True when a counter increment sits in a `defer` statement
+    /// segment: it runs at scope exit on every trip, including
+    /// continue and break trips that skip the store (EPH-I1304).
+    inc_deferred: bool = false,
     depth: usize = 0,
     cur_line: usize = 0,
 };
@@ -7179,6 +7219,18 @@ fn applyFillOccurrence(
     if (occ == .none) return true;
     if (occ == .counter_other) return false;
     if (occ == .counter_inc) {
+        // A deferred increment runs at scope exit, not at its source
+        // position: a continue or break trip still fires it while the
+        // store is skipped, so the counter runs ahead of the stores
+        // (EPH-I1304). Record the defer class for the body walk's
+        // guards. An errdefer increment fires only on error trips —
+        // never the per-trip increment the credit requires — so it
+        // never credits the fill pattern.
+        switch (fillIncrementDeferClass(line, pos)) {
+            .errdefer_stmt => return false,
+            .defer_stmt => state.inc_deferred = true,
+            .none => {},
+        }
         state.inc_count += 1;
         state.inc_line = state.cur_line;
         state.inc_col = pos;
@@ -83510,6 +83562,161 @@ test "isDeferStart matches the defer and errdefer statement forms (EPH-I1301)" {
     try std.testing.expect(!isDeferStart("mydefer"));
     try std.testing.expect(!isDeferStart(""));
     try std.testing.expect(!isDeferStart("if (x)"));
+}
+
+test "ZA607: continue with a deferred fill increment still fires (EPH-I1304)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The p3 probe shape: `if (skip) continue;` skips the store on some
+    // trips while the `defer dlen += 1;` still fires at scope exit, so
+    // the counter runs ahead of the stores and the read loop observes
+    // never-written elements. The suppressor credited the fill pre-fix:
+    // the deferred increment landed in the same counter_inc path as a
+    // plain trailing increment, and the continue guard covered only the
+    // continuation form.
+    const content =
+        \\fn fmt(buf: []u8, val: u64, skip: bool) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) {
+        \\        if (skip) continue;
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        defer dlen += 1;
+        \\        v /= 10;
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1304_cont.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1304_cont.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: break with a deferred fill increment still fires (EPH-I1304)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A `break` trip still runs the deferred increment at scope exit
+    // while the store is skipped: the counter runs ahead of the stores,
+    // and the read loop observes never-written elements. No break guard
+    // existed pre-fix, so the suppressor credited the fill.
+    const content =
+        \\fn fmt(buf: []u8, val: u64, skip: bool) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) {
+        \\        if (skip) break;
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        defer dlen += 1;
+        \\        v /= 10;
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1304_break.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1304_break.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: continue with a plain fill increment stays silent (EPH-I1304 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The plain body-form increment sits after the continue: a skipped
+    // trip skips the store AND the increment together, so the counter
+    // never runs ahead. The new guards must not fire on this shape.
+    const content =
+        \\fn fmt(buf: []u8, val: u64, skip: bool) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) {
+        \\        if (skip) continue;
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        dlen += 1;
+        \\        v /= 10;
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1304_plaincont.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1304_plaincont.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: errdefer fill increment never credits the fill (EPH-I1304)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // An errdefer increment fires only on error trips, never the
+    // per-trip increment the credit requires: the suppressor must not
+    // credit the fill pattern.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) !usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        errdefer dlen += 1;
+        \\        v = try divByTen(v);
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+        \\fn divByTen(v: u64) !u64 {
+        \\    return v / 10;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1304_errdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1304_errdefer.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
 }
 
 test "ZA607: loop guard-continue before same-scope assignment is silent" {

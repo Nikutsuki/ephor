@@ -928,7 +928,7 @@ write_fresh_build_zig "$D"
 printf '%s\n' '[{"name":"v0.12.3"},{"name":"v0.12.4"}]' > "$TEST_ROOT/tags-t35.json"
 run_installer_with_tags "$TEST_ROOT/tags-t35.json" "$D"
 assert_rc 0
-assert_grep "$D/out.log" 'v0.15.0' 'fallback floor not applied'
+assert_grep "$D/out.log" 'v0.15.1' 'fallback floor not applied'
 assert_grep "$D/err.log" 'below the fallback' 'no below-fallback warning'
 pass "t35 below-fallback tags hold the floor (F-13)"
 
@@ -995,9 +995,9 @@ unset CURL_ARGS_FILE CURL_BODY_FILE
 assert_rc 1
 assert_grep "$D/err.log" 'EPHOR_TAGS_API is ignored without EPHOR_TEST_MODE=1' 'missing tags-override warning'
 assert_grep "$D/err.log" 'EPHOR_ARCHIVE_URL is ignored without EPHOR_TEST_MODE=1' 'missing archive-override warning'
-assert_grep "$D/out.log" 'v0.15.0' 'fallback tag not chosen'
+assert_grep "$D/out.log" 'v0.15.1' 'fallback tag not chosen'
 assert_grep "$D/curl-args" 'codeberg.org/api/v1/repos/RhyosLabs/ephor/tags' 'override URL used without the marker'
-assert_grep "$D/curl-args" 'codeberg.org/RhyosLabs/ephor/archive/v0.15.0.tar.gz' 'the verification did not use the real archive URL'
+assert_grep "$D/curl-args" 'codeberg.org/RhyosLabs/ephor/archive/v0.15.1.tar.gz' 'the verification did not use the real archive URL'
 assert_grep "$D/err.log" 'could not download the release tarball for verification' 'no fail-closed download error'
 assert_not_grep "$D/out.log" 'Done!' 'Done! printed after the fail-closed refusal'
 pass "t38 ambient overrides ignored without EPHOR_TEST_MODE (F-19, WP-7 fail closed)"

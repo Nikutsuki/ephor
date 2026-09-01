@@ -611,8 +611,10 @@ is narrow — the duplicated run must BE the whole type exactly, both
 sides must declare the same name, the container must be the bare
 anonymous struct (a named container, an else block, or deeper nesting
 keeps the pair firing), and the import must resolve with the resolved
-file declaring the same name. The condition is never inspected: a
-condition that does not route to the import keeps the pair firing. The
+file declaring the same name. The condition is never inspected: the
+pair goes silent whenever the shape matches, even when the condition
+would select the import arm and leave the else arm dead in that build
+configuration. The
 analyzer re-verifies hash-collision candidates byte-for-byte before
 reporting, so a finding is never a hash collision.
 

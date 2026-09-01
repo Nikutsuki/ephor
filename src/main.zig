@@ -30030,8 +30030,9 @@ fn sameDeclSpan(a: DeclSpanView, b: DeclSpanView) bool {
 //     record markReachable trusts — and the resolved file must declare
 //     the same name (the re-export shape `const Name = mod.Name;`
 //     counts: the RhyOS import reaches vfs.zig, not types.zig),
-//   - the condition is never evaluated (fail-open): a condition that
-//     does not route to the import keeps the pair firing.
+//   - the condition is never evaluated: the arm does not attempt to
+//     prove which branch a build selects, because either branch is the
+//     same stand-in mechanism.
 // Either side may carry the shape: the finding reports on both sides of
 // a pair, so each report path runs the check on the run side and then
 // the witness side.

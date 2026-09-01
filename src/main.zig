@@ -6414,8 +6414,9 @@ const ReadScanCtx = struct {
     /// Per-variable early-return memo (EPH-I0335): the suppressor query
     /// is O(1) instead of a per-read rescan.
     early_returns: *const EarlyReturnMemo,
-    /// The tracked var's declaration body-line (EPH-I1293): the
-    /// counter-bounded suppressor verifies the fill loop sits after it.
+    /// The tracked var's declaration file line, absolute (EPH-I1293,
+    /// EPH-I1309): the counter-bounded suppressor converts the fill
+    /// loop's body index to the same space before comparing.
     var_line: usize,
 };
 
@@ -6754,7 +6755,11 @@ fn isCounterBoundedRead(
     const decl = findCounterInitDecl(lines, opener, ri) orelse return false;
     if (writesBetween(lines, decl.idx + 1, opener, ri)) return false;
     const loop = findCounterLoop(lines, opener, decl.counter) orelse return false;
-    if (sc.var_line >= loop.loop_idx) return false;
+    // The decl line is absolute (func_line + body idx); loop.loop_idx is
+    // a body index. Add the function base to compare in one space — the
+    // pre-fix cross-space comparison made the suppressor dead in every
+    // function starting at file line >= 6 (EPH-I1309).
+    if (sc.var_line >= sc.da.func_line + loop.loop_idx) return false;
     if (!declaredZeroBefore(lines, loop.loop_idx, decl.counter)) return false;
     if (!fillLoopStoresVar(lines, loop, decl.counter, var_name)) return false;
     if (counterWrittenOutsideLoop(lines, loop, decl.idx, decl.counter)) return false;
@@ -84000,6 +84005,58 @@ test "ZA607: counter-bounded fill-then-read stays silent (EPH-I1293, system_moni
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_i1293_sm.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: counter-bounded read with fn at file line 9 stays silent (EPH-I1309)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The absolute-vs-relative pin (EPH-I1309): the same writeDecimal
+    // shape as the EPH-I1293 pin, but with 8 leading comment lines so
+    // the fn starts at file line 9. The suppressor's decl-vs-fill-loop
+    // comparison mixed the absolute decl line with the body-relative
+    // loop index, so any fn starting at line >= 6 stayed flagged. The
+    // leading lines are the discriminator the flat fixtures masked.
+    const content =
+        \\// Leading comment line 1.
+        \\// Leading comment line 2.
+        \\// Leading comment line 3.
+        \\// Leading comment line 4.
+        \\// Leading comment line 5.
+        \\// Leading comment line 6.
+        \\// Leading comment line 7.
+        \\// Leading comment line 8.
+        \\fn writeDecimal(buf: []u8, val: u64) u8 {
+        \\    var v = val;
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: u8 = 0;
+        \\    if (v == 0) {
+        \\        buf[0] = '0';
+        \\        return 1;
+        \\    }
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var pos: u8 = 0;
+        \\    var di: u8 = dlen;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[pos] = '0' + digits[di];
+        \\        pos += 1;
+        \\    }
+        \\    return pos;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1309_sm.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1309_sm.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

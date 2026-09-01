@@ -303,7 +303,7 @@ built-in threshold defaults apply when the thresholds block is absent.
 
 ```json
 {
-  "version": "0.15.0",
+  "version": "0.15.1",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -1557,6 +1557,41 @@ Ephor uses three testing layers:
 - Community baseline regression testing against key projects
 
 ## Changelog
+
+### v0.15.1 — AST-Tier Skip Signal, ZA607 Suppressor, Analyzer Arm Fixes (2026-09-01)
+
+**Fixed (0.15.0 regressions):**
+
+- The install-path fingerprint repair accepts both zig 0.16.0 hint
+  shapes and adds the missing fingerprint field (the live-install
+  defect the 0.15.0 release exposed) (EPH-I1291).
+- The AST tier now names its skip class (size cap, nesting, parse,
+  spawn) with the hardcoded 64 KiB cap documented as the stack-coupled
+  bound. The 34 files over the 50 KB threshold that 0.15.0 skipped now
+  count into the analysis with a class note (EPH-I1297).
+- ZA607 gains a counter-bounded suppressor for the fill-then-read loop
+  shape, the dominant class of the 0.15.0 ZA607 surge. Failed checks
+  stay in the fail-safe over-warn direction (EPH-I1293).
+- ZA703 skips the std canonical error names in declared error sets (the
+  488-name comptime table from the pinned stdlib). Use sites stay
+  governed (EPH-I1296).
+- ZT106 excludes pure reference-discard compile-pin bodies, the pinned
+  compile-check test shape (EPH-I1294).
+- ZA504 excludes same-name whole-type stand-in mirrors across build
+  roots. The arm's claims re-scope to cross-root whole-type mirrors
+  only, with the same-root comptime-if pair documented as a residual
+  (EPH-I1295).
+- The run-span check reads `end_line` from the run's last covered stream
+  line directly, and the whole-type opener accepts the optional
+  parenthesized backing group. Gaps no longer break the exact-span check
+  in either direction (EPH-I1306, EPH-I1307).
+
+**Operations:**
+
+- The smoke suite gains the sig fixture and joins the gate as leg 1g
+  (EPH-I1292).
+- The README gains the config-changes-by-version note. The error-naming
+  flip ships in v0.15.0, not a phantom 0.14.4 (EPH-I1298).
 
 ### v0.15.0 — Directive Anchoring, ZA1xx Accuracy, Print-Path Cache (2026-08-31)
 

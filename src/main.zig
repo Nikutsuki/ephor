@@ -17357,6 +17357,34 @@ fn analyzeCFGErrdeferCoverage(
 // Import Graph
 // ============================================================================
 
+/// Append one bare-import record to an analysis (EPH-I1308): the
+/// extractBareImports output shape — path, resolved target, name "_",
+/// line/col 0. The record dups its strings, so the caller's `resolved`
+/// stays caller-owned. Shared by the graph's bare-import extraction and
+/// the clone-test stub, so the record shape has one definition (the
+/// ZA504 pair the two inline copies once formed).
+fn appendBareImportRecord(
+    allocator: Allocator,
+    analysis: *FileAnalysis,
+    path: []const u8,
+    resolved: ?[]const u8,
+) !void {
+    const path_copy = try allocator.dupe(u8, path);
+    errdefer allocator.free(path_copy);
+    const resolved_copy: ?[]const u8 = if (resolved) |r| try allocator.dupe(u8, r) else null;
+    errdefer if (resolved_copy) |r| allocator.free(r);
+    const name_copy = try allocator.dupe(u8, "_");
+    errdefer allocator.free(name_copy);
+    try analysis.imports.append(allocator, .{
+        .path = path_copy,
+        .resolved = resolved_copy,
+        .name = name_copy,
+        .line = 0,
+        .col = 0,
+        .is_pub = false,
+    });
+}
+
 const ImportGraph = struct {
     allocator: Allocator,
     /// Run diagnostics context: I/O handle plus the note/warn counters the
@@ -17963,23 +17991,13 @@ const ImportGraph = struct {
         if (mem.eql(u8, imp, "std")) return;
         if (mem.eql(u8, imp, "builtin")) return;
         if (hasImportPath(analysis, imp)) return;
+        const resolved = try self.resolveImport(file_path, imp);
+        defer if (resolved) |r| self.allocator.free(r);
         // Build the record fully, then commit: each dupe frees itself on
         // a later failure, and the append hands ownership to the analysis
-        // on success (EPH-I0582, hashmap-ownership rule).
-        const path_copy = try self.allocator.dupe(u8, imp);
-        errdefer self.allocator.free(path_copy);
-        const name_copy = try self.allocator.dupe(u8, "_");
-        errdefer self.allocator.free(name_copy);
-        const resolved = try self.resolveImport(file_path, imp);
-        errdefer if (resolved) |r| self.allocator.free(r);
-        try analysis.imports.append(self.allocator, .{
-            .path = path_copy,
-            .resolved = resolved,
-            .name = name_copy,
-            .line = 0,
-            .col = 0,
-            .is_pub = false,
-        });
+        // on success (EPH-I0582, hashmap-ownership rule). The helper is
+        // the one definition of the bare-import record shape (EPH-I1308).
+        try appendBareImportRecord(self.allocator, analysis, imp, resolved);
     }
 
     /// Extract @import("...") patterns that are not preceded by `const`
@@ -29455,7 +29473,13 @@ fn analyzeClones(
     defer dup.deinit(allocator);
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
     errdefer deinitIssues(&issues, allocator);
-    try reportCloneRuns(allocator, &scan, dup.items, &issues);
+    const ctx = CloneReportCtx{
+        .allocator = allocator,
+        .graph = graph,
+        .scan = &scan,
+        .issues = &issues,
+    };
+    try reportCloneRuns(&ctx, dup.items);
     return issues;
 }
 
@@ -29555,19 +29579,24 @@ fn collectDuplicateWindows(
     return dup;
 }
 
+/// The per-run report bundle for the clone reporters (EPH-I1308): the
+/// allocator, graph, scan, and issue sink travel as one context so the
+/// report fns stay at the four-parameter bound.
+const CloneReportCtx = struct {
+    allocator: Allocator,
+    graph: *ImportGraph,
+    scan: *const CloneScan,
+    issues: *std.ArrayListUnmanaged(Issue),
+};
+
 /// Report one finding per maximal duplicated run. A run without a witness
 /// outside itself (a self-repeating block) reports against a second
 /// offset inside the run.
-fn reportCloneRuns(
-    allocator: Allocator,
-    scan: *const CloneScan,
-    dup: []const DupWindow,
-    issues: *std.ArrayListUnmanaged(Issue),
-) !void {
+fn reportCloneRuns(ctx: *const CloneReportCtx, dup: []const DupWindow) !void {
     var i: usize = 0;
     while (i < dup.len) {
         const run = findCloneRun(dup, i);
-        try reportCloneRun(allocator, scan, run, issues);
+        try reportCloneRun(ctx, run);
         i = run.next;
     }
 }
@@ -29587,42 +29616,40 @@ fn findCloneRun(dup: []const DupWindow, start: usize) CloneRun {
 }
 
 /// Report one duplicated run after witness selection and byte verification.
-fn reportCloneRun(
-    allocator: Allocator,
-    scan: *const CloneScan,
-    run: CloneRun,
-    issues: *std.ArrayListUnmanaged(Issue),
-) !void {
-    const file = scan.files.items[run.file];
-    const witness = findCloneWitness(scan, run) orelse return;
-    if (!cloneWindowsMatch(scan, run.file, run.head, witness)) return;
+fn reportCloneRun(ctx: *const CloneReportCtx, run: CloneRun) !void {
+    const file = ctx.scan.files.items[run.file];
+    const witness = findCloneWitness(ctx.scan, run) orelse return;
+    if (!cloneWindowsMatch(ctx.scan, run.file, run.head, witness)) return;
     // Pairs whose two files both sit in a versioned-compat directory are
     // deliberate mirrors (EPH-I1076), never duplication. A same-named
     // whole-type pair mirrored byte-for-byte across two build roots is a
-    // host-build stand-in (EPH-I1295) and stays silent the same way.
+    // host-build stand-in (EPH-I1295), and a whole-type pair whose side
+    // carries the comptime-if/@import-vs-else stand-in shape is the same
+    // class under one root (EPH-I1308): both stay silent.
     if (witness.file != run.file) {
-        const witness_path = scan.files.items[witness.file].path;
+        const witness_path = ctx.scan.files.items[witness.file].path;
         if (hasCompatComponent(file.path) and hasCompatComponent(witness_path)) return;
-        if (try standInMirrorExcluded(allocator, scan, run, witness)) return;
+        if (try standInMirrorExcluded(ctx.allocator, ctx.scan, run, witness)) return;
+        if (try sameRootStandInExcluded(ctx, run, witness)) return;
     }
     const span = run.windows + MIN_CLONE_LINES - 1;
     const line = file.stream.items[run.head].line;
-    const witness_file = scan.files.items[witness.file];
+    const witness_file = ctx.scan.files.items[witness.file];
     const witness_line = witness_file.stream.items[witness.stream].line;
     const message = if (witness.file == run.file)
         try std.fmt.allocPrint(
-            allocator,
+            ctx.allocator,
             "duplicated block: {d} lines also appear at line {d}",
             .{ span, witness_line },
         )
     else
         try std.fmt.allocPrint(
-            allocator,
+            ctx.allocator,
             "duplicated block: {d} lines also appear at {s}:{d}",
             .{ span, witness_file.path, witness_line },
         );
-    errdefer allocator.free(message);
-    try issues.append(allocator, .{
+    errdefer ctx.allocator.free(message);
+    try ctx.issues.append(ctx.allocator, .{
         .file = file.path,
         .line = line,
         .col = 1,
@@ -29702,7 +29729,7 @@ fn hasCompatComponent(path: []const u8) bool {
     return false;
 }
 
-// --- ZA504 stand-in mirror exclusion (EPH-I1295) ---
+// --- ZA504 stand-in mirror exclusion (EPH-I1295, EPH-I1308) ---
 // The cross-root whole-type mirror shape: a whole-type declaration
 // (struct, union, or opaque, plain or packed/extern, with an optional
 // backing-type group such as `struct(u32)` — EPH-I1306) that mirrors a
@@ -29710,9 +29737,9 @@ fn hasCompatComponent(path: []const u8) bool {
 // duplication IS the mechanism — the two builds cannot share the file,
 // and merging would break both — so flagging demands an impossible
 // refactor (the EPH-I1076 compat-mirror class). The same-root
-// comptime-if stand-in (the comptime-if/@import-vs-else struct arm
-// under one build root) is a different mechanism and stays uncovered
-// here: it keeps firing and is tracked in EPH-I1308.
+// comptime-if stand-in — the comptime-if/@import-vs-else struct arm
+// under one build root — is a different mechanism with its own arm
+// below (sameRootStandInExcluded, EPH-I1308).
 // Scoped narrowly: the duplicated run must BE the whole type, exactly
 // (opener line to closer line, nothing more, nothing less), both sides
 // must declare the same type name, and the two files must attribute to
@@ -29770,30 +29797,67 @@ fn standInMirrorExcluded(
     const ra = fa.root orelse return false;
     const rb = fb.root orelse return false;
     if (mem.eql(u8, ra, rb)) return false;
+    var pair = (try standInDeclPair(allocator, scan, run, witness)) orelse return false;
+    defer pair.deinit(allocator);
+    return true;
+}
+
+/// The whole-type stand-in decl pair, shared by the cross-root mirror
+/// arm (EPH-I1295) and the same-root comptime-if arm (EPH-I1308): the
+/// duplicated run and its witness both open a whole-type declaration,
+/// the declared names match, the run IS the whole type exactly, and the
+/// two spans carry the same normalized code. Owns the two line lists;
+/// deinit releases them.
+const StandInDeclPair = struct {
+    decl_a: WholeTypeDecl,
+    decl_b: WholeTypeDecl,
+    a_lines: std.ArrayListUnmanaged([]const u8),
+    b_lines: std.ArrayListUnmanaged([]const u8),
+
+    fn deinit(self: *StandInDeclPair, allocator: Allocator) void {
+        self.a_lines.deinit(allocator);
+        self.b_lines.deinit(allocator);
+    }
+};
+
+/// The whole-type stand-in decl-pair qualification (EPH-I1295,
+/// EPH-I1308), or null. The conditional defers free the two line lists
+/// on every exit that does not hand the pair over.
+fn standInDeclPair(
+    allocator: Allocator,
+    scan: *const CloneScan,
+    run: CloneRun,
+    witness: CloneOccurrence,
+) !?StandInDeclPair {
+    const fa = scan.files.items[run.file];
+    const fb = scan.files.items[witness.file];
     const head_line = fa.stream.items[run.head].line;
     const witness_line = fb.stream.items[witness.stream].line;
+    var result: ?StandInDeclPair = null;
     var a_lines = try cloneContentLines(allocator, fa.content);
-    defer a_lines.deinit(allocator);
+    defer if (result == null) a_lines.deinit(allocator);
     var b_lines = try cloneContentLines(allocator, fb.content);
-    defer b_lines.deinit(allocator);
-    const decl_a = wholeTypeDeclAt(a_lines.items, head_line - 1) orelse return false;
-    const decl_b = wholeTypeDeclAt(b_lines.items, witness_line - 1) orelse return false;
-    if (!mem.eql(u8, decl_a.name, decl_b.name)) return false;
+    defer if (result == null) b_lines.deinit(allocator);
+    const decl_a = wholeTypeDeclAt(a_lines.items, head_line - 1) orelse return null;
+    const decl_b = wholeTypeDeclAt(b_lines.items, witness_line - 1) orelse return null;
+    if (!mem.eql(u8, decl_a.name, decl_b.name)) return null;
     // The run must BE the whole type: it starts at the opener and its
     // last covered stream line must be the closer. end_line reads that
     // line's original line number, so internal blank/comment gaps (lines
     // the stream drops) never shift the end (EPH-I1307).
     const end_line = fa.stream.items[run.head + run.windows - 1 + MIN_CLONE_LINES - 1].line;
-    if (decl_a.open_idx + 1 != head_line or decl_a.close_idx + 1 != end_line) return false;
-    return sameDeclSpan(.{
-        .lines = a_lines.items,
-        .open_idx = decl_a.open_idx,
-        .close_idx = decl_a.close_idx,
-    }, .{
-        .lines = b_lines.items,
-        .open_idx = decl_b.open_idx,
-        .close_idx = decl_b.close_idx,
-    });
+    if (decl_a.open_idx + 1 != head_line or decl_a.close_idx + 1 != end_line) return null;
+    if (!sameDeclSpan(
+        .{ .lines = a_lines.items, .open_idx = decl_a.open_idx, .close_idx = decl_a.close_idx },
+        .{ .lines = b_lines.items, .open_idx = decl_b.open_idx, .close_idx = decl_b.close_idx },
+    )) return null;
+    result = .{
+        .decl_a = decl_a,
+        .decl_b = decl_b,
+        .a_lines = a_lines,
+        .b_lines = b_lines,
+    };
+    return result;
 }
 
 /// One whole-type declaration: the declared name and the 0-based opener
@@ -29819,12 +29883,14 @@ fn wholeTypeDeclAt(lines: []const []const u8, idx: usize) ?WholeTypeDecl {
 /// `(pub )?const Name = (packed |extern )?kw` with an optional
 /// parenthesized backing-type group before the `{` — `struct(u32)`,
 /// `union(enum)` (EPH-I1306) — and only `;` allowed after the brace.
-/// `brace_col` is the 0-based column of the `{` on the raw line, for
-/// braceGroupEndLine.
+/// `brace_col` is the 0-based column of the `{` in the TRIMMED code:
+/// the only consumer (braceGroupEndLine) walks LineWalk's trimmed text,
+/// so a raw-line column would start the fold past the line on indented
+/// declarations (EPH-I1308: the RhyOS stand-in decl is indented, and the
+/// raw-relative column made the whole-type span check miss it).
 fn wholeTypeOpener(raw: []const u8) ?struct { name: []const u8, brace_col: usize } {
     const code_end = findCommentStart(raw) orelse raw.len;
     const t = mem.trim(u8, raw[0..code_end], " \t\r");
-    const lead = t.ptr - raw.ptr;
     var pos: usize = 0;
     if (mem.startsWith(u8, t, "pub ")) pos += 4;
     if (!mem.startsWith(u8, t[pos..], "const ")) return null;
@@ -29874,7 +29940,7 @@ fn wholeTypeOpener(raw: []const u8) ?struct { name: []const u8, brace_col: usize
             while (tail < t.len and (t[tail] == ' ' or t[tail] == '\t')) tail += 1;
             if (tail < t.len) return null;
         }
-        return .{ .name = name, .brace_col = lead + after };
+        return .{ .name = name, .brace_col = after };
     }
     return null;
 }
@@ -29939,6 +30005,250 @@ fn sameDeclSpan(a: DeclSpanView, b: DeclSpanView) bool {
         if (la == null or lb == null) return false;
         if (!mem.eql(u8, la.?, lb.?)) return false;
     }
+}
+
+// --- ZA504 same-root comptime-if stand-in exclusion (EPH-I1308) ---
+// Serves REL-P2-VERIFY-3. The RhyOS OpenFlags class: one side of the
+// duplicated pair is a whole-type declaration directly inside the
+// anonymous-struct ELSE arm of a comptime if whose THEN arm is one
+// @import resolving to a file that declares the same-named type. The
+// host build cannot take the import branch, so the else-arm stand-in IS
+// the mechanism and flagging demands an impossible refactor (the
+// cross-root arm's same-root sibling, EPH-I1295). Constrained tightly:
+//   - the run must BE the whole type exactly and both sides must
+//     declare the same name (the standInDeclPair gate),
+//   - the decl's immediate container must be a bare anonymous
+//     `struct {` — a named container, an else block, or any deeper
+//     nesting keeps the pair firing,
+//   - the code line above the container must be exactly `else`,
+//   - the code line above the else must be exactly one
+//     `@import("...")` call,
+//   - the code line above the import must end with a whole-word
+//     `if (...)` header (a switch/while/for else never qualifies),
+//   - the import path must appear in the file's recorded imports with
+//     a resolved target — the graph's own import machinery, the same
+//     record markReachable trusts — and the resolved file must declare
+//     the same name (the re-export shape `const Name = mod.Name;`
+//     counts: the RhyOS import reaches vfs.zig, not types.zig),
+//   - the condition is never evaluated (fail-open): a condition that
+//     does not route to the import keeps the pair firing.
+// Either side may carry the shape: the finding reports on both sides of
+// a pair, so each report path runs the check on the run side and then
+// the witness side.
+fn sameRootStandInExcluded(
+    ctx: *const CloneReportCtx,
+    run: CloneRun,
+    witness: CloneOccurrence,
+) !bool {
+    var pair = (try standInDeclPair(ctx.allocator, ctx.scan, run, witness)) orelse return false;
+    defer pair.deinit(ctx.allocator);
+    if (standInElseArm(ctx, run.file, pair.decl_a, pair.a_lines.items)) return true;
+    return standInElseArm(ctx, witness.file, pair.decl_b, pair.b_lines.items);
+}
+
+/// The comptime-if/@import-vs-else stand-in shape on ONE side of a pair
+/// (EPH-I1308). True when `decl` sits directly inside an
+/// anonymous-struct else arm whose if-branch is one resolvable @import,
+/// and the resolved file declares the decl's name.
+fn standInElseArm(
+    ctx: *const CloneReportCtx,
+    file_idx: u32,
+    decl: WholeTypeDecl,
+    lines: []const []const u8,
+) bool {
+    const container = enclosingGroupOpener(lines, decl.open_idx) orelse return false;
+    if (!isBareStructOpener(lines[container])) return false;
+    const else_line = prevCodeLine(lines, container) orelse return false;
+    if (!mem.eql(u8, else_line.code, "else")) return false;
+    const arm_line = prevCodeLine(lines, else_line.idx) orelse return false;
+    const import_path = singleImportPath(arm_line.code) orelse return false;
+    const header_line = prevCodeLine(lines, arm_line.idx) orelse return false;
+    if (!endsWithIfCondition(header_line.code)) return false;
+    const file = ctx.scan.files.items[file_idx];
+    const analysis = ctx.graph.files.getPtr(file.path) orelse return false;
+    const resolved = importResolvedTarget(analysis, import_path) orelse return false;
+    const target = graphFileForResolved(ctx.graph, resolved) orelse return false;
+    return declaresConstNamed(target.content, decl.name);
+}
+
+/// One code line above `idx` (EPH-I1308): the index plus the
+/// comment-stripped trimmed text. Blank, comment-only, and `\\`
+/// multiline-string lines never count (the nextCodeLineBack contract).
+const PrevCodeLine = struct { idx: usize, code: []const u8 };
+
+/// The nearest code line above `idx`, or null at the file head
+/// (EPH-I1308).
+fn prevCodeLine(lines: []const []const u8, idx: usize) ?PrevCodeLine {
+    var walk = LineWalk.backward(lines, idx, 0);
+    const step = walk.nextCodeLineBack() orelse return null;
+    return .{ .idx = step.idx, .code = step.text };
+}
+
+/// The line index of the brace-group opener that directly encloses line
+/// `idx` (EPH-I1308): the nearest group whose opener sits above `idx`
+/// and whose closer sits below. The backward walk folds each line's net
+/// brace balance (string-aware): a closer-heavy line arms a pending
+/// sibling group the walk pairs off at its opener, a self-balanced line
+/// passes through, and an opener line with no pending closer is the
+/// enclosing container.
+fn enclosingGroupOpener(lines: []const []const u8, idx: usize) ?usize {
+    var pending: usize = 0;
+    var i = idx;
+    while (i > 0) {
+        i -= 1;
+        const raw = lines[i];
+        if (isCommentOrMultilineString(mem.trim(u8, raw, " \t\r"))) continue;
+        const code = mem.trim(u8, stripLineComment(raw), " \t\r");
+        if (code.len == 0) continue;
+        const bal = lineBraceBalance(code);
+        if (bal < 0) {
+            pending += @intCast(-bal);
+            continue;
+        }
+        if (bal == 0) continue;
+        // More openers than pending closers: at least one opener's group
+        // closes below the decl, so the decl sits inside it.
+        const opens: usize = @intCast(bal);
+        if (pending < opens) return i;
+        pending -= opens;
+    }
+    return null;
+}
+
+/// The net brace balance of one code line (EPH-I1308): openers minus
+/// closers, string/char-aware. A `\\` multiline opener swallows the rest
+/// of the line (the braceDepthFrom convention, EPH-I0751).
+fn lineBraceBalance(code: []const u8) i32 {
+    var bal: i32 = 0;
+    var walk = QuoteWalk.initAt(code, 0);
+    while (walk.next()) |i| : (walk.advance()) {
+        const c = code[i];
+        if (types.isMultilineOpenerAt(code, i)) break;
+        if (c == '{') bal += 1;
+        if (c == '}') bal -= 1;
+    }
+    return bal;
+}
+
+/// True when one raw line opens a bare anonymous struct (EPH-I1308):
+/// the comment-stripped trimmed code reads exactly `struct {`. A named
+/// container (`const X = struct {`), a packed/extern form, an else
+/// block, or any other opener keeps the pair firing.
+fn isBareStructOpener(raw: []const u8) bool {
+    const code = mem.trim(u8, stripLineComment(raw), " \t\r");
+    return mem.eql(u8, code, "struct {");
+}
+
+/// The path of one code line that is exactly an `@import("...")` call
+/// (EPH-I1308), or null. The whole line must be the call — after the
+/// closing paren only whitespace may follow — so an if-arm with extra
+/// work (`@import("x.zig").foo` or a longer expression) keeps the pair
+/// firing.
+fn singleImportPath(code: []const u8) ?[]const u8 {
+    const tag = "@import(";
+    if (!mem.startsWith(u8, code, tag)) return null;
+    var pos = tag.len;
+    while (pos < code.len and (code[pos] == ' ' or code[pos] == '\t')) pos += 1;
+    if (pos >= code.len or code[pos] != '"') return null;
+    const path_start = pos + 1;
+    const path_end = mem.indexOfScalarPos(u8, code, path_start, '"') orelse return null;
+    if (path_end == path_start) return null;
+    pos = path_end + 1;
+    while (pos < code.len and (code[pos] == ' ' or code[pos] == '\t')) pos += 1;
+    if (pos >= code.len or code[pos] != ')') return null;
+    pos += 1;
+    while (pos < code.len and (code[pos] == ' ' or code[pos] == '\t')) pos += 1;
+    if (pos != code.len) return null;
+    return code[path_start..path_end];
+}
+
+/// True when one code line ends with a whole-word `if (...)` header
+/// (EPH-I1308): a `)` closes the line, its matching `(` carries `if`
+/// directly before it, and the `if` stands at a word boundary. The
+/// condition body is never evaluated — only the header shape matters —
+/// and a while/for/switch header (no `if`) keeps the pair firing.
+fn endsWithIfCondition(code: []const u8) bool {
+    var close = code.len;
+    while (close > 0 and (code[close - 1] == ' ' or code[close - 1] == '\t')) close -= 1;
+    if (close == 0 or code[close - 1] != ')') return false;
+    const open = openParenBefore(code, close) orelse return false;
+    return wordBeforeIsIf(code, open);
+}
+
+/// The index of the `(` matching a closing paren at code[close - 1]
+/// (EPH-I1308), or null. The backward walk counts parens without quote
+/// masking: a condition string carrying more `(` than `)` can end the
+/// walk early, and the word check then rejects the line (fail-open —
+/// the pair keeps firing), so the bound costs coverage only, never a
+/// false exclusion. A `(` seen at depth zero is the match.
+fn openParenBefore(code: []const u8, close: usize) ?usize {
+    var depth: usize = 0;
+    var i = close - 1;
+    while (i > 0) {
+        i -= 1;
+        if (code[i] == ')') {
+            depth += 1;
+            continue;
+        }
+        if (code[i] == '(') {
+            if (depth == 0) return i;
+            depth -= 1;
+        }
+    }
+    return null;
+}
+
+/// True when the word directly before `open` is a whole-word `if`
+/// (EPH-I1308): `if (` after optional whitespace, with no identifier
+/// character before the `if`.
+fn wordBeforeIsIf(code: []const u8, open: usize) bool {
+    var j = open;
+    while (j > 0 and (code[j - 1] == ' ' or code[j - 1] == '\t')) j -= 1;
+    if (j < 2) return false;
+    if (!mem.eql(u8, code[j - 2 .. j], "if")) return false;
+    return j - 2 == 0 or !isIdent(code[j - 3]);
+}
+
+/// The resolved target recorded for one import path string in the
+/// file's analysis (EPH-I1308), or null. The graph records every bare
+/// @import (extractBareImports) with its resolveImport result: a null
+/// resolved means the import never resolved and the pair keeps firing.
+fn importResolvedTarget(analysis: *const FileAnalysis, path: []const u8) ?[]const u8 {
+    for (analysis.imports.items) |imp| {
+        if (!mem.eql(u8, imp.path, path)) continue;
+        return imp.resolved;
+    }
+    return null;
+}
+
+/// The FileAnalysis for one resolved path (EPH-I1308): the graph's
+/// reverse index first, then the files map itself — the
+/// findImportsForPath two-step, which also serves stubbed test graphs
+/// whose reverse index is empty.
+fn graphFileForResolved(graph: *const ImportGraph, resolved: []const u8) ?*FileAnalysis {
+    const key = graph.resolved_to_key.get(resolved) orelse resolved;
+    return graph.files.getPtr(key);
+}
+
+/// True when `content` declares the given name as a const at a code
+/// position (`const Name =` or `pub const Name =`, any depth — the
+/// re-export shape the witness modules use, EPH-I1308). The declared
+/// name is the parsed identifier, so a string or comment mention never
+/// matches.
+fn declaresConstNamed(content: []const u8, name: []const u8) bool {
+    var lines = mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const t = mem.trim(u8, line, " \t\r");
+        var rest = t;
+        if (mem.startsWith(u8, rest, "pub ")) rest = rest[4..];
+        if (!mem.startsWith(u8, rest, "const ")) continue;
+        rest = rest["const ".len..];
+        var end: usize = 0;
+        while (end < rest.len and isIdent(rest[end])) end += 1;
+        if (end == 0) continue;
+        if (mem.eql(u8, rest[0..end], name)) return true;
+    }
+    return false;
 }
 // ============================================================================
 // Function Interface Analysis (ZA405, ZA406, ZA505, ZA506, ZA507, ZA508)
@@ -133672,9 +133982,17 @@ fn runCloneTest(
     var graph = ImportGraph.init(allocator, diag);
     errdefer graph.deinit();
     try putTestFiles(&graph, allocator, files);
-    var issues = try analyzeClones(allocator, &graph);
+    return finishCloneTestRun(allocator, &graph);
+}
+
+/// The shared tail of the clone-test runners (EPH-I1308): run the clone
+/// analysis over the prepared graph and wrap it in the owned result. The
+/// three runners once carried this block inline and ZA504 flagged the
+/// copies.
+fn finishCloneTestRun(allocator: Allocator, graph: *ImportGraph) !CloneTestRun {
+    var issues = try analyzeClones(allocator, graph);
     errdefer deinitIssues(&issues, allocator);
-    return .{ .graph = graph, .issues = issues };
+    return .{ .graph = graph.*, .issues = issues };
 }
 
 /// Test helper: like runCloneTest, but first marks each given build-root
@@ -133696,9 +134014,47 @@ fn runCloneTestRooted(
         try graph.reachable.put(build_path, {});
         owned = false;
     }
-    var issues = try analyzeClones(allocator, &graph);
-    errdefer deinitIssues(&issues, allocator);
-    return .{ .graph = graph, .issues = issues };
+    return finishCloneTestRun(allocator, &graph);
+}
+
+/// One stubbed import record for the same-root stand-in fixtures
+/// (EPH-I1308): the recorded import path plus the resolved target the
+/// graph's resolveImport would have stored. A null resolved is the
+/// production shape of an import that failed to resolve.
+const CloneTestImport = struct {
+    path: []const u8,
+    resolved: ?[]const u8,
+};
+
+/// One in-memory clone-test file with stubbed import records.
+const CloneTestFileImported = struct {
+    path: []const u8,
+    content: []const u8,
+    imports: []const CloneTestImport,
+};
+
+/// Test helper: like runCloneTest, but attaches the given stubbed import
+/// records to each file's analysis first (EPH-I1308). The analysis owns
+/// the records, so each string dupes into the allocator — the graph
+/// deinit frees them.
+fn runCloneTestImported(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    files: []const CloneTestFileImported,
+) !CloneTestRun {
+    var graph = ImportGraph.init(allocator, diag);
+    errdefer graph.deinit();
+    for (files) |f| {
+        var analysis = try createTestFileAnalysis(allocator, f.path, f.content);
+        var owned = true;
+        errdefer if (owned) analysis.deinit(allocator);
+        for (f.imports) |imp| {
+            try appendBareImportRecord(allocator, &analysis, imp.path, imp.resolved);
+        }
+        try graph.files.put(analysis.path, analysis);
+        owned = false;
+    }
+    return finishCloneTestRun(allocator, &graph);
 }
 
 test "ZA504 normalization: comment and whitespace differences still duplicate" {
@@ -134037,6 +134393,364 @@ test "wholeTypeOpener accepts backing-type groups and rejects non-groups (EPH-I1
     try std.testing.expect(parse("const A = struct(u32.5) {") == null);
     try std.testing.expect(parse("const A = opaque(u32) {") == null);
     try std.testing.expect(parse("const A = struct(u32) ") == null);
+}
+
+// The same-root stand-in fixtures (EPH-I1308) share one witness: a
+// whole-type decl the else arm mirrors byte-for-byte. The clone stream
+// drops the /// comment inside the else arm, so the duplicated run is
+// exactly the decl.
+const same_root_witness =
+    \\pub const OpenFlags = packed struct(u32) {
+    \\    read: bool = false,
+    \\    write: bool = false,
+    \\    append: bool = false,
+    \\    create: bool = false,
+    \\    truncate: bool = false,
+    \\    exclusive: bool = false,
+    \\    _padding: u26 = 0,
+    \\};
+;
+
+test "ZA504 same-root stand-in: the comptime-if else-arm pair goes silent (EPH-I1308)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const standin =
+        \\const is_freestanding = false;
+        \\const vfs = if (is_freestanding)
+        \\    @import("witness.zig")
+        \\else
+        \\    struct {
+        \\        /// Host-build stand-in for the kernel VFS OpenFlags.
+        \\        pub const OpenFlags = packed struct(u32) {
+        \\            read: bool = false,
+        \\            write: bool = false,
+        \\            append: bool = false,
+        \\            create: bool = false,
+        \\            truncate: bool = false,
+        \\            exclusive: bool = false,
+        \\            _padding: u26 = 0,
+        \\        };
+        \\    };
+    ;
+    // The stubbed import record is the extractBareImports output shape:
+    // the if-arm @import path with its resolved target. Both report
+    // directions run the arm — the standin side as the run, the witness
+    // side as the witness — so one pair exercises both checks.
+    var run = try runCloneTestImported(&diag, allocator, &.{
+        .{ .path = "standin.zig", .content = standin, .imports = &.{
+            .{ .path = "witness.zig", .resolved = "witness.zig" },
+        } },
+        .{ .path = "witness.zig", .content = same_root_witness, .imports = &.{} },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZA504 same-root stand-in: an else arm without an import sibling keeps firing (EPH-I1308)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const standin =
+        \\const is_freestanding = false;
+        \\const vfs = if (is_freestanding)
+        \\    someFn()
+        \\else
+        \\    struct {
+        \\        /// Host-build stand-in for the kernel VFS OpenFlags.
+        \\        pub const OpenFlags = packed struct(u32) {
+        \\            read: bool = false,
+        \\            write: bool = false,
+        \\            append: bool = false,
+        \\            create: bool = false,
+        \\            truncate: bool = false,
+        \\            exclusive: bool = false,
+        \\            _padding: u26 = 0,
+        \\        };
+        \\    };
+    ;
+    // The if-arm is not an @import: the condition does not route to the
+    // import, so the pair keeps firing (the fail-open rule).
+    var run = try runCloneTest(&diag, allocator, &.{
+        .{ .path = "standin.zig", .content = standin },
+        .{ .path = "witness.zig", .content = same_root_witness },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "standin.zig", RULE_DUPLICATED_BLOCK),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "witness.zig", RULE_DUPLICATED_BLOCK),
+    );
+}
+
+test "ZA504 same-root stand-in: a named else container keeps firing (EPH-I1308)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const standin =
+        \\const is_freestanding = false;
+        \\const vfs = if (is_freestanding)
+        \\    @import("witness.zig")
+        \\else
+        \\    HostVfs;
+        \\const HostVfs = struct {
+        \\    /// Host-build stand-in for the kernel VFS OpenFlags.
+        \\    pub const OpenFlags = packed struct(u32) {
+        \\        read: bool = false,
+        \\        write: bool = false,
+        \\        append: bool = false,
+        \\        create: bool = false,
+        \\        truncate: bool = false,
+        \\        exclusive: bool = false,
+        \\        _padding: u26 = 0,
+        \\    };
+        \\};
+    ;
+    // The decl's container is a named struct, not the bare anonymous
+    // struct arm: the pair keeps firing.
+    var run = try runCloneTestImported(&diag, allocator, &.{
+        .{ .path = "standin.zig", .content = standin, .imports = &.{
+            .{ .path = "witness.zig", .resolved = "witness.zig" },
+        } },
+        .{ .path = "witness.zig", .content = same_root_witness, .imports = &.{} },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "standin.zig", RULE_DUPLICATED_BLOCK),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "witness.zig", RULE_DUPLICATED_BLOCK),
+    );
+}
+
+test "ZA504 same-root stand-in: an unresolved import keeps firing (EPH-I1308)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const standin =
+        \\const is_freestanding = false;
+        \\const vfs = if (is_freestanding)
+        \\    @import("missing.zig")
+        \\else
+        \\    struct {
+        \\        /// Host-build stand-in for the kernel VFS OpenFlags.
+        \\        pub const OpenFlags = packed struct(u32) {
+        \\            read: bool = false,
+        \\            write: bool = false,
+        \\            append: bool = false,
+        \\            create: bool = false,
+        \\            truncate: bool = false,
+        \\            exclusive: bool = false,
+        \\            _padding: u26 = 0,
+        \\        };
+        \\    };
+    ;
+    // The import is recorded with a null resolved target (the
+    // resolveImport failure shape): the pair keeps firing.
+    var run = try runCloneTestImported(&diag, allocator, &.{
+        .{ .path = "standin.zig", .content = standin, .imports = &.{
+            .{ .path = "missing.zig", .resolved = null },
+        } },
+        .{ .path = "witness.zig", .content = same_root_witness, .imports = &.{} },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "standin.zig", RULE_DUPLICATED_BLOCK),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "witness.zig", RULE_DUPLICATED_BLOCK),
+    );
+}
+
+test "ZA504 same-root stand-in: nesting inside a deeper container keeps firing (EPH-I1308)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const standin =
+        \\const is_freestanding = false;
+        \\const vfs = if (is_freestanding)
+        \\    @import("witness.zig")
+        \\else
+        \\    struct {
+        \\        /// Host-build stand-in wrapper.
+        \\        pub const HostTypes = struct {
+        \\            pub const OpenFlags = packed struct(u32) {
+        \\                read: bool = false,
+        \\                write: bool = false,
+        \\                append: bool = false,
+        \\                create: bool = false,
+        \\                truncate: bool = false,
+        \\                exclusive: bool = false,
+        \\                _padding: u26 = 0,
+        \\            };
+        \\        };
+        \\    };
+    ;
+    // The decl is two containers deep inside the else arm: its direct
+    // container is the named HostTypes struct, so the pair keeps firing.
+    var run = try runCloneTestImported(&diag, allocator, &.{
+        .{ .path = "standin.zig", .content = standin, .imports = &.{
+            .{ .path = "witness.zig", .resolved = "witness.zig" },
+        } },
+        .{ .path = "witness.zig", .content = same_root_witness, .imports = &.{} },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "standin.zig", RULE_DUPLICATED_BLOCK),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "witness.zig", RULE_DUPLICATED_BLOCK),
+    );
+}
+
+test "ZA504 same-root stand-in: an else block keeps firing (EPH-I1308)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const standin =
+        \\const is_freestanding = false;
+        \\const vfs = if (is_freestanding)
+        \\    @import("witness.zig")
+        \\else
+        \\    {
+        \\        /// Host-build stand-in for the kernel VFS OpenFlags.
+        \\        pub const OpenFlags = packed struct(u32) {
+        \\            read: bool = false,
+        \\            write: bool = false,
+        \\            append: bool = false,
+        \\            create: bool = false,
+        \\            truncate: bool = false,
+        \\            exclusive: bool = false,
+        \\            _padding: u26 = 0,
+        \\        };
+        \\    }
+    ;
+    // The decl sits in an else block, not an anonymous struct: the
+    // container opener reads `{`, so the pair keeps firing.
+    var run = try runCloneTestImported(&diag, allocator, &.{
+        .{ .path = "standin.zig", .content = standin, .imports = &.{
+            .{ .path = "witness.zig", .resolved = "witness.zig" },
+        } },
+        .{ .path = "witness.zig", .content = same_root_witness, .imports = &.{} },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "standin.zig", RULE_DUPLICATED_BLOCK),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "witness.zig", RULE_DUPLICATED_BLOCK),
+    );
+}
+
+test "ZA504 same-root stand-in: a resolved import without the same-named type keeps firing (EPH-I1308)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const standin =
+        \\const is_freestanding = false;
+        \\const vfs = if (is_freestanding)
+        \\    @import("other.zig")
+        \\else
+        \\    struct {
+        \\        /// Host-build stand-in for the kernel VFS OpenFlags.
+        \\        pub const OpenFlags = packed struct(u32) {
+        \\            read: bool = false,
+        \\            write: bool = false,
+        \\            append: bool = false,
+        \\            create: bool = false,
+        \\            truncate: bool = false,
+        \\            exclusive: bool = false,
+        \\            _padding: u26 = 0,
+        \\        };
+        \\    };
+    ;
+    const other =
+        \\pub const Config = struct {
+        \\    host: []const u8,
+        \\    port: u16 = 0,
+        \\    workers: u32 = 0,
+        \\    timeout_ms: u64 = 0,
+        \\    retries: u32 = 0,
+        \\    log_level: u8 = 0,
+        \\};
+    ;
+    // The import resolves, but the resolved file declares no OpenFlags:
+    // the stand-in relationship is unsubstantiated, so the pair keeps
+    // firing.
+    var run = try runCloneTestImported(&diag, allocator, &.{
+        .{ .path = "standin.zig", .content = standin, .imports = &.{
+            .{ .path = "other.zig", .resolved = "other.zig" },
+        } },
+        .{ .path = "witness.zig", .content = same_root_witness, .imports = &.{} },
+        .{ .path = "other.zig", .content = other, .imports = &.{} },
+    });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "standin.zig", RULE_DUPLICATED_BLOCK),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "witness.zig", RULE_DUPLICATED_BLOCK),
+    );
+}
+
+test "ZA504 stand-in mirrors: an indented decl pair in different roots stays silent (EPH-I1308)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The decls sit at an indent: the opener's brace column must be
+    // trimmed-relative, or the span walk starts past the trimmed line
+    // and the whole-type check misses the pair entirely (EPH-I1308).
+    const flags =
+        \\    pub const OpenFlags = packed struct(u32) {
+        \\        read: bool,
+        \\        write: bool,
+        \\        exec: bool,
+        \\        append: bool,
+        \\        truncate: bool,
+        \\        create: bool,
+        \\    };
+    ;
+    var run = try runCloneTestRooted(&diag, allocator, &.{
+        .{ .path = "host/archive_manager.zig", .content = flags },
+        .{ .path = "kernel/vfs/types.zig", .content = flags },
+    }, &.{ "host", "kernel" });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "same-root stand-in parsers accept the exact shape only (EPH-I1308)" {
+    const import = singleImportPath;
+    try std.testing.expectEqualStrings("a.zig", import("@import(\"a.zig\")").?);
+    try std.testing.expect(import("@import( \"a.zig\" )") != null);
+    try std.testing.expect(import("@import(\"a.zig\").foo") == null);
+    try std.testing.expect(import("@import(\"a.zig\") ;") == null);
+    try std.testing.expect(import("x = @import(\"a.zig\")") == null);
+    try std.testing.expect(import("@import(\"\")") == null);
+    const header = endsWithIfCondition;
+    try std.testing.expect(header("const vfs = if (is_freestanding)"));
+    try std.testing.expect(header("if (a and b)"));
+    try std.testing.expect(header("else if (b)"));
+    try std.testing.expect(!header("const vfs = while (c)"));
+    try std.testing.expect(!header("const vfs = switch (x) {"));
+    try std.testing.expect(!header("const s = \"if (x)\";"));
+    try std.testing.expect(!header("const v = zif (x)"));
+    const bare = isBareStructOpener;
+    try std.testing.expect(bare("    struct {"));
+    try std.testing.expect(bare("struct { // host build"));
+    try std.testing.expect(!bare("const HostVfs = struct {"));
+    try std.testing.expect(!bare("else {"));
+    const bal = lineBraceBalance;
+    try std.testing.expectEqual(@as(i32, 1), bal("struct {"));
+    try std.testing.expectEqual(@as(i32, -1), bal("};"));
+    try std.testing.expectEqual(@as(i32, 0), bal("pub fn foo() void {}"));
+    try std.testing.expectEqual(@as(i32, 2), bal("if (a) { if (b) {"));
+    try std.testing.expectEqual(@as(i32, 0), bal("names = &.{ \"a\", \"b\" },"));
+    try std.testing.expectEqual(@as(i32, 0), bal("const s = \"{\";"));
 }
 
 test "ZA504 same-file and cross-file duplication both report" {

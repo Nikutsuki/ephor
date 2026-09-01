@@ -600,9 +600,19 @@ arm is narrow — the duplicated run must BE the whole type exactly, both
 sides must declare the same name, and the two files must attribute to
 two different build roots (their nearest directories containing a
 `build.zig`). A partial-field pair and a same-root pair keep firing.
-The same-root comptime-if stand-in (the RhyOS `OpenFlags` pair, a
-comptime-if/@import-vs-else struct arm under one build root) stays
-outside this arm and keeps firing. EPH-I1308 tracks it. The
+A fifth surface stays silent: the same-root comptime-if stand-in
+(EPH-I1308, the RhyOS `OpenFlags` pair) — a same-named whole-type
+declaration directly inside the anonymous-struct else arm of
+`const x = if (cond) @import(...) else struct { ... }`, where the
+@import resolves to a file that declares the same name. The host build
+cannot take the import branch, so the else-arm stand-in IS the
+mechanism, and flagging demands the same impossible refactor. The arm
+is narrow — the duplicated run must BE the whole type exactly, both
+sides must declare the same name, the container must be the bare
+anonymous struct (a named container, an else block, or deeper nesting
+keeps the pair firing), and the import must resolve with the resolved
+file declaring the same name. The condition is never inspected: a
+condition that does not route to the import keeps the pair firing. The
 analyzer re-verifies hash-collision candidates byte-for-byte before
 reporting, so a finding is never a hash collision.
 

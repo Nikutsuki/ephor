@@ -26031,7 +26031,10 @@ fn reportUntestedPubFns(
 // test decls the listing skips stay silent. A body that only declares
 // items (nested consts, comptime blocks without calls) fires — the block
 // executes no call either way. A body whose brace group never balances
-// stays silent (fail open).
+// stays silent (fail open). A compile-pin body — every statement a pure
+// reference discard (`_ = Name;`) — also stays silent (EPH-I1294): the
+// references force the compiler to semantically analyze the named
+// declarations, a real verification the call-site premise misses.
 
 /// The first code-position `{` of a test block's body, starting at the
 /// opener line `start` (0-based): literal contents blank so a brace inside
@@ -26110,6 +26113,11 @@ fn reportBlockIfCallless(
     const open = testBodyOpenPos(lines, start, blank_buf) orelse return;
     const close_idx = braceGroupEndLine(lines, open.idx, open.col) orelse return;
     if (spanHasCallSite(lines, open.idx, close_idx)) return;
+    if (isCompilePinBody(lines, .{
+        .open_idx = open.idx,
+        .open_col = open.col,
+        .close_idx = close_idx,
+    }, blank_buf)) return;
     const name = if (block.name.len > 0) block.name else "(unnamed)";
     const msg = try std.fmt.allocPrint(
         sink.allocator,
@@ -26126,7 +26134,9 @@ fn reportBlockIfCallless(
         .message = msg,
         .message_owned = true,
         .help = "call a real function so the test exercises behavior; " ++
-            "a call-less block passes while it verifies nothing dynamic",
+            "a call-less block passes while it verifies nothing dynamic; " ++
+            "a body of only `_ = Name;` reference discards is a compile " ++
+            "pin and stays silent (EPH-I1294)",
     });
 }
 
@@ -26138,6 +26148,87 @@ fn spanHasCallSite(lines: []const []const u8, from: usize, to: usize) bool {
         if (nextCallSite(raw[0..code_end], 0) != null) return true;
     }
     return false;
+}
+
+/// The body span for the compile-pin check (EPH-I1294): the opener line
+/// index and the `{` column, plus the closer line index.
+const CompilePinSpan = struct {
+    open_idx: usize,
+    open_col: usize,
+    close_idx: usize,
+};
+
+/// ZT106 accepted-class arm (EPH-I1294): true when the test body between
+/// the opener `{` and the closer `}` carries one or more statements and
+/// every statement is a pure reference discard (`_ = a.b.c;`). Such a
+/// block is a compile pin: the references force Zig to semantically
+/// analyze the named declarations, a real verification the call-site
+/// premise misses. One non-discard statement or an empty body fails the
+/// check — the block executes no call either way and stays reportable.
+fn isCompilePinBody(lines: []const []const u8, span: CompilePinSpan, blank_buf: []u8) bool {
+    if (span.open_idx > span.close_idx or span.close_idx >= lines.len) return false;
+    var statements: usize = 0;
+    var idx = span.open_idx;
+    while (idx <= span.close_idx) : (idx += 1) {
+        const code_end = findCommentStart(lines[idx]) orelse lines[idx].len;
+        const blanked = blankLiteralContents(lines[idx][0..code_end], blank_buf);
+        var seg = mem.trim(u8, blanked, " \t\r");
+        if (idx == span.open_idx) seg = seg[@min(span.open_col + 1, seg.len)..];
+        if (idx == span.close_idx) {
+            const closer = mem.lastIndexOfScalar(u8, seg, '}') orelse return false;
+            seg = seg[0..closer];
+        }
+        if (mem.trim(u8, seg, " \t\r").len == 0) continue;
+        if (!isPureReferenceDiscards(mem.trim(u8, seg, " \t\r"))) return false;
+        statements += 1;
+    }
+    return statements > 0;
+}
+
+/// True when the trimmed code is one or more `_ = <ref-chain>;` discards
+/// and nothing else (EPH-I1294): the compile-pin statement shape. A
+/// reference chain is identifiers separated by `.` — no call, no
+/// operator, no literal.
+fn isPureReferenceDiscards(t: []const u8) bool {
+    var rest = t;
+    var statements: usize = 0;
+    while (rest.len > 0) {
+        if (!mem.startsWith(u8, rest, "_ =")) return false;
+        rest = mem.trim(u8, rest[3..], " \t\r");
+        const end = referenceChainEnd(rest) orelse return false;
+        rest = mem.trim(u8, rest[end..], " \t\r");
+        if (rest.len == 0) {
+            statements += 1;
+            break;
+        }
+        if (rest[0] != ';') return false;
+        rest = mem.trim(u8, rest[1..], " \t\r");
+        statements += 1;
+    }
+    return statements > 0;
+}
+
+/// End of one pure reference chain: identifiers separated by `.`
+/// (EPH-I1294). Null when the first byte is not an identifier start, or
+/// when the first identifier is a literal keyword (undefined/true/false/
+/// null) that references no declaration.
+fn referenceChainEnd(t: []const u8) ?usize {
+    const first = identRunEnd(t, 0);
+    // A run that ends on `.` (`a.`) or starts with it is a malformed
+    // chain, not a reference.
+    if (first == 0 or t[first - 1] == '.') return null;
+    const head = t[0..first];
+    if (mem.eql(u8, head, "undefined") or mem.eql(u8, head, "true") or
+        mem.eql(u8, head, "false") or mem.eql(u8, head, "null")) return null;
+    var pos = first;
+    while (true) {
+        const next = skipWhitespace(t, pos);
+        if (next >= t.len or t[next] != '.') return pos;
+        const after = skipWhitespace(t, next + 1);
+        const seg_end = identRunEnd(t, after);
+        if (seg_end == after or t[seg_end - 1] == '.') return null;
+        pos = seg_end;
+    }
 }
 
 /// Project-level ZT105 pass: gather test-corpus and alias evidence across
@@ -28608,8 +28699,10 @@ fn analyzeUnused(
 // string content (help text and fixtures are data, not code). Cross-file
 // pairs whose files both sit under a directory named `compat` are
 // version mirrors by convention and never reported (hasCompatComponent).
-// Consecutive duplicated windows merge into one finding per maximal run,
-// so a 30-line copy reports once, not 25 times.
+// A same-named whole-type pair mirrored byte-for-byte across two build
+// roots is a host-build stand-in (EPH-I1295) and never reported either
+// (standInMirrorExcluded). Consecutive duplicated windows merge into one
+// finding per maximal run, so a 30-line copy reports once, not 25 times.
 
 /// Minimum normalized lines in one reported duplicated block. Untyped
 /// (comptime_int): the same constant participates in u32 window
@@ -28630,10 +28723,15 @@ const CloneLine = struct {
 };
 
 /// One file in the clone scan. path/content borrow the graph's storage.
-/// The stream owns only its array.
+/// The stream owns only its array. `resolved` is the realpath spelling
+/// (the test seam uses the plain path), and `root` the nearest build-root
+/// directory the file sits under (EPH-I1295), or null when the tree
+/// carries no visible build.zig.
 const CloneFile = struct {
     path: []const u8,
     content: []const u8,
+    resolved: []const u8,
+    root: ?[]const u8,
     stream: std.ArrayListUnmanaged(CloneLine),
 
     fn hashWindow(self: CloneFile, stream_start: usize) u64 {
@@ -28718,11 +28816,21 @@ fn analyzeClones(
             try scan.files.append(allocator, .{
                 .path = a.path,
                 .content = a.content,
+                .resolved = a.resolved_path,
+                .root = null,
                 .stream = stream,
             });
         }
         try hashCloneWindows(allocator, &scan, @intCast(scan.files.items.len - 1));
     }
+    // Attribute each file to its nearest build-root directory (EPH-I1295):
+    // the stand-in mirror exclusion keys on the two files living under
+    // different roots. Roots derive from the reachable build.zig files the
+    // graph already tracks, so the attribution needs no filesystem work.
+    var root_dirs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer root_dirs.deinit(allocator);
+    try collectBuildRootDirs(allocator, graph, &root_dirs);
+    for (scan.files.items) |*f| f.root = nearestBuildRoot(f.resolved, root_dirs.items);
     var dup = try collectDuplicateWindows(allocator, &scan);
     defer dup.deinit(allocator);
     var issues: std.ArrayListUnmanaged(Issue) = .empty;
@@ -28869,10 +28977,13 @@ fn reportCloneRun(
     const witness = findCloneWitness(scan, run) orelse return;
     if (!cloneWindowsMatch(scan, run.file, run.head, witness)) return;
     // Pairs whose two files both sit in a versioned-compat directory are
-    // deliberate mirrors (EPH-I1076), never duplication.
+    // deliberate mirrors (EPH-I1076), never duplication. A same-named
+    // whole-type pair mirrored byte-for-byte across two build roots is a
+    // host-build stand-in (EPH-I1295) and stays silent the same way.
     if (witness.file != run.file) {
         const witness_path = scan.files.items[witness.file].path;
         if (hasCompatComponent(file.path) and hasCompatComponent(witness_path)) return;
+        if (try standInMirrorExcluded(allocator, scan, run, witness)) return;
     }
     const span = run.windows + MIN_CLONE_LINES - 1;
     const line = file.stream.items[run.head].line;
@@ -28969,6 +29080,220 @@ fn hasCompatComponent(path: []const u8) bool {
         if (mem.eql(u8, comp, "compat")) return true;
     }
     return false;
+}
+
+// --- ZA504 stand-in mirror exclusion (EPH-I1295) ---
+// The host-build stand-in shape: a whole-type declaration (struct, union,
+// or opaque, plain or packed/extern) that mirrors a same-named type in a
+// DIFFERENT build root byte-for-byte. The RhyOS evidence is the
+// archive_manager.zig:23 OpenFlags packed struct mirroring
+// fs/vfs/types.zig:110. The duplication IS the mechanism — the host
+// build and the kernel build cannot share the file, no import path
+// exists between the roots, and merging would break both — so flagging
+// demands an impossible refactor (the EPH-I1076 compat-mirror class).
+// Scoped narrowly: the duplicated run must BE the whole type, exactly
+// (opener line to closer line, nothing more, nothing less), both sides
+// must declare the same type name, and the two files must attribute to
+// two different non-null build roots. A partial-field pair (the shared
+// prefix duplicates but the types differ) keeps firing.
+
+/// Collect the directory of every reachable build.zig file into `dirs`
+/// (EPH-I1295). The entries borrow the graph's reachable keys, which
+/// outlive the scan.
+fn collectBuildRootDirs(
+    allocator: Allocator,
+    graph: *const ImportGraph,
+    dirs: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var it = graph.reachable.keyIterator();
+    while (it.next()) |key| {
+        if (!mem.eql(u8, std.fs.path.basename(key.*), "build.zig")) continue;
+        const dir = std.fs.path.dirname(key.*) orelse continue;
+        try dirs.append(allocator, dir);
+    }
+}
+
+/// The nearest build-root directory that is a path prefix of `resolved`
+/// (EPH-I1295), or null. Deeper roots win, so a nested build root owns
+/// its own subtree.
+fn nearestBuildRoot(resolved: []const u8, roots: []const []const u8) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    for (roots) |r| {
+        if (!pathHasDirPrefix(resolved, r)) continue;
+        if (best == null or r.len > best.?.len) best = r;
+    }
+    return best;
+}
+
+/// True when `dir` is a component-wise path prefix of `path`: equal, or
+/// a leading prefix followed by a separator (EPH-I1295).
+fn pathHasDirPrefix(path: []const u8, dir: []const u8) bool {
+    if (!mem.startsWith(u8, path, dir)) return false;
+    if (path.len == dir.len) return true;
+    return path[dir.len] == '/';
+}
+
+/// The ZA504 stand-in mirror check for one cross-file pair (EPH-I1295).
+/// True when the duplicated run is exactly one whole-type declaration
+/// and the witness sits in a byte-identical same-named declaration under
+/// a different build root.
+fn standInMirrorExcluded(
+    allocator: Allocator,
+    scan: *const CloneScan,
+    run: CloneRun,
+    witness: CloneOccurrence,
+) !bool {
+    const fa = scan.files.items[run.file];
+    const fb = scan.files.items[witness.file];
+    const ra = fa.root orelse return false;
+    const rb = fb.root orelse return false;
+    if (mem.eql(u8, ra, rb)) return false;
+    const head_line = fa.stream.items[run.head].line;
+    const witness_line = fb.stream.items[witness.stream].line;
+    var a_lines = try cloneContentLines(allocator, fa.content);
+    defer a_lines.deinit(allocator);
+    var b_lines = try cloneContentLines(allocator, fb.content);
+    defer b_lines.deinit(allocator);
+    const decl_a = wholeTypeDeclAt(a_lines.items, head_line - 1) orelse return false;
+    const decl_b = wholeTypeDeclAt(b_lines.items, witness_line - 1) orelse return false;
+    if (!mem.eql(u8, decl_a.name, decl_b.name)) return false;
+    // The run must BE the whole type: it starts at the opener and its
+    // last covered line is the closer (internal blank/comment lines are
+    // not stream lines, so their gaps never break the run).
+    const end_line = fa.stream.items[run.head + run.windows - 1].line + MIN_CLONE_LINES - 1;
+    if (decl_a.open_idx + 1 != head_line or decl_a.close_idx + 1 != end_line) return false;
+    return sameDeclSpan(.{
+        .lines = a_lines.items,
+        .open_idx = decl_a.open_idx,
+        .close_idx = decl_a.close_idx,
+    }, .{
+        .lines = b_lines.items,
+        .open_idx = decl_b.open_idx,
+        .close_idx = decl_b.close_idx,
+    });
+}
+
+/// One whole-type declaration: the declared name and the 0-based opener
+/// and closer line indices (EPH-I1295).
+const WholeTypeDecl = struct {
+    name: []const u8,
+    open_idx: usize,
+    close_idx: usize,
+};
+
+/// If the code on line `idx` of `lines` opens a whole-type declaration
+/// (`const Name = struct {` family, `pub` prefix allowed) whose brace
+/// group closes with only `;` and whitespace after, return its span.
+fn wholeTypeDeclAt(lines: []const []const u8, idx: usize) ?WholeTypeDecl {
+    const opener = wholeTypeOpener(lines[idx]) orelse return null;
+    const close_idx = braceGroupEndLine(lines, idx, opener.brace_col) orelse return null;
+    if (!closerEndsDecl(lines[close_idx])) return null;
+    return .{ .name = opener.name, .open_idx = idx, .close_idx = close_idx };
+}
+
+/// Parse a whole-type opener on one raw line (EPH-I1295). Null unless
+/// the trimmed code reads `(pub )?const Name = (packed |extern )?kw {`
+/// with only `;` allowed after the brace. `brace_col` is the 0-based
+/// column of the `{` on the raw line, for braceGroupEndLine.
+fn wholeTypeOpener(raw: []const u8) ?struct { name: []const u8, brace_col: usize } {
+    const code_end = findCommentStart(raw) orelse raw.len;
+    const t = mem.trim(u8, raw[0..code_end], " \t\r");
+    const lead = t.ptr - raw.ptr;
+    var pos: usize = 0;
+    if (mem.startsWith(u8, t, "pub ")) pos += 4;
+    if (!mem.startsWith(u8, t[pos..], "const ")) return null;
+    pos += "const ".len;
+    const name_start = pos;
+    while (pos < t.len and isIdent(t[pos])) pos += 1;
+    if (pos == name_start) return null;
+    const name = t[name_start..pos];
+    while (pos < t.len and (t[pos] == ' ' or t[pos] == '\t')) pos += 1;
+    if (pos >= t.len or t[pos] != '=') return null;
+    pos += 1;
+    while (pos < t.len and (t[pos] == ' ' or t[pos] == '\t')) pos += 1;
+    const type_kws = [_][]const u8{ "packed ", "extern " };
+    for (type_kws) |prefix| {
+        if (mem.startsWith(u8, t[pos..], prefix)) pos += prefix.len;
+    }
+    const whole_kws = [_][]const u8{ "struct", "union", "opaque" };
+    for (whole_kws) |kw| {
+        if (!mem.startsWith(u8, t[pos..], kw)) continue;
+        var after = pos + kw.len;
+        while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
+        if (after >= t.len or t[after] != '{') return null;
+        var tail = after + 1;
+        while (tail < t.len and (t[tail] == ' ' or t[tail] == '\t')) tail += 1;
+        if (tail < t.len and t[tail] != ';') return null;
+        if (tail < t.len) {
+            tail += 1;
+            while (tail < t.len and (t[tail] == ' ' or t[tail] == '\t')) tail += 1;
+            if (tail < t.len) return null;
+        }
+        return .{ .name = name, .brace_col = lead + after };
+    }
+    return null;
+}
+
+/// True when a whole-type closer line ends the declaration: after the
+/// last code `}` only `;` and whitespace may follow (EPH-I1295). The
+/// closure-alias shape `...}.call;` must not pass.
+fn closerEndsDecl(raw: []const u8) bool {
+    const code_end = findCommentStart(raw) orelse raw.len;
+    const code = mem.trim(u8, raw[0..code_end], " \t\r");
+    const close = mem.lastIndexOfScalar(u8, code, '}') orelse return false;
+    const tail = mem.trim(u8, code[close + 1 ..], " \t\r");
+    if (tail.len == 0) return true;
+    if (tail.len == 1 and tail[0] == ';') return true;
+    return false;
+}
+
+/// Split one file content into lines for the whole-type span walk.
+fn cloneContentLines(
+    allocator: Allocator,
+    content: []const u8,
+) !std.ArrayListUnmanaged([]const u8) {
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer lines.deinit(allocator);
+    var it = mem.splitScalar(u8, content, '\n');
+    while (it.next()) |l| try lines.append(allocator, l);
+    return lines;
+}
+
+/// The next code line of a declaration span, or null past the closer:
+/// normalized like the clone stream (comment-stripped and trimmed, blank
+/// and comment-only lines dropped) (EPH-I1295).
+fn nextDeclCodeLine(lines: []const []const u8, idx: *usize, close: usize) ?[]const u8 {
+    while (idx.* <= close) : (idx.* += 1) {
+        const raw = lines[idx.*];
+        if (isCommentOrMultilineString(mem.trim(u8, raw, " \t\r"))) continue;
+        const norm = mem.trim(u8, stripLineComment(raw), " \t\r");
+        if (norm.len == 0) continue;
+        idx.* += 1;
+        return norm;
+    }
+    return null;
+}
+
+/// One declaration span for the stand-in byte comparison (EPH-I1295):
+/// the file's line array plus the 0-based opener and closer indices.
+const DeclSpanView = struct {
+    lines: []const []const u8,
+    open_idx: usize,
+    close_idx: usize,
+};
+
+/// True when the two declaration spans carry the same normalized code
+/// line sequence (EPH-I1295).
+fn sameDeclSpan(a: DeclSpanView, b: DeclSpanView) bool {
+    var i: usize = a.open_idx;
+    var j: usize = b.open_idx;
+    while (true) {
+        const la = nextDeclCodeLine(a.lines, &i, a.close_idx);
+        const lb = nextDeclCodeLine(b.lines, &j, b.close_idx);
+        if (la == null and lb == null) return true;
+        if (la == null or lb == null) return false;
+        if (!mem.eql(u8, la.?, lb.?)) return false;
+    }
 }
 // ============================================================================
 // Function Interface Analysis (ZA405, ZA406, ZA505, ZA506, ZA507, ZA508)
@@ -33526,11 +33851,13 @@ fn stepErrorSetTrivia(t: []const u8, i: *usize, depth: *usize) ErrorSetTriviaVer
 
 /// Check error set members on this line against the configured convention
 /// (caller guarantees the line is inside an error block). `_`-prefixed
-/// names are exempt. Std-lib names are NOT — a project DECLARES its own
-/// members, so it can rename a member that collides with a std name
-/// (EPH-I0473). References never fire at all (EPH-I1075), so the std-name
-/// exemption applies to declarations only, and only in snake_case mode
-/// (title_case std names conform anyway).
+/// names are exempt. Std canonical error names are exempt (EPH-I1296):
+/// a Zig error name is a global singleton, so a declared member matching
+/// a std-declared name unions with the SAME error — renaming it changes
+/// the error identity and breaks the coercion, an impossible refactor.
+/// A non-canonical collision stays actionable (EPH-I0473): the project
+/// owns the name and can rename it. References never fire at all
+/// (EPH-I1075), so the exemption applies to declarations only.
 fn checkErrorSetMemberNames(ctx: NamingLineCtx) !void {
     const t = ctx.t;
     var i: usize = errorSetBodyStart(t);
@@ -33548,10 +33875,15 @@ fn checkErrorSetMemberNames(ctx: NamingLineCtx) !void {
             continue;
         }
         const name = t[member_start..end];
-        // Declared members carry no std-name exemption (EPH-I0473): the
-        // project owns the name and can rename it. `_`-prefixed names stay
-        // exempt by convention.
+        // Declared members: `_`-prefixed names stay exempt by convention,
+        // and std canonical names are exempt on the identity argument
+        // (EPH-I1296). A non-canonical collision is the project's own
+        // name and stays reportable (EPH-I0473).
         if (name[0] == '_') {
+            i = skipOptionalComma(t, end);
+            continue;
+        }
+        if (isStdCanonicalErrorName(name)) {
             i = skipOptionalComma(t, end);
             continue;
         }
@@ -33563,6 +33895,521 @@ fn checkErrorSetMemberNames(ctx: NamingLineCtx) !void {
         });
         i = skipOptionalComma(t, end);
     }
+}
+
+/// The std library's declared error names (EPH-I1296), sorted for binary
+/// search. Derived from the pinned stdlib (Zig 0.16.0, the `.zenv/
+/// zig-aarch64-macos-0.16.0/lib/std` tree): every name inside an
+/// `error{...}` set body, with strings and comments stripped. The std's
+/// own test-only names (`error{foo}`, `error{bar}`, `error{A}`,
+/// `error{Foo}`, `error{Test}`) are excluded. The table is a superset
+/// for older std versions: a 0.15-only std name absent here keeps
+/// firing, the FN-safe direction.
+const std_canonical_error_names = [_][]const u8{
+    "Aborted",
+    "AccessDenied",
+    "AddressFamilyUnsupported",
+    "AddressInUse",
+    "AddressUnavailable",
+    "AllocatorRequired",
+    "AlreadyConnected",
+    "AlreadyReported",
+    "AlreadyStarted",
+    "AnalysisFail",
+    "AntivirusInterference",
+    "ApiLevelQueryFailed",
+    "AuthenticationFailed",
+    "BadBufferSize",
+    "BadGzipHeader",
+    "BadMagic",
+    "BadPathName",
+    "BadString",
+    "BadSymtab",
+    "BadZlibHeader",
+    "BlockOversize",
+    "BlockedByFirewall",
+    "BrokenPipe",
+    "BufferTooSmall",
+    "BufferUnderrun",
+    "CCompilerCannotFindHeaders",
+    "CCompilerCrashed",
+    "CCompilerExitCode",
+    "CacheCheckFailed",
+    "CancelRequested",
+    "Canceled",
+    "CertificateAuthorityBundleTooBig",
+    "CertificateBundleLoadFailure",
+    "CertificateExpired",
+    "CertificateFieldHasInvalidLength",
+    "CertificateFieldHasWrongDataType",
+    "CertificateHasInvalidBitString",
+    "CertificateHasUnrecognizedObjectId",
+    "CertificateHostMismatch",
+    "CertificateIssuerMismatch",
+    "CertificateIssuerNotFound",
+    "CertificateNotYetValid",
+    "CertificatePublicKeyInvalid",
+    "CertificateSignatureAlgorithmMismatch",
+    "CertificateSignatureAlgorithmUnsupported",
+    "CertificateSignatureInvalid",
+    "CertificateSignatureInvalidLength",
+    "CertificateSignatureNamedCurveUnsupported",
+    "CertificateSignatureUnsupportedBitCount",
+    "CertificateTimeInvalid",
+    "ChecksumFailure",
+    "ClockUnavailable",
+    "Closed",
+    "CodepointTooLarge",
+    "CompressedSizeMismatch",
+    "CompressionUnsupported",
+    "CompromisedData",
+    "ConcurrencyUnavailable",
+    "ConnectionAborted",
+    "ConnectionClose",
+    "ConnectionFin",
+    "ConnectionPending",
+    "ConnectionRefused",
+    "ConnectionReset",
+    "ConnectionResetByPeer",
+    "ContentOversize",
+    "ContextTooLong",
+    "CorruptInput",
+    "CorruptedData",
+    "CrcError",
+    "CrcMismatch",
+    "CrossDevice",
+    "CurrentDirUnlinked",
+    "DanglingSurrogateHalf",
+    "DarwinSdkNotFound",
+    "DeadLock",
+    "DecompressedSizeMismatch",
+    "DetectingNetworkConfigurationFailed",
+    "DeviceBusy",
+    "DeviceError",
+    "DictionaryIdFlagUnsupported",
+    "DirNotEmpty",
+    "DiskQuota",
+    "DivisionByZero",
+    "DuplicateField",
+    "DwordNotFound",
+    "ElfHashTableNotFound",
+    "ElfStringSectionNotFound",
+    "ElfSymSectionNotFound",
+    "EndOfFile",
+    "EndOfMedia",
+    "EndOfStream",
+    "EntropyUnavailable",
+    "EnvironmentVariableMissing",
+    "EvenModulus",
+    "EventNotFound",
+    "EventNotSupported",
+    "EventRequiresUnsupportedCpuFeature",
+    "ExceededMaxDepth",
+    "ExecNotSupported",
+    "ExitCodeFailure",
+    "ExpectedSecondSurrogateHalf",
+    "FastOpenAlreadyInProgress",
+    "FileBusy",
+    "FileDescriptorNotASocket",
+    "FileLocksUnsupported",
+    "FileNotFound",
+    "FileSystem",
+    "FileTooBig",
+    "HardwareFailure",
+    "HostUnreachable",
+    "HttpChunkInvalid",
+    "HttpChunkTruncated",
+    "HttpConnectionClosing",
+    "HttpConnectionHeaderUnsupported",
+    "HttpContentEncodingUnsupported",
+    "HttpError",
+    "HttpExpectationFailed",
+    "HttpHeaderContinuationsUnsupported",
+    "HttpHeadersInvalid",
+    "HttpHeadersOversize",
+    "HttpRedirectLocationInvalid",
+    "HttpRedirectLocationMissing",
+    "HttpRedirectLocationOversize",
+    "HttpRequestTruncated",
+    "HttpTransferEncodingUnsupported",
+    "HuffmanTreeIncomplete",
+    "IcmpError",
+    "IdentityElement",
+    "IncompatibleRegisterSize",
+    "IncompatibleVersion",
+    "Incomplete",
+    "IncompleteExpressionContext",
+    "IncompleteHuffmanTree",
+    "InnerCarriageReturn",
+    "InputBufferUndersize",
+    "InputOutput",
+    "InstallationNotFound",
+    "InsufficientEntropy",
+    "InterfaceNotFound",
+    "Invalid",
+    "InvalidAddress",
+    "InvalidArg0",
+    "InvalidBatchScriptArg",
+    "InvalidBitStream",
+    "InvalidBlockType",
+    "InvalidCFAOpcode",
+    "InvalidCharacter",
+    "InvalidCode",
+    "InvalidCodepoint",
+    "InvalidCompressedSection",
+    "InvalidContentLength",
+    "InvalidDebugInfo",
+    "InvalidDnsAAAARecord",
+    "InvalidDnsARecord",
+    "InvalidDnsCnameRecord",
+    "InvalidDnsPacket",
+    "InvalidDwarf",
+    "InvalidDynamicBlockHeader",
+    "InvalidElfClass",
+    "InvalidElfEndian",
+    "InvalidElfFile",
+    "InvalidElfMagic",
+    "InvalidElfVersion",
+    "InvalidEncoding",
+    "InvalidEnd",
+    "InvalidEnumTag",
+    "InvalidExe",
+    "InvalidExpression",
+    "InvalidFileDescriptor",
+    "InvalidFileName",
+    "InvalidFormat",
+    "InvalidFrameBase",
+    "InvalidGnuLibCVersion",
+    "InvalidHandle",
+    "InvalidHostName",
+    "InvalidIntegralTypeSize",
+    "InvalidLanguage",
+    "InvalidLiteral",
+    "InvalidMachO",
+    "InvalidMachine",
+    "InvalidMatch",
+    "InvalidName",
+    "InvalidNumber",
+    "InvalidOperand",
+    "InvalidPEHeader",
+    "InvalidPEMagic",
+    "InvalidPadding",
+    "InvalidParameter",
+    "InvalidPort",
+    "InvalidProcessGroupId",
+    "InvalidProtocolOption",
+    "InvalidRangeCode",
+    "InvalidRegister",
+    "InvalidSignature",
+    "InvalidStrtabSize",
+    "InvalidSubExpression",
+    "InvalidSyscall",
+    "InvalidSyscallParameters",
+    "InvalidTypeLength",
+    "InvalidUserId",
+    "InvalidUtf8",
+    "InvalidVersion",
+    "InvalidWtf8",
+    "IpAddressConflict",
+    "IsDir",
+    "KeyMismatch",
+    "KeyNotFound",
+    "LargeValue",
+    "LengthMismatch",
+    "LibCInstallationMissingCrtDir",
+    "LibCKernel32LibNotFound",
+    "LibCRuntimeNotFound",
+    "LibCStdLibHeaderNotFound",
+    "LimitTooBig",
+    "LinkQuotaExceeded",
+    "LoadError",
+    "LockViolation",
+    "LockedMemoryLimitExceeded",
+    "MadviseUnavailable",
+    "MakeFailed",
+    "MakeSkipped",
+    "MalformedAccuracyLog",
+    "MalformedBlock",
+    "MalformedCompressedBlock",
+    "MalformedFrame",
+    "MalformedFseBits",
+    "MalformedFseTable",
+    "MalformedHuffmanTree",
+    "MalformedLiteralsHeader",
+    "MalformedLiteralsLength",
+    "MalformedLiteralsSection",
+    "MalformedSequence",
+    "MappingAlreadyExists",
+    "MarkAlreadyExists",
+    "MediaChanged",
+    "MemoryMappingNotSupported",
+    "MessageOversize",
+    "MessageTooLong",
+    "MincoreUnavailable",
+    "MissingCoffSection",
+    "MissingCoreServicesSymbol",
+    "MissingDebugInfo",
+    "MissingDynamicLinkingInformation",
+    "MissingEndCertificateMarker",
+    "MissingEndOfBlockCode",
+    "MissingField",
+    "MissingFinalNewline",
+    "MissingMaskBit",
+    "MissingPEHeader",
+    "MissingPrefix",
+    "MissingStartBit",
+    "MissingStringTable",
+    "ModulusTooSmall",
+    "MsvcLibDirNotFound",
+    "NameServerFailure",
+    "NameTooLong",
+    "NegativeIntoUnsigned",
+    "NetworkDown",
+    "NetworkNotFound",
+    "NetworkUnreachable",
+    "NoAddressReturned",
+    "NoDevice",
+    "NoMapping",
+    "NoMedia",
+    "NoResponse",
+    "NoSpaceLeft",
+    "NoStrtab",
+    "NoSymtab",
+    "NonCanonical",
+    "NonResizable",
+    "NotADword",
+    "NotAPgrpMember",
+    "NotAString",
+    "NotATerminal",
+    "NotAssociatedWithFileSystem",
+    "NotDir",
+    "NotDynamicLibrary",
+    "NotElfFile",
+    "NotFound",
+    "NotLink",
+    "NotNtPath",
+    "NotOpenForReading",
+    "NotOpenForWriting",
+    "NotReady",
+    "NotSquare",
+    "NotStarted",
+    "NotTerminalDevice",
+    "NotXzStream",
+    "NullExponent",
+    "OSVersionDetectionFail",
+    "OctalOverflow",
+    "OpenFrameworkFailed",
+    "OperationUnsupported",
+    "OptionUnsupported",
+    "OutOfMemory",
+    "OutOfResources",
+    "OutputBufferUndersize",
+    "OutputTooLong",
+    "Overflow",
+    "OversubscribedHuffmanTree",
+    "ParseError",
+    "ParseFailed",
+    "ParseZon",
+    "PasswordVerificationFailed",
+    "PathAlreadyExists",
+    "PathNotFound",
+    "PathTooLong",
+    "PermissionDenied",
+    "PipeBusy",
+    "PkgConfigCrashed",
+    "PkgConfigFailed",
+    "PkgConfigInvalidOutput",
+    "PkgConfigNotInstalled",
+    "PortUnreachable",
+    "ProcessAlreadyExec",
+    "ProcessFdQuotaExceeded",
+    "ProcessNotFound",
+    "ProcessOrphaned",
+    "ProcessResources",
+    "ProcessTerminated",
+    "ProtocolError",
+    "ProtocolFailure",
+    "ProtocolUnreachable",
+    "ProtocolUnsupportedByAddressFamily",
+    "ProtocolUnsupportedBySystem",
+    "ReadFailed",
+    "ReadFailure",
+    "ReadOnlyFileSystem",
+    "RedirectRequiresResend",
+    "RepeatModeFirst",
+    "ReservedBitSet",
+    "ReservedBlock",
+    "ResolvConfParseFailed",
+    "ResourceLimitReached",
+    "SampleMaxStackOverflow",
+    "SampleStackNotSupported",
+    "SectionOversize",
+    "SecurityViolation",
+    "SequenceBufferUndersize",
+    "SignalInterrupt",
+    "SignatureVerificationFailed",
+    "SizeMismatch",
+    "SizeTooSmall",
+    "SkipZigTest",
+    "SocketModeUnsupported",
+    "SocketNotBound",
+    "SocketNotListening",
+    "SocketUnconnected",
+    "StartFailed",
+    "StaticElfFile",
+    "StreamTooLong",
+    "Streaming",
+    "StringNotFound",
+    "SymLinkLoop",
+    "SyntaxError",
+    "SystemCannotYield",
+    "SystemFdQuotaExceeded",
+    "SystemOutdated",
+    "SystemResources",
+    "TargetTooSmall",
+    "TestExpectedEqual",
+    "TftpError",
+    "ThreadQuotaExceeded",
+    "Timeout",
+    "TimeoutTooBig",
+    "TlsAlert",
+    "TlsAlertAccessDenied",
+    "TlsAlertBadCertificate",
+    "TlsAlertBadCertificateStatusResponse",
+    "TlsAlertBadRecordMac",
+    "TlsAlertCertificateExpired",
+    "TlsAlertCertificateRequired",
+    "TlsAlertCertificateRevoked",
+    "TlsAlertCertificateUnknown",
+    "TlsAlertDecodeError",
+    "TlsAlertDecryptError",
+    "TlsAlertHandshakeFailure",
+    "TlsAlertIllegalParameter",
+    "TlsAlertInappropriateFallback",
+    "TlsAlertInsufficientSecurity",
+    "TlsAlertInternalError",
+    "TlsAlertMissingExtension",
+    "TlsAlertNoApplicationProtocol",
+    "TlsAlertProtocolVersion",
+    "TlsAlertRecordOverflow",
+    "TlsAlertUnexpectedMessage",
+    "TlsAlertUnknown",
+    "TlsAlertUnknownCa",
+    "TlsAlertUnknownPskIdentity",
+    "TlsAlertUnrecognizedName",
+    "TlsAlertUnsupportedCertificate",
+    "TlsAlertUnsupportedExtension",
+    "TlsBadLength",
+    "TlsBadRecordMac",
+    "TlsBadRsaSignatureBitCount",
+    "TlsBadSignatureScheme",
+    "TlsCertificateNotVerified",
+    "TlsConnectionTruncated",
+    "TlsDecodeError",
+    "TlsDecryptError",
+    "TlsDecryptFailure",
+    "TlsIllegalParameter",
+    "TlsInitializationFailed",
+    "TlsRecordOverflow",
+    "TlsSequenceOverflow",
+    "TlsUnexpectedMessage",
+    "TooBig",
+    "TooManyBreakpoints",
+    "TooManyHttpRedirects",
+    "TooManyParentDirs",
+    "TreelessLiteralsFirst",
+    "TruncatedElfFile",
+    "TruncatedIntegralType",
+    "UnableToSpawnCCompiler",
+    "UnalignedMemory",
+    "Underflow",
+    "Unexpected",
+    "UnexpectedCharacter",
+    "UnexpectedElement",
+    "UnexpectedEndOfInput",
+    "UnexpectedEndOfLiteralStream",
+    "UnexpectedOpCode",
+    "UnexpectedRepresentation",
+    "UnexpectedSecondSurrogateHalf",
+    "UnexpectedSubgroup",
+    "UnexpectedToken",
+    "Unimplemented",
+    "UnimplementedExpressionCall",
+    "UnimplementedOpcode",
+    "UnimplementedTypeConversion",
+    "UnimplementedTypedComparison",
+    "UnimplementedUserOpcode",
+    "UnknownExpressionOpcode",
+    "UnknownField",
+    "UnknownHostName",
+    "UnknownHttpMethod",
+    "UnknownName",
+    "UnknownTotalSystemMemory",
+    "UnmappedMemory",
+    "UnrecognizedFormat",
+    "UnrecognizedGnuLibCFileName",
+    "UnrecognizedVolume",
+    "UnresolvedScope",
+    "Unseekable",
+    "Unsupported",
+    "UnsupportedArchitecture",
+    "UnsupportedCertificateVersion",
+    "UnsupportedCompressionMethod",
+    "UnsupportedDebugInfo",
+    "UnsupportedFeature",
+    "UnsupportedFlags",
+    "UnsupportedOperation",
+    "UnsupportedRegister",
+    "UnsupportedReparsePointType",
+    "UnsupportedUriScheme",
+    "UriMissingHost",
+    "UserMarkQuotaExceeded",
+    "Utf8CannotEncodeSurrogateHalf",
+    "Utf8CodepointTooLarge",
+    "Utf8EncodesSurrogateHalf",
+    "Utf8ExpectedContinuation",
+    "Utf8InvalidStartByte",
+    "Utf8OverlongEncoding",
+    "ValueNameNotFound",
+    "ValueTooLong",
+    "VersionTooLong",
+    "VolumeCorrupted",
+    "VolumeFull",
+    "WeakParameters",
+    "WeakPublicKey",
+    "WindowOversize",
+    "WindowSizeUnknown",
+    "WindowTooSmall",
+    "WindowsSdkNotFound",
+    "WouldBlock",
+    "WouldExceedMaximumResidentSetSize",
+    "WriteFailed",
+    "WriteProtected",
+    "WrongChecksum",
+    "WrongGzipChecksum",
+    "WrongGzipSize",
+    "WrongStoredBlockNlen",
+    "WrongType",
+    "WrongZlibChecksum",
+    "ZigIsTheCCompiler",
+    "ZipNoEndRecord",
+    "ZipTruncated",
+};
+
+/// True when `name` is a std-declared canonical error name (EPH-I1296).
+/// Binary search over the sorted table above.
+fn isStdCanonicalErrorName(name: []const u8) bool {
+    var lo: usize = 0;
+    var hi: usize = std_canonical_error_names.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        switch (mem.order(u8, name, std_canonical_error_names[mid])) {
+            .lt => hi = mid,
+            .gt => lo = mid + 1,
+            .eq => return true,
+        }
+    }
+    return false;
 }
 
 /// Advance past whitespace and one optional `,` — members in an error set may
@@ -94845,7 +95692,7 @@ test "checkErrorNaming: error set members must be snake_case" {
     );
 }
 
-test "checkErrorNaming: declared members carry no std-name exemption (EPH-I0473, EPH-I1075)" {
+test "checkErrorNaming: declared std canonical names stay silent, owned names fire (EPH-I0473, EPH-I1296)" {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const a = gpa.allocator();
@@ -94854,9 +95701,7 @@ test "checkErrorNaming: declared members carry no std-name exemption (EPH-I0473,
     defer deinitIssues(&issues, a);
 
     // Use sites never fire (EPH-I1075), so this pin lives entirely on the
-    // declaration surface: a project DECLARES its own members and can
-    // rename a member that collides with a std name, so snake_case mode
-    // reports it (EPH-I0473).
+    // declaration surface.
     const oom_line = "    if (err == error.OutOfMemory) return error.OutOfMemory;";
     try checkErrorNaming(.{
         .issues = &issues,
@@ -94893,8 +95738,10 @@ test "checkErrorNaming: declared members carry no std-name exemption (EPH-I0473,
     // The reference lines never fire (EPH-I1075).
     try std.testing.expectEqual(@as(usize, 0), issues.items.len);
 
-    // A DECLARED member colliding with a std name is the project's own
-    // name — it can rename it, so snake_case mode reports it (EPH-I0473).
+    // A DECLARED member matching a std canonical name is the std error
+    // itself — renaming it changes the error identity (the allocator's
+    // OutOfMemory is a global singleton), so ZA703 stays silent
+    // (EPH-I1296).
     try checkErrorNaming(.{
         .issues = &issues,
         .allocator = a,
@@ -94911,14 +95758,22 @@ test "checkErrorNaming: declared members carry no std-name exemption (EPH-I0473,
         .line_num = 6,
         .error_naming = .snake_case,
     }, .inside);
-    try std.testing.expectEqual(@as(usize, 2), issues.items.len);
+    try std.testing.expectEqual(@as(usize, 0), issues.items.len);
+
+    // A non-canonical TitleCase member is the project's own name — it can
+    // rename it, so snake_case mode still reports it (EPH-I0473).
+    try checkErrorNaming(.{
+        .issues = &issues,
+        .allocator = a,
+        .path = "test.zig",
+        .t = "    OwnedFailure,",
+        .line_num = 7,
+        .error_naming = .snake_case,
+    }, .inside);
+    try std.testing.expectEqual(@as(usize, 1), issues.items.len);
     try std.testing.expectEqualStrings(
-        "error set member 'OutOfMemory' should be snake_case",
+        "error set member 'OwnedFailure' should be snake_case",
         issues.items[0].message,
-    );
-    try std.testing.expectEqualStrings(
-        "error set member 'FileNotFound' should be snake_case",
-        issues.items[1].message,
     );
 }
 
@@ -117144,6 +117999,45 @@ test "ZT106: an unbalanced body stays silent (fail open, EPH-I1089)" {
     );
 }
 
+test "ZT106: compile-pin bodies stay silent, mixed and keyword bodies fire (EPH-I1294)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A body whose every statement is a pure reference discard verifies
+    // that the named declarations compile — real coverage the call-site
+    // premise misses, so the note stays silent (EPH-I1294). A body mixing
+    // a discard with a real statement fires, and `_ = undefined;` is not
+    // a reference (the keyword names no declaration), so it fires too.
+    const content =
+        \\pub const Flags = struct { read: bool };
+        \\pub const Mode = enum { fast, safe };
+        \\test "compile_pin" {
+        \\    _ = Flags;
+        \\    _ = Mode.fast;
+        \\}
+        \\test "mixed_body" {
+        \\    _ = Flags;
+        \\    var x: u32 = 0;
+        \\    x += 1;
+        \\}
+        \\test "keyword_only" {
+        \\    _ = undefined;
+        \\}
+    ;
+    var run = try runTestQualityCheck(&diag, allocator, "zt106_compile_pin.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        countBySeverity(run.issues.items, RULE_TEST_NO_CALLS, .note),
+    );
+    try std.testing.expectEqual(@as(usize, 0), countNoCallNotes(run.issues.items, "compile_pin"));
+    try std.testing.expectEqual(@as(usize, 1), countNoCallNotes(run.issues.items, "mixed_body"));
+    try std.testing.expectEqual(@as(usize, 1), countNoCallNotes(run.issues.items, "keyword_only"));
+}
+
 // ============================================================================
 // Concurrency Analysis Tests (ZC101)
 // ============================================================================
@@ -131545,6 +132439,30 @@ fn runCloneTest(
     return .{ .graph = graph, .issues = issues };
 }
 
+/// Test helper: like runCloneTest, but first marks each given build-root
+/// directory's build.zig reachable, so the stand-in mirror attribution
+/// (EPH-I1295) sees the roots. The graph owns the build.zig keys.
+fn runCloneTestRooted(
+    diag: *DiagCtx,
+    allocator: Allocator,
+    files: []const CloneTestFile,
+    roots: []const []const u8,
+) !CloneTestRun {
+    var graph = ImportGraph.init(allocator, diag);
+    errdefer graph.deinit();
+    try putTestFiles(&graph, allocator, files);
+    for (roots) |root| {
+        const build_path = try std.fmt.allocPrint(allocator, "{s}/build.zig", .{root});
+        var owned = true;
+        errdefer if (owned) allocator.free(build_path);
+        try graph.reachable.put(build_path, {});
+        owned = false;
+    }
+    var issues = try analyzeClones(allocator, &graph);
+    errdefer deinitIssues(&issues, allocator);
+    return .{ .graph = graph, .issues = issues };
+}
+
 test "ZA504 normalization: comment and whitespace differences still duplicate" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
@@ -131647,6 +132565,104 @@ test "ZA504 compat mirrors: versioned-compat pairs stay silent" {
     });
     defer run.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZA504 stand-in mirrors: same-name whole types in different roots stay silent (EPH-I1295)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The RhyOS OpenFlags shape: a packed struct mirrored byte-for-byte.
+    const flags =
+        \\const OpenFlags = packed struct {
+        \\    read: bool,
+        \\    write: bool,
+        \\    exec: bool,
+        \\    append: bool,
+        \\    truncate: bool,
+        \\    create: bool,
+        \\};
+    ;
+    // host/ and kernel/ are separate build roots. The host-build
+    // stand-in IS the mechanism — no import path exists between the
+    // roots — so the pair stays silent (EPH-I1295).
+    var run = try runCloneTestRooted(&diag, allocator, &.{
+        .{ .path = "host/archive_manager.zig", .content = flags },
+        .{ .path = "kernel/vfs/types.zig", .content = flags },
+    }, &.{ "host", "kernel" });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZA504 stand-in mirrors: same-name whole types in one root keep firing (EPH-I1295)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const flags =
+        \\const OpenFlags = packed struct {
+        \\    read: bool,
+        \\    write: bool,
+        \\    exec: bool,
+        \\    append: bool,
+        \\    truncate: bool,
+        \\    create: bool,
+        \\};
+    ;
+    // Both files live under ONE build root: the pair is ordinary
+    // duplication (same-root same-name types cannot even coexist in a
+    // compiling module), so both sides report.
+    var run = try runCloneTestRooted(&diag, allocator, &.{
+        .{ .path = "root/arch_a.zig", .content = flags },
+        .{ .path = "root/arch_b.zig", .content = flags },
+    }, &.{"root"});
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "root/arch_a.zig", RULE_DUPLICATED_BLOCK),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "root/arch_b.zig", RULE_DUPLICATED_BLOCK),
+    );
+}
+
+test "ZA504 stand-in mirrors: a partial-field pair keeps firing (EPH-I1295)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const kernel_flags =
+        \\const OpenFlags = packed struct {
+        \\    read: bool,
+        \\    write: bool,
+        \\    exec: bool,
+        \\    append: bool,
+        \\    truncate: bool,
+        \\    create: bool,
+        \\};
+    ;
+    const host_flags =
+        \\const OpenFlags = packed struct {
+        \\    read: bool,
+        \\    write: bool,
+        \\    exec: bool,
+        \\    append: bool,
+        \\    truncate: bool,
+        \\    create: bool,
+        \\    delete: bool,
+        \\};
+    ;
+    // The shared prefix duplicates (8 lines), but the declarations are
+    // not the same type — the host side carries an extra field — so the
+    // stand-in arm must not apply: the pair keeps firing.
+    var run = try runCloneTestRooted(&diag, allocator, &.{
+        .{ .path = "host/archive_manager.zig", .content = host_flags },
+        .{ .path = "kernel/vfs/types.zig", .content = kernel_flags },
+    }, &.{ "host", "kernel" });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "host/archive_manager.zig", RULE_DUPLICATED_BLOCK),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "kernel/vfs/types.zig", RULE_DUPLICATED_BLOCK),
+    );
 }
 
 test "ZA504 same-file and cross-file duplication both report" {

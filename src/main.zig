@@ -7468,41 +7468,48 @@ fn minusOneReadCovered(ctx: ExprReadCtx, expr: ExprRead) bool {
     if (!whileDescendingHeader(ctx.ot, loop_var)) return false;
     const decl = findCounterInitDecl(ctx.sc.da.lines, ctx.opener, loop_var) orelse return false;
     if (writesBetween(ctx.sc.da.lines, decl.idx + 1, ctx.opener, loop_var)) return false;
-    return exprReadTailCovered(ctx, .{ loop_var, loop_var }, decl.counter, decl.idx);
+    return exprReadTailCovered(ctx, .{ loop_var, loop_var, "" }, decl.counter, decl.idx);
 }
 
-/// The `c - 1 - i` read shape (EPH-I1299): the read loop ascends from
-/// zero under `i < c` (the bare comparison, a top-level `and` conjunct,
-/// or a min-derived bound) with `: (i += 1)`, or runs as `for (0..c)
-/// |i|`. The trips read the elements counter - 1 down to 0 — the
-/// written range in reverse. The index re-reads the counter every
-/// trip, so the read loop body must write neither the loop var nor the
-/// counter: a body counter write would shift the next read past the
-/// written range.
+/// The `c - 1 - i` read shape (EPH-I1299, EPH-I1311): the read loop
+/// ascends from zero under `i < c` (the bare comparison, a top-level
+/// `and` conjunct, or a min-derived bound) with `: (i += 1)`, or runs
+/// as `for (0..c) |i|`. The trips read the elements counter - 1 down
+/// to 0 — the written range in reverse. The index re-reads the counter
+/// every trip, so the read loop body must write neither the loop var
+/// nor the counter: a body counter write would shift the next read
+/// past the written range. A min-derived bound var joins the tracked
+/// set when it differs from the counter (EPH-I1311): a body write to
+/// it raises the bound past the counter, and a later trip underflows
+/// the index.
 fn minusOneMinusReadCovered(ctx: ExprReadCtx, expr: ExprRead) bool {
     const loop_var = expr.loop_var;
     const counter = expr.counter.?;
     const while_bound = whileAscendingHeader(ctx.ot, loop_var);
     const for_counter = forRangeHeader(ctx.ot, loop_var);
+    var bound_name: []const u8 = "";
     if (for_counter) |fc| {
         if (!mem.eql(u8, fc, counter)) return false;
     } else if (while_bound) |b| {
         if (!boundMatchesCounter(ctx.sc.da.lines, ctx.opener, b, counter)) return false;
         const decl = findZeroInitDecl(ctx.sc.da.lines, ctx.opener, loop_var) orelse return false;
         if (writesBetween(ctx.sc.da.lines, decl + 1, ctx.opener, loop_var)) return false;
+        if (!mem.eql(u8, b, counter)) bound_name = b;
     } else {
         return false;
     }
     const c_decl = findZeroInitDecl(ctx.sc.da.lines, ctx.opener, counter) orelse return false;
-    return exprReadTailCovered(ctx, .{ loop_var, counter }, counter, c_decl);
+    return exprReadTailCovered(ctx, .{ loop_var, counter, bound_name }, counter, c_decl);
 }
 
 /// The shared read-side tail of the expression-index suppressors
-/// (EPH-I1299): the read-loop body must write neither tracked name,
-/// and the fill side proves the counter covers the read.
+/// (EPH-I1299, EPH-I1311): the read-loop body must write none of the
+/// tracked names, and the fill side proves the counter covers the read.
+/// The third slot carries the min-derived bound var — empty when the
+/// bound is the counter itself or the shape has no bound var.
 fn exprReadTailCovered(
     ctx: ExprReadCtx,
-    names: [2][]const u8,
+    names: [3][]const u8,
     counter: []const u8,
     c_decl: usize,
 ) bool {
@@ -7846,13 +7853,18 @@ const BodyWriteQuery = struct {
     lines: []const []const u8,
     opener_idx: usize,
     bound: usize,
-    names: [2][]const u8,
+    names: [3][]const u8,
 };
 
-/// True when a word-bounded write of either tracked name occurs on the
-/// line (EPH-I1299).
-fn namesWrittenOnLine(t: []const u8, names: [2][]const u8) bool {
-    return lineWritesName(t, names[0]) or lineWritesName(t, names[1]);
+/// True when a word-bounded write of any tracked name occurs on the
+/// line (EPH-I1299, EPH-I1311). Empty slots are the no-third-name form;
+/// the scan skips them.
+fn namesWrittenOnLine(t: []const u8, names: [3][]const u8) bool {
+    for (names) |n| {
+        if (n.len == 0) continue;
+        if (lineWritesName(t, n)) return true;
+    }
+    return false;
 }
 
 /// One braced-body line's fold verdict for the write walks
@@ -7880,16 +7892,17 @@ fn foldBracedWalkLine(code: []const u8, depth: *usize) BracedWalkVerdict {
     return .open;
 }
 
-/// True when the read loop's body at `opener_idx` writes either
-/// tracked name anywhere between the body start and the body close, or
-/// the close is not found within the window — fail-closed (EPH-I1299).
-/// The whole body matters, not only the window before the read: the
-/// index expression re-reads the counter every trip, so a write after
-/// one read shifts the next read past the written range. The walk
-/// mirrors bracedLoopBodyEnd's conventions (EPH-I1177, EPH-I1191,
-/// EPH-I1209). A braceless body is one statement, so only the opener
-/// line's tail counts — a statement that spans lines keeps its later
-/// lines unseen (accepted FN, shared with the direct-shape walk).
+/// True when the read loop's body at `opener_idx` writes any tracked
+/// name anywhere between the body start and the body close, or
+/// the close is not found within the window — fail-closed (EPH-I1299,
+/// EPH-I1311). The whole body matters, not only the window before the
+/// read: the index expression re-reads the counter every trip, so a
+/// write after one read shifts the next read past the written range.
+/// The walk mirrors bracedLoopBodyEnd's conventions (EPH-I1177,
+/// EPH-I1191, EPH-I1209). A braceless body is one statement, so only
+/// the opener line's tail counts — a statement that spans lines keeps
+/// its later lines unseen (accepted FN, shared with the direct-shape
+/// walk).
 fn readLoopBodyWritesAny(q: BodyWriteQuery) bool {
     const t = mem.trim(u8, q.lines[q.opener_idx], " \t\r");
     const body_start = loopBodyStartCol(t) orelse return true;
@@ -85375,6 +85388,43 @@ test "ZA607: min-derived bound reverse copy stays silent (EPH-I1299)" {
     try std.testing.expectEqual(
         0,
         countRuleIssues(run.issues.items, "da_i1299_minbound.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: min-bound var write in the read loop still fires (EPH-I1311)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A var-declared min-derived bound written in the read-loop body
+    // raises the bound past the counter: the trip i = dlen reads
+    // digits[dlen - 1 - dlen]. The body-write scan must track the bound
+    // var too, so this shape keeps firing.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var out_len = @min(dlen, buf.len);
+        \\    var i: usize = 0;
+        \\    while (i < out_len) : (i += 1) {
+        \\        buf[i] = digits[dlen - 1 - i];
+        \\        out_len += 1;
+        \\    }
+        \\    return out_len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1311_minboundwrite.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1311_minboundwrite.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

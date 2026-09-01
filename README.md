@@ -148,7 +148,7 @@ Add the dependency. Substitute the newest tag from the
 [tags page](https://codeberg.org/RhyosLabs/ephor/tags) for `v0.14.2`:
 
 ```bash
-zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.15.0.tar.gz
+zig fetch --save=ephor https://codeberg.org/RhyosLabs/ephor/archive/v0.15.1.tar.gz
 ```
 
 Then add to `build.zig`:

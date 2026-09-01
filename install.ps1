@@ -59,7 +59,7 @@ $installExitCode = & {
     }
     # This tag is the fallback when the Codeberg tags API fails. Refresh it
     # on every release.
-    $EPHOR_FALLBACK_TAG = "v0.15.0"
+    $EPHOR_FALLBACK_TAG = "v0.15.1"
     # Pin for Zig 0.15.x. Every remote tag (v0.12.3 and later) declares
     # minimum_zig_version 0.16.0. The 0.16 migration landed in v0.12.0, so
     # no remote tag builds on Zig 0.15.x. v0.11.13 declares

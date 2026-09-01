@@ -112,11 +112,14 @@ fn countSkip(stats: ?*Stats, class: SkipClass) void {
 }
 
 /// Stack for the parse worker thread (EPH-I0191, EPH-I0268, EPH-I1300).
-/// The byte cap bounds the input. The ten-frame density is the grouped-
-/// type paren recursion chain (parseExpr → ... → expectExpr in the
-/// pinned Parse.zig); the expr-paren chain costs ~5 frames per level.
-/// A file of N bytes can drive at most N/2 nesting levels, so the worst
-/// case is 5 × N frames and the pair budgets 1,638 B per frame
+/// The byte cap bounds the input. Both paren forms share the ten-frame-
+/// per-level density: the expr-paren cycle is the chain documented
+/// above with the nesting budget (:231-240), and the grouped-type
+/// cycle is the same ten frames offset by the type entry
+/// (parseTypeExpr → ... → parseCurlySuffixExpr → parseTypeExpr in the
+/// pinned Parse.zig). A file of N bytes can drive at most N/2 nesting
+/// levels, so the worst case is 5 × N frames for either chain and the
+/// pair budgets 1,638 B per frame
 /// (2 GiB / (5 × 262,144)). Both chains fit 2 GiB at the worst legal
 /// nesting: the 131,072-level grouped-type probe parses this stack in
 /// both build modes (PROBE_OK), and the expr-paren bisection tops out

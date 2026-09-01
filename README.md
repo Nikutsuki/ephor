@@ -591,17 +591,20 @@ lines inside test bodies, including each test block's closing brace
 (help text and fixtures are data, not code), and cross-file pairs whose
 files both sit under a directory named `compat` (version-mirror trees).
 A fourth surface stays silent: a same-named whole-type declaration
-(`const Name = struct {` family, plain, packed, or extern) mirrored
+(`const Name = struct {` family, plain, packed, or extern, with an
+optional backing-type group such as `struct(u32)` — EPH-I1306) mirrored
 byte-for-byte in a different build root — the host-build stand-in shape
-(the RhyOS `OpenFlags` host/kernel pair, EPH-I1295). The duplication IS
-the mechanism there: the roots cannot share the file, and flagging
-demands an impossible refactor. The arm is narrow — the duplicated run
-must BE the whole type exactly, both sides must declare the same name,
-and the two files must attribute to two different build roots (their
-nearest directories containing a `build.zig`). A partial-field pair and
-a same-root pair keep firing. The analyzer re-verifies hash-collision
-candidates byte-for-byte before reporting, so a finding is never a hash
-collision.
+(EPH-I1295). The duplication IS the mechanism there: the two builds
+cannot share the file, and flagging demands an impossible refactor. The
+arm is narrow — the duplicated run must BE the whole type exactly, both
+sides must declare the same name, and the two files must attribute to
+two different build roots (their nearest directories containing a
+`build.zig`). A partial-field pair and a same-root pair keep firing.
+The same-root comptime-if stand-in (the RhyOS `OpenFlags` pair, a
+comptime-if/@import-vs-else struct arm under one build root) stays
+outside this arm and keeps firing. EPH-I1308 tracks it. The
+analyzer re-verifies hash-collision candidates byte-for-byte before
+reporting, so a finding is never a hash collision.
 
 **ZA501 and the build graph:** build.zig contributes reachability
 through its `b.path("...")` references — test roots and tools that

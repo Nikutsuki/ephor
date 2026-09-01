@@ -29083,14 +29083,16 @@ fn hasCompatComponent(path: []const u8) bool {
 }
 
 // --- ZA504 stand-in mirror exclusion (EPH-I1295) ---
-// The host-build stand-in shape: a whole-type declaration (struct, union,
-// or opaque, plain or packed/extern) that mirrors a same-named type in a
-// DIFFERENT build root byte-for-byte. The RhyOS evidence is the
-// archive_manager.zig:23 OpenFlags packed struct mirroring
-// fs/vfs/types.zig:110. The duplication IS the mechanism — the host
-// build and the kernel build cannot share the file, no import path
-// exists between the roots, and merging would break both — so flagging
-// demands an impossible refactor (the EPH-I1076 compat-mirror class).
+// The cross-root whole-type mirror shape: a whole-type declaration
+// (struct, union, or opaque, plain or packed/extern, with an optional
+// backing-type group such as `struct(u32)` — EPH-I1306) that mirrors a
+// same-named type in a DIFFERENT build root byte-for-byte. The
+// duplication IS the mechanism — the two builds cannot share the file,
+// and merging would break both — so flagging demands an impossible
+// refactor (the EPH-I1076 compat-mirror class). The same-root
+// comptime-if stand-in (the comptime-if/@import-vs-else struct arm
+// under one build root) is a different mechanism and stays uncovered
+// here: it keeps firing and is tracked in EPH-I1308.
 // Scoped narrowly: the duplicated run must BE the whole type, exactly
 // (opener line to closer line, nothing more, nothing less), both sides
 // must declare the same type name, and the two files must attribute to
@@ -29158,9 +29160,10 @@ fn standInMirrorExcluded(
     const decl_b = wholeTypeDeclAt(b_lines.items, witness_line - 1) orelse return false;
     if (!mem.eql(u8, decl_a.name, decl_b.name)) return false;
     // The run must BE the whole type: it starts at the opener and its
-    // last covered line is the closer (internal blank/comment lines are
-    // not stream lines, so their gaps never break the run).
-    const end_line = fa.stream.items[run.head + run.windows - 1].line + MIN_CLONE_LINES - 1;
+    // last covered stream line must be the closer. end_line reads that
+    // line's original line number, so internal blank/comment gaps (lines
+    // the stream drops) never shift the end (EPH-I1307).
+    const end_line = fa.stream.items[run.head + run.windows - 1 + MIN_CLONE_LINES - 1].line;
     if (decl_a.open_idx + 1 != head_line or decl_a.close_idx + 1 != end_line) return false;
     return sameDeclSpan(.{
         .lines = a_lines.items,
@@ -29191,10 +29194,13 @@ fn wholeTypeDeclAt(lines: []const []const u8, idx: usize) ?WholeTypeDecl {
     return .{ .name = opener.name, .open_idx = idx, .close_idx = close_idx };
 }
 
-/// Parse a whole-type opener on one raw line (EPH-I1295). Null unless
-/// the trimmed code reads `(pub )?const Name = (packed |extern )?kw {`
-/// with only `;` allowed after the brace. `brace_col` is the 0-based
-/// column of the `{` on the raw line, for braceGroupEndLine.
+/// Parse a whole-type opener on one raw line (EPH-I1295, EPH-I1306).
+/// Null unless the trimmed code reads
+/// `(pub )?const Name = (packed |extern )?kw` with an optional
+/// parenthesized backing-type group before the `{` — `struct(u32)`,
+/// `union(enum)` (EPH-I1306) — and only `;` allowed after the brace.
+/// `brace_col` is the 0-based column of the `{` on the raw line, for
+/// braceGroupEndLine.
 fn wholeTypeOpener(raw: []const u8) ?struct { name: []const u8, brace_col: usize } {
     const code_end = findCommentStart(raw) orelse raw.len;
     const t = mem.trim(u8, raw[0..code_end], " \t\r");
@@ -29215,11 +29221,30 @@ fn wholeTypeOpener(raw: []const u8) ?struct { name: []const u8, brace_col: usize
     for (type_kws) |prefix| {
         if (mem.startsWith(u8, t[pos..], prefix)) pos += prefix.len;
     }
-    const whole_kws = [_][]const u8{ "struct", "union", "opaque" };
-    for (whole_kws) |kw| {
-        if (!mem.startsWith(u8, t[pos..], kw)) continue;
-        var after = pos + kw.len;
+    const whole_kws = [_]struct { kw: []const u8, backing_group: bool }{
+        .{ .kw = "struct", .backing_group = true },
+        .{ .kw = "union", .backing_group = true },
+        .{ .kw = "opaque", .backing_group = false },
+    };
+    for (whole_kws) |entry| {
+        if (!mem.startsWith(u8, t[pos..], entry.kw)) continue;
+        var after = pos + entry.kw.len;
         while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
+        // The optional parenthesized backing-type group (EPH-I1306):
+        // `struct(u32)`, `union(enum)`. Zig allows the group on struct
+        // and union only — opaque never carries one. The content is one
+        // identifier; anything else rejects the opener.
+        if (entry.backing_group and after < t.len and t[after] == '(') {
+            var inner = after + 1;
+            while (inner < t.len and (t[inner] == ' ' or t[inner] == '\t')) inner += 1;
+            const backing_start = inner;
+            while (inner < t.len and isIdent(t[inner])) inner += 1;
+            if (inner == backing_start) return null;
+            while (inner < t.len and (t[inner] == ' ' or t[inner] == '\t')) inner += 1;
+            if (inner >= t.len or t[inner] != ')') return null;
+            after = inner + 1;
+            while (after < t.len and (t[after] == ' ' or t[after] == '\t')) after += 1;
+        }
         if (after >= t.len or t[after] != '{') return null;
         var tail = after + 1;
         while (tail < t.len and (t[tail] == ' ' or t[tail] == '\t')) tail += 1;
@@ -132570,7 +132595,8 @@ test "ZA504 compat mirrors: versioned-compat pairs stay silent" {
 test "ZA504 stand-in mirrors: same-name whole types in different roots stay silent (EPH-I1295)" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
-    // The RhyOS OpenFlags shape: a packed struct mirrored byte-for-byte.
+    // A cross-root whole-type pair: a packed struct mirrored
+    // byte-for-byte in two build roots.
     const flags =
         \\const OpenFlags = packed struct {
         \\    read: bool,
@@ -132582,8 +132608,8 @@ test "ZA504 stand-in mirrors: same-name whole types in different roots stay sile
         \\};
     ;
     // host/ and kernel/ are separate build roots. The host-build
-    // stand-in IS the mechanism — no import path exists between the
-    // roots — so the pair stays silent (EPH-I1295).
+    // stand-in IS the mechanism — the two builds cannot share the file
+    // — so the pair stays silent (EPH-I1295).
     var run = try runCloneTestRooted(&diag, allocator, &.{
         .{ .path = "host/archive_manager.zig", .content = flags },
         .{ .path = "kernel/vfs/types.zig", .content = flags },
@@ -132627,7 +132653,7 @@ test "ZA504 stand-in mirrors: a partial-field pair keeps firing (EPH-I1295)" {
     var diag = testDiagCtx();
     const allocator = std.testing.allocator;
     const kernel_flags =
-        \\const OpenFlags = packed struct {
+        \\const OpenFlags = packed struct(u32) {
         \\    read: bool,
         \\    write: bool,
         \\    exec: bool,
@@ -132637,7 +132663,7 @@ test "ZA504 stand-in mirrors: a partial-field pair keeps firing (EPH-I1295)" {
         \\};
     ;
     const host_flags =
-        \\const OpenFlags = packed struct {
+        \\const OpenFlags = packed struct(u32) {
         \\    read: bool,
         \\    write: bool,
         \\    exec: bool,
@@ -132649,7 +132675,9 @@ test "ZA504 stand-in mirrors: a partial-field pair keeps firing (EPH-I1295)" {
     ;
     // The shared prefix duplicates (8 lines), but the declarations are
     // not the same type — the host side carries an extra field — so the
-    // stand-in arm must not apply: the pair keeps firing.
+    // stand-in arm must not apply: the pair keeps firing. The
+    // backing-type openers pin that the EPH-I1306 acceptance never
+    // weakens the span comparison.
     var run = try runCloneTestRooted(&diag, allocator, &.{
         .{ .path = "host/archive_manager.zig", .content = host_flags },
         .{ .path = "kernel/vfs/types.zig", .content = kernel_flags },
@@ -132663,6 +132691,139 @@ test "ZA504 stand-in mirrors: a partial-field pair keeps firing (EPH-I1295)" {
         @as(usize, 1),
         countRuleIssues(run.issues.items, "kernel/vfs/types.zig", RULE_DUPLICATED_BLOCK),
     );
+}
+
+test "ZA504 stand-in mirrors: a backing-type pair in different roots stays silent (EPH-I1306)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // A packed struct with a backing-type group: the opener parse must
+    // accept the `(u32)` between the keyword and the brace, so the
+    // cross-root mirror pair stays silent (EPH-I1306).
+    const flags =
+        \\const OpenFlags = packed struct(u32) {
+        \\    read: bool,
+        \\    write: bool,
+        \\    exec: bool,
+        \\    append: bool,
+        \\    truncate: bool,
+        \\    create: bool,
+        \\};
+    ;
+    var run = try runCloneTestRooted(&diag, allocator, &.{
+        .{ .path = "host/archive_manager.zig", .content = flags },
+        .{ .path = "kernel/vfs/types.zig", .content = flags },
+    }, &.{ "host", "kernel" });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZA504 stand-in mirrors: a backing-type pair in one root keeps firing (EPH-I1306)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    const flags =
+        \\const OpenFlags = packed struct(u32) {
+        \\    read: bool,
+        \\    write: bool,
+        \\    exec: bool,
+        \\    append: bool,
+        \\    truncate: bool,
+        \\    create: bool,
+        \\};
+    ;
+    // One build root: the backing-type acceptance must not leak past
+    // the root check — the same-root pair keeps firing (EPH-I1306).
+    var run = try runCloneTestRooted(&diag, allocator, &.{
+        .{ .path = "root/arch_a.zig", .content = flags },
+        .{ .path = "root/arch_b.zig", .content = flags },
+    }, &.{"root"});
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "root/arch_a.zig", RULE_DUPLICATED_BLOCK),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "root/arch_b.zig", RULE_DUPLICATED_BLOCK),
+    );
+}
+
+test "ZA504 stand-in mirrors: a gapped pair in different roots stays silent (EPH-I1307)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // Eight code lines with one internal blank line: the blank never
+    // joins the stream, so the run's last covered stream line is the
+    // closer and the exact-span check must accept the gap (EPH-I1307).
+    const flags =
+        \\const OpenFlags = packed struct {
+        \\    read: bool,
+        \\    write: bool,
+        \\    exec: bool,
+        \\
+        \\    append: bool,
+        \\    truncate: bool,
+        \\    create: bool,
+        \\};
+    ;
+    var run = try runCloneTestRooted(&diag, allocator, &.{
+        .{ .path = "host/archive_manager.zig", .content = flags },
+        .{ .path = "kernel/vfs/types.zig", .content = flags },
+    }, &.{ "host", "kernel" });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), run.issues.items.len);
+}
+
+test "ZA504 stand-in mirrors: a run past the closer keeps firing (EPH-I1307)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The duplicated run extends past the decl's closer (a trailing
+    // const) while a blank gap sits inside the final window: the old
+    // end_line arithmetic landed on the closer and silenced the
+    // extension; the last-covered-stream-line read must see the const
+    // and keep the pair firing (EPH-I1307).
+    const flags =
+        \\const OpenFlags = packed struct {
+        \\    read: bool,
+        \\    write: bool,
+        \\    exec: bool,
+        \\
+        \\    append: bool,
+        \\    truncate: bool,
+        \\    create: bool,
+        \\};
+        \\const extra = 1;
+    ;
+    var run = try runCloneTestRooted(&diag, allocator, &.{
+        .{ .path = "host/archive_manager.zig", .content = flags },
+        .{ .path = "kernel/vfs/types.zig", .content = flags },
+    }, &.{ "host", "kernel" });
+    defer run.deinit(allocator);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "host/archive_manager.zig", RULE_DUPLICATED_BLOCK),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        countRuleIssues(run.issues.items, "kernel/vfs/types.zig", RULE_DUPLICATED_BLOCK),
+    );
+}
+
+test "wholeTypeOpener accepts backing-type groups and rejects non-groups (EPH-I1306)" {
+    const parse = wholeTypeOpener;
+    // Plain and packed openers stay accepted (EPH-I1295).
+    try std.testing.expect(parse("const A = struct {") != null);
+    try std.testing.expect(parse("const A = packed struct {") != null);
+    try std.testing.expect(parse("pub const A = extern union {") != null);
+    // Backing-type groups on struct and union (EPH-I1306).
+    try std.testing.expect(parse("const A = packed struct(u32) {") != null);
+    try std.testing.expect(parse("const A = union(enum) {") != null);
+    try std.testing.expect(parse("const A = extern union(u8) {") != null);
+    try std.testing.expect(parse("const A = struct (u32) {") != null);
+    // Rejections: an empty group, non-identifier content, a group on
+    // opaque, and a missing brace.
+    try std.testing.expect(parse("const A = struct() {") == null);
+    try std.testing.expect(parse("const A = struct(u32.5) {") == null);
+    try std.testing.expect(parse("const A = opaque(u32) {") == null);
+    try std.testing.expect(parse("const A = struct(u32) ") == null);
 }
 
 test "ZA504 same-file and cross-file duplication both report" {

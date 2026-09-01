@@ -1567,8 +1567,8 @@ Ephor uses three testing layers:
   defect the 0.15.0 release exposed) (EPH-I1291).
 - The AST tier now names its skip class (size cap, nesting, parse,
   spawn) with the hardcoded 64 KiB cap documented as the stack-coupled
-  bound. The 34 files over the 50 KB threshold that 0.15.0 skipped now
-  count into the analysis with a class note (EPH-I1297).
+  bound. The 34 files over the AST-tier byte cap that 0.15.0 skipped
+  silently now surface in a named per-class skip note (EPH-I1297).
 - ZA607 gains a counter-bounded suppressor for the fill-then-read loop
   shape, the dominant class of the 0.15.0 ZA607 surge. Failed checks
   stay in the fail-safe over-warn direction (EPH-I1293).

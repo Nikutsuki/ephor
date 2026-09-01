@@ -4259,18 +4259,13 @@ fn loopBodyStartCol(t: []const u8) ?usize {
 /// when the condition does not close on this line. A mid-line `\\` opener
 /// cuts the scan (EPH-I1269, serves REL-REDTEAM-4): its tail is string
 /// data, so a `)` there never closes the group (an invalid-Zig shape —
-/// valid Zig closes the group on a later line).
+/// valid Zig closes the group on a later line). The group close walks in
+/// parenCloseCol (EPH-I1299).
 fn loopCondCloseCol(t: []const u8) ?usize {
-    var depth: usize = 0;
     var walk = QuoteWalk.init(t);
     while (walk.next()) |i| : (walk.advance()) {
-        const c = t[i];
         if (types.isMultilineOpenerAt(t, i)) break;
-        if (c == '(') depth += 1;
-        if (c != ')') continue;
-        if (depth == 0) continue;
-        depth -= 1;
-        if (depth == 0) return i;
+        if (t[i] == '(') return parenCloseCol(t, i);
     }
     return null;
 }
@@ -6449,11 +6444,14 @@ fn readIsUncovered(sc: *const ReadScanCtx, var_name: []const u8, idx: usize) boo
     // the var per trip and increments count (EPH-I0131).
     if (isZeroTripGuardCovered(sc.da.lines, idx, var_name)) return false;
     // Check if a counter-bounded fill-then-read pair covers the read
-    // (EPH-I1293): a fill loop stores var[counter] per trip, and the
-    // read loop reads var[ri] under `ri` decremented from the counter.
-    // The read then observes only written elements, and a zero-trip
-    // fill leaves the counter zero, so the read loop never runs.
+    // (EPH-I1293, EPH-I1299): a fill loop stores var[counter] per trip,
+    // and the read loop reads var[ri] under `ri` decremented from the
+    // counter, or the expression-index siblings (var[c - 1 - i],
+    // var[i - 1]) under the same bound proof. The read then observes
+    // only written elements, and a zero-trip fill leaves the counter
+    // zero, so the read loop never runs.
     if (isCounterBoundedRead(sc, idx, read_col, var_name)) return false;
+    if (isExprCounterBoundedRead(sc, idx, read_col, var_name)) return false;
     // Check if the read is inside a null-guard on a variable that is only
     // set non-null in blocks that also assign the flagged variable.
     if (isNullGuardCorrelatedRead(sc.da.lines, idx, read_col, var_name)) return false;
@@ -6644,9 +6642,9 @@ fn nextGuardHopLine(lines: []const []const u8, search_from: usize) ?usize {
 /// (the one-line body form) reaches the guard-if through the read column
 /// (EPH-I0846/49).
 ///
-/// Documented residual (EPH-I0826): a LOOP-carried guard — a write loop
-/// gated by one counter and a read loop gated by the same counter —
-/// stays invisible to this suppressor. The RhyOS
+/// Documented residual, closed by EPH-I1299: a LOOP-carried guard — a
+/// write loop gated by one counter and a read loop gated by the same
+/// counter — stays invisible to THIS guard suppressor. The RhyOS
 /// net/dns_recursive.zig:2034 shape (`var tmp: [20]u8 = undefined`. The
 /// digit loop writes tmp[tmp_len] and bumps tmp_len. The reverse loop
 /// reads tmp[tmp_len - 1 - ri] under `ri < tmp_len`) has no unassigned
@@ -6654,9 +6652,10 @@ fn nextGuardHopLine(lines: []const []const u8, search_from: usize) ?usize {
 /// counter bounds the read to written elements. Correlating the two
 /// loops needs an invariant proof (the write loop increments tmp_len
 /// exactly once per element write) that the line-based guard model
-/// cannot carry soundly. The verdict is the fail-safe over-warn. The
-/// site is the regression pin (test "ZA607: loop-carried counter guard
-/// over-warns (EPH-I0826, documented residual)").
+/// cannot carry soundly. The counter-bounded suppressor carries it
+/// instead (isCounterBoundedRead, EPH-I1293, EPH-I1299), and the site
+/// is pinned silent (test "ZA607: loop-carried reverse copy stays
+/// silent (EPH-I0826, EPH-I1299)").
 fn isCorrelatedGuardRead(
     lines: []const []const u8,
     read_idx: usize,
@@ -6728,57 +6727,44 @@ fn isZeroTripGuardCovered(
 /// > 0)`. Every path to the read then observes a stored element: the
 /// read loop trips only when the counter recorded at least one storing
 /// trip, and an element store assigns the whole var under the EPH-I0132
-/// strictness semantic. The expression-index sibling (tmp[count - 1 -
-/// i]) stays the EPH-I0826 documented residual. Every failed check is
-/// the fail-safe over-warn direction. The windows match the guard
-/// family (EPH-I0225).
+/// strictness semantic. The expression-index siblings (tmp[count - 1 -
+/// i], tmp[i - 1]) ride the same proof through isExprCounterBoundedRead
+/// (EPH-I1299). Every failed check is the fail-safe over-warn
+/// direction. The windows match the guard family (EPH-I0225).
 fn isCounterBoundedRead(
     sc: *const ReadScanCtx,
     idx: usize,
     read_col: usize,
     var_name: []const u8,
 ) bool {
-    const lines = sc.da.lines;
-    const t = mem.trim(u8, lines[idx], " \t\r");
+    const t = mem.trim(u8, sc.da.lines[idx], " \t\r");
     const ri = elementReadIndexName(t, read_col, var_name) orelse return false;
-    const opener = enclosingLoopOpenerLine(lines, idx) orelse return false;
-    const ot = mem.trim(u8, lines[opener], " \t\r");
-    if (!whileConditionIsNameGtZero(ot, ri)) return false;
+    const oc = enclosingLoopOpenerText(sc, idx) orelse return false;
+    if (!whileConditionIsNameGtZero(oc.ot, ri)) return false;
     const read_walk = ReadLoopWalk{
-        .lines = lines,
-        .opener = opener,
+        .lines = sc.da.lines,
+        .opener = oc.opener,
         .read_idx = idx,
         .read_col = read_col,
         .ri = ri,
     };
     if (!read_walk.provesBound()) return false;
-    const decl = findCounterInitDecl(lines, opener, ri) orelse return false;
-    if (writesBetween(lines, decl.idx + 1, opener, ri)) return false;
-    const loop = findCounterLoop(lines, opener, decl.counter) orelse return false;
-    // The decl line is absolute (func_line + body idx); loop.loop_idx is
-    // a body index. Add the function base to compare in one space — the
-    // pre-fix cross-space comparison made the suppressor dead in every
-    // function starting at file line >= 6 (EPH-I1309).
-    if (sc.var_line >= sc.da.func_line + loop.loop_idx) return false;
-    if (!declaredZeroBefore(lines, loop.loop_idx, decl.counter)) return false;
-    if (!fillLoopStoresVar(lines, loop, decl.counter, var_name)) return false;
-    if (counterWrittenOutsideLoop(lines, loop, decl.idx, decl.counter)) return false;
-    // No counter write may sit outside the fill loop between the counter
-    // decl and the read loop: another loop's increment would break the
-    // trip-to-store correlation.
-    const outside = OutsideFillScan{
-        .lines = lines,
-        .c_decl = decl.idx,
-        .loop = loop,
-        .read_opener = opener,
-    };
-    return !outside.writesCounter(decl.counter);
+    const decl = findCounterInitDecl(sc.da.lines, oc.opener, ri) orelse return false;
+    if (writesBetween(sc.da.lines, decl.idx + 1, oc.opener, ri)) return false;
+    return counterFillProvesVar(.{
+        .sc = sc,
+        .opener = oc.opener,
+        .counter = decl.counter,
+        .outside_start = decl.idx,
+        .var_name = var_name,
+    });
 }
 
 /// The bare-identifier index of the flagged read when the read at
 /// `read_col` is the direct-index element form var[ri], else null
 /// (EPH-I1293). An expression index (digits[count - 1 - i]) returns
-/// null: that bound proof stays the EPH-I0826 documented residual.
+/// null: the expression forms ride the EPH-I1299 expression-index
+/// suppressor (isExprCounterBoundedRead) instead.
 fn elementReadIndexName(t: []const u8, read_col: usize, var_name: []const u8) ?[]const u8 {
     if (read_col + var_name.len >= t.len) return null;
     const open = read_col + var_name.len;
@@ -6805,6 +6791,19 @@ fn enclosingLoopOpenerLine(lines: []const []const u8, idx: usize) ?usize {
         if (isLoopOpenerLine(t)) return line;
     }
     return null;
+}
+
+/// The nearest enclosing loop opener body index and its trimmed text,
+/// else null (EPH-I1293, EPH-I1299). The shared opener discovery of
+/// the direct and the expression counter-bounded suppressors.
+const LoopOpenerCtx = struct {
+    opener: usize,
+    ot: []const u8,
+};
+
+fn enclosingLoopOpenerText(sc: *const ReadScanCtx, idx: usize) ?LoopOpenerCtx {
+    const opener = enclosingLoopOpenerLine(sc.da.lines, idx) orelse return null;
+    return .{ .opener = opener, .ot = mem.trim(u8, sc.da.lines[opener], " \t\r") };
 }
 
 /// True when the opener line is a `while` whose condition is exactly
@@ -6977,15 +6976,69 @@ fn statementSegmentBefore(line: []const u8, pos: usize) []const u8 {
     return mem.trim(u8, line[seg_start..pos], " \t");
 }
 
-/// True when the trimmed statement segment before `pos` starts an
-/// errdefer statement (EPH-I1304). An errdefer increment fires only
-/// when an error propagates out of the enclosing function, never per
-/// trip, so it never provides the per-trip credit. A braced
-/// `errdefer { ... }` increment never reaches this check: the `{`
-/// resets the segment start (accepted FN, shared with EPH-I1301).
+/// True when the trimmed statement segment before `pos` is an errdefer
+/// statement or the body of a braceless conditional — the
+/// conditional-prefix form `if (x) errdefer dlen += 1;` (EPH-I1304,
+/// EPH-I1305). An errdefer increment fires only when an error
+/// propagates out of the enclosing function, never per trip, so it
+/// never provides the per-trip credit. The conditional-prefix form
+/// starts with the conditional opener, so the segment-prefix check
+/// alone credited it as a plain increment — the fail-open FN the walk
+/// closes. A braced `errdefer { ... }` increment never reaches this
+/// check: the `{` resets the segment start (accepted FN, shared with
+/// EPH-I1301).
 fn isErrdeferStatementAt(line: []const u8, pos: usize) bool {
     const segment = statementSegmentBefore(line, pos);
-    return startsWithKeyword(segment, "errdefer");
+    if (startsWithKeyword(segment, "errdefer")) return true;
+    const body = afterConditionalPrefix(segment) orelse return false;
+    return startsWithKeyword(body, "errdefer");
+}
+
+/// The statement text after a leading conditional opener — `if (...)`,
+/// `else`, `else if (...)`, `while (...)` with its continuation, `for
+/// (...)` with its capture, `switch (...)` — or null when no such
+/// opener starts `t` or its condition does not close on the line. A
+/// multi-line condition leaves the body on a later line, so a
+/// conditional errdefer there stays unseen — accepted FN (EPH-I1305).
+fn afterConditionalPrefix(t: []const u8) ?[]const u8 {
+    if (startsWithKeyword(t, "else")) {
+        const else_body = mem.trimStart(u8, t["else".len..], " \t");
+        if (!startsWithKeyword(else_body, "if")) return else_body;
+    }
+    const opener = leadingConditionalKeyword(t) orelse return null;
+    const is_loop = mem.eql(u8, opener.kw, "while") or mem.eql(u8, opener.kw, "for");
+    var rest = mem.trimStart(u8, opener.tail, " \t");
+    if (rest.len == 0 or rest[0] != '(') return null;
+    const close = loopCondCloseCol(rest) orelse return null;
+    rest = mem.trimStart(u8, rest[close + 1 ..], " \t");
+    if (!is_loop) return rest;
+    // The loop headers carry a `|capture|` (for) and a `: (continuation)`
+    // (while) between the condition and the body.
+    var pos: usize = 0;
+    pos = skipPayloadCapture(rest, pos);
+    pos = skipLoopContinuation(rest, pos);
+    return mem.trimStart(u8, rest[pos..], " \t");
+}
+
+/// The conditional opener keyword `t` starts with and the text after
+/// it, or null (EPH-I1305). A leading `else` is consumed first, so
+/// `else if (...)` reports the `if`. A bare `else` returns null: the
+/// caller handles it before this helper runs.
+const ConditionalKeyword = struct {
+    kw: []const u8,
+    tail: []const u8,
+};
+
+fn leadingConditionalKeyword(t: []const u8) ?ConditionalKeyword {
+    var rest = t;
+    if (startsWithKeyword(rest, "else")) {
+        rest = mem.trimStart(u8, rest["else".len..], " \t");
+    }
+    const kws = [_][]const u8{ "if", "while", "for", "switch" };
+    for (kws) |kw| {
+        if (startsWithKeyword(rest, kw)) return .{ .kw = kw, .tail = rest[kw.len..] };
+    }
+    return null;
 }
 
 /// True when the trimmed text starts a defer or errdefer statement
@@ -7056,25 +7109,45 @@ const CounterInitDecl = struct {
     counter: []const u8,
 };
 
-fn findCounterInitDecl(
+/// One decl found by the backward decl walk (EPH-I1293, EPH-I1299):
+/// its line and its initializer text.
+const NamedInitDecl = struct {
+    idx: usize,
+    rhs: []const u8,
+};
+
+/// The nearest decl of `name` before `before_idx` within the guard
+/// window, with its initializer text, else null (EPH-I1293,
+/// EPH-I1299). The shared walk of the counter-init and bound decl
+/// lookups: each caller filters the initializer shape it admits.
+fn findNamedInitDecl(
     lines: []const []const u8,
-    opener: usize,
-    ri: []const u8,
-) ?CounterInitDecl {
-    const stop = opener -| guard_candidate_window;
-    var i = opener;
+    before_idx: usize,
+    name: []const u8,
+) ?NamedInitDecl {
+    const stop = before_idx -| guard_candidate_window;
+    var i = before_idx;
     while (i > stop) {
         i -= 1;
         const t = mem.trim(u8, lines[i], " \t\r");
         if (isCommentOrMultilineString(t)) continue;
         const decl_name = extractVarDeclName(t) orelse continue;
-        if (!mem.eql(u8, decl_name, ri)) continue;
+        if (!mem.eql(u8, decl_name, name)) continue;
         const after = declInitializerStart(t) orelse continue;
         const rhs = trimTrailingSemicolon(mem.trim(u8, t[after..], " \t"));
-        if (rhs.len == 0 or !isAllIdent(rhs)) continue;
-        return .{ .idx = i, .counter = rhs };
+        return .{ .idx = i, .rhs = rhs };
     }
     return null;
+}
+
+fn findCounterInitDecl(
+    lines: []const []const u8,
+    opener: usize,
+    ri: []const u8,
+) ?CounterInitDecl {
+    const d = findNamedInitDecl(lines, opener, ri) orelse return null;
+    if (d.rhs.len == 0 or !isAllIdent(d.rhs)) return null;
+    return .{ .idx = d.idx, .counter = d.rhs };
 }
 
 /// The initializer text with one trailing `;` removed (EPH-I1293): the
@@ -7280,6 +7353,565 @@ const OutsideFillScan = struct {
         return false;
     }
 };
+
+/// One fill-side query of the counter-bounded suppressors
+/// (EPH-I1293, EPH-I1299): the read scan, the read-loop opener, the
+/// fill counter, the anchor line of the outside-write scan, and the
+/// tracked var.
+const CounterFillQuery = struct {
+    sc: *const ReadScanCtx,
+    opener: usize,
+    counter: []const u8,
+    outside_start: usize,
+    var_name: []const u8,
+};
+
+/// The shared fill-side tail of the counter-bounded suppressors
+/// (EPH-I1293, EPH-I1299): the counter's fill loop stores the var per
+/// trip, the counter declares zero before the fill, and no counter
+/// write sits outside the fill span between `outside_start` and the
+/// read loop. `outside_start` anchors the outside-write scan: the
+/// read-index decl for the direct forms, the counter's own zero decl
+/// for the expression form whose index names the counter directly.
+fn counterFillProvesVar(q: CounterFillQuery) bool {
+    const lines = q.sc.da.lines;
+    const loop = findCounterLoop(lines, q.opener, q.counter) orelse return false;
+    // The decl line is absolute (func_line + body idx); loop.loop_idx is
+    // a body index. Add the function base to compare in one space — the
+    // pre-fix cross-space comparison made the suppressor dead in every
+    // function starting at file line >= 6 (EPH-I1309).
+    if (q.sc.var_line >= q.sc.da.func_line + loop.loop_idx) return false;
+    if (!declaredZeroBefore(lines, loop.loop_idx, q.counter)) return false;
+    if (!fillLoopStoresVar(lines, loop, q.counter, q.var_name)) return false;
+    if (counterWrittenOutsideLoop(lines, loop, q.outside_start, q.counter)) return false;
+    // No counter write may sit outside the fill loop between the counter
+    // decl and the read loop: another loop's increment would break the
+    // trip-to-store correlation.
+    const outside = OutsideFillScan{
+        .lines = lines,
+        .c_decl = q.outside_start,
+        .loop = loop,
+        .read_opener = q.opener,
+    };
+    return !outside.writesCounter(q.counter);
+}
+
+/// The two admitted expression-index shapes (EPH-I1299).
+const ExprIndexForm = enum { minus_one_minus, minus_one };
+
+/// The parsed expression-index read (EPH-I1299): `c - 1 - i` (the
+/// EPH-I0826 reverse copy — the read loop ascends from zero) and
+/// `i - 1` (the decrementing reverse copy — the read loop descends
+/// from the counter). `counter` carries the fill counter only for the
+/// minus_one_minus form; the minus_one form derives the counter from
+/// the loop var's decl.
+const ExprRead = struct {
+    form: ExprIndexForm,
+    counter: ?[]const u8,
+    loop_var: []const u8,
+};
+
+/// One expression-index read query (EPH-I1299): the read scan, the
+/// read body index, the enclosing loop opener, its trimmed text, and
+/// the tracked var.
+const ExprReadCtx = struct {
+    sc: *const ReadScanCtx,
+    idx: usize,
+    opener: usize,
+    ot: []const u8,
+    var_name: []const u8,
+};
+
+/// The expression-index counter-bounded suppressor (EPH-I1299): the
+/// read at (idx, read_col) carries the bracket index `c - 1 - i` or
+/// `i - 1`. The fill side is the same trip-to-store proof as the
+/// direct form: the counter counts storing trips, and the index
+/// algebra keeps every read inside the written elements. The loop
+/// var's per-trip step must sit in the while continuation — a body
+/// step before the read underflows the index expression on the last
+/// trip. Every failed check is the fail-safe over-warn direction.
+/// Rejected neighbors stay firing (documented FN): `c - 2` offsets, a
+/// mixed `other - 1` index, a counter decrement before the fill
+/// completes, cast-wrapped loop vars, and multi-range for captures.
+fn isExprCounterBoundedRead(
+    sc: *const ReadScanCtx,
+    idx: usize,
+    read_col: usize,
+    var_name: []const u8,
+) bool {
+    const lines = sc.da.lines;
+    const t = mem.trim(u8, lines[idx], " \t\r");
+    const expr = exprReadIndexAt(t, read_col, var_name) orelse return false;
+    const oc = enclosingLoopOpenerText(sc, idx) orelse return false;
+    const ctx = ExprReadCtx{
+        .sc = sc,
+        .idx = idx,
+        .opener = oc.opener,
+        .ot = oc.ot,
+        .var_name = var_name,
+    };
+    return switch (expr.form) {
+        .minus_one => minusOneReadCovered(ctx, expr),
+        .minus_one_minus => minusOneMinusReadCovered(ctx, expr),
+    };
+}
+
+/// The `i - 1` read shape (EPH-I1299): the read loop descends from the
+/// counter under `while (i > 0) : (i -= 1)`, so the trips read the
+/// elements counter - 1 down to 0 — the written range in reverse. The
+/// decrement must sit in the continuation: a body decrement before the
+/// read underflows the index on the last trip, and any other body
+/// write to the loop var shifts a later trip's read past the written
+/// range.
+fn minusOneReadCovered(ctx: ExprReadCtx, expr: ExprRead) bool {
+    const loop_var = expr.loop_var;
+    if (!whileDescendingHeader(ctx.ot, loop_var)) return false;
+    const decl = findCounterInitDecl(ctx.sc.da.lines, ctx.opener, loop_var) orelse return false;
+    if (writesBetween(ctx.sc.da.lines, decl.idx + 1, ctx.opener, loop_var)) return false;
+    return exprReadTailCovered(ctx, .{ loop_var, loop_var }, decl.counter, decl.idx);
+}
+
+/// The `c - 1 - i` read shape (EPH-I1299): the read loop ascends from
+/// zero under `i < c` (the bare comparison, a top-level `and` conjunct,
+/// or a min-derived bound) with `: (i += 1)`, or runs as `for (0..c)
+/// |i|`. The trips read the elements counter - 1 down to 0 — the
+/// written range in reverse. The index re-reads the counter every
+/// trip, so the read loop body must write neither the loop var nor the
+/// counter: a body counter write would shift the next read past the
+/// written range.
+fn minusOneMinusReadCovered(ctx: ExprReadCtx, expr: ExprRead) bool {
+    const loop_var = expr.loop_var;
+    const counter = expr.counter.?;
+    const while_bound = whileAscendingHeader(ctx.ot, loop_var);
+    const for_counter = forRangeHeader(ctx.ot, loop_var);
+    if (for_counter) |fc| {
+        if (!mem.eql(u8, fc, counter)) return false;
+    } else if (while_bound) |b| {
+        if (!boundMatchesCounter(ctx.sc.da.lines, ctx.opener, b, counter)) return false;
+        const decl = findZeroInitDecl(ctx.sc.da.lines, ctx.opener, loop_var) orelse return false;
+        if (writesBetween(ctx.sc.da.lines, decl + 1, ctx.opener, loop_var)) return false;
+    } else {
+        return false;
+    }
+    const c_decl = findZeroInitDecl(ctx.sc.da.lines, ctx.opener, counter) orelse return false;
+    return exprReadTailCovered(ctx, .{ loop_var, counter }, counter, c_decl);
+}
+
+/// The shared read-side tail of the expression-index suppressors
+/// (EPH-I1299): the read-loop body must write neither tracked name,
+/// and the fill side proves the counter covers the read.
+fn exprReadTailCovered(
+    ctx: ExprReadCtx,
+    names: [2][]const u8,
+    counter: []const u8,
+    c_decl: usize,
+) bool {
+    const query = BodyWriteQuery{
+        .lines = ctx.sc.da.lines,
+        .opener_idx = ctx.opener,
+        .bound = ctx.idx +| guard_candidate_window,
+        .names = names,
+    };
+    if (readLoopBodyWritesAny(query)) return false;
+    return counterFillProvesVar(.{
+        .sc = ctx.sc,
+        .opener = ctx.opener,
+        .counter = counter,
+        .outside_start = c_decl,
+        .var_name = ctx.var_name,
+    });
+}
+
+/// The bracket index expression of the read at `read_col` when it is
+/// one of the two admitted shapes, else null (EPH-I1299).
+fn exprReadIndexAt(t: []const u8, read_col: usize, var_name: []const u8) ?ExprRead {
+    if (read_col + var_name.len >= t.len) return null;
+    const open = read_col + var_name.len;
+    if (t[open] != '[') return null;
+    const close = skipBracketed(t, open) orelse return null;
+    return parseExprIndex(mem.trim(u8, t[open + 1 .. close - 1], " \t"));
+}
+
+/// The two token shapes of an admitted expression index (EPH-I1299):
+/// `<c> - 1 - <i>` (counter minus one minus loop var) and `<i> - 1`.
+/// Spacing-insensitive, nothing else admitted: an offset (`c - 2`), a
+/// cast-wrapped var, or a parenthesized term returns null and the site
+/// keeps firing.
+fn parseExprIndex(contents: []const u8) ?ExprRead {
+    var pos: usize = 0;
+    pos = skipHorizontalSpace(contents, pos);
+    const first = identTokenAt(contents, pos) orelse return null;
+    pos = skipHorizontalSpace(contents, pos + first.len);
+    if (pos >= contents.len or contents[pos] != '-') return null;
+    pos = skipHorizontalSpace(contents, pos + 1);
+    if (pos >= contents.len or contents[pos] != '1') return null;
+    if (pos + 1 < contents.len and isIdent(contents[pos + 1])) return null;
+    pos = skipHorizontalSpace(contents, pos + 1);
+    if (pos == contents.len) return .{ .form = .minus_one, .counter = null, .loop_var = first };
+    if (contents[pos] != '-') return null;
+    pos = skipHorizontalSpace(contents, pos + 1);
+    const second = identTokenAt(contents, pos) orelse return null;
+    pos = skipHorizontalSpace(contents, pos + second.len);
+    if (pos != contents.len) return null;
+    if (mem.eql(u8, first, second)) return null;
+    return .{ .form = .minus_one_minus, .counter = first, .loop_var = second };
+}
+
+/// The identifier token at `pos`, or null when `pos` is out of bounds
+/// or the byte is not an identifier start — a digit never starts an
+/// identifier, so `16` and `0` parse as null (EPH-I1299).
+fn identTokenAt(t: []const u8, pos: usize) ?[]const u8 {
+    if (pos >= t.len) return null;
+    if (!isIdent(t[pos]) or std.ascii.isDigit(t[pos])) return null;
+    var end = pos + 1;
+    while (end < t.len and isIdent(t[end])) end += 1;
+    return t[pos..end];
+}
+
+/// The bound var of a `while (<loop_var> < b) : (<loop_var> += 1)`
+/// read loop, or null when the opener does not carry exactly that
+/// header (EPH-I1299). The continuation must be exactly the one-step
+/// increment.
+fn whileAscendingHeader(t: []const u8, loop_var: []const u8) ?[]const u8 {
+    const rest = stripLabel(t);
+    if (!mem.startsWith(u8, rest, "while(") and !mem.startsWith(u8, rest, "while ")) return null;
+    const open = mem.indexOf(u8, rest, "(") orelse return null;
+    const close = loopCondCloseCol(rest) orelse return null;
+    if (close <= open) return null;
+    const cond = mem.trim(u8, rest[open + 1 .. close], " \t");
+    const b = conditionBoundsLoopVar(cond, loop_var) orelse return null;
+    if (!continuationIncrementsOne(rest, close, loop_var)) return null;
+    return b;
+}
+
+/// True when the opener is `while (<loop_var> > 0) : (<loop_var> -= 1)`
+/// exactly — the decrementing reverse copy header (EPH-I1299). The
+/// condition check is the existing direct-shape form; the continuation
+/// must be exactly the one-step decrement.
+fn whileDescendingHeader(t: []const u8, loop_var: []const u8) bool {
+    if (!whileConditionIsNameGtZero(t, loop_var)) return false;
+    const rest = stripLabel(t);
+    const close = loopCondCloseCol(rest) orelse return false;
+    return continuationDecrementsOne(rest, close, loop_var);
+}
+
+/// The range bound when the opener is `for (0..<bound>) |<loop_var>|`
+/// exactly — the for-form reverse copy header (EPH-I1299). The range
+/// must start at zero and the capture must be the loop var alone:
+/// multi-range and multi-capture forms stay excluded (FN).
+fn forRangeHeader(t: []const u8, loop_var: []const u8) ?[]const u8 {
+    const rest = stripLabel(t);
+    if (!mem.startsWith(u8, rest, "for(") and !mem.startsWith(u8, rest, "for ")) return null;
+    const open = mem.indexOf(u8, rest, "(") orelse return null;
+    const close = loopCondCloseCol(rest) orelse return null;
+    if (close <= open) return null;
+    const range = mem.trim(u8, rest[open + 1 .. close], " \t");
+    const dots = mem.indexOf(u8, range, "..") orelse return null;
+    const lhs = mem.trim(u8, range[0..dots], " \t");
+    if (!mem.eql(u8, lhs, "0")) return null;
+    const rhs = mem.trim(u8, range[dots + 2 ..], " \t");
+    if (rhs.len == 0 or !isAllIdent(rhs)) return null;
+    var pos = close + 1;
+    pos = skipHorizontalSpace(rest, pos);
+    if (pos >= rest.len or rest[pos] != '|') return null;
+    const pipe = mem.indexOfScalarPos(u8, rest, pos + 1, '|') orelse return null;
+    const capture = mem.trim(u8, rest[pos + 1 .. pipe], " \t");
+    if (!mem.eql(u8, capture, loop_var)) return null;
+    return rhs;
+}
+
+/// The bound var when the condition bounds `loop_var` from above: the
+/// bare comparison `<loop_var> < b` or one conjunct of a top-level
+/// `and`/`&&` chain (EPH-I1299). Extra conjuncts only tighten the
+/// bound, so the first bound conjunct names the proof's bound and the
+/// rest are ignored — every trip still satisfies the first conjunct.
+/// A conjunct that writes the loop var or the bound breaks the proof:
+/// a write in the condition shifts the bound per check. A bound
+/// conjunct whose bound does not name the counter falls to
+/// boundMatchesCounter and stays rejected there (FN direction).
+fn conditionBoundsLoopVar(cond: []const u8, loop_var: []const u8) ?[]const u8 {
+    if (conditionIsLessThan(cond, loop_var)) |b| return b;
+    var parts: [4][]const u8 = undefined;
+    const n = topLevelAndParts(cond, &parts);
+    var bound: ?[]const u8 = null;
+    for (parts[0..n]) |part| {
+        const p = mem.trim(u8, part, " \t\r");
+        if (conditionIsLessThan(p, loop_var)) |b| {
+            if (bound == null) bound = b;
+        }
+    }
+    const b = bound orelse return null;
+    for (parts[0..n]) |part| {
+        const p = mem.trim(u8, part, " \t\r");
+        if (conditionIsLessThan(p, loop_var) != null) continue;
+        if (lineWritesName(p, loop_var) or lineWritesName(p, b)) return null;
+    }
+    return b;
+}
+
+/// `<loop_var> < b` exactly (b a bare identifier), spacing-insensitive
+/// (EPH-I1299).
+fn conditionIsLessThan(cond: []const u8, loop_var: []const u8) ?[]const u8 {
+    var pos: usize = 0;
+    pos = skipHorizontalSpace(cond, pos);
+    const lv = identTokenAt(cond, pos) orelse return null;
+    if (!mem.eql(u8, lv, loop_var)) return null;
+    pos = skipHorizontalSpace(cond, pos + lv.len);
+    if (pos >= cond.len or cond[pos] != '<') return null;
+    pos = skipHorizontalSpace(cond, pos + 1);
+    const b = identTokenAt(cond, pos) orelse return null;
+    return if (skipHorizontalSpace(cond, pos + b.len) == cond.len) b else null;
+}
+
+/// True when the `and`/`&&` operator starts at `i` of `cond`
+/// (EPH-I1299). The char fast-path skips the word check on every other
+/// byte.
+fn isAndKeywordAt(cond: []const u8, i: usize, c: u8) bool {
+    return (c == 'a' and wordOccursAt(cond, i, "and")) or
+        (c == '&' and i + 1 < cond.len and cond[i + 1] == '&');
+}
+
+/// True when the `or`/`||` operator starts at `i` of `cond`
+/// (EPH-I1299). The char fast-path skips the word check on every other
+/// byte.
+fn isOrKeywordAt(cond: []const u8, i: usize, c: u8) bool {
+    return (c == 'o' and wordOccursAt(cond, i, "or")) or
+        (c == '|' and i + 1 < cond.len and cond[i + 1] == '|');
+}
+
+/// The source length of the boolean operator starting at `i` — 3 for
+/// the `and` word, 2 for `&&` (EPH-I1299).
+fn boolOpLen(c: u8) usize {
+    return if (c == 'a') 3 else 2;
+}
+
+/// The top-level `and`/`&&` conjuncts of `cond` into `out`, or zero
+/// when the split truncates past `out.len` or a top-level `or`/`||`
+/// appears — a dropped conjunct could carry the very write the callers
+/// check for, and `and` binds tighter than `or`, so a mixed chain
+/// admits trips the bound conjunct does not gate. Both fail closed
+/// (EPH-I1299). The walk is quote-masked and depth-aware: a `and`
+/// inside a group stays nested.
+fn topLevelAndParts(cond: []const u8, out: [][]const u8) usize {
+    var depth: usize = 0;
+    var start: usize = 0;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < cond.len) {
+        const c = cond[i];
+        if (skipLiteral(cond, &i)) continue;
+        depth = updatedBracketDepth(depth, c);
+        if (depth == 0 and isOrKeywordAt(cond, i, c)) return 0;
+        if (depth == 0 and isAndKeywordAt(cond, i, c)) {
+            if (n >= out.len) return 0;
+            out[n] = cond[start..i];
+            n += 1;
+            start = i + boolOpLen(c);
+            i = start;
+            continue;
+        }
+        i += 1;
+    }
+    if (n >= out.len) return 0;
+    out[n] = cond[start..];
+    return n + 1;
+}
+
+/// Index of the `)` closing the paren group opening at `open`, else
+/// null — the paren-group sibling of skipBracketed (EPH-I1299). The
+/// walk is quote-masked and counts only parens: a `]` or `}` never
+/// closes a `(` group. A mid-line `\\` opener cuts the scan: its tail
+/// is string data (the loopCondCloseCol convention).
+fn parenCloseCol(t: []const u8, open: usize) ?usize {
+    var depth: usize = 0;
+    var walk = QuoteWalk.init(t);
+    while (walk.next()) |i| : (walk.advance()) {
+        if (types.isMultilineOpenerAt(t, i)) break;
+        if (i < open) continue;
+        const c = t[i];
+        if (c == '(') depth += 1;
+        if (c != ')') continue;
+        if (depth == 0) continue;
+        depth -= 1;
+        if (depth == 0) return i;
+    }
+    return null;
+}
+
+/// The `: (continuation)` group text after the condition's closing `)`
+/// at `cond_close`, else null (EPH-I1299). The group must close on the
+/// opener line.
+fn continuationGroup(t: []const u8, cond_close: usize) ?[]const u8 {
+    var pos = cond_close + 1;
+    pos = skipHorizontalSpace(t, pos);
+    if (pos >= t.len or t[pos] != ':') return null;
+    pos = skipHorizontalSpace(t, pos + 1);
+    if (pos >= t.len or t[pos] != '(') return null;
+    const close = parenCloseCol(t, pos) orelse return null;
+    return mem.trim(u8, t[pos + 1 .. close], " \t");
+}
+
+/// True when the continuation group after `cond_close` is exactly
+/// `<name> += 1` or `<name> +%= 1` (EPH-I1299). Anything else — a
+/// multi-statement group, another operand — never credits.
+fn continuationIncrementsOne(t: []const u8, cond_close: usize, name: []const u8) bool {
+    const inner = continuationGroup(t, cond_close) orelse return false;
+    if (!wordOccursAt(inner, 0, name)) return false;
+    const after = mem.trimStart(u8, inner[name.len..], " \t");
+    const op_len = oneStepOpLen(after) orelse return false;
+    const rhs = mem.trimStart(u8, after[op_len..], " \t");
+    return rhs.len == 1 and rhs[0] == '1';
+}
+
+/// True when the continuation group after `cond_close` is exactly
+/// `<name> -= 1` (EPH-I1299). Anything else never credits.
+fn continuationDecrementsOne(t: []const u8, cond_close: usize, name: []const u8) bool {
+    const inner = continuationGroup(t, cond_close) orelse return false;
+    if (!wordOccursAt(inner, 0, name)) return false;
+    const after = mem.trimStart(u8, inner[name.len..], " \t");
+    if (!mem.startsWith(u8, after, "-=")) return false;
+    const rhs = mem.trimStart(u8, after[2..], " \t");
+    return rhs.len == 1 and rhs[0] == '1';
+}
+
+/// True when the condition's bound var `b` names the fill counter:
+/// directly, or through a same-window decl whose initializer is the
+/// counter or a `@min` with the counter as one argument (EPH-I1299).
+/// The min bound only tightens the trip count, so the read index stays
+/// inside the written range. A bound var written between its decl and
+/// the read loop breaks the proof.
+fn boundMatchesCounter(
+    lines: []const []const u8,
+    opener: usize,
+    b: []const u8,
+    counter: []const u8,
+) bool {
+    if (mem.eql(u8, b, counter)) return true;
+    const d = findNamedInitDecl(lines, opener, b) orelse return false;
+    if (lineWritesName(d.rhs, counter)) return false;
+    if (!rhsIsMinBound(d.rhs, counter)) return false;
+    return !writesBetween(lines, d.idx + 1, opener, b);
+}
+
+/// True when `rhs` is the bare counter or `@min(...)` with the counter
+/// as one argument (EPH-I1299): min only lowers the bound.
+fn rhsIsMinBound(rhs: []const u8, counter: []const u8) bool {
+    if (mem.eql(u8, rhs, counter)) return true;
+    if (!mem.startsWith(u8, rhs, "@min")) return false;
+    var pos: usize = 4;
+    pos = skipHorizontalSpace(rhs, pos);
+    if (pos >= rhs.len or rhs[pos] != '(') return false;
+    const close = parenCloseCol(rhs, pos) orelse return false;
+    var parts: [4][]const u8 = undefined;
+    const n = splitTopLevelArgs(rhs[pos + 1 .. close], &parts);
+    if (n != 2) return false;
+    const a = mem.trim(u8, parts[0], " \t");
+    const b2 = mem.trim(u8, parts[1], " \t");
+    if (a.len == 0 or b2.len == 0) return false;
+    return mem.eql(u8, a, counter) or mem.eql(u8, b2, counter);
+}
+
+/// The line of the nearest `var <name> = 0` decl before `before_idx`
+/// within the guard window, else null (EPH-I1299). The walk shares
+/// findNamedInitDecl; the var-only and literal-zero filters keep the
+/// former isZeroCounterDecl semantics — a `const`, a non-zero
+/// initializer, or an offset decl is skipped and the scan continues.
+fn findZeroInitDecl(
+    lines: []const []const u8,
+    before_idx: usize,
+    name: []const u8,
+) ?usize {
+    var before = before_idx;
+    while (true) {
+        const d = findNamedInitDecl(lines, before, name) orelse return null;
+        if (rhsIsLiteralZero(d.rhs)) {
+            const t = mem.trim(u8, lines[d.idx], " \t\r");
+            if (mem.startsWith(u8, t, "var ")) return d.idx;
+        }
+        before = d.idx;
+    }
+}
+
+/// True when `rhs` is the literal-zero initializer (EPH-I1299): the
+/// bare `0`, no fraction and no suffix — the former isZeroCounterDecl
+/// tail check on the semicolon-stripped text.
+fn rhsIsLiteralZero(rhs: []const u8) bool {
+    return rhs.len > 0 and rhs[0] == '0' and (rhs.len == 1 or (!isIdent(rhs[1]) and rhs[1] != '.'));
+}
+
+/// One read-loop body-write query (EPH-I1299): the body lines, the
+/// opener body index, the window end, and the two names any body write
+/// of which breaks the proof.
+const BodyWriteQuery = struct {
+    lines: []const []const u8,
+    opener_idx: usize,
+    bound: usize,
+    names: [2][]const u8,
+};
+
+/// True when a word-bounded write of either tracked name occurs on the
+/// line (EPH-I1299).
+fn namesWrittenOnLine(t: []const u8, names: [2][]const u8) bool {
+    return lineWritesName(t, names[0]) or lineWritesName(t, names[1]);
+}
+
+/// One braced-body line's fold verdict for the write walks
+/// (EPH-I1209, EPH-I1299): still open, closed at this line, or
+/// divergent (fail closed).
+const BracedWalkVerdict = enum { open, closed, divergent };
+
+/// Fold one body line's braces into the carried depth and report the
+/// walk state (EPH-I1299): still open, closed at this line, or
+/// divergent (fail closed). Non-close-first lines fold with the
+/// net-zero convention, so one-line blocks and struct literals leave
+/// the depth unchanged (mirrors bracedLoopBodyEnd, EPH-I1209).
+fn foldBracedWalkLine(code: []const u8, depth: *usize) BracedWalkVerdict {
+    if (code.len == 0 or code[0] != '}') {
+        const before = depth.*;
+        depth.* = foldNonCloseLine(code, depth.*);
+        if (depth.* != 0) return .open;
+        if (trailingClosePos(code, before) == null) return .divergent;
+        return .closed;
+    }
+    const run = leadingCloseRun(code);
+    if (run.closes >= depth.*) return .closed;
+    const bc = braceCountOnLine(code);
+    depth.* = (depth.* -| bc.closes) + bc.opens;
+    return .open;
+}
+
+/// True when the read loop's body at `opener_idx` writes either
+/// tracked name anywhere between the body start and the body close, or
+/// the close is not found within the window — fail-closed (EPH-I1299).
+/// The whole body matters, not only the window before the read: the
+/// index expression re-reads the counter every trip, so a write after
+/// one read shifts the next read past the written range. The walk
+/// mirrors bracedLoopBodyEnd's conventions (EPH-I1177, EPH-I1191,
+/// EPH-I1209). A braceless body is one statement, so only the opener
+/// line's tail counts — a statement that spans lines keeps its later
+/// lines unseen (accepted FN, shared with the direct-shape walk).
+fn readLoopBodyWritesAny(q: BodyWriteQuery) bool {
+    const t = mem.trim(u8, q.lines[q.opener_idx], " \t\r");
+    const body_start = loopBodyStartCol(t) orelse return true;
+    if (body_start >= t.len) return true; // Allman body — fail closed
+    const is_braced = t[body_start] == '{';
+    const from = body_start + @intFromBool(is_braced);
+    if (namesWrittenOnLine(t[from..], q.names)) return true;
+    if (!is_braced) return false;
+    if (hasOnelineLoopClose(t)) return false;
+    var depth: usize = 1;
+    var j = q.opener_idx + 1;
+    const walk_end = @min(q.bound, q.lines.len);
+    while (j < walk_end) : (j += 1) {
+        const body = mem.trim(u8, q.lines[j], " \t\r");
+        if (isCommentOrMultilineString(body)) continue;
+        if (namesWrittenOnLine(body, q.names)) return true;
+        const verdict = foldBracedWalkLine(stripLineComment(body), &depth);
+        if (verdict == .divergent) return true;
+        if (verdict == .closed) return false;
+    }
+    return true; // no close within the window — fail closed
+}
 
 /// Span of the loop whose trip counter `counter` increments: the opener
 /// line and the first line AFTER its body (the body end is exclusive —
@@ -7661,40 +8293,10 @@ fn zeroTripGuardCounter(t: []const u8) ?[]const u8 {
 /// True when `counter` declares with a literal-zero initializer before
 /// `before_idx` (the loop opener), with no counter write in between.
 fn declaredZeroBefore(lines: []const []const u8, before_idx: usize, counter: []const u8) bool {
-    const stop = before_idx -| guard_candidate_window;
-    var decl: ?usize = null;
-    var i = before_idx;
-    while (i > stop) {
-        i -= 1;
-        const t = mem.trim(u8, lines[i], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        if (!isZeroCounterDecl(t, counter)) continue;
-        // The first `var <counter> = 0` is the counter's origin — any
-        // earlier counter write contradicts it, so it wins.
-        decl = i;
-        break;
-    }
-    const decl_idx = decl orelse return false;
+    const decl_idx = findZeroInitDecl(lines, before_idx, counter) orelse return false;
     // A counter write between the decl and the loop breaks the guard's
     // zero reading meaning zero trips.
-    var j = decl_idx + 1;
-    while (j < before_idx) : (j += 1) {
-        const t = mem.trim(u8, lines[j], " \t\r");
-        if (isCommentOrMultilineString(t)) continue;
-        if (lineWritesName(t, counter)) return false;
-    }
-    return true;
-}
-
-/// True when `t` declares `counter` with a literal-zero initializer.
-fn isZeroCounterDecl(t: []const u8, counter: []const u8) bool {
-    if (!mem.startsWith(u8, t, "var ")) return false;
-    const decl_name = extractVarDeclName(t) orelse return false;
-    if (!mem.eql(u8, decl_name, counter)) return false;
-    const after = declInitializerStart(t) orelse return false;
-    const rhs = mem.trim(u8, t[after..], " \t");
-    if (!mem.startsWith(u8, rhs, "0")) return false;
-    return rhs.len == 1 or (!isIdent(rhs[1]) and rhs[1] != '.');
+    return !writesBetween(lines, decl_idx + 1, before_idx, counter);
 }
 
 /// True when a counter write exists outside the loop body between the
@@ -83912,7 +84514,7 @@ test "ZA607: correlated guard read is silent" {
     );
 }
 
-test "ZA607: loop-carried counter guard over-warns (EPH-I0826, documented residual)" {
+test "ZA607: loop-carried reverse copy stays silent (EPH-I0826, EPH-I1299)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
@@ -83923,12 +84525,13 @@ test "ZA607: loop-carried counter guard over-warns (EPH-I0826, documented residu
     // loop reads tmp[tmp_len - 1 - ri] under `ri < tmp_len`. No
     // unassigned read exists at runtime — tmp_len counts the writes, so
     // the read loop's counter bounds the read to written elements. The
-    // guard correlation needs an invariant proof the line-based model
-    // cannot carry soundly, so the verdict is the accepted fail-safe
-    // over-warn (documented at isCorrelatedGuardRead, EPH-I0826). This
-    // pin locks the over-warn: a change that silences it must come with
-    // the guard-correlation model, and a change that keeps the warning
-    // keeps the site honest on every RG-1 re-run.
+    // guard correlation needed an invariant proof the line-based model
+    // could not carry, so the site was the EPH-I0826 documented
+    // residual. The EPH-I1299 expression-index extension closes it: the
+    // index algebra (counter minus one minus the ascending loop var)
+    // keeps every read inside the written range, and the fill side
+    // carries the same trip-to-store proof as the direct form. This pin
+    // locks the silence.
     const content =
         \\fn formatIdx(buf: []u8, idx: usize) usize {
         \\    var pos: usize = 0;
@@ -83957,7 +84560,7 @@ test "ZA607: loop-carried counter guard over-warns (EPH-I0826, documented residu
     defer run.deinit(allocator);
 
     try std.testing.expectEqual(
-        1,
+        0,
         countRuleIssues(run.issues.items, "da_i0826_rh.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
@@ -84665,6 +85268,509 @@ test "ZA607: defer increment before the store with a continue still fires (EPH-I
         1,
         countRuleIssues(run.issues.items, "da_i1304_deferpre.zig", RULE_DEFINITE_ASSIGNMENT),
     );
+}
+
+test "ZA607: decrementing i-1 reverse copy stays silent (EPH-I1299)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The RhyOS font_viewer writeDec shape: the read loop descends from
+    // the counter under `while (i > 0) : (i -= 1)` and reads
+    // digits[i - 1] — the written range in reverse. The decrement sits
+    // in the continuation, after the read, so every trip observes a
+    // written element.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var pos: usize = 0;
+        \\    var i = dlen;
+        \\    while (i > 0) : (i -= 1) {
+        \\        buf[pos] = digits[i - 1];
+        \\        pos += 1;
+        \\    }
+        \\    return pos;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1299_minus1.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1299_minus1.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: for-range reverse copy stays silent (EPH-I1299)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The RhyOS sip_sdp formatU32 shape: `for (0..dlen) |di|` captures
+    // the ascending loop var and reads digits[dlen - 1 - di] — the
+    // written range in reverse. The capture needs no decl and cannot
+    // be written, so only the counter write check guards the body.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    for (0..dlen) |di| {
+        \\        buf[di] = digits[dlen - 1 - di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1299_for.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1299_for.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: min-derived bound reverse copy stays silent (EPH-I1299)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The RhyOS audit_rules formatU32 shape: the read loop bounds on
+    // `out_len = @min(dlen, buf.len)` while the index names the fill
+    // counter directly. The min bound only tightens the trip count, so
+    // the reads stay inside the written range.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    const out_len = @min(dlen, buf.len);
+        \\    var i: usize = 0;
+        \\    while (i < out_len) : (i += 1) {
+        \\        buf[i] = digits[dlen - 1 - i];
+        \\    }
+        \\    return out_len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1299_minbound.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1299_minbound.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: compound-condition reverse copy stays silent (EPH-I1299)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The RhyOS http_client shape: `while (i < dlen and i < buf.len)`
+    // carries the counter bound as one top-level `and` conjunct. The
+    // extra conjunct only tightens the bound, so the reads stay inside
+    // the written range.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var i: usize = 0;
+        \\    while (i < dlen and i < buf.len) : (i += 1) {
+        \\        buf[i] = digits[dlen - 1 - i];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1299_compound.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1299_compound.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: i-1 read as a call argument stays silent (EPH-I1299)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The RhyOS dice_roller shape: the reverse copy feeds a helper
+    // call instead of a plain assignment. The read position is the
+    // argument occurrence, and the same bound proof applies.
+    const content =
+        \\fn appendByte(out: *[20]u8, len: *usize, b: u8) void {
+        \\    out[len.*] = b;
+        \\    len.* += 1;
+        \\}
+        \\fn fmt(out: *[20]u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var olen: usize = 0;
+        \\    var i = dlen;
+        \\    while (i > 0) : (i -= 1) {
+        \\        appendByte(out, &olen, digits[i - 1]);
+        \\    }
+        \\    return olen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1299_callarg.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1299_callarg.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: offset reverse index still fires (EPH-I1299 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // `dlen - 2 - i` skips the last written element and underflows on
+    // the final trip. Only the exact `c - 1 - i` algebra is admitted,
+    // so this neighbor must keep firing.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var i: usize = 0;
+        \\    while (i < dlen) : (i += 1) {
+        \\        buf[i] = digits[dlen - 2 - i];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1299_offset.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1299_offset.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: mixed index name still fires (EPH-I1299 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The loop var declares from `other`, a counter no fill loop
+    // increments: the trip-to-store correlation does not exist, so the
+    // site must keep firing.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var pos: usize = 0;
+        \\    var other: usize = 5;
+        \\    var i = other;
+        \\    while (i > 0) : (i -= 1) {
+        \\        buf[pos] = digits[i - 1];
+        \\        pos += 1;
+        \\    }
+        \\    return pos;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1299_mixed.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1299_mixed.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: counter write between the loops still fires (EPH-I1299 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A counter decrement between the fill loop and the read loop
+    // breaks the trip-to-store correlation: the suppressor must not
+    // credit the fill after any outside counter write.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    if (dlen > 0) dlen -= 1;
+        \\    var i: usize = 0;
+        \\    while (i < dlen) : (i += 1) {
+        \\        buf[i] = digits[dlen - 1 - i];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1299_between.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1299_between.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: body step before the reverse read still fires (EPH-I1299 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The increment before the read shifts the index algebra: the
+    // final trip reads digits[-1]. The step must sit in the
+    // continuation, so this body-step form keeps firing.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var pos: usize = 0;
+        \\    var i: usize = 0;
+        \\    while (i < dlen) {
+        \\        i += 1;
+        \\        buf[pos] = digits[dlen - 1 - i];
+        \\        pos += 1;
+        \\    }
+        \\    return pos;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1299_bodystep.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1299_bodystep.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: counter write in the read loop still fires (EPH-I1299 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The index re-reads the counter every trip, so a body write to
+    // the counter shifts the next read past the written range. The
+    // whole-body scan must reject it even though the write follows the
+    // read on the line.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var i: usize = 0;
+        \\    while (i < dlen) : (i += 1) {
+        \\        buf[i] = digits[dlen - 1 - i];
+        \\        dlen += 1;
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1299_counterbody.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1299_counterbody.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: loop var write in the reverse read loop still fires (EPH-I1299 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A body write to the loop var after the read lets a later trip
+    // read past the written range. The whole-body scan must reject it
+    // even though the write follows the read on the line.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var pos: usize = 0;
+        \\    var i = dlen;
+        \\    while (i > 0) : (i -= 1) {
+        \\        buf[pos] = digits[i - 1];
+        \\        pos += 1;
+        \\        i = 5;
+        \\    }
+        \\    return pos;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1299_loopvar.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1299_loopvar.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "parseExprIndex admits the two shapes and rejects the offsets (EPH-I1299)" {
+    const a = parseExprIndex("tmp_len - 1 - ri").?;
+    try std.testing.expectEqual(ExprIndexForm.minus_one_minus, a.form);
+    try std.testing.expectEqualStrings("tmp_len", a.counter.?);
+    try std.testing.expectEqualStrings("ri", a.loop_var);
+    const b = parseExprIndex("i-1").?;
+    try std.testing.expectEqual(ExprIndexForm.minus_one, b.form);
+    try std.testing.expectEqualStrings("i", b.loop_var);
+    try std.testing.expect(parseExprIndex("len - 2 - i") == null);
+    try std.testing.expect(parseExprIndex("i") == null);
+    try std.testing.expect(parseExprIndex("") == null);
+    try std.testing.expect(parseExprIndex("c - 1 - c") == null);
+    try std.testing.expect(parseExprIndex("@intCast(i) - 1") == null);
+    try std.testing.expect(parseExprIndex("0") == null);
+}
+
+test "ZA607: conditional errdefer fill increment still fires (EPH-I1305)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // `if (x) errdefer dlen += 1;` starts with the conditional opener,
+    // so the segment-prefix check credited it as a plain increment and
+    // the suppressor silenced a fill whose counter never advances per
+    // trip. The conditional-prefix walk closes the fail-open FN.
+    const content =
+        \\fn fmt(buf: []u8, val: u64, x: bool) !usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        if (x) errdefer dlen += 1;
+        \\        v = try divByTen(v);
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+        \\fn divByTen(v: u64) !u64 {
+        \\    return v / 10;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1305_conderrdefer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1305_conderrdefer.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: conditional plain fill increment stays silent (EPH-I1305 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A conditional plain increment only undercounts the stores, so
+    // the bound still holds — the conditional-prefix walk must keep
+    // crediting it while it rejects the errdefer form.
+    const content =
+        \\fn fmt(buf: []u8, val: u64, x: bool) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        if (x) dlen += 1;
+        \\        v /= 10;
+        \\    }
+        \\    var di: usize = dlen;
+        \\    while (di > 0) {
+        \\        di -= 1;
+        \\        buf[di] = digits[di];
+        \\    }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1305_condinc.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1305_condinc.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "isErrdeferStatementAt resolves the conditional-prefix forms (EPH-I1305)" {
+    const line1 = "if (x) errdefer dlen += 1;";
+    try std.testing.expect(isErrdeferStatementAt(line1, mem.indexOf(u8, line1, "dlen").?));
+    const line2 = "} else errdefer dlen += 1;";
+    try std.testing.expect(isErrdeferStatementAt(line2, mem.indexOf(u8, line2, "dlen").?));
+    const line3 = "} else if (x) errdefer dlen += 1;";
+    try std.testing.expect(isErrdeferStatementAt(line3, mem.indexOf(u8, line3, "dlen").?));
+    const line4 = "if (x) dlen += 1;";
+    try std.testing.expect(!isErrdeferStatementAt(line4, mem.indexOf(u8, line4, "dlen").?));
+    const line5 = "errdefer dlen += 1;";
+    try std.testing.expect(isErrdeferStatementAt(line5, mem.indexOf(u8, line5, "dlen").?));
 }
 
 test "ZA607: loop guard-continue before same-scope assignment is silent" {

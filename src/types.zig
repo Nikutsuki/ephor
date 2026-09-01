@@ -377,7 +377,7 @@ fn printWriteFallback(comptime fmt: []const u8, args: anytype, writer: ?*std.Io.
 // Output Sanitization (RED5: EPH-I0146, I0147, I0148, I0149, I0162)
 // ============================================================================
 // The sanitizers moved to sanitize.zig so each file stays under the
-// 64 KiB ZA111 input cap (EPH-I1123). The re-exports keep the types.*
+// 256 KiB ZA111 input cap (EPH-I1123). The re-exports keep the types.*
 // API surface unchanged for main.zig and the compat layer. OutBuf stays
 // here: the Issue format cores own its private print helper.
 
@@ -394,7 +394,7 @@ pub const sanitizeSnippet = sanitize.sanitizeSnippet;
 // the AST tier skipped it in silence, so a syntax-broken file exited 0
 // under every strictness. One warning per file, at the first non-note
 // parse error. The helpers live here, not in ast_tier.zig, so
-// ast_tier.zig stays under its 64 KiB ZA111 input cap (the F12 pin).
+// ast_tier.zig stays under its 256 KiB ZA111 input cap (the F12 pin).
 
 /// Byte cap on a rendered parse-error message: renderError prints one
 /// short line per error, so the cap is a bound, not a budget.

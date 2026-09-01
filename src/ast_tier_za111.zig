@@ -4,8 +4,9 @@
 // SPDX-License-Identifier: MIT
 
 //! ZA111 (returned-stack-reference) lives here, split out of
-//! ast_tier.zig so each half stays under the 64 KiB AST-tier input cap
-//! (EPH-I0601): the file implementing the rule must stay analyzable.
+//! ast_tier.zig so each half stays under the 256 KiB AST-tier input cap
+//! (EPH-I0601; raised from 64 KiB by EPH-I1300): the file implementing
+//! the rule must stay analyzable.
 //! ast_tier.zig owns the parse and the per-file pipeline. This file
 //! Owns the ZA111 analysis, its type index, and its collection passes.
 //! The fn-body walker lives in ast_tier_za111_walk.zig (EPH-I0046).

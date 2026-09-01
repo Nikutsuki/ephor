@@ -5,7 +5,7 @@
 // SPDX-License-Identifier: MIT
 
 //! The EPH-I1297 battery lives here, split out of ast_tier.zig so the
-//! core stays under the 64 KiB byte cap (EPH-I0601, F12 guard): at the
+//! core stays under the 256 KiB byte cap (EPH-I0601, F12 guard): at the
 //! I1297 fix ast_tier.zig held 101 spare bytes. The suite-join shim in
 //! ast_tier.zig references this file.
 
@@ -33,7 +33,7 @@ fn buildParseErrorPast50K(a: Allocator) ![]u8 {
     return buf.toOwnedSlice(a);
 }
 
-test "EPH-I1297: >64 KiB valid file skips with the cap class (REL-P1-VERIFY-3)" {
+test "EPH-I1297: a file one byte past the cap skips with the cap class (REL-P1-VERIFY-3)" {
     const a = std.testing.allocator;
     const src = try buildPaddedSource(a, max_ast_file_bytes + 1);
     defer a.free(src);

@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Output sanitization lives here, split out of types.zig so each file
-//! stays under the 64 KiB ZA111 input cap (EPH-I1123): the file that
+//! stays under the 256 KiB ZA111 input cap (EPH-I1123): the file that
 //! implements the memory rule must stay small enough for the rule to
 //! analyze it. The split is mechanical: no behavior changed.
 //! types.zig re-exports Sanitized, sanitizeTerminal, escapeJson,

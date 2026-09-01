@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT
 
 //! The EPH-I0046 test battery lives here, split out of ast_tier.zig so
-//! both AST-tier halves stay under the 64 KiB byte cap (EPH-I0601,
+//! both AST-tier halves stay under the 256 KiB byte cap (EPH-I0601,
 //! F12 guard). The suite-join shim in ast_tier.zig references this file.
 
 const std = @import("std");

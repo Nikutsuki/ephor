@@ -1,6 +1,6 @@
 // Rhyos Labs - Ephor
 // ZA111 walker: the AST body-walk machinery, split out of
-// ast_tier_za111.zig to keep both halves under the 64 KiB AST-tier
+// ast_tier_za111.zig to keep both halves under the 256 KiB AST-tier
 // input cap (EPH-I0601, EPH-I0046). This file owns the fn-body DFS and
 // the node records. The rule file owns collection and classification.
 // Copyright (C) 2025 Rhyos Labs LLC

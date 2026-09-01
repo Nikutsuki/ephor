@@ -13,11 +13,12 @@
 //! runs (EPH-I0191). A refused thread skips too (EPH-I0597).
 //!
 //! ZA111 (returned-stack-reference) lives in ast_tier_za111.zig, split
-//! out so each half stays under the 64 KiB AST-tier input cap
-//! (EPH-I0601). This file owns the parse, the nesting pre-scan, and the
-//! per-file pipeline. EPH-I0046 extension tests live in
-//! ast_tier_za111_tests.zig and the I1297 tier-pipeline battery in
-//! ast_tier_pipeline_tests.zig for the same cap.
+//! out so each half stays under the 256 KiB AST-tier input cap
+//! (EPH-I0601; raised from 64 KiB by EPH-I1300). This file owns the
+//! parse, the nesting pre-scan, and the per-file pipeline. EPH-I0046
+//! extension tests live in ast_tier_za111_tests.zig and the I1297
+//! tier-pipeline battery in ast_tier_pipeline_tests.zig for the same
+//! cap.
 
 const std = @import("std");
 const mem = std.mem;
@@ -110,11 +111,23 @@ fn countSkip(stats: ?*Stats, class: SkipClass) void {
     }
 }
 
-/// Stack for the parse worker thread. The worst verified density is ten
-/// frames per byte pair, so a 64 KiB input needs well under 512 MB even
-/// with chunky Parse.zig frames. The OS commits pages lazily, so
-/// resident cost tracks real use.
-const parse_stack_bytes: usize = 512 * 1024 * 1024;
+/// Stack for the parse worker thread (EPH-I0191, EPH-I0268, EPH-I1300).
+/// The byte cap bounds the input, and the worst verified density is ten
+/// parser frames per byte pair (the paren recursion chain in the pinned
+/// Parse.zig): a file of N bytes can drive at most N/2 nesting levels,
+/// so the worst case is 5 × N frames. The shipped 64 KiB/512 MiB pair
+/// budgeted 1,638 B per frame at that density. The 256 KiB cap
+/// (EPH-I1300) quadruples the input, so this stack quadruples to
+/// 2 GiB: the identical per-frame budget, with the identical margin
+/// over the pinned empirical frame-size range (200-500 B per frame,
+/// the 20k-paren measurement in the tests below). The pair re-derives
+/// together: a cap raise without the stack raise reopens the SIGSEGV
+/// class, and a config-driven cap with no safety ceiling is the same
+/// defect. The OS commits stack pages lazily, so resident cost tracks
+/// real use; the caller joins before the next spawn, so the
+/// reservation is transient. The 2 GiB reservation assumes a 64-bit
+/// target.
+const parse_stack_bytes: usize = 2 * 1024 * 1024 * 1024;
 
 /// Worker payload for the threaded parse. The result slot moves the
 /// context back to the caller after join.
@@ -223,15 +236,20 @@ pub const AstTierOut = struct {
 /// of levels, so 512 keeps a wide margin.
 pub const max_nesting_depth: usize = 512;
 
-/// AST-tier input byte cap (EPH-I0268). Parser stack need grows with
-/// input size, so this cap plus `parse_stack_bytes` bounds the worst
-/// case by construction. This bound is the tier's own: the config key
-/// `max_file_bytes` (the ZA702 threshold) does not widen it, which
-/// silently dropped ZA111 coverage on 34 zig-pulse files in 0.15.0
-/// (EPH-I1297, REL-P1-VERIFY-3). Raising the cap needs a matching
-/// `parse_stack_bytes` re-derivation at the same frame-density budget.
-/// Over-cap files degrade to line-tier coverage like parse errors.
-pub const max_ast_file_bytes: usize = 64 * 1024;
+/// AST-tier input byte cap (EPH-I0268, EPH-I1300). Parser stack need
+/// grows with input size, so this cap plus `parse_stack_bytes` bounds
+/// the worst case by construction. This bound is the tier's own: the
+/// config key `max_file_bytes` (the ZA702 threshold) does not widen it,
+/// which silently dropped ZA111 coverage on 34 zig-pulse files in
+/// 0.15.0 (EPH-I1297, REL-P1-VERIFY-3). EPH-I1300 re-derived the pair:
+/// the cap quadruples from 64 KiB to 256 KiB and `parse_stack_bytes`
+/// quadruples with it, holding the identical per-frame budget at the
+/// verified ten-frames-per-byte-pair density. The 256 KiB cap
+/// re-admits the 0.15.x-skipped files (window_driver 228 KB,
+/// peer_manager 143 KB, and 78 corpus files across the four gate
+/// corpora). Over-cap files degrade to line-tier coverage like parse
+/// errors.
+pub const max_ast_file_bytes: usize = 256 * 1024;
 
 /// Carried state for the pre-scan: the live-frame counters, the
 /// `anyframe->` arrow watch, and the fn-type paren watch (EPH-I0598).
@@ -1556,6 +1574,32 @@ test "EPH-I0268: at-cap file parses" {
     const src = try buildPaddedSource(a, max_ast_file_bytes);
     defer a.free(src);
     try expectTierCounters(src, 1, 0);
+}
+
+test "EPH-I1300: a >64 KiB file parses again (REL-P2-VERIFY-3)" {
+    // The 0.15.x cap skipped every file past 64 KiB (EPH-I1297). The
+    // re-derived 256 KiB cap re-admits them: a 200 KiB valid file
+    // parses with no skip class.
+    const a = std.testing.allocator;
+    const src = try buildPaddedSource(a, 200 * 1024);
+    defer a.free(src);
+    try expectTierCounters(src, 1, 0);
+}
+
+test "EPH-I1300: the cap-sized nesting worst case parses on the worker" {
+    // 131,072 nesting levels hold the cap's full byte-pair budget (2n
+    // delimiter bytes). The worker's 2 GiB stack must hold them: at
+    // the verified ten frames per level this is the cap's worst case
+    // by construction (EPH-I0191), and without the worker thread it
+    // SIGSEGVs any default thread stack. Do not run it against a
+    // pre-thread build: the crash kills the test runner.
+    const a = std.testing.allocator;
+    const src = try buildNestedParens(a, 131_072);
+    defer a.free(src);
+    try std.testing.expect(src.len >= max_ast_file_bytes);
+    var actx = try AstContext.init(a, src);
+    defer actx.deinit(a);
+    try std.testing.expect(actx.ok);
 }
 
 test "EPH-I0268: init parses nesting past the default thread stack" {

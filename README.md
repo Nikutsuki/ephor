@@ -1482,9 +1482,9 @@ The line-based analyzers mask string, char, `//` comment, and multiline-string c
 | ZA701 exempts string-literal tails from the column count | ZA6xx | False negative | EPH-I0267 |
 | `@import` missed when the string opens on the next line | ZA5xx | Import-graph false negative | EPH-I0300 |
 | fn-naming check stops at the first match and masks a real fn later on the line | ZA7xx | False negative | EPH-I0302 |
-| Files over the 64 KiB AST cap lose ZA111 coverage | AST tier | False negative | EPH-I0293 |
+| Files over the 256 KiB AST cap lose ZA111 coverage | AST tier | False negative | EPH-I0293 |
 
-The 64 KiB AST-tier cap is an accepted residual (EPH-I0293). It is a parser-stack safety guarantee: at the module's worst verified density (ten parser frames per byte pair) the 512 MiB parse-thread stack covers 64 KiB of source, and ephor's own `src/main.zig` sits far past the cap (4.5 MB on the 0.15-dev line), so no cap raise can cover it while the stack bound holds. Chunking a whole-file grammar is out of scope. The per-run skip note is the designed visibility for the residual (EPH-I0200).
+The 256 KiB AST-tier cap is an accepted residual (EPH-I0293, re-derived in EPH-I1300). It is a parser-stack safety guarantee: at the module's worst verified density (ten parser frames per byte pair) the 2 GiB parse-thread stack covers 256 KiB of source, and ephor's own `src/main.zig` sits far past the cap (5.2 MiB on the 0.15.2 line), so covering it would need a ~42 GiB stack under the same linear scaling. Chunking a whole-file grammar is out of scope. The per-run skip note is the designed visibility for the residual (EPH-I0200).
 
 #### What Is NOT Parsed
 

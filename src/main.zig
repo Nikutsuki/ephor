@@ -6739,7 +6739,7 @@ fn isCounterBoundedRead(
 ) bool {
     const t = mem.trim(u8, sc.da.lines[idx], " \t\r");
     const ri = elementReadIndexName(t, read_col, var_name) orelse return false;
-    const oc = enclosingLoopOpenerText(sc, idx) orelse return false;
+    const oc = enclosingLoopOpenerText(sc, idx, read_col) orelse return false;
     if (!whileConditionIsNameGtZero(oc.ot, ri)) return false;
     const read_walk = ReadLoopWalk{
         .lines = sc.da.lines,
@@ -6776,13 +6776,18 @@ fn elementReadIndexName(t: []const u8, read_col: usize, var_name: []const u8) ?[
 }
 
 /// The nearest enclosing loop opener line of `idx` within the guard
-/// window, else null (EPH-I1293). The walk collects enclosing
-/// conditional openers nearest-first and returns the first loop. An if
-/// arm between the read and its loop (the usb_write read inside `if
-/// (pos < MAX)`) is skipped, and the loop is found further out. A loop
-/// beyond the window or deeper than the collector's four slots is
-/// missed — accepted FN.
-fn enclosingLoopOpenerLine(lines: []const []const u8, idx: usize) ?usize {
+/// window, else null (EPH-I1293, EPH-I1312, REL-P3-VERIFY-3). The read at (idx, read_col)
+/// sits inside the loop opened on the same line when the line carries a
+/// one-line body (for (0..count) |i| out[i] = tmp[count - 1 - i];) — the
+/// backward walk is exclusive of idx, so the same-line opener is checked
+/// first with its own read-position guard. Then the walk collects
+/// enclosing conditional openers nearest-first and returns the first
+/// loop. An if arm between the read and its loop (the usb_write read
+/// inside `if (pos < MAX)`) is skipped, and the loop is found further
+/// out. A loop beyond the window or deeper than the collector's four
+/// slots is missed — accepted FN.
+fn enclosingLoopOpenerLine(lines: []const []const u8, idx: usize, read_col: usize) ?usize {
+    if (sameLineLoopBodyHolds(lines, idx, read_col)) return idx;
     var openers: [4]usize = undefined;
     const stop = idx -| guard_candidate_window;
     const n = enclosingConditionalLines(lines, idx, stop, &openers);
@@ -6794,16 +6799,107 @@ fn enclosingLoopOpenerLine(lines: []const []const u8, idx: usize) ?usize {
 }
 
 /// The nearest enclosing loop opener body index and its trimmed text,
-/// else null (EPH-I1293, EPH-I1299). The shared opener discovery of
-/// the direct and the expression counter-bounded suppressors.
+/// else null (EPH-I1293, EPH-I1299, EPH-I1312). The shared opener
+/// discovery of the direct and the expression counter-bounded
+/// suppressors.
 const LoopOpenerCtx = struct {
     opener: usize,
     ot: []const u8,
 };
 
-fn enclosingLoopOpenerText(sc: *const ReadScanCtx, idx: usize) ?LoopOpenerCtx {
-    const opener = enclosingLoopOpenerLine(sc.da.lines, idx) orelse return null;
+fn enclosingLoopOpenerText(sc: *const ReadScanCtx, idx: usize, read_col: usize) ?LoopOpenerCtx {
+    const opener = enclosingLoopOpenerLine(sc.da.lines, idx, read_col) orelse return null;
     return .{ .opener = opener, .ot = mem.trim(u8, sc.da.lines[opener], " \t\r") };
+}
+
+/// True when the read at (idx, read_col) sits inside the body of the loop
+/// opened on the same line (EPH-I1312, REL-P3-VERIFY-3). The backward enclosure walk is
+/// exclusive of idx, so the same-line opener carries its own read-position
+/// proof: the read must sit past the body start, before the same-line body
+/// close for a braced body, and before the first statement boundary for a
+/// braceless one. A read in the header region, an Allman body, a
+/// multi-line condition, a read past the same-line close, and a read in a
+/// later statement on the line all fail closed — the read then falls to
+/// the walked openers.
+fn sameLineLoopBodyHolds(lines: []const []const u8, idx: usize, read_col: usize) bool {
+    const t = mem.trim(u8, lines[idx], " \t\r");
+    if (!isLoopOpenerLine(t)) return false;
+    const body_start = loopBodyStartCol(t) orelse return false;
+    if (body_start >= t.len or read_col < body_start) return false;
+    if (t[body_start] == '{') {
+        if (read_col <= body_start) return false;
+        const close = onelineBodyCloseCol(t, body_start) orelse return true;
+        return read_col <= close;
+    }
+    return noStatementBoundaryBefore(t, body_start, read_col);
+}
+
+/// Column of the same-line body close for the braced body at
+/// `body_start`, else null when the body continues past the line
+/// (EPH-I1312). Mirrors hasOnelineLoopClose's depth discipline: paren and
+/// bracket depth keep header and call-argument braces out of the body
+/// balance, and the body's own `{` starts the count. The comment strip
+/// cuts only the tail, so the returned column stays valid in the
+/// original line.
+fn onelineBodyCloseCol(t: []const u8, body_start: usize) ?usize {
+    const code = stripLineComment(t);
+    if (body_start >= code.len) return null;
+    var paren_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    var brace_depth: usize = 0;
+    var walk = QuoteWalk.init(code);
+    while (walk.next()) |i| : (walk.advance()) {
+        if (types.isMultilineOpenerAt(code, i)) break;
+        foldHeaderDepths(code[i], &paren_depth, &bracket_depth);
+        if (i < body_start) continue;
+        if (paren_depth != 0 or bracket_depth != 0) continue;
+        if (onelineBodyStep(&brace_depth, code[i])) |closed| {
+            if (closed) return i;
+            return null;
+        }
+    }
+    return null;
+}
+
+/// True when no statement boundary sits between `body_start` and
+/// `read_col` on the line (EPH-I1312, REL-P3-VERIFY-3). The braceless
+/// body is one statement: a depth-0 `;` or a `}` that closes the
+/// statement's top level before the read puts the read in a later
+/// statement, outside the loop body. A read after a `}` that continues
+/// the statement (`} else`, `} catch`) is rejected too — accepted FN,
+/// the fail-closed direction.
+fn noStatementBoundaryBefore(t: []const u8, body_start: usize, read_col: usize) bool {
+    const code = stripLineComment(t);
+    if (read_col >= code.len) return false;
+    var paren_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    var depth: usize = 0;
+    var walk = QuoteWalk.init(code);
+    while (walk.next()) |i| : (walk.advance()) {
+        if (types.isMultilineOpenerAt(code, i)) break;
+        if (i < body_start) continue;
+        if (i >= read_col) return true;
+        if (statementBoundaryStep(code[i], &paren_depth, &bracket_depth, &depth)) return false;
+    }
+    return true;
+}
+
+/// Fold one code byte of the statement-boundary scan (EPH-I1312,
+/// REL-P3-VERIFY-3): true when the byte ends the braceless body's
+/// statement before the read — a depth-0 `;` or a `}` that closes the
+/// top level. Paren and bracket depth mask nested content, and the
+/// brace depth tracks the statement's nested blocks.
+fn statementBoundaryStep(c: u8, paren: *usize, bracket: *usize, depth: *usize) bool {
+    foldHeaderDepths(c, paren, bracket);
+    if (paren.* != 0 or bracket.* != 0) return false;
+    if (c == '{') {
+        depth.* += 1;
+        return false;
+    }
+    if (c != '}') return c == ';' and depth.* == 0;
+    if (depth.* == 0) return true;
+    depth.* -= 1;
+    return depth.* == 0;
 }
 
 /// True when the opener line is a `while` whose condition is exactly
@@ -7442,7 +7538,7 @@ fn isExprCounterBoundedRead(
     const lines = sc.da.lines;
     const t = mem.trim(u8, lines[idx], " \t\r");
     const expr = exprReadIndexAt(t, read_col, var_name) orelse return false;
-    const oc = enclosingLoopOpenerText(sc, idx) orelse return false;
+    const oc = enclosingLoopOpenerText(sc, idx, read_col) orelse return false;
     const ctx = ExprReadCtx{
         .sc = sc,
         .idx = idx,
@@ -7471,17 +7567,19 @@ fn minusOneReadCovered(ctx: ExprReadCtx, expr: ExprRead) bool {
     return exprReadTailCovered(ctx, .{ loop_var, loop_var, "" }, decl.counter, decl.idx);
 }
 
-/// The `c - 1 - i` read shape (EPH-I1299, EPH-I1311): the read loop
-/// ascends from zero under `i < c` (the bare comparison, a top-level
-/// `and` conjunct, or a min-derived bound) with `: (i += 1)`, or runs
-/// as `for (0..c) |i|`. The trips read the elements counter - 1 down
+/// The `c - 1 - i` read shape (EPH-I1299, EPH-I1311, EPH-I1313,
+/// REL-P3-VERIFY-3): the
+/// read loop ascends from zero under `i < c` (the bare comparison, a
+/// top-level `and` conjunct, or a min-derived bound) with `: (i += 1)`,
+/// or runs as `for (0..<bound>) |i|` with the bound the bare counter or
+/// a min-derived bound var. The trips read the elements counter - 1 down
 /// to 0 — the written range in reverse. The index re-reads the counter
 /// every trip, so the read loop body must write neither the loop var
 /// nor the counter: a body counter write would shift the next read
 /// past the written range. A min-derived bound var joins the tracked
-/// set when it differs from the counter (EPH-I1311): a body write to
-/// it raises the bound past the counter, and a later trip underflows
-/// the index.
+/// set when it differs from the counter (EPH-I1311, EPH-I1313): a body
+/// write to it raises the bound past the counter, and a later trip
+/// underflows the index.
 fn minusOneMinusReadCovered(ctx: ExprReadCtx, expr: ExprRead) bool {
     const loop_var = expr.loop_var;
     const counter = expr.counter.?;
@@ -7489,17 +7587,37 @@ fn minusOneMinusReadCovered(ctx: ExprReadCtx, expr: ExprRead) bool {
     const for_counter = forRangeHeader(ctx.ot, loop_var);
     var bound_name: []const u8 = "";
     if (for_counter) |fc| {
-        if (!mem.eql(u8, fc, counter)) return false;
+        // EPH-I1313, REL-P3-VERIFY-3: a min-derived range bound admits
+        // the same proof as the while branch: min only tightens the
+        // bound. The capture carries no decl check — forRangeHeader
+        // pinned the exact |loop_var| capture.
+        bound_name = boundNameFor(ctx.sc.da.lines, ctx.opener, fc, counter) orelse return false;
     } else if (while_bound) |b| {
-        if (!boundMatchesCounter(ctx.sc.da.lines, ctx.opener, b, counter)) return false;
+        bound_name = boundNameFor(ctx.sc.da.lines, ctx.opener, b, counter) orelse return false;
         const decl = findZeroInitDecl(ctx.sc.da.lines, ctx.opener, loop_var) orelse return false;
         if (writesBetween(ctx.sc.da.lines, decl + 1, ctx.opener, loop_var)) return false;
-        if (!mem.eql(u8, b, counter)) bound_name = b;
     } else {
         return false;
     }
     const c_decl = findZeroInitDecl(ctx.sc.da.lines, ctx.opener, counter) orelse return false;
     return exprReadTailCovered(ctx, .{ loop_var, counter, bound_name }, counter, c_decl);
+}
+
+/// The tracked bound name of a matched header bound (EPH-I1311,
+/// EPH-I1313, REL-P3-VERIFY-3): empty when the bound is the counter
+/// itself, the bound var when a min-derived decl admits it, else null
+/// (reject). The shared arm of the while and the for bound checks: a
+/// body write to the returned name breaks the proof through the
+/// body-write scan.
+fn boundNameFor(
+    lines: []const []const u8,
+    opener: usize,
+    b: []const u8,
+    counter: []const u8,
+) ?[]const u8 {
+    if (mem.eql(u8, b, counter)) return "";
+    if (!boundMatchesCounter(lines, opener, b, counter)) return null;
+    return b;
 }
 
 /// The shared read-side tail of the expression-index suppressors
@@ -85736,6 +85854,208 @@ test "ZA607: min-bound var write in the read loop still fires (EPH-I1311)" {
     try std.testing.expectEqual(
         1,
         countRuleIssues(run.issues.items, "da_i1311_minboundwrite.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line for opener reverse copy stays silent (EPH-I1312, REL-P3-VERIFY-3)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The RhyOS size.zig:188 writeDecimal shape: the read sits on the
+    // loop-opener line — for (0..dlen) |di| with the reverse read in the
+    // same-line braceless body. The backward opener walk is exclusive of
+    // the read line, so the same-line body guard admits it (EPH-I1312).
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    for (0..dlen) |di| buf[di] = digits[dlen - 1 - di];
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1312_sameline.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1312_sameline.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line opener read in a later statement still fires (EPH-I1312 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The braceless body is one statement: a read after the body's `;`
+    // sits outside the loop with i == dlen and underflows the index.
+    // The same-line guard must reject it — the read falls to the walked
+    // openers, none encloses it, and the site keeps firing.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var i: usize = 0;
+        \\    while (i < dlen) : (i += 1) buf[i] = 0; buf[0] = digits[dlen - 1 - i];
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1312_later.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1312_later.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line opener read past the braced close still fires (EPH-I1312 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The braced one-line body closes on the opener line: a read past
+    // the same-line `}` sits outside the loop with i == dlen and
+    // underflows the index. The same-line guard must reject it.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var i: usize = 0;
+        \\    while (i < dlen) : (i += 1) { buf[i] = 0; } buf[0] = digits[dlen - 1 - i];
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1312_postclose.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1312_postclose.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: min-derived for-range bound reverse copy stays silent (EPH-I1313, REL-P3-VERIFY-3)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The RhyOS caldav.zig:1698 shape: the read loop is a for-range
+    // whose bound out_len derives from @min(dlen, buf.len), and the
+    // index names the fill counter directly. The min bound only
+    // tightens the trip count, so the reads stay inside the written
+    // range (EPH-I1313).
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    const out_len = @min(dlen, buf.len);
+        \\    for (0..out_len) |i| {
+        \\        buf[i] = digits[dlen - 1 - i];
+        \\    }
+        \\    return out_len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1313_formin.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1313_formin.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: min-bound var write in the for-range read loop still fires (EPH-I1313 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The for-form twin of the EPH-I1311 control: a var-declared
+    // min-derived range bound written in the read-loop body joins the
+    // tracked set, so the body-write scan rejects the shape.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var out_len = @min(dlen, buf.len);
+        \\    for (0..out_len) |i| {
+        \\        buf[i] = digits[dlen - 1 - i];
+        \\        out_len += 1;
+        \\    }
+        \\    return out_len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1313_forwrite.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1313_forwrite.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: non-min for-range bound still fires (EPH-I1313 control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A bound derived from the counter by anything but @min raises the
+    // trip count past the written range: only the min-derived named
+    // bound is admitted, so this neighbor keeps firing.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    const out_len = dlen + 1;
+        \\    for (0..out_len) |i| {
+        \\        buf[i] = digits[dlen - 1 - i];
+        \\    }
+        \\    return out_len;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1313_foroffset.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1313_foroffset.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

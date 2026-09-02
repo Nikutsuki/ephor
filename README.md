@@ -1570,7 +1570,7 @@ Ephor uses three testing layers:
 
 ## Changelog
 
-### v0.15.3 — ZA607 Same-Line Opener, Min-Derived FOR Bound, Else-Arm Rejection (2026-09-02)
+### v0.15.3 — ZA607 Same-Line Opener, Min-Derived FOR Bound, Else-Arm Rejection (2026-09-01)
 
 **Fixed:**
 

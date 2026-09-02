@@ -303,7 +303,7 @@ built-in threshold defaults apply when the thresholds block is absent.
 
 ```json
 {
-  "version": "0.15.4",
+  "version": "0.15.5",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -1569,6 +1569,48 @@ Ephor uses three testing layers:
 - Community baseline regression testing against key projects
 
 ## Changelog
+
+### v0.15.5 — ZC101 Receiver Lifetime, Over-Cap Guards, ZA103 Free Helpers, ZA505 Namespace Scope (2026-09-02)
+
+**Fixed:**
+
+- ZC101/ZC103 recognize the free-function release again: the stored
+  acquire receiver now borrows stable file content instead of the reused
+  blanking buffer, whose per-line re-masking made the pairing read the
+  last line's bytes at the stored offset, so the pairing broke on length
+  rather than content. The class re-opened on the 2026-09-02 live
+  evidence (still firing at skytale advanced_features.zig:129 under the
+  pinned tag), and the discriminating pin now mirrors that live-site
+  shape (EPH-I0903).
+- The over-cap call sites fail closed instead of panicking: the raw-code
+  receiver walk skips past the 16 KiB mask at the call sites, and the
+  defer-depth walk clamps its end to the mask bound. The call-site panic
+  appeared with the receiver fix. The defer-overhang panic was a latent
+  pre-existing sibling (EPH-I1321, EPH-I1322).
+- ZA103 recognizes free-helper cleanup calls: a word-bounded
+  free/deinit/destroy-prefixed helper at a compound boundary followed by
+  a call paren counts as the release, with the name test holding the
+  coverage. Six pins: the two cited silent shapes, three fail-closed
+  controls, and the direct battery (EPH-I1318).
+- ZA505 scopes its receiver gate to the reference kind: the value-ref
+  collection splits into any and namespace maps, so a self-named wrapper
+  exempts only on a namespace-scope ref. Fn-body and file-scope refs
+  keep firing. Four pins: the skytale table shape and its s-sibling
+  stay silent, and the two controls fire (EPH-I1319).
+
+**Operations:**
+
+- The retro-verification battery closes the verify-on-tag leg: ten
+  v0.15.0-shipped classes carry cited pass verdicts on skytale's pinned
+  0.15.4 tree, and every passing entry gains the dated VERIFIED mark in
+  the skytale log (EPH-I1317).
+
+**Deferred:**
+
+- The ZA106 block-scoped-defer false-positive fix (EPH-I1310) stays in
+  flight in another lane at release prep. It joins this release only if
+  its fix lands and passes review before the release gate. Otherwise it
+  ships in a later patch.
 
 ### v0.15.4 — Changelog-Header Date Gate (2026-09-02)
 

@@ -303,7 +303,7 @@ built-in threshold defaults apply when the thresholds block is absent.
 
 ```json
 {
-  "version": "0.15.2",
+  "version": "0.15.3",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -1569,6 +1569,31 @@ Ephor uses three testing layers:
 - Community baseline regression testing against key projects
 
 ## Changelog
+
+### v0.15.3 — ZA607 Same-Line Opener, Min-Derived FOR Bound, Else-Arm Rejection (2026-09-02)
+
+**Fixed:**
+
+- ZA607 admits the same-line loop opener: the enclosing-loop walk checks
+  the opener on the read line itself, with three fail-closed boundary
+  guards (header, braced, and braceless). The nine RhyOS sites named in
+  the issue go silent, and the I1299 fail-closed controls hold
+  (EPH-I1312).
+- ZA607 admits the min-derived for-range bound with the identical
+  bound-var tracking as the while branch. The 16 RhyOS sites named in
+  the issue go silent, and the fail-closed controls hold (EPH-I1313).
+- The same-line admission rejects the arm when a depth-0 else keyword
+  follows the body start (quote-aware, masked, on both branches). The
+  else-arm read on the zero-trip path can no longer ride the body read's
+  silence. Four pins: the three else shapes fire, and the braced
+  positive stays silent (EPH-I1315).
+
+**Deferred:**
+
+- The ZA106 block-scoped-defer false-positive fix (EPH-I1310) stays in
+  flight in another lane at release prep. It joins this release only if
+  its fix lands and passes review before the release gate. Otherwise it
+  ships in a later patch.
 
 ### v0.15.2 — ZA607 Expression Arms, 256 KiB AST Re-Entry, Stand-In Exclusions (2026-09-02)
 

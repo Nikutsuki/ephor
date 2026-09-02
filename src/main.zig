@@ -31467,7 +31467,12 @@ fn checkPassthroughWrapper(
     // bare identifier inside a container body — a struct-body table
     // initializer — resolves to the container's member, so a ref recorded
     // at namespace scope is an unambiguous decl reference and silences a
-    // self-named wrapper too (the skytale interface-table class). A ref
+    // self-named wrapper too (the skytale interface-table class). The
+    // namespace map keys by name per file, not per container: a ref in
+    // container A silences a same-named self-passthrough in sibling
+    // container B, and a container-scope block shadow records the
+    // shadow's name — the accepted FN directions of the per-file keying
+    // (the EPH-I1243 class). A ref
     // inside any fn body stays lexical and never silences one.
     const has_self_receiver = params.len > 0 and params[0].is_self;
     if (!has_self_receiver and c.value_refs.any.contains(open.name)) return;

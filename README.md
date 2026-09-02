@@ -303,7 +303,7 @@ built-in threshold defaults apply when the thresholds block is absent.
 
 ```json
 {
-  "version": "0.15.3",
+  "version": "0.15.4",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -1569,6 +1569,24 @@ Ephor uses three testing layers:
 - Community baseline regression testing against key projects
 
 ## Changelog
+
+### v0.15.4 — Changelog-Header Date Gate (2026-09-02)
+
+**Fixed:**
+
+- check-version.sh section 8 validates the newest changelog header date
+  against the local calendar date at the pre-tag run. The I1314 class
+  fired on v0.15.2 and v0.15.3: each header carried a one-day-forward
+  date and passed only on the human binding check. The gate now fails a
+  mismatch mechanically, ahead or behind, and fails closed when a
+  header carries no date (EPH-I1316).
+
+**Deferred:**
+
+- The ZA106 block-scoped-defer false-positive fix (EPH-I1310) stays in
+  flight in another lane at release prep. It joins this release only if
+  its fix lands and passes review before the release gate. Otherwise it
+  ships in a later patch.
 
 ### v0.15.3 — ZA607 Same-Line Opener, Min-Derived FOR Bound, Else-Arm Rejection (2026-09-01)
 

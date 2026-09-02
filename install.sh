@@ -83,7 +83,7 @@ elif [ -n "${EPHOR_TAGS_API:-}" ]; then
     echo "warning: EPHOR_TAGS_API is ignored without EPHOR_TEST_MODE=1." >&2
 fi
 # This tag is the fallback when the Codeberg tags API fails. Refresh it on every release.
-EPHOR_FALLBACK_TAG="v0.15.4"
+EPHOR_FALLBACK_TAG="v0.15.5"
 # Pin for Zig 0.15.x. Every remote tag (v0.12.3 and later) declares
 # minimum_zig_version 0.16.0. The 0.16 migration landed in v0.12.0, so no
 # remote tag builds on Zig 0.15.x. v0.11.13 declares minimum_zig_version

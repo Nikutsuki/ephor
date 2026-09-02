@@ -27838,15 +27838,28 @@ fn recordReleaseLock(
 /// pass like `fileUnlock(&file)`). A literal, nested call, or multiline
 /// argument returns null and the release is not paired — the safe
 /// direction (no false suppression).
-fn firstCallArg(blanked: []const u8, open_paren: usize) ?[]const u8 {
+///
+/// `code` is the RAW line (comment-stripped), never the literal-blanked
+/// form: the returned slice is stored in the fn record and read at
+/// evaluation time, after the per-scan blanking buffer has been reused
+/// for every later line. Borrowing the reused buffer made the receiver
+/// ephemeral — a later line long enough to reach the argument's offset
+/// silently rewrote the stored receiver, and the pairing verdict then
+/// depended on unrelated trailing content (the EPH-I0903 live shape:
+/// advanced_features.zig fired ZC101 on `file.lock` with
+/// releaseFileLock's `compat.fileUnlock(file)` present). The mask adds
+/// nothing here: the walk accepts only `&`, identifier, and `.` bytes,
+/// and a literal char (masked to a blank) stops it exactly where the
+/// raw quote stops it, so the verdicts are identical on either form.
+fn firstCallArg(code: []const u8, open_paren: usize) ?[]const u8 {
     var i = open_paren + 1;
-    while (i < blanked.len and (blanked[i] == ' ' or blanked[i] == '\t')) i += 1;
-    if (i < blanked.len and blanked[i] == '&') i += 1;
+    while (i < code.len and (code[i] == ' ' or code[i] == '\t')) i += 1;
+    if (i < code.len and code[i] == '&') i += 1;
     const start = i;
-    while (i < blanked.len and (isIdent(blanked[i]) or blanked[i] == '.')) i += 1;
-    if (i == start or i >= blanked.len or
-        (blanked[i] != ')' and blanked[i] != ',')) return null;
-    return blanked[start..i];
+    while (i < code.len and (isIdent(code[i]) or code[i] == '.')) i += 1;
+    if (i == start or i >= code.len or
+        (code[i] != ')' and code[i] != ',')) return null;
+    return code[start..i];
 }
 
 /// True when the call at `call_start` sits in the guard condition of an
@@ -27924,7 +27937,7 @@ fn scanConcurrencyCalls(state: *ConcurrencyScanState, lc: ConcLineCtx) !void {
         // releases `file`. A bare `fileUnlock(file)` has no receiver at
         // all). An argument-less call of the name is not followed.
         const receiver = if (isFreeFnReleaseMethod(seg))
-            firstCallArg(lc.blanked, site.open_paren) orelse continue
+            firstCallArg(lc.code, site.open_paren) orelse continue
         else
             callReceiver(target) orelse continue;
         try recordLockCall(state, lc, kind, .{
@@ -120707,6 +120720,45 @@ test "ZC101: free-function fileUnlock satisfies the cross-fn release (EPH-I0903)
         \\}
     ;
     var run = try runConcurrencyCheck(&diag, allocator, "zc101_fileunlock.zig", content);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: free-function receiver survives later long lines (EPH-I0903 live shape)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The unisolated live trigger (skytale advanced_features.zig, the
+    // 2026-09-02 log): the minimal pins stay silent, but the live file
+    // still fires because the stored free-function receiver borrowed the
+    // per-scan blanking buffer. Any later line long enough to reach the
+    // argument's offset rewrote the stored receiver, so a trailing
+    // const decl of 23+ bytes silently broke the releaseFileLock
+    // pairing. Pre-fix this fixture warns; post-fix it is silent.
+    const content =
+        \\fn doWork() void {}
+        \\fn acquireOsLock(file: File, lock_type: LockType) void {
+        \\    file.lock(switch (lock_type) {
+        \\        .exclusive => .exclusive,
+        \\        .shared => .shared,
+        \\    }) catch {
+        \\        file.close();
+        \\    };
+        \\    doWork();
+        \\}
+        \\fn releaseFileLock(lock_id: u64) void {
+        \\    if (lock_id == 0) return;
+        \\    var file = getLockedFile(lock_id);
+        \\    compat.fileUnlock(file);
+        \\    file.close();
+        \\}
+        \\
+        \\const active_lock_limit: u32 = 64;
+    ;
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_fileunlock_live.zig", content);
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);

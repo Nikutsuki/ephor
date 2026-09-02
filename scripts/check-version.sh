@@ -19,6 +19,7 @@
 #   5c. install.ps1          EPHOR_0_15_COMMIT matches install.sh's value
 #   6. Codeberg tags API     latest remote tag matches
 #   7. README.md             changelog header names the in-development version
+#   8. README.md             changelog header date matches the local date
 
 set -e
 
@@ -289,12 +290,72 @@ else
     fi
 fi
 
+# 8. README.md changelog header date matches the local calendar date.
+# EPH-I1316 (REL-P4-SCOPE-1, the date leg of REL-P4-RELEASE-4): the
+# I1314 class fired on v0.15.2 and v0.15.3 — the release header carried
+# a one-day-forward date (the planner ETA, not the push day) and both
+# releases survived only on the human binding check. The run-63 WP-7
+# amendment pins the header date to the planned push day, re-derived
+# from the actual calendar at the bump step; a push-day slip updates the
+# header date in the same release commit before the tag. This section
+# closes the class mechanically: at the pre-tag run the header names the
+# version being tagged, so its date must equal the local date
+# (date +%F, the local calendar — the push-day pin). Any difference is
+# MISMATCH (ahead or behind, the message names the direction); a header
+# with no parenthesized date fails closed as MISSING.
+#
+# The check fires only in that pre-tag state. It skips when the header
+# names another version (section 7 governs the version relationship),
+# when the tag is already on the remote (the header date is frozen
+# history with the immutable tag, and the post-tag commits must not
+# trip on it), and offline (the tags API verdict is the shipped-state
+# signal; the pre-tag run is online by definition — the push follows
+# it). No PENDING case exists by design.
+#
+# Controls (REL-P4-VERIFY-3, run at the candidate): positive — a
+# header naming the expected version with today's date exits green;
+# negative — the same header with a different date exits red. Both run
+# in a scratch tree whose zon/main/installer pins match the release
+# prep state (see the VERDICT.md record).
+TODAY=$(date +%F)
+if [ -z "$CHANGELOG_VERSION" ]; then
+    echo "SKIP     README.md changelog header date: no changelog header (section 7)"
+elif [ "$CHANGELOG_VERSION" != "$EXPECTED" ]; then
+    echo "SKIP     README.md changelog header date: header v${CHANGELOG_VERSION} is not the release being tagged"
+elif [ -z "$REMOTE_TAG" ]; then
+    echo "SKIP     README.md changelog header date: Codeberg tags API unreachable"
+elif [ "$REMOTE_TAG" = "$EXPECTED" ]; then
+    echo "SKIP     README.md changelog header date: v${EXPECTED} on the remote (the header date is frozen history)"
+else
+    HEADER_DATE=$(grep '^### v' README.md | head -1 \
+        | sed 's/.*(\([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\))[[:space:]]*$/\1/')
+    case "$HEADER_DATE" in
+        [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+        *) HEADER_DATE="" ;;
+    esac
+    if [ -z "$HEADER_DATE" ]; then
+        echo "MISSING  README.md changelog header date: no (YYYY-MM-DD) on the v${CHANGELOG_VERSION} header"
+        ERRORS=$((ERRORS + 1))
+    elif [ "$HEADER_DATE" = "$TODAY" ]; then
+        echo "ok       README.md changelog header date: ${HEADER_DATE} (local date)"
+    else
+        NEWER_DATE=$(printf '%s\n%s\n' "$HEADER_DATE" "$TODAY" | sort | tail -n 1)
+        if [ "$NEWER_DATE" = "$HEADER_DATE" ]; then
+            echo "MISMATCH README.md changelog header date: ${HEADER_DATE} (local date ${TODAY}, the header date is ahead)"
+        else
+            echo "MISMATCH README.md changelog header date: ${HEADER_DATE} (local date ${TODAY}, the header date is behind)"
+        fi
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
 echo ""
 if [ "$ERRORS" -gt 0 ]; then
     echo "FAILED: ${ERRORS} version mismatch(es) found"
     echo "  Sections 1, 2, 4, and 7 must be ${EXPECTED} before tagging v${EXPECTED}."
     echo "  Sections 3 and 5 must match the latest remote tag."
     echo "  Sections 5b and 5c pins must agree across install.sh and install.ps1."
+    echo "  Section 8 must carry the local date at the pre-tag run."
     exit 1
 else
     echo "All versions match: ${EXPECTED}"

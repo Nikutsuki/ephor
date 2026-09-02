@@ -27928,6 +27928,16 @@ fn scanConcurrencyCalls(state: *ConcurrencyScanState, lc: ConcLineCtx) !void {
     var pos: usize = 0;
     while (nextCallSite(lc.code, pos)) |site| {
         pos = site.open_paren + 1;
+        // A call past the 16 KiB mask bound drops with the overhang
+        // (fail closed, EPH-I1258): `blanked` ends there, and the
+        // recorded facts (the brace delta, the condition position)
+        // index it at the call offset. The raw-code walk (EPH-I0903)
+        // still reaches these sites, so this guard is the mask's own
+        // drop (EPH-I1321, serves REL-P5-SCOPE-1: the free-fn release
+        // past the bound panicked the brace-delta slice after the
+        // raw-code receiver fix, and the acquire panicked on both
+        // binaries as a latent class).
+        if (site.start >= lc.blanked.len) continue;
         const target = lc.code[site.start..site.name_end];
         const seg = lastSegment(target);
         const kind = classifyCall(seg);
@@ -28298,8 +28308,17 @@ fn scanConcurrencyLine(
     // braceDepthAtCodeOffset skips `/* */` spans — mid-edit text, since
     // Zig has no block comments (the I0916 ruling) — whose braces would
     // otherwise shift the attributed depth (EPH-I0925).
+    // A defer keyword past the 16 KiB mask bound drops with the overhang
+    // (EPH-I1258): the keyword scan reads the raw line, so the walk's end
+    // can sit past blanked.len and the unguarded blanked[i] read panicked.
+    // The clamp covers the masked head; trackConcurrencyDefer's keyword
+    // position stays past the mask, so the defer fact never records
+    // (fail closed, EPH-I1322, serves REL-P5-SCOPE-1).
     const defer_stmt_depth = if (defer_pos) |p|
-        braceDepthAtCodeOffset(state.fn_depth, blanked, skipLeadingWhitespace(code) + p)
+        braceDepthAtCodeOffset(state.fn_depth, blanked, @min(
+            skipLeadingWhitespace(code) + p,
+            blanked.len,
+        ))
     else
         state.fn_depth;
     const defer_attr_depth = if (state.in_defer) state.defer_stmt_depth else defer_stmt_depth;
@@ -120762,6 +120781,106 @@ test "ZC101: free-function receiver survives later long lines (EPH-I0903 live sh
     defer run.deinit(allocator);
 
     try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: free-fn release past the 16 KiB mask drops fail-closed (EPH-I1321, REL-P5-SCOPE-1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The edge-16k probe mirror: the acquire sits inside the mask, the
+    // free-fn release sits past byte 16384. The release drops with the
+    // overhang (EPH-I1258), so the acquire stays unpaired and ZC101
+    // warns — the graceful pre-fix observable. Post-0abe2fb the
+    // raw-code receiver made this shape panic ("index out of bounds:
+    // index 17000, len 16384") at the brace-delta slice. The guard in
+    // scanConcurrencyCalls restores the drop.
+    var content = std.ArrayListUnmanaged(u8).empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator,
+        \\fn doWork() void {}
+        \\fn acquireOsLock(file: File) void {
+        \\    file.lock(.exclusive) catch {};
+        \\    doWork();
+        \\}
+        \\fn releaseFileLock(lock_id: u64) void {
+        \\    var file = getLockedFile(lock_id);
+        \\
+    );
+    try content.appendNTimes(allocator, ' ', 16 * 1024 + 1);
+    try content.appendSlice(allocator, "compat.fileUnlock(file);\n    file.close();\n}\n");
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_overcap_release.zig", content.items);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
+}
+
+test "ZC101: acquire past the 16 KiB mask drops fail-closed (EPH-I1321, REL-P5-SCOPE-1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The edge-16k-acq probe mirror: the acquire sits past byte 16384.
+    // The overhang drops (EPH-I1258), so the acquire never registers
+    // and ZC101 stays silent — the fail-closed drop, never a panic.
+    // This was a pre-existing latent class: BOTH binaries panicked on
+    // this shape ("index out of bounds: index 17000, len 16384") at the
+    // brace-delta slice. The guard in scanConcurrencyCalls closes it.
+    // The firing sibling for this silent pin is the release-form test
+    // above (a warnings==0 check is otherwise vacuous).
+    var content = std.ArrayListUnmanaged(u8).empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator,
+        \\fn doWork() void {}
+        \\fn acquireOsLock(file: File) void {
+        \\
+    );
+    try content.appendNTimes(allocator, ' ', 16 * 1024 + 1);
+    try content.appendSlice(allocator,
+        \\file.lock(.exclusive) catch {};
+        \\    doWork();
+        \\}
+    );
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_overcap_acquire.zig", content.items);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 0, 0);
+}
+
+test "ZC101: defer past the 16 KiB mask drops fail-closed (EPH-I1322, REL-P5-SCOPE-1)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The defer keyword sits past byte 16384 on its line. The keyword
+    // scan reads the raw line (the 16 KiB mask truncates only the
+    // literal-blanked form), so the depth walk's end landed past the
+    // mask and the unguarded blanked[i] read panicked — "index out of
+    // bounds: index 16384, len 16384" at braceDepthAtCodeOffset, on
+    // both binaries (EPH-I1322, the latent sibling of EPH-I1321). The
+    // clamp at the call covers the masked head, and the defer fact
+    // never records (its keyword position stays past the mask), so the
+    // acquire stays unpaired and ZC101 warns — the fail-closed drop
+    // (EPH-I1258). The firing sibling for this shape is the paired
+    // in-mask test "lock with defer unlock is silent" (0, 0): this pin
+    // asserts the drop, not the silence.
+    var content = std.ArrayListUnmanaged(u8).empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator,
+        \\fn doWork() void {}
+        \\fn holdLock(mu: Mutex) void {
+        \\    mu.lock();
+        \\
+    );
+    try content.appendNTimes(allocator, ' ', 16 * 1024 + 1);
+    try content.appendSlice(allocator, "defer mu.unlock();\n    doWork();\n}\n");
+    var run = try runConcurrencyCheck(&diag, allocator, "zc101_overcap_defer.zig", content.items);
+    defer run.deinit(allocator);
+
+    try expectZC101Counts(run.issues.items, 1, 0);
 }
 
 test "ZC101: free-function fileUnlock with a MISMATCHED argument does not suppress" {

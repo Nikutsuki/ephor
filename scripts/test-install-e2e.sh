@@ -397,7 +397,7 @@ rc=0
     sh "$ROOT/install.sh") > "$E2E/s9/out.log" 2> "$E2E/s9/err.log" || rc=$?
 expect "s9 downgrade refusal falls back rc 0" "0" "$rc"
 expect_grep "s9 fallback warning" "$E2E/s9/err.log" "warning: could not resolve the latest ephor tag from the Codeberg API."
-expect_grep "s9 fallback tag line" "$E2E/s9/out.log" "Installing ephor v0.15.3"
+expect_grep "s9 fallback tag line" "$E2E/s9/out.log" "Installing ephor v0.15.4"
 expect_grep "s9 install completes" "$E2E/s9/out.log" "Done!"
 
 # The remaining scenario needs no redirect servers.

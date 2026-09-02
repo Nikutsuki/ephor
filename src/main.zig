@@ -30675,6 +30675,10 @@ fn appendSegment(list: SegmentList, seg: []const u8) SegmentList {
     return result;
 }
 
+/// One value-ref name map (the extractors record into either half of a
+/// ValueRefSet).
+const ValueRefMap = std.StringHashMapUnmanaged(void);
+
 /// Names one file references as fn values (the ZA505 generic-adapter
 /// carve-out, EPH-I1238. Serves REL-ZERO-1 and REL-AB-5). A wrapper whose
 /// name takes a value position — an argument segment, an assignment
@@ -30685,16 +30689,27 @@ fn appendSegment(list: SegmentList, seg: []const u8) SegmentList {
 /// surface is a per-line stack buffer), freed by deinitValueRefSet. The
 /// names are bare identifiers only, and the check applies the set to
 /// non-receiver-typed wrappers alone (EPH-I1243): a bare name never binds
-/// a method.
-const ValueRefSet = std.StringHashMapUnmanaged(void);
+/// a method. The premise is scope-qualified (EPH-I1319): at namespace
+/// scope (inside a container body, outside every fn body) a bare name
+/// resolves to the container's member, so a ref recorded there is an
+/// unambiguous decl reference and silences a self-named wrapper too.
+/// The `any` map holds every value ref; the `namespace` map holds the
+/// subset recorded at container scope. Each map owns its keys.
+const ValueRefSet = struct {
+    any: ValueRefMap = .empty,
+    namespace: ValueRefMap = .empty,
+};
 
-/// Scan one file for the value-reference names (EPH-I1238). The line
-/// masking mirrors visitFnInterfaceFile's walk (KEEP-IN-SYNC with that
-/// loop): blank, comment, and multiline-string content lines contribute
-/// nothing, and string literals blank before the shape scan.
+/// Scan one file for the value-reference names (EPH-I1238) with their
+/// namespace-scope split (EPH-I1319). The line masking mirrors
+/// visitFnInterfaceFile's walk (KEEP-IN-SYNC with that loop): blank,
+/// comment, and multiline-string content lines contribute nothing, and
+/// string literals blank before the shape scan. The scope tracker reuses
+/// the pass's span primitives so the two walks open the same fn bodies.
 fn collectValueRefNames(allocator: Allocator, content: []const u8) !ValueRefSet {
-    var set: ValueRefSet = .empty;
+    var set: ValueRefSet = .{};
     errdefer deinitValueRefSet(&set, allocator);
+    var tracker = NsScopeTracker{ .sets = &set };
     var blank_buf: [16 * 1024]u8 = undefined;
     var mask_buf: [256]u8 = undefined;
     var in_mline = false;
@@ -30706,22 +30721,207 @@ fn collectValueRefNames(allocator: Allocator, content: []const u8) !ValueRefSet 
         if (advanceFnIfaceMline(&in_mline, &open_braces, t, &mask_buf)) continue;
         const code_end = findCommentStart(raw) orelse raw.len;
         const blanked = blankLiteralContents(raw[0..code_end], &blank_buf);
-        try collectValueRefLine(&set, allocator, blanked);
+        try collectNsValueRefLine(&tracker, allocator, t, blanked);
     }
     return set;
 }
 
-/// Free the owned names and the table (every key is a duped slice).
+/// Namespace-scope classification for the value-ref collector (EPH-I1319,
+/// serves REL-P5-SCOPE-1).
+/// The receiver gate's premise (a bare identifier never binds a method)
+/// holds inside fn bodies — lexical scope — but not at container scope,
+/// where a bare name resolves to the container's member. The tracker walks
+/// every code line with the pass's own span primitives (fnIfaceBodyBraceAt,
+/// walkBodyBraces, the EPH-I1250 type-block skip) so the collector and the
+/// pass open the same fn bodies; the shared blind spot (a def on the same
+/// line as a previous close) misclassifies toward lexical, the over-warn
+/// direction. Container depth sits on a brace stack: a `struct`/`union`/
+/// `enum` body opens a container and a plain block inside one only nests.
+const NsScopeTracker = struct {
+    /// The two value-ref sets the walk records into.
+    sets: *ValueRefSet,
+    /// Inside an open fn body.
+    in_body: bool = false,
+    /// Inside a fn signature whose body brace has not arrived.
+    in_sig: bool = false,
+    /// Open-brace depth of the current fn body (walkBodyBraces semantics).
+    fn_depth: usize = 0,
+    /// Carried signature paren depth (fnIfaceBodyBraceAt semantics).
+    sig_parens: usize = 0,
+    /// Carried return-type-block depth (the EPH-I1250 skip).
+    sig_type_depth: usize = 0,
+    /// Open container bodies, counted on a per-level nesting stack.
+    container_count: usize = 0,
+    container_stack: [16]usize = undefined,
+
+    /// Open a container body at `blanked[i]` when the brace is a
+    /// container opener; a plain brace only nests the innermost open
+    /// container. Past the stack cap the tracker stops pushing: the
+    /// undercount classifies later refs toward file scope (the over-warn
+    /// direction), never toward namespace.
+    fn openNsBrace(self: *NsScopeTracker, blanked: []const u8, i: usize) void {
+        if (!sigContainerOpen(blanked, i)) {
+            if (self.container_count > 0) self.container_stack[self.container_count - 1] += 1;
+            return;
+        }
+        if (self.container_count >= self.container_stack.len) return;
+        self.container_stack[self.container_count] = 1;
+        self.container_count += 1;
+    }
+
+    /// Close the innermost open container on a `}`.
+    fn closeNsBrace(self: *NsScopeTracker) void {
+        if (self.container_count == 0) return;
+        const top = self.container_count - 1;
+        if (self.container_stack[top] == 1) {
+            self.container_count -= 1;
+        } else {
+            self.container_stack[top] -= 1;
+        }
+    }
+};
+
+/// One line of the collector walk, dispatched by scope mode.
+fn collectNsValueRefLine(
+    tracker: *NsScopeTracker,
+    allocator: Allocator,
+    t: []const u8,
+    blanked: []const u8,
+) !void {
+    if (tracker.in_body) return collectNsBodyLine(tracker, allocator, blanked);
+    if (tracker.in_sig) return collectNsSigLine(tracker, allocator, t, blanked);
+    try collectNsOuterLine(tracker, allocator, t, blanked);
+}
+
+/// One line inside an open fn body: advance the brace depth, close the
+/// body at the depth-0 brace, and hand the remainder after the close back
+/// to container tracking (a `};` on the close line closes the container
+/// too). Refs tag lexical.
+fn collectNsBodyLine(
+    tracker: *NsScopeTracker,
+    allocator: Allocator,
+    blanked: []const u8,
+) !void {
+    const walk = walkBodyBraces(blanked, 0, tracker.fn_depth);
+    tracker.fn_depth = walk.depth;
+    if (walk.close) |close_rel| {
+        tracker.in_body = false;
+        tracker.fn_depth = 0;
+        updateNsContainerDepth(tracker, blanked[close_rel + 1 ..]);
+    }
+    try collectValueRefLine(&tracker.sets.any, allocator, blanked);
+}
+
+/// One signature-continuation line: the body brace opens it into body
+/// mode, and a `;` drops a bodiless decl (`fn f(...);`). Refs tag lexical
+/// — a signature carries no value positions.
+fn collectNsSigLine(
+    tracker: *NsScopeTracker,
+    allocator: Allocator,
+    t: []const u8,
+    blanked: []const u8,
+) !void {
+    const open_rel = fnIfaceBodyBraceAt(
+        blanked,
+        0,
+        &tracker.sig_parens,
+        &tracker.sig_type_depth,
+    );
+    if (open_rel) |brace_rel| {
+        tracker.in_sig = false;
+        tracker.sig_type_depth = 0;
+        openNsFnBody(tracker, blanked, brace_rel);
+    } else if (tracker.sig_type_depth == 0 and endsWithCodeSemicolon(t)) {
+        tracker.in_sig = false;
+    }
+    try collectValueRefLine(&tracker.sets.any, allocator, blanked);
+}
+
+/// A line outside every fn span: a new def line opens a body or a
+/// signature (mirroring detectFnIfaceDef), anything else updates the
+/// container depth and tags the line's refs by the resulting scope. A def
+/// line's refs record lexical only — a ref there sits in a one-line body,
+/// and the over-warn direction keeps the carve-out silent about it.
+fn collectNsOuterLine(
+    tracker: *NsScopeTracker,
+    allocator: Allocator,
+    t: []const u8,
+    blanked: []const u8,
+) !void {
+    if (findRealFnDef(t)) |pos| {
+        const is_clean_boundary = pos == 0 or !isIdent(t[pos - 1]);
+        if (is_clean_boundary and !isBodilessFnDecl(t)) {
+            openNsFnDefLine(tracker, blanked, pos);
+            try collectValueRefLine(&tracker.sets.any, allocator, blanked);
+            return;
+        }
+    }
+    updateNsContainerDepth(tracker, blanked);
+    try collectValueRefLine(&tracker.sets.any, allocator, blanked);
+    if (tracker.container_count > 0) {
+        try collectValueRefLine(&tracker.sets.namespace, allocator, blanked);
+    }
+}
+
+/// A fn-def line: the container scan covers the pre-keyword region, then
+/// the body brace search (with the EPH-I1250 type-block skip) opens a body
+/// or a signature.
+fn openNsFnDefLine(tracker: *NsScopeTracker, blanked: []const u8, pos: usize) void {
+    const lead = skipLeadingWhitespace(blanked);
+    updateNsContainerDepth(tracker, blanked[0 .. lead + pos]);
+    var sig_parens: usize = 0;
+    var sig_type_depth: usize = 0;
+    const open_rel = fnIfaceBodyBraceAt(blanked, lead + pos, &sig_parens, &sig_type_depth);
+    if (open_rel) |brace_rel| {
+        openNsFnBody(tracker, blanked, brace_rel);
+    } else {
+        tracker.in_sig = true;
+        tracker.sig_parens = sig_parens;
+        tracker.sig_type_depth = sig_type_depth;
+    }
+}
+
+/// Open a fn body at `brace_rel` on the current line: a same-line close
+/// resets the body state and the remainder after the close is container
+/// material, an open body enters body mode with the carried depth.
+fn openNsFnBody(tracker: *NsScopeTracker, blanked: []const u8, brace_rel: usize) void {
+    const walk = walkBodyBraces(blanked, brace_rel + 1, 1);
+    if (walk.close) |close_rel| {
+        updateNsContainerDepth(tracker, blanked[close_rel + 1 ..]);
+        tracker.in_body = false;
+        tracker.fn_depth = 0;
+    } else {
+        tracker.in_body = true;
+        tracker.fn_depth = walk.depth;
+    }
+}
+
+/// Update the container-depth stack from one blanked line's braces.
+fn updateNsContainerDepth(tracker: *NsScopeTracker, blanked: []const u8) void {
+    var i: usize = 0;
+    while (i < blanked.len) : (i += 1) {
+        if (blanked[i] == '{') {
+            tracker.openNsBrace(blanked, i);
+        } else if (blanked[i] == '}') {
+            tracker.closeNsBrace();
+        }
+    }
+}
+
+/// Free the owned names and the tables (every key is a duped slice).
 fn deinitValueRefSet(set: *ValueRefSet, allocator: Allocator) void {
-    var keys = set.keyIterator();
-    while (keys.next()) |key| allocator.free(key.*);
-    set.deinit(allocator);
+    var any_keys = set.any.keyIterator();
+    while (any_keys.next()) |key| allocator.free(key.*);
+    set.any.deinit(allocator);
+    var ns_keys = set.namespace.keyIterator();
+    while (ns_keys.next()) |key| allocator.free(key.*);
+    set.namespace.deinit(allocator);
 }
 
 /// One blanked code line's value positions: return expressions, assignment
 /// right-hand sides, and argument segments (the three shapes a generic fn
 /// cannot serve, EPH-I1238).
-fn collectValueRefLine(set: *ValueRefSet, allocator: Allocator, code: []const u8) !void {
+fn collectValueRefLine(set: *ValueRefMap, allocator: Allocator, code: []const u8) !void {
     try collectReturnValueRefs(set, allocator, code);
     try collectAssignValueRefs(set, allocator, code);
     try collectArgValueRefs(set, allocator, code);
@@ -30729,7 +30929,7 @@ fn collectValueRefLine(set: *ValueRefSet, allocator: Allocator, code: []const u8
 
 /// `return <name>;` (an optional single paren wrap allowed): the returned
 /// name is a value position. The statement cuts at its first `;`.
-fn collectReturnValueRefs(set: *ValueRefSet, allocator: Allocator, code: []const u8) !void {
+fn collectReturnValueRefs(set: *ValueRefMap, allocator: Allocator, code: []const u8) !void {
     var s: usize = 0;
     while (s + 6 <= code.len) {
         const pos = mem.indexOfPos(u8, code, s, "return") orelse return;
@@ -30760,7 +30960,7 @@ fn returnValueName(code: []const u8, pos: usize) ?[]const u8 {
 /// follows, or the line ends): the assignment right-hand side is a value
 /// position. Comparison operators never match — their `=` follows an
 /// operator byte (`==`, `!=`, `<=`, `>=`) or precedes `>` (`=>`).
-fn collectAssignValueRefs(set: *ValueRefSet, allocator: Allocator, code: []const u8) !void {
+fn collectAssignValueRefs(set: *ValueRefMap, allocator: Allocator, code: []const u8) !void {
     var i: usize = 0;
     while (i < code.len) : (i += 1) {
         if (code[i] != '=') continue;
@@ -30793,7 +30993,7 @@ fn assignValueName(code: []const u8, from: usize) ?[]const u8 {
 /// A bare-name segment inside any paren group (a call argument or a
 /// parenthesized expression) is a value position. Control-keyword groups
 /// never count: their names are variable conditions, not fn values.
-fn collectArgValueRefs(set: *ValueRefSet, allocator: Allocator, code: []const u8) !void {
+fn collectArgValueRefs(set: *ValueRefMap, allocator: Allocator, code: []const u8) !void {
     var i: usize = 0;
     while (i < code.len) : (i += 1) {
         if (code[i] != '(') continue;
@@ -30830,7 +31030,7 @@ fn parenFollowsControlKeyword(code: []const u8, pos: usize) bool {
 
 /// Record one value-referenced name (an owned dupe. The scan surface is a
 /// per-line stack buffer).
-fn recordValueRef(set: *ValueRefSet, allocator: Allocator, name: []const u8) !void {
+fn recordValueRef(set: *ValueRefMap, allocator: Allocator, name: []const u8) !void {
     if (set.contains(name)) return;
     const owned = try allocator.dupe(u8, name);
     errdefer allocator.free(owned);
@@ -31263,9 +31463,15 @@ fn checkPassthroughWrapper(
     // as a field or slice-length access (`items.len`), so no value-ref
     // form silences a receiver-typed wrapper — the FN-eliminating
     // direction. A method genuinely taken as a fn value stays a rare
-    // un-silenced firing.
+    // un-silenced firing. The premise is scope-qualified (EPH-I1319): a
+    // bare identifier inside a container body — a struct-body table
+    // initializer — resolves to the container's member, so a ref recorded
+    // at namespace scope is an unambiguous decl reference and silences a
+    // self-named wrapper too (the skytale interface-table class). A ref
+    // inside any fn body stays lexical and never silences one.
     const has_self_receiver = params.len > 0 and params[0].is_self;
-    if (!has_self_receiver and c.value_refs.contains(open.name)) return;
+    if (!has_self_receiver and c.value_refs.any.contains(open.name)) return;
+    if (has_self_receiver and c.value_refs.namespace.contains(open.name)) return;
     if (!argsForwardParams(callee.args, params)) return;
     const msg = try std.fmt.allocPrint(
         c.allocator,
@@ -136380,6 +136586,123 @@ test "ZA505 stays silent for a file-scope wrapper a same-named local shadows" {
     );
     defer run.deinit(allocator);
     try expectNoFindings(&run);
+}
+
+// --- ZA505 receiver-gate namespace scope (EPH-I1319) -------------------------
+
+test "ZA505 stays silent when a struct-body table refs a self-named method (EPH-I1319, REL-P5-SCOPE-1)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The skytale interface.zig shape (EPH-I1319): `.no_arg = wDisplayHelp`
+    // at container scope binds the method decl, so the receiver gate must
+    // not block the value-reference carve-out.
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\const App = struct {
+        \\    fn render(self: *App) void {
+        \\        _ = self;
+        \\    }
+        \\};
+        \\
+        \\const CmdEntry = struct {
+        \\    names: []const []const u8,
+        \\    no_arg: ?*const fn (*App) void = null,
+        \\};
+        \\
+        \\const Interface = struct {
+        \\    fn wDisplayHelp(self: *App) void {
+        \\        App.render(self);
+        \\    }
+        \\
+        \\    const command_table = [_]CmdEntry{
+        \\        .{ .names = &.{"help"}, .no_arg = wDisplayHelp },
+        \\    };
+        \\};
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA505 stays silent when a struct-body table refs an s-named sibling (EPH-I1319, REL-P5-SCOPE-1)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The sibling pin (EPH-I1319): the receiver renamed to `s`, the same
+    // `.no_arg = name` table shape — byte-identical verdict to the
+    // self-named sibling.
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\const App = struct {
+        \\    fn render(self: *App) void {
+        \\        _ = self;
+        \\    }
+        \\};
+        \\
+        \\const CmdEntry = struct {
+        \\    names: []const []const u8,
+        \\    no_arg: ?*const fn (*App) void = null,
+        \\};
+        \\
+        \\const Interface = struct {
+        \\    fn wDisplayStatus(s: *App) void {
+        \\        App.render(s);
+        \\    }
+        \\
+        \\    const command_table = [_]CmdEntry{
+        \\        .{ .names = &.{"status"}, .no_arg = wDisplayStatus },
+        \\    };
+        \\};
+    );
+    defer run.deinit(allocator);
+    try expectNoFindings(&run);
+}
+
+test "ZA505 keeps firing when a self-named method has no value reference (EPH-I1319, REL-P5-SCOPE-1)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The firing control (EPH-I1319): no table entry refs the wrapper, so
+    // the carve-out has nothing to honor and the passthrough fires.
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\const App = struct {
+        \\    fn render(self: *App) void {
+        \\        _ = self;
+        \\    }
+        \\};
+        \\
+        \\const Interface = struct {
+        \\    fn wDisplayHelp(self: *App) void {
+        \\        App.render(self);
+        \\    }
+        \\};
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_PASSTHROUGH_WRAPPER);
+    const issue = run.structure.items[0];
+    try std.testing.expect(mem.indexOf(u8, issue.message, "wDisplayHelp") != null);
+}
+
+test "ZA505 keeps firing when a fn-body ref names a self-named method (EPH-I1319, REL-P5-SCOPE-1)" {
+    var diag = testDiagCtx();
+    const allocator = std.testing.allocator;
+    // The lexical-scope control (EPH-I1319): `return wDisplayHelp;` inside
+    // a one-line fn body binds lexical scope, never the container member,
+    // so the namespace carve-out must not silence the wrapper.
+    var run = try runFnIfaceTest(&diag, allocator,
+        \\const App = struct {
+        \\    fn render(self: *App) void {
+        \\        _ = self;
+        \\    }
+        \\};
+        \\
+        \\const Interface = struct {
+        \\    fn wDisplayHelp(self: *App) void {
+        \\        App.render(self);
+        \\    }
+        \\
+        \\    fn pick() ?*const fn (*App) void { return wDisplayHelp; }
+        \\};
+    );
+    defer run.deinit(allocator);
+    try expectSingleFinding(&run, RULE_PASSTHROUGH_WRAPPER);
+    const issue = run.structure.items[0];
+    try std.testing.expect(mem.indexOf(u8, issue.message, "wDisplayHelp") != null);
 }
 
 // --- ZA506: boolean flag parameters ------------------------------------------

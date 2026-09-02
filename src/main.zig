@@ -3250,6 +3250,51 @@ fn hasRealCleanupPattern(t: []const u8) bool {
     return false;
 }
 
+/// The free-helper name prefixes the ZA103 cleanup matcher recognizes: a
+/// cleanup wrapped in a named helper (freeHopKeys, deinitChunks) carries
+/// no literal .free(/.deinit(/.destroy( token, so the matcher must
+/// recognize the helper-call form by name (EPH-I1318).
+const free_helper_prefixes = [_][]const u8{ "free", "deinit", "destroy" };
+
+/// True when the identifier `word` names a free helper: it starts with a
+/// free-helper prefix, and the prefix ends at a compound boundary (an
+/// uppercase hump, `_`, or the name end). A lowercase continuation
+/// (freeze, freed) is a different word and stays unrecognized — the
+/// over-warn direction (EPH-I1318).
+fn isFreeHelperName(word: []const u8) bool {
+    for (free_helper_prefixes) |pfx| {
+        if (!mem.startsWith(u8, word, pfx)) continue;
+        if (word.len == pfx.len) return true;
+        const c = word[pfx.len];
+        return c == '_' or std.ascii.isUpper(c);
+    }
+    return false;
+}
+
+/// True when `t` carries a bare call to a free-helper identifier: a
+/// word-bounded identifier with a free-helper name followed by `(`.
+/// Recognition failure keeps the record absent and the ZA103 warning
+/// alive (EPH-I1318).
+fn hasFreeHelperCall(t: []const u8) bool {
+    var s: usize = 0;
+    while (s < t.len) : (s += 1) {
+        if (!isIdent(t[s])) continue;
+        const word = identSpan(t, s);
+        const paren = types.skipWhitespace(t, s + word.len);
+        const is_call = paren < t.len and t[paren] == '(';
+        if (isFreeHelperName(word) and is_call and !types.isInsideString(t, s)) return true;
+        s += word.len - 1;
+    }
+    return false;
+}
+
+/// The identifier that starts at `start` (t[start] is an ident char).
+fn identSpan(t: []const u8, start: usize) []const u8 {
+    var e = start + 1;
+    while (e < t.len and isIdent(t[e])) e += 1;
+    return t[start..e];
+}
+
 /// Check if a keyword appears as real code: not inside a string literal,
 /// not embedded in a longer identifier (`@panic("Retry ...")` contains
 /// "try " on both counts), and not inside a trailing `//` comment
@@ -16885,7 +16930,13 @@ fn tryAppendCleanupInfo(
     errdefers: *std.ArrayListUnmanaged(ErrdeferInfo),
     allocator: Allocator,
 ) !void {
-    if (!hasRealCleanupPattern(items)) return;
+    // A cleanup record needs a cleanup shape: the classic literal pattern
+    // (.free(/.deinit(/.destroy() or a free-helper call whose name matches
+    // a free-helper prefix (freeHopKeys, EPH-I1318). A cleanup wrapped in
+    // a named helper carries no literal token, so the matcher must
+    // recognize the helper-call form by name. Recognition failure keeps the
+    // record absent and the ZA103 warning alive (over-warn direction).
+    if (!hasRealCleanupPattern(items) and !hasFreeHelperCall(items)) return;
     const content = try allocator.dupe(u8, items);
     // The dupe is owned by the record only after the append commits. A
     // failed append must release it (band-B03 F15, EPH-I0375).
@@ -71440,6 +71491,191 @@ test "ZA103: return error after alloc without errdefer is a gap" {
         "test_return_error.zig",
         RULE_ALLOC_NO_ERRDEFER,
     ) == 1);
+}
+
+test "ZA103: errdefer free-helper call covers the alloc (EPH-I1318)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // skytale circuit_relay_building.zig:228 shape: the cleanup is a
+    // named helper that carries the allocator and the allocation — no
+    // literal .free( token exists for the classic cleanup matcher.
+    const content =
+        \\fn build(allocator: std.mem.Allocator, n: usize) !void {
+        \\    const hop_keys = try allocator.alloc(Key, n);
+        \\    errdefer freeHopKeys(allocator, hop_keys);
+        \\    try validate(hop_keys);
+        \\}
+        \\const Key = struct {};
+        \\fn freeHopKeys(a: std.mem.Allocator, keys: []Key) void {
+        \\    a.free(keys);
+        \\}
+        \\fn validate(keys: []const Key) !void {
+        \\    if (keys.len == 0) return error.Empty;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_free_helper.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_free_helper.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: errdefer deinit-helper call over a slice covers the alloc (EPH-I1318)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // skytale document_transfer.zig:612 shape: the helper frees a
+    // partial slice of the alloc, and the alloc name appears in the
+    // subscript, not as a bare argument.
+    const content =
+        \\fn transfer(allocator: std.mem.Allocator, n: usize) !void {
+        \\    const chunks = try allocator.alloc(Chunk, n);
+        \\    var idx: usize = 0;
+        \\    errdefer deinitChunks(allocator, chunks[0..idx]);
+        \\    try load(chunks);
+        \\}
+        \\const Chunk = struct {};
+        \\fn deinitChunks(a: std.mem.Allocator, list: []Chunk) void {
+        \\    a.free(list);
+        \\}
+        \\fn load(list: []const Chunk) !void {
+        \\    if (list.len == 0) return error.Empty;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_deinit_helper.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_deinit_helper.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 0);
+}
+
+test "ZA103: errdefer free-helper call of another alloc stays a gap (EPH-I1318 firing control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The helper frees `other`, never `hop_keys`: the record matches the
+    // name it carries, and hop_keys must keep firing.
+    const content =
+        \\fn build(allocator: std.mem.Allocator, n: usize) !void {
+        \\    const hop_keys = try allocator.alloc(Key, n);
+        \\    const other = try allocator.alloc(Key, n);
+        \\    errdefer freeHopKeys(allocator, other);
+        \\    try validate(hop_keys);
+        \\}
+        \\const Key = struct {};
+        \\fn freeHopKeys(a: std.mem.Allocator, keys: []Key) void {
+        \\    a.free(keys);
+        \\}
+        \\fn validate(keys: []const Key) !void {
+        \\    if (keys.len == 0) return error.Empty;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_free_helper_other.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_free_helper_other.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: non-free helper name stays unrecognized (EPH-I1318 fail-closed)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // storeHopKeys does not free: the name does not match the free-helper
+    // prefixes, so the errdefer is not a cleanup record and the gap
+    // stays — the over-warn direction when recognition fails.
+    const content =
+        \\fn build(allocator: std.mem.Allocator, n: usize) !void {
+        \\    const hop_keys = try allocator.alloc(Key, n);
+        \\    errdefer storeHopKeys(allocator, hop_keys);
+        \\    try validate(hop_keys);
+        \\}
+        \\const Key = struct {};
+        \\fn storeHopKeys(a: std.mem.Allocator, keys: []Key) void {
+        \\    _ = a;
+        \\    _ = keys;
+        \\}
+        \\fn validate(keys: []const Key) !void {
+        \\    if (keys.len == 0) return error.Empty;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_non_free_helper.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_non_free_helper.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "ZA103: lowercase-continuation helper name stays unrecognized (EPH-I1318 fail-closed)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // `freeze` starts with `free` but is a different word: the compound
+    // boundary gate keeps it out of the cleanup records (over-warn).
+    const content =
+        \\fn build(allocator: std.mem.Allocator, n: usize) !void {
+        \\    const hop_keys = try allocator.alloc(Key, n);
+        \\    errdefer freeze(allocator, hop_keys);
+        \\    try validate(hop_keys);
+        \\}
+        \\const Key = struct {};
+        \\fn freeze(a: std.mem.Allocator, keys: []Key) void {
+        \\    _ = a;
+        \\    _ = keys;
+        \\}
+        \\fn validate(keys: []const Key) !void {
+        \\    if (keys.len == 0) return error.Empty;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_freeze_helper.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_freeze_helper.zig",
+        RULE_ALLOC_NO_ERRDEFER,
+    ) == 1);
+}
+
+test "hasFreeHelperCall: helper-call recognition battery (EPH-I1318)" {
+    // Named shapes: the two skytale forms and the snake-case form.
+    try std.testing.expect(hasFreeHelperCall("errdefer freeHopKeys(allocator, hop_keys);"));
+    try std.testing.expect(hasFreeHelperCall("errdefer deinitChunks(allocator, chunks[0..idx]);"));
+    try std.testing.expect(hasFreeHelperCall("defer free_keys(gpa, keys);"));
+    // Bare helper names.
+    try std.testing.expect(hasFreeHelperCall("defer free (gpa, buf);"));
+    try std.testing.expect(hasFreeHelperCall("errdefer destroy(arena, state);"));
+    // Fail-closed edges: non-free names, a lowercase continuation, a
+    // non-boundary prefix, a string mention, and a call-free reference.
+    try std.testing.expect(!hasFreeHelperCall("storeHopKeys(allocator, keys)"));
+    try std.testing.expect(!hasFreeHelperCall("freeze(state, keys)"));
+    try std.testing.expect(!hasFreeHelperCall("unfreeHopKeys(keys)"));
+    try std.testing.expect(!hasFreeHelperCall("not_freeHopKeys(keys)"));
+    try std.testing.expect(!hasFreeHelperCall("log(\"freeHopKeys(x)\", 0);"));
+    try std.testing.expect(!hasFreeHelperCall("const f = freeHopKeys;"));
 }
 
 test "ZA103: error return before field-store transfer is a gap (EPH-I0005)" {

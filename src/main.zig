@@ -6813,25 +6813,52 @@ fn enclosingLoopOpenerText(sc: *const ReadScanCtx, idx: usize, read_col: usize) 
 }
 
 /// True when the read at (idx, read_col) sits inside the body of the loop
-/// opened on the same line (EPH-I1312, REL-P3-VERIFY-3). The backward enclosure walk is
+/// opened on the same line (EPH-I1312, EPH-I1315, REL-P3-VERIFY-3). The backward enclosure walk is
 /// exclusive of idx, so the same-line opener carries its own read-position
 /// proof: the read must sit past the body start, before the same-line body
 /// close for a braced body, and before the first statement boundary for a
-/// braceless one. A read in the header region, an Allman body, a
-/// multi-line condition, a read past the same-line close, and a read in a
-/// later statement on the line all fail closed — the read then falls to
-/// the walked openers.
+/// braceless one. A same-line else arm rejects the admission in both
+/// branches: the arm runs on the zero-trip path, so an arm read never
+/// sees a trip's fill and must not ride the body-read silence. A read in
+/// the header region, an Allman body, a multi-line condition, a read past
+/// the same-line close, and a read in a later statement on the line all
+/// fail closed — the read then falls to the walked openers.
 fn sameLineLoopBodyHolds(lines: []const []const u8, idx: usize, read_col: usize) bool {
     const t = mem.trim(u8, lines[idx], " \t\r");
     if (!isLoopOpenerLine(t)) return false;
     const body_start = loopBodyStartCol(t) orelse return false;
     if (body_start >= t.len or read_col < body_start) return false;
+    if (hasSameLineElseAfter(t, body_start)) return false;
     if (t[body_start] == '{') {
         if (read_col <= body_start) return false;
         const close = onelineBodyCloseCol(t, body_start) orelse return true;
         return read_col <= close;
     }
     return noStatementBoundaryBefore(t, body_start, read_col);
+}
+
+/// True when a whole-word `else` keyword sits at paren/bracket depth 0
+/// on the line at or after `body_start` (EPH-I1315, REL-P3-VERIFY-3). The else
+/// terminates the same-line loop body and opens the zero-trip arm: a read
+/// in the arm never observes a trip's fill, so the same-line body
+/// admission must not silence it. The scan is quote-aware (string and
+/// char content never matches) and paren/bracket-masked, mirroring the
+/// header-depth discipline, and a `\\` multiline tail cuts the scan
+/// because nothing after it is code. An inner if-else inside a braceless
+/// same-line body also rejects — the fail-closed direction (accepted FN,
+/// over-warn, never over-silence).
+fn hasSameLineElseAfter(t: []const u8, body_start: usize) bool {
+    const code = stripLineComment(t);
+    var paren_depth: usize = 0;
+    var bracket_depth: usize = 0;
+    var walk = QuoteWalk.initAt(code, body_start);
+    while (walk.next()) |i| : (walk.advance()) {
+        if (types.isMultilineOpenerAt(code, i)) return false;
+        foldHeaderDepths(code[i], &paren_depth, &bracket_depth);
+        if (paren_depth != 0 or bracket_depth != 0) continue;
+        if (wordAt(code, i, "else")) return true;
+    }
+    return false;
 }
 
 /// Column of the same-line body close for the braced body at
@@ -85951,6 +85978,141 @@ test "ZA607: same-line opener read past the braced close still fires (EPH-I1312 
     try std.testing.expectEqual(
         1,
         countRuleIssues(run.issues.items, "da_i1312_postclose.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line braceless while else-arm read fires (EPH-I1315, REL-P3-VERIFY-3)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The braceless else hole (EPH-I1315): the else arm of the same-line
+    // while runs on the zero-trip path, and its read is digits[dlen - 1 -
+    // dlen] — the underflowing index. The same-line body admission
+    // silenced the whole line (the else-arm read rode the body-read
+    // silence). The depth-0 else rejects the admission, the read falls to
+    // the walked openers, and the line fires.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var i: usize = 0;
+        \\    while (i < dlen) : (i += 1) buf[i] = digits[dlen - 1 - i] else buf[0] = digits[dlen - 1 - i];
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1315_braceless.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1315_braceless.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line braced while else-arm read fires (EPH-I1315, REL-P3-VERIFY-3)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The braced one-liner twin of the braceless hole (EPH-I1315): the
+    // braced body closes on the opener line and the else arm follows on
+    // the same line. The body read inside the braces was admitted, and
+    // the else-arm read rode that silence. The depth-0 else after
+    // body_start rejects the admission in the braced branch too.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    var i: usize = 0;
+        \\    while (i < dlen) : (i += 1) { buf[i] = digits[dlen - 1 - i]; } else buf[0] = digits[dlen - 1 - i];
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1315_braced.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1315_braced.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line for else-arm outer-var read fires (EPH-I1315, REL-P3-VERIFY-3)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The for-else twin (EPH-I1315): the for's zero-trip else arm reads
+    // the outer var digits — on the zero-trip path the fill never ran,
+    // so digits[0] is uninitialized. The first read on the line (the
+    // body-side read) was admitted, and the else-arm read rode that
+    // silence. The depth-0 else must reject for openers exactly as for
+    // while.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    for (0..dlen) |di| buf[di] = digits[dlen - 1 - di] else buf[0] = digits[0];
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1315_forelse.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        1,
+        countRuleIssues(run.issues.items, "da_i1315_forelse.zig", RULE_DEFINITE_ASSIGNMENT),
+    );
+}
+
+test "ZA607: same-line braced loop without else stays silent (EPH-I1315 positive, REL-P3-VERIFY-3)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The positive braced control (EPH-I1315, the reviewer's N1): the
+    // braced one-line body without an else arm keeps its admission — the
+    // else rejection must not shrink the else-free suppression surface.
+    // The shape is the EPH-I1312 silent pin presented braced.
+    const content =
+        \\fn fmt(buf: []u8, val: u64) usize {
+        \\    var digits: [20]u8 = undefined;
+        \\    var dlen: usize = 0;
+        \\    var v = val;
+        \\    while (v > 0) : (dlen += 1) {
+        \\        digits[dlen] = @intCast(v % 10);
+        \\        v /= 10;
+        \\    }
+        \\    for (0..dlen) |di| { buf[di] = digits[dlen - 1 - di]; }
+        \\    return dlen;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "da_i1315_positive.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expectEqual(
+        0,
+        countRuleIssues(run.issues.items, "da_i1315_positive.zig", RULE_DEFINITE_ASSIGNMENT),
     );
 }
 

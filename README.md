@@ -303,7 +303,7 @@ built-in threshold defaults apply when the thresholds block is absent.
 
 ```json
 {
-  "version": "0.15.5",
+  "version": "0.15.6",
   "path_dir": "src",
   "entries": ["src/main.zig", "build.zig"],
   "exclude": ["test", "vendor", "third_party"],
@@ -1569,6 +1569,30 @@ Ephor uses three testing layers:
 - Community baseline regression testing against key projects
 
 ## Changelog
+
+### v0.15.6 — ZA101 Handoff References, Free-Helper Defer Parity (2026-09-02)
+
+**Fixed:**
+
+- ZA101 recognizes the handoff reference on the guarded-return call
+  shape: an `if (!f(...)) return error.X` line hands the alloc through
+  the call argument, and the return-line rejection must not block the
+  handoff scan from the call. The struct-literal field store counts
+  too: a `.field` assignment into a `gop.value_ptr.*` store is a
+  handoff, not a return construct. The two skytale live sites
+  (connection_handshake_tests.zig:835, client_file_service.zig:1243)
+  stay silent and the controls fire (EPH-I1320).
+- ZA101 gains the free-helper parity on the defer scans: a plain
+  `defer freeHelper(...)` covers the alloc the way the ZA103 matcher
+  recognized the helper form (EPH-I1318), with the I0349 errdefer-only
+  bound and the I1318 bounds intact (EPH-I1323).
+
+**Deferred:**
+
+- The ZA106 block-scoped-defer false-positive fix (EPH-I1310) stays in
+  flight in another lane at release prep. It joins this release only if
+  its fix lands and passes review before the release gate. Otherwise it
+  ships in a later patch.
 
 ### v0.15.5 — ZC101 Receiver Lifetime, Over-Cap Guards, ZA103 Free Helpers, ZA505 Namespace Scope (2026-09-02)
 

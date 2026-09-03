@@ -3250,6 +3250,20 @@ fn hasRealCleanupPattern(t: []const u8) bool {
     return false;
 }
 
+/// True when `t` carries a per-alloc free shape the defer scans
+/// recognize: a literal free/destroy pattern (no .deinit — bulk cleanup
+/// stays outside) or a free-helper call (EPH-I1318 parity, EPH-I1323).
+fn hasFreePatternOrHelper(t: []const u8) bool {
+    return hasRealFreePattern(t) or hasFreeHelperCall(t);
+}
+
+/// True when `t` carries a cleanup shape the covering-defer scans
+/// recognize: any literal cleanup pattern (.free/.destroy/.deinit) or a
+/// free-helper call (EPH-I1318 parity, EPH-I1323).
+fn hasCleanupPatternOrHelper(t: []const u8) bool {
+    return hasRealCleanupPattern(t) or hasFreeHelperCall(t);
+}
+
 /// The free-helper name prefixes the ZA103 cleanup matcher recognizes: a
 /// cleanup wrapped in a named helper (freeHopKeys, deinitChunks) carries
 /// no literal .free(/.deinit(/.destroy( token, so the matcher must
@@ -14469,8 +14483,9 @@ fn scanOverhangStatement(line: []const u8, bound: usize) OverhangStatementScan {
 }
 
 /// True when a candidate defer line at the alloc's indent actually cleans
-/// up: the joined line frees the alloc (real pattern, word-bounded name),
-/// and an errdefer form holds a handoff reference on the success path
+/// up: the joined line frees the alloc (real pattern or free-helper
+/// call, word-bounded name — EPH-I1318 parity, EPH-I1323), and an
+/// errdefer form holds a handoff reference on the success path
 /// (EPH-I0349). The exit-between check ran in the caller.
 fn isValidCleanupLine(
     joined: []const u8,
@@ -14478,7 +14493,7 @@ fn isValidCleanupLine(
     check_idx: usize,
     name: []const u8,
 ) bool {
-    if (!hasRealCleanupPattern(joined) or
+    if (!hasCleanupPatternOrHelper(joined) or
         !containsIdentifier(joined, name)) return false;
     const scan_line = mem.trim(u8, lines[check_idx], " \t\r");
     if (mem.startsWith(u8, scan_line, "errdefer ") and
@@ -14512,13 +14527,14 @@ fn nearbyCandidateCleans(base: DeferScanBase, check_idx: usize, scan_line: []con
 
 /// True when an outer-scope candidate defer line cleans up the alloc
 /// (hasCoveringDefer): a defer/errdefer below the alloc's indent whose
-/// joined line matches the name in a cleanup pattern, with no
-/// scope-exit source between the alloc and the line, and an errdefer
-/// form holding a handoff reference on the success path (EPH-I0349).
+/// joined line matches the name in a cleanup pattern or a free-helper
+/// call (EPH-I1318 parity, EPH-I1323), with no scope-exit source between
+/// the alloc and the line, and an errdefer form holding a handoff
+/// reference on the success path (EPH-I0349).
 fn outerCandidateCleans(base: DeferScanBase, check_idx: usize, scan_line: []const u8) bool {
     if (!isDeferOrErrdefer(scan_line)) return false;
     const joined = joinParenContinuation(base.lines, check_idx, base.join_buf);
-    if (!hasRealCleanupPattern(joined) or
+    if (!hasCleanupPatternOrHelper(joined) or
         !containsIdentifier(joined, base.name)) return false;
     if (check_idx > base.alloc_end_idx and
         hasExitBetween(base.lines, base.alloc_end_idx, check_idx)) return false;
@@ -14605,6 +14621,54 @@ fn isHandoffReferenceLine(
 /// with a transfer found.
 const HandoffLineVerdict = enum { check, skip, handoff };
 
+/// The Zig keywords whose `(` opens a control construct, never a call
+/// (guardConditionTransfers): `if(` and friends must not read as a call
+/// to a callee named `if`.
+fn isControlKeyword(word: []const u8) bool {
+    const control = [_][]const u8{ "if", "else", "while", "for", "switch", "catch" };
+    for (control) |kw| {
+        if (mem.eql(u8, word, kw)) return true;
+    }
+    return false;
+}
+
+/// True when the statement-level call opener at column `open` carries a
+/// callee that can own a transfer (EPH-I1320): a bare identifier that is
+/// not a control keyword and not a builtin. `if(`/`while(`/`for(`/
+/// `switch(` parens read as calls to the keyword otherwise, and
+/// `@intCast(` is a pure builtin — passing the alloc through either
+/// transfers nothing.
+fn openerHasCallCallee(t: []const u8, open: usize) bool {
+    var m = open;
+    while (m > 0 and (t[m - 1] == ' ' or t[m - 1] == '\t')) m -= 1;
+    var e = m;
+    while (e > 0 and isIdent(t[e - 1])) e -= 1;
+    if (e == m) return false;
+    if (e > 0 and t[e - 1] == '@') return false;
+    return !isControlKeyword(t[e..m]);
+}
+
+/// True when the guard condition of a guarded return line hands `name`
+/// off through a call argument (EPH-I1320): a call opener with a callee
+/// identifier whose argument span holds the name. The shape
+/// `if (!reinsertFixtureConnection(ctx, label)) return error.put_failed;`
+/// passes the ownership through the call even when the return carries
+/// the error. A control paren never opens a call, and an opener whose
+/// span stays unbalanced on the line (a wrapped condition) stays
+/// unrecognized — the over-warn direction.
+fn guardConditionTransfers(head: []const u8, name: []const u8) bool {
+    if (name.len == 0) return false;
+    var i: usize = 0;
+    while (i < head.len) : (i += 1) {
+        if (head[i] != '(') continue;
+        if (!openerHasCallCallee(head, i)) continue;
+        var depth: usize = 0;
+        const close = matchingParenCol(head, i, &depth) orelse continue;
+        if (containsIdentifier(head[i + 1 .. close], name)) return true;
+    }
+    return false;
+}
+
 /// Carried state for the handoff scan (hasHandoffReference): the blocked
 /// flag once a return construct closed, the open return construct's paren
 /// and brace depths, the join buffer for the occurrence walk, and the
@@ -14618,11 +14682,12 @@ const HandoffScanState = struct {
 };
 
 /// Advance the handoff scan across one masked line. Inside an open return
-/// construct the depths advance and a close sets blocked. On a return
-/// opener line the occurrence walk runs first (a direct call argument on
-/// `return try f(x)` transfers), then the construct tracking starts and
-/// the plain reference check is skipped. A blocked line skips the check
-/// too (EPH-I0349 corpus).
+/// construct the depths advance and a close sets blocked. A return
+/// keyword line routes through handoffReturnLineVerdict: a guarded
+/// return (`if (cond) return err;`) exits only its branch and never
+/// blocks the scan (EPH-I1320), an unguarded return line runs the
+/// occurrence walk and the construct tracking. A blocked line skips the
+/// check (EPH-I0349 corpus).
 fn advanceHandoffScanLine(
     t: []const u8,
     code: []const u8,
@@ -14635,9 +14700,30 @@ fn advanceHandoffScanLine(
         if (state.ret_paren <= 0 and state.ret_brace == 0) state.blocked = true;
         return .check;
     }
-    if (!hasRealReturnKeyword(code)) {
-        if (state.blocked) return .skip;
-        return .check;
+    if (firstRealReturnColumn(code)) |_|
+        return handoffReturnLineVerdict(t, code, name, state);
+    if (state.blocked) return .skip;
+    return .check;
+}
+
+/// The verdict for a line whose masked code carries a return keyword
+/// (advanceHandoffScanLine). A guarded return (`if (cond) return err;`)
+/// exits only its branch: the success path continues past the line, so
+/// it never blocks the scan — the guard's call arguments still transfer
+/// through the call even when the return carries the error (EPH-I1320).
+/// An unguarded return runs the occurrence walk first (a direct call
+/// argument on `return try f(x)` transfers), then the construct tracking
+/// starts and the plain reference check is skipped (EPH-I0349 corpus).
+fn handoffReturnLineVerdict(
+    t: []const u8,
+    code: []const u8,
+    name: []const u8,
+    state: *HandoffScanState,
+) HandoffLineVerdict {
+    const ret_pos = firstRealReturnColumn(code) orelse return .skip;
+    if (segmentHasGuard(code, ret_pos)) {
+        if (guardConditionTransfers(code[0..ret_pos], name)) return .handoff;
+        return .skip;
     }
     if (handoffOccurrences("", code, name, &state.join_buf)) return .handoff;
     state.ret_paren = parenBalance(t);
@@ -15637,11 +15723,12 @@ const BlockLineScan = struct {
 };
 
 /// True when the joined continuation line frees the tracked alloc
-/// (scanSingleBlock): a real free pattern on the wrapped-joined line with
-/// the alloc's name present (EPH-I0351).
+/// (scanSingleBlock): a real free pattern or a free-helper call on the
+/// wrapped-joined line with the alloc's name present (EPH-I0351,
+/// EPH-I1318 parity, EPH-I1323).
 fn lineFreesAlloc(scan: DeferScanCtx, idx: usize, join_buf: []u8) bool {
     const ft = joinParenContinuation(scan.lines, idx, join_buf);
-    return hasRealFreePattern(ft) and containsIdentifier(ft, scan.alloc_name);
+    return hasFreePatternOrHelper(ft) and containsIdentifier(ft, scan.alloc_name);
 }
 
 /// Scan a single CFG block for defer/free/return/ownership patterns
@@ -16146,6 +16233,14 @@ fn checkDeferCoverageForAlloc(
 /// strings and comments. Covers every exit form: bare `return;`,
 /// `return x;`, `return error.E;` (EPH-I0348).
 fn hasRealReturnKeyword(code: []const u8) bool {
+    return firstRealReturnColumn(code) != null;
+}
+
+/// Column of the first word-bounded `return` keyword in masked code, or
+/// null when none appears (EPH-I1320). The position feeds the guarded
+/// probe: a guard opener in the statement segment before the keyword
+/// makes the return conditional.
+fn firstRealReturnColumn(code: []const u8) ?usize {
     // One classifier walk per line (EPH-I0153): candidates ascend.
     var cls = LineClassifier.init(code);
     var s: usize = 0;
@@ -16155,9 +16250,9 @@ fn hasRealReturnKeyword(code: []const u8) bool {
         if (pos > 0 and (isIdent(code[pos - 1]) or code[pos - 1] == '.')) continue;
         if (s < code.len and isIdent(code[s])) continue;
         if (cls.isInsideString(pos)) continue;
-        return true;
+        return pos;
     }
-    return false;
+    return null;
 }
 
 /// True when a scope-exit source sits on a line strictly between `from`
@@ -16219,7 +16314,11 @@ fn checkDeferFreeLine(
 
     if (ctx.defer_depth.* > 0) {
         const joined = joinParenContinuation(ctx.lines, idx, ctx.join_buf);
-        if (hasRealFreePattern(joined) and containsIdentifier(joined, ctx.alloc_name)) {
+        // The block interior free: a literal free/destroy or a free-helper
+        // call (EPH-I1318 parity, EPH-I1323), word-bounded name.
+        if (hasFreePatternOrHelper(joined) and
+            containsIdentifier(joined, ctx.alloc_name))
+        {
             // The defer block must dominate the alloc's exits: an early
             // return or try before the defer registration leaks on that
             // path (EPH-I0348).
@@ -16253,9 +16352,12 @@ fn handleDeferStart(
     // (EPH-I0348). An errdefer counts only when the success path also
     // references the alloc after it (EPH-I0349). The free check runs on
     // the joined logical line so a zig-fmt wrapped free stays visible
-    // (EPH-I0351).
+    // (EPH-I0351), and recognizes a free-helper call like a literal free
+    // (EPH-I1318 parity, EPH-I1323).
     const joined = joinParenContinuation(ctx.lines, idx, ctx.join_buf);
-    if (hasRealFreePattern(joined) and containsIdentifier(joined, ctx.alloc_name)) {
+    if (hasFreePatternOrHelper(joined) and
+        containsIdentifier(joined, ctx.alloc_name))
+    {
         if (ctx.alloc_idx < idx and hasExitBetween(ctx.lines, ctx.alloc_idx, idx))
             return false;
         if (is_errdefer and !hasHandoffReference(ctx.lines, idx, ctx.alloc_name))
@@ -64781,6 +64883,133 @@ test "ZA101: errdefer plus multi-line return literal stays silent (EPH-I0349 loc
     ) == 0);
 }
 
+test "ZA101: errdefer plus conditional-return call transfer stays silent (EPH-I1320)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // skytale connection_handshake_tests.zig:835 shape: the guard call
+    // takes the label into the manager map, and the failing branch
+    // returns the error — the errdefer frees on exactly that path. The
+    // guarded return must not block the handoff scan from the call.
+    const content =
+        \\const Manager = struct {
+        \\    map: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
+        \\};
+        \\fn reinsertFixtureConnection(m: *Manager, label: []u8) bool {
+        \\    m.map.put(0, label) catch return false;
+        \\    return true;
+        \\}
+        \\fn rekeyerRun(m: *Manager) !void {
+        \\    const allocator = std.testing.allocator;
+        \\    const label = try allocator.dupe(u8, "alice");
+        \\    errdefer allocator.free(label);
+        \\    if (!reinsertFixtureConnection(m, label)) return error.put_failed;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_cond_return_call.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_cond_return_call.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
+test "ZA101: errdefer plus struct-literal store after conditional return stays silent (EPH-I1320)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // skytale client_file_service.zig:1243 shape: the dupe runs before
+    // the getOrPut, the conditional return exits the duplicate branch,
+    // and the success path stores the name into the record through the
+    // struct-literal field. The conditional return must not block the
+    // scan from the store line.
+    const content =
+        \\const Record = struct {
+        \\    filename: []u8,
+        \\    id: u32,
+        \\};
+        \\var store: std.AutoHashMapUnmanaged(u32, Record) = .empty;
+        \\fn registerOutgoing(allocator: std.mem.Allocator, id: u32, path: []const u8) !void {
+        \\    const filename = try allocator.dupe(u8, std.fs.path.basename(path));
+        \\    errdefer allocator.free(filename);
+        \\
+        \\    const gop = try store.getOrPut(id);
+        \\    if (gop.found_existing) return error.duplicate_transfer_id;
+        \\    gop.value_ptr.* = Record{
+        \\        .filename = filename,
+        \\        .id = id,
+        \\    };
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_struct_store.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_struct_store.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
+test "ZA101: guarded return read mention without transfer still warns (EPH-I1320 firing control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // A guard that only reads the alloc passes nothing through a call:
+    // the guarded return exits the error branch and the success path
+    // leaks the alloc, so the errdefer must not cover it. Only a call
+    // argument in the guard counts as the transfer (EPH-I1320).
+    const content =
+        \\fn read_guard(allocator: std.mem.Allocator, s: []const u8) !void {
+        \\    const x = try allocator.dupe(u8, s);
+        \\    errdefer allocator.free(x);
+        \\    if (x.len == 0) return error.Empty;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_read_guard.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_read_guard.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA101: plain return after errdefer without handoff still warns (EPH-I1320 firing control)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The unguarded return exits every path before any handoff: the
+    // errdefer covers the error exits only, and the block-on-return rule
+    // keeps the warning alive (EPH-I0349, EPH-I1320).
+    const content =
+        \\fn plain_return(allocator: std.mem.Allocator, s: []const u8) !void {
+        \\    const x = try allocator.dupe(u8, s);
+        \\    errdefer allocator.free(x);
+        \\    return error.Bad;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_plain_return.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_plain_return.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
 test "ZA101: buffer_size struct field does not bind the buf owner (EPH-I0840)" {
     var diag = testDiagCtx();
     var gpa = std.heap.DebugAllocator(.{}){};
@@ -71887,6 +72116,182 @@ test "hasFreeHelperCall: helper-call recognition battery (EPH-I1318)" {
     try std.testing.expect(!hasFreeHelperCall("not_freeHopKeys(keys)"));
     try std.testing.expect(!hasFreeHelperCall("log(\"freeHopKeys(x)\", 0);"));
     try std.testing.expect(!hasFreeHelperCall("const f = freeHopKeys;"));
+}
+
+test "guardConditionTransfers: conditional-return guard call battery (EPH-I1320)" {
+    // The guard call argument transfers through the call even when the
+    // return carries the error: plain callee, dotted receiver, and the
+    // `!`-prefixed form all count.
+    try std.testing.expect(guardConditionTransfers("if (!reinsert(ctx, label)) ", "label"));
+    try std.testing.expect(guardConditionTransfers("if (store.put(0, label)) ", "label"));
+    try std.testing.expect(guardConditionTransfers("if (!reinsert(m, label)) ", "label"));
+    // Fail-closed edges: a read-only mention, a control paren, a
+    // grouping paren, a builtin, and a struct-literal field value never
+    // transfer.
+    try std.testing.expect(!guardConditionTransfers("if (label.len == 0) ", "label"));
+    try std.testing.expect(!guardConditionTransfers("if (label) ", "label"));
+    try std.testing.expect(!guardConditionTransfers("if ((label) == 0) ", "label"));
+    try std.testing.expect(!guardConditionTransfers("if (@intCast(label) > 3) ", "label"));
+    try std.testing.expect(!guardConditionTransfers("if (label == other) ", "label"));
+    // A call whose argument span holds another alloc never transfers
+    // this one.
+    try std.testing.expect(!guardConditionTransfers("if (!reinsert(ctx, other)) ", "label"));
+    // An empty name never matches.
+    try std.testing.expect(!guardConditionTransfers("if (!reinsert(ctx, label)) ", ""));
+}
+
+test "ZA101: plain defer free-helper call covers the alloc (EPH-I1323)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The parity arm: a plain defer wrapped in a free-helper carries no
+    // literal .free( token, and the ZA101 defer scan recognizes the
+    // helper name the way the ZA103 matcher does (EPH-I1318).
+    const content =
+        \\const Widget = struct {};
+        \\fn freeWidgets(a: std.mem.Allocator, widgets: []Widget) void {
+        \\    a.free(widgets);
+        \\}
+        \\fn run(allocator: std.mem.Allocator) !void {
+        \\    const widgets = try allocator.alloc(Widget, 4);
+        \\    defer freeWidgets(allocator, widgets);
+        \\    for (widgets) |_| {}
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_defer_helper.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_defer_helper.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
+test "ZA101: multi-line defer block with free-helper call covers the alloc (EPH-I1323)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The block interior free: the helper call sits on its own line
+    // inside the defer block, and both the CFG lattice and the linear
+    // fallback recognize the helper form (EPH-I1323).
+    const content =
+        \\const Widget = struct {};
+        \\fn freeWidgets(a: std.mem.Allocator, widgets: []Widget) void {
+        \\    a.free(widgets);
+        \\}
+        \\fn run(allocator: std.mem.Allocator) !void {
+        \\    const widgets = try allocator.alloc(Widget, 4);
+        \\    defer {
+        \\        freeWidgets(allocator, widgets);
+        \\    }
+        \\    for (widgets) |_| {}
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_defer_block_helper.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_defer_block_helper.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 0);
+}
+
+test "ZA101: errdefer free-helper without handoff still warns (EPH-I1323 I0349 lock)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The parity arm keeps the errdefer-only-warns semantics: an
+    // errdefer helper with no success-path handoff reference still
+    // cannot cover the alloc (EPH-I0349, EPH-I1323).
+    const content =
+        \\const Widget = struct {};
+        \\fn freeWidgets(a: std.mem.Allocator, widgets: []Widget) void {
+        \\    a.free(widgets);
+        \\}
+        \\fn run(allocator: std.mem.Allocator) !void {
+        \\    const widgets = try allocator.alloc(Widget, 4);
+        \\    errdefer freeWidgets(allocator, widgets);
+        \\    _ = widgets;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_errdefer_helper_gap.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_errdefer_helper_gap.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA101: lowercase-continuation helper name stays unrecognized (EPH-I1323 fail-closed)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // `freeze` starts with `free` but is a different word: the compound
+    // boundary gate keeps the plain defer unrecognized and the warning
+    // alive (EPH-I1318 bound, EPH-I1323).
+    const content =
+        \\const Widget = struct {};
+        \\fn freeze(a: std.mem.Allocator, widgets: []Widget) void {
+        \\    _ = a;
+        \\    _ = widgets;
+        \\}
+        \\fn run(allocator: std.mem.Allocator) !void {
+        \\    const widgets = try allocator.alloc(Widget, 4);
+        \\    defer freeze(allocator, widgets);
+        \\    for (widgets) |_| {}
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_freeze_defer.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_freeze_defer.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
+}
+
+test "ZA101: free-helper freeing another alloc stays unrecognized (EPH-I1323 fail-closed)" {
+    var diag = testDiagCtx();
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) @panic("gpa leaked");
+    const allocator = gpa.allocator();
+
+    // The helper frees `other`, never `mine`: the name check keeps the
+    // covering-defer recognition off and the warning on the leaking
+    // alloc alive (EPH-I1323).
+    const content =
+        \\const Widget = struct {};
+        \\fn freeWidgets(a: std.mem.Allocator, widgets: []Widget) void {
+        \\    a.free(widgets);
+        \\}
+        \\fn run(allocator: std.mem.Allocator) !void {
+        \\    const mine = try allocator.alloc(Widget, 4);
+        \\    const other = try allocator.alloc(Widget, 2);
+        \\    defer freeWidgets(allocator, other);
+        \\    _ = mine;
+        \\}
+    ;
+    var run = try runCFGMemoryTest(&diag, allocator, "test_helper_wrong_name.zig", content);
+    defer run.deinit(allocator);
+
+    try std.testing.expect(countRuleIssues(
+        run.issues.items,
+        "test_helper_wrong_name.zig",
+        RULE_ALLOC_NO_DEFER,
+    ) == 1);
 }
 
 test "ZA103: error return before field-store transfer is a gap (EPH-I0005)" {

@@ -14657,6 +14657,9 @@ fn openerHasCallCallee(t: []const u8, open: usize) bool {
 /// span stays unbalanced on the line (a wrapped condition) stays
 /// unrecognized — the over-warn direction.
 fn guardConditionTransfers(head: []const u8, name: []const u8) bool {
+    // The callee is not distinguished: a read-only call argument counts
+    // as the transfer (the standing call-argument proxy — the read-callee
+    // under-warn edge, EPH-I1325).
     if (name.len == 0) return false;
     var i: usize = 0;
     while (i < head.len) : (i += 1) {
@@ -14715,6 +14718,9 @@ fn advanceHandoffScanLine(
 /// argument on `return try f(x)` transfers), then the construct tracking
 /// starts and the plain reference check is skipped (EPH-I0349 corpus).
 fn handoffReturnLineVerdict(
+    // The residual conservative shapes: a return guarded by catch/orelse
+    // and a wrapped condition whose close paren shares the return line
+    // stay blocked (they fire — the over-warn direction).
     t: []const u8,
     code: []const u8,
     name: []const u8,

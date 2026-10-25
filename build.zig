@@ -41,9 +41,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run Ephor");
     run_step.dependOn(&run_cmd.step);
@@ -61,14 +59,5 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    // EPH-I0291: record the per-run seed with every test run (see
-    // printTestSeed). Runs before the test binary as a test-step dependency.
-    const seed_step = b.allocator.create(std.Build.Step) catch @panic("OOM");
-    seed_step.* = std.Build.Step.init(.{
-        .id = .custom,
-        .name = "test-seed",
-        .owner = b,
-        .makeFn = printTestSeed,
-    });
-    test_step.dependOn(seed_step);
+
 }

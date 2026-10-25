@@ -79,7 +79,7 @@ fn hostileSeqLen(s: []const u8) usize {
 /// dispatch complexity). The slots are `*const fn` pointers: a bare `fn`
 /// type is comptime-only, and the dispatcher indexes with a runtime byte.
 const hostile_leads = blk: {
-    var table = [_]?*const fn ([]const u8) HostileUnit{null} ** 256;
+    var table: [256]?*const fn ([]const u8) HostileUnit = @splat(null);
     table[0xC2] = c2Unit;
     table[0xD8] = d8Unit;
     table[0xDB] = dbUnit;

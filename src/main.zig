@@ -590,7 +590,7 @@ test "cliDiag over-cap format keeps the head and sets the sink truncated latch (
     var diag = testDiagCtx();
     var capture = CaptureSink{};
     diag.diag_sink = capture.sink();
-    const long_arg = "x" ** (diag_msg_buf_bytes + 808);
+    const long_arg: [diag_msg_buf_bytes + 808]u8 = @splat('x');
     cliDiag(&diag, "note: {s}\n", .{long_arg});
     try std.testing.expect(capture.truncated);
     try std.testing.expectEqual(@as(usize, 512), capture.len);
@@ -4459,7 +4459,7 @@ fn parenStackScan(
 /// and a `(` in a string no longer fakes the header paren.
 fn parenHeaderKeyword(code: []const u8, close_idx: usize) ?[]const u8 {
     var cls = LineClassifier.init(code);
-    var stack: [max_paren_stack]usize = [_]usize{0} ** max_paren_stack;
+    var stack: [max_paren_stack]usize = @splat(0);
     const depth = parenStackScan(&cls, code, close_idx, &stack) orelse return null;
     if (depth == 0) return null;
     return identBefore(code, stack[depth - 1]);
@@ -4904,7 +4904,7 @@ fn unmatchedOpenParenBefore(t: []const u8, pos: usize) ?usize {
     var cls = LineClassifier.init(t);
     const comment_start = findCommentStart(t) orelse t.len;
     const scan_end = @min(pos, comment_start);
-    var stack: [max_paren_stack]usize = [_]usize{0} ** max_paren_stack;
+    var stack: [max_paren_stack]usize = @splat(0);
     const depth = parenStackScan(&cls, t, scan_end, &stack) orelse return null;
     if (depth == 0) return null;
     return stack[depth - 1];
@@ -5760,7 +5760,7 @@ const ComptimeState = struct {
     // Open-brace counts per open block scope, innermost last. A
     // statement scope holds no entry: it closes at its line end.
     block_braces: [max_comptime_block_nesting]usize =
-        [_]usize{0} ** max_comptime_block_nesting,
+        @splat(0),
     block_count: usize = 0,
 
     fn update(self: *ComptimeState, t: []const u8) void {
@@ -8809,7 +8809,7 @@ fn lineSetContains(set: []const usize, line: usize) bool {
 /// corpus convention (a truncated cand set can only miss divergence).
 fn guardDominatesRead(lines: []const []const u8, if_idx: usize, read_idx: usize) bool {
     var cand: [enclosing_block_lookback]usize =
-        [_]usize{0} ** enclosing_block_lookback;
+        @splat(0);
     const cand_stop = if_idx -| enclosing_block_lookback;
     const n_cand = enclosingConditionalLines(lines, if_idx, cand_stop, &cand);
     if (n_cand == 0) return true;
@@ -8819,7 +8819,7 @@ fn guardDominatesRead(lines: []const []const u8, if_idx: usize, read_idx: usize)
     // the cand lines determine. The topmost cand line is the last entry
     // (the walk collects nearest first).
     var read: [enclosing_block_lookback]usize =
-        [_]usize{0} ** enclosing_block_lookback;
+        @splat(0);
     const read_stop = cand[n_cand - 1] - 1;
     const n_read = enclosingConditionalLines(lines, read_idx, read_stop, &read);
     if (n_read == read.len) return true;
@@ -9083,7 +9083,7 @@ fn hasCorrelatedSameBlockAssign(
         0;
     const end = @min(guard_pos.line + guard_correlation_radius, limit);
     var depth_before: [2 * guard_correlation_radius]usize =
-        [_]usize{0} ** (2 * guard_correlation_radius);
+        @splat(0);
     windowDepthsBefore(lines, start, end, &depth_before);
     for (start..end) |j| {
         const t = mem.trim(u8, lines[j], " \t\r");
@@ -12918,7 +12918,7 @@ test "collectRegisteredFrees: mode dispatch pins the defer/errdefer filters (EPH
     };
     const in_defer = [_]bool{ false, false, true, true, true, false, false, false, false };
     const in_errdefer = [_]bool{ false, false, false, false, false, true, true, false, false };
-    const capture_shadowed = [_]bool{false} ** 9;
+    const capture_shadowed: [9]bool = @splat(false);
     var aliases = std.StringHashMapUnmanaged([]const u8){};
     defer aliases.deinit(a);
     const ctx: DeferPairCtx = .{
@@ -15238,7 +15238,7 @@ fn isContainerArgHandoff(
     const code = maskedCodeLine(t, &blank_buf);
     if (handoffOccurrences("", code, name, &join_buf)) return true;
     var acc: [max_join_bytes]u8 = undefined;
-    var prev_idx = [_]usize{0} ** max_join_lines;
+    var prev_idx: [max_join_lines]usize = @splat(0);
     var n: usize = 0;
     var total: usize = 0;
     var prev = idx;
@@ -22745,7 +22745,7 @@ const ErrorAnalysisState = struct {
     pending_undefined: PendingUndefinedSet = .{},
     struct_state: StructLiteralState = .{},
     pending_struct_fields: [64]PendingStructField =
-        [_]PendingStructField{.{}} ** 64,
+        @splat(.{}),
     pending_field_count: usize = 0,
     // Track static storage struct pattern (const S = struct { var x; })
     in_static_struct: bool = false,
@@ -40097,7 +40097,7 @@ fn operandFormStart(t: []const u8, end: usize) ?usize {
 /// t[0..close] slice is the pre-migration `i < close` bound. The stack
 /// keeps absolute offsets, so the slice changes nothing (EPH-I1232 C2b).
 fn parenOpenBackAt(t: []const u8, close: usize) ?usize {
-    var stack = [_]usize{0} ** 64;
+    var stack: [64]usize = @splat(0);
     var len: usize = 0;
     var walk = QuoteWalk.init(t[0..close]);
     while (walk.next()) |i| : (walk.advance()) {
@@ -50467,7 +50467,7 @@ fn runInstallCommand(
     verifyReleaseSignature(diag, allocator, release_pubkey, package_url) catch
         return error.InstallFailed;
 
-    const url_z = try allocator.dupeZ(u8, package_url);
+    const url_z = try allocator.dupeSentinel(u8, package_url, 0);
     defer allocator.free(url_z);
 
     try runInstallFetch(
@@ -51224,7 +51224,7 @@ const UpgradeRun = struct {
         // download, or a bad signature fails the upgrade closed.
         try verifyReleaseSignature(self.diag, self.allocator, release_pubkey, package_url);
 
-        const url_z = try self.allocator.dupeZ(u8, package_url);
+        const url_z = try self.allocator.dupeSentinel(u8, package_url, 0);
         defer self.allocator.free(url_z);
 
         // Run zig fetch --save to update the dependency
@@ -51443,14 +51443,14 @@ fn createVerifyDir(allocator: Allocator, io: std.Io) ![]const u8 {
         .{ verify_tmp_base, rng.int(u64) },
     );
     errdefer allocator.free(dir_path);
-    try std.Io.Dir.cwd().createDir(io, dir_path, std.Io.File.Permissions.fromMode(0o700));
+    try std.Io.Dir.cwd().createDir(io, dir_path, .default_dir);
     // POSIX-only (see the doc comment): the Windows createDir applies no
     // umask and the Windows backend panics on setFilePermissions.
     if (@import("builtin").os.tag != .windows) {
         try std.Io.Dir.cwd().setFilePermissions(
             io,
             dir_path,
-            std.Io.File.Permissions.fromMode(0o700),
+            .default_dir,
             .{},
         );
     }
@@ -78984,7 +78984,7 @@ test "blankLiteralContents blanks a mid-line multiline opener tail (EPH-I0671)" 
     var buf: [64]u8 = undefined;
     // Target text: const s = \\ if (x) { }
     const out = blankLiteralContents("const s = \\\\ if (x) { }", &buf);
-    try std.testing.expectEqualStrings("const s = " ++ (" " ** 13), out);
+    try std.testing.expectEqualStrings("const s = " ++ "             ", out);
 }
 
 test "maskLiteralContents drops the overhang past the buffer (EPH-I1258)" {
@@ -78992,7 +78992,7 @@ test "maskLiteralContents drops the overhang past the buffer (EPH-I1258)" {
     // The line opens a string inside the buffer and runs past it. The
     // mask covers the head (string contents blanked) and the overhang
     // drops: the tail's braces and semicolons never survive as code.
-    const line = "const s = \"" ++ ("a" ** 40) ++ "}; }; def;\"" ++ ("b" ** 40);
+    const line = "const s = \"" ++ "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++ "}; }; def;\"" ++ "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const out = blankLiteralContents(line, &buf);
     try std.testing.expectEqual(@as(usize, 64), out.len);
     try std.testing.expect(mem.indexOf(u8, out, ";") == null);
@@ -104120,7 +104120,7 @@ test "isInsideWhileCondition ignores comment keywords (EPH-I0424)" {
 }
 
 test "backward lookback window bounds the per-line prefix (EPH-I0425)" {
-    const lines = [_][]const u8{"    work();"} ** 130;
+    const lines = @as([130][]const u8, @splat("    work();"));
     // The whole prefix passes through before the window engages.
     const near_start = backwardLookbackWindow(&lines, 10) orelse
         return error.TestUnexpectedResult;
@@ -105613,12 +105613,12 @@ test "ZA303 exempts callconv(.Stdcall) and export declarations (EPH-I1093, EPH-I
 test "stringContentStats splits code from string content (EPH-I0272)" {
     // 4 spaces + quote + 113 x's + quote + comma = 120 visible. Code 5,
     // content 113.
-    const long_literal = "    \"" ++ "x" ** 113 ++ "\",";
+    const long_literal = "    \"" ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ++ "\",";
     try std.testing.expectEqual(@as(usize, 120), calculateVisibleLength(long_literal));
     try std.testing.expectEqual(@as(usize, 5), stringContentStats(long_literal).code);
     try std.testing.expectEqual(@as(usize, 113), stringContentStats(long_literal).content);
     // Pure code line — no content excluded
-    const pure_code = "x" ** 120;
+    const pure_code = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
     try std.testing.expectEqual(@as(usize, 120), stringContentStats(pure_code).code);
     try std.testing.expectEqual(@as(usize, 0), stringContentStats(pure_code).content);
     // Escaped quote inside a literal must not terminate it
@@ -105655,7 +105655,7 @@ test "stringContentStats does not treat '\"' char literal as a string" {
     );
     // Real string overage adjacent to a char literal stays exempt: the
     // 100-column content dominates 26 columns of code.
-    const mixed = "    if (c == '\"') return \"" ++ "x" ** 100 ++ "\";";
+    const mixed = "    if (c == '\"') return \"" ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ++ "\";";
     try std.testing.expect(calculateVisibleLength(mixed) > 100);
     const mixed_stats = stringContentStats(mixed);
     try std.testing.expectEqual(@as(usize, 26), mixed_stats.code);
@@ -105680,10 +105680,10 @@ test "generated-file banner silences ZA701 and ZA703 (EPH-I1062)" {
     const generated =
         "//! DO NOT EDIT! File generated by `gen_tool.zig`.\n" ++
         "const badName = 1;\n" ++
-        "const line = " ++ ("x" ** 130) ++ ";\n";
+        "const line = " ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ++ ";\n";
     const hand_written =
         "const badName = 1;\n" ++
-        "const line = " ++ ("x" ** 130) ++ ";\n";
+        "const line = " ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ++ ";\n";
 
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
@@ -105759,13 +105759,13 @@ test "ZA701 exempts lines over-length solely due to string literals (EPH-I0267)"
     var graph = ImportGraph.init(allocator, &diag);
     defer graph.deinit();
 
-    const long_literal = "    \"" ++ "x" ** 113 ++ "\",";
-    const short_string_long_code = "x" ** 50 ++ " \"ab\" " ++ "y" ** 60;
-    const pure_code = "x" ** 120;
+    const long_literal = "    \"" ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ++ "\",";
+    const short_string_long_code = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ++ " \"ab\" " ++ "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy";
+    const pure_code = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
     const char_literal_line =
         "if (c == '\"') return self.handleTheStringLiteral" ++
         "WithAnExcessivelyLongFunctionName(alpha, beta, gamma);";
-    const mixed_char_and_string = "    if (c == '\"') return \"" ++ "x" ** 100 ++ "\";";
+    const mixed_char_and_string = "    if (c == '\"') return \"" ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ++ "\";";
     const code = long_literal ++ "\n" ++
         short_string_long_code ++ "\n" ++
         pure_code ++ "\n" ++
@@ -105834,14 +105834,14 @@ test "ZA701 flags a long line with a short embedded string (EPH-I0272)" {
 test "ZA701: multi-byte lines count codepoints, not bytes (EPH-I0248)" {
     // 60 CJK chars = 180 bytes. The byte model reported 182 columns.
     // The codepoint model counts 63 (the "// " prefix included).
-    const cjk = "// " ++ "界" ** 60;
+    const cjk = "// " ++ "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界";
     try std.testing.expectEqual(@as(usize, 63), calculateVisibleLength(cjk));
     try std.testing.expectEqual(@as(usize, 63), stringContentStats(cjk).code);
     // Emoji: 25 four-byte sequences = 100 bytes, 28 codepoints.
-    const emoji = "// " ++ "🚀" ** 25;
+    const emoji = "// " ++ "🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀🚀";
     try std.testing.expectEqual(@as(usize, 28), calculateVisibleLength(emoji));
     // Tabs keep the 4-stop model with codepoint counts.
-    const tabbed = "\t" ++ "界" ** 40;
+    const tabbed = "\t" ++ "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界";
     try std.testing.expectEqual(@as(usize, 44), calculateVisibleLength(tabbed));
 }
 
@@ -105849,14 +105849,14 @@ test "ZA701: malformed clusters stay byte-counted, valid ones collapse (EPH-I024
     // \xE2ab is 3 bytes: 0xE2 plus two ASCII bytes that are not valid
     // continuations, so the cluster falls back to 3 single-byte counts.
     // 3 + 98 ASCII bytes = 101 columns, over the 100 limit (fires).
-    const malformed = "\xE2ab" ++ "x" ** 98;
+    const malformed = "\xE2ab" ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
     try std.testing.expectEqual(@as(usize, 101), calculateVisibleLength(malformed));
     // Overlong \xE0\x80\x80: the first continuation (0x80) is below the
     // 0xA0 floor for 0xE0, so all three bytes count separately.
-    const overlong = "\xE0\x80\x80" ++ "x" ** 98;
+    const overlong = "\xE0\x80\x80" ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
     try std.testing.expectEqual(@as(usize, 101), calculateVisibleLength(overlong));
     // A valid 3-byte cluster still collapses to one column.
-    const valid = "†" ++ "x" ** 99;
+    const valid = "†" ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
     try std.testing.expectEqual(@as(usize, 100), calculateVisibleLength(valid));
 }
 
@@ -105871,9 +105871,9 @@ test "ZA701: a long CJK comment line is silent, a long ASCII+CJK line fires (EPH
 
     // 60 CJK chars: 180 bytes but 63 codepoints — silent under the
     // codepoint model, flagged under the byte model.
-    const cjk_line = "// " ++ "界" ** 60;
+    const cjk_line = "// " ++ "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界";
     // 60 CJK chars plus 50 ASCII chars: 113 codepoints — still too long.
-    const over_line = "// " ++ "界" ** 60 ++ " " ++ "x" ** 49;
+    const over_line = "// " ++ "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界" ++ " " ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
     const code = cjk_line ++ "\n" ++ over_line ++ "\n";
 
     const analysis = try createTestFileAnalysis(allocator, "test_cjk_lines.zig", code);
@@ -109970,7 +109970,7 @@ test "ZA903: loop-init witness survives a fn ( string in the body (EPH-I0949)" {
     const content =
         \\fn dec_loop_str_fn() usize {
         \\    var i = 10;
-        \\    var buf = [_]usize{0} ** 10;
+        \\    var buf = @splat(0);
         \\    while (i > 0) {
         \\        const pat = "fn (";
         \\        return buf[i - 2];
@@ -110004,7 +110004,7 @@ test "ZA903: loop-init witness survives a } string in the body (EPH-I0949)" {
     const content =
         \\fn dec_loop_str_brace() usize {
         \\    var i = 10;
-        \\    var buf = [_]usize{0} ** 10;
+        \\    var buf = @splat(0);
         \\    while (i > 0) {
         \\        const s = "}";
         \\        return buf[i - 2];
@@ -110038,7 +110038,7 @@ test "ZA903: Allman loop-condition bound covers the bare-brace body (EPH-I0952)"
     // silent.
     const content =
         \\fn dec_allman_bound(n: usize) usize {
-        \\    var buf = [_]usize{0} ** 10;
+        \\    var buf = @splat(0);
         \\    while (n > 2)
         \\    {
         \\        return buf[n - 1];
@@ -110632,7 +110632,7 @@ test "ZA903: Allman if header proves the bound above a bare-brace body (EPH-I097
     // loop headers were judged and the if twin fired (EPH-I0976).
     const content =
         \\fn allman_if_bound(n: usize) usize {
-        \\    var buf = [_]usize{0} ** 10;
+        \\    var buf = @splat(0);
         \\    if (n > 2)
         \\    {
         \\        return buf[n - 1];
@@ -110663,7 +110663,7 @@ test "ZA903: Allman if header below the subtrahend still fires (EPH-I0976)" {
     // (EPH-I0976).
     const content =
         \\fn allman_if_too_small(n: usize) usize {
-        \\    var buf = [_]usize{0} ** 10;
+        \\    var buf = @splat(0);
         \\    if (n > 2)
         \\    {
         \\        return buf[n - 4];
@@ -115846,7 +115846,7 @@ test "ZA301: two block prongs plus a trailing statement measure the full fn (EPH
         \\        },
         \\        else => {},
         \\    }
-    ++ "\n" ++ "    sink(9);\n" ** 39 ++
+    ++ "\n" ++ "    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n    sink(9);\n" ++
         \\}
         \\fn sink(v: u8) void {
         \\    _ = v;
@@ -115875,7 +115875,7 @@ test "ZA301: same-line empty prong does not end the fn early (EPH-I0133)" {
         \\        1 => sink(1),
         \\        else => {},
         \\    }
-    ++ "\n" ++ "    sink(2);\n" ** 54 ++
+    ++ "\n" ++ "    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n    sink(2);\n" ++
         \\}
         \\fn sink(v: u8) void {
         \\    _ = v;
@@ -115917,7 +115917,7 @@ test "ZA301: block-prong switch with code after it measures to the fn end (EPH-I
         \\            set_line();
         \\        },
         \\    }
-    ++ "\n" ++ "    after();\n" ** 32 ++
+    ++ "\n" ++ "    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n    after();\n" ++
         \\}
         \\fn edge() void {}
         \\fn set_line() void {}
@@ -116502,7 +116502,7 @@ test "ZA301: wrapped type-factory signature keeps the [tf] multiplier (EPH-I0457
         \\    comptime T: type,
         \\) type {
         \\    const S = struct { x: T };
-    ++ "\n" ++ "    if (T == u8) {}\n" ++ "    _ = T;\n" ** 53 ++
+    ++ "\n" ++ "    if (T == u8) {}\n" ++ "    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n" ++
         \\    return S;
         \\}
     ;
@@ -116516,7 +116516,7 @@ test "ZA301: wrapped type-factory signature keeps the [tf] multiplier (EPH-I0457
         \\    comptime T: type,
         \\) void {
         \\    const S = struct { x: T };
-    ++ "\n" ++ "    if (T == u8) {}\n" ++ "    _ = T;\n" ** 53 ++
+    ++ "\n" ++ "    if (T == u8) {}\n" ++ "    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n    _ = T;\n" ++
         \\    _ = S;
         \\}
     ;
@@ -126288,7 +126288,7 @@ test "ZA209: literal brace on a >512-byte line cannot close the fn early (EPH-I0
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    const long_line = "    const s = \"" ++ ("x" ** 600) ++ "}\";";
+    const long_line = "    const s = \"" ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ++ "}\";";
     var content = std.ArrayListUnmanaged(u8).empty;
     defer content.deinit(allocator);
     try content.appendSlice(allocator, "fn parse() !void {\n");
@@ -126313,7 +126313,7 @@ test "ZA209: literal brace on a >512-byte line cannot keep the fn open (EPH-I042
     defer if (gpa.deinit() == .leak) @panic("gpa leaked");
     const allocator = gpa.allocator();
 
-    const long_line = "    const s = \"" ++ ("x" ** 600) ++ "{\";";
+    const long_line = "    const s = \"" ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ++ "{\";";
     var content = std.ArrayListUnmanaged(u8).empty;
     defer content.deinit(allocator);
     try content.appendSlice(allocator, "fn parse() !void {\n");

@@ -152,9 +152,9 @@ fn parseWorker(job: *ParseJob) void {
 }
 
 fn parseOnCurrentThread(allocator: Allocator, source: []const u8) !AstContext {
-    const zsource = try allocator.dupeZ(u8, source);
+    const zsource = try allocator.dupeSentinel(u8, source, 0);
     errdefer allocator.free(zsource);
-    var tree = try Ast.parse(allocator, zsource, .zig);
+    var tree = try Ast.parse(allocator, zsource, .{ .mode = .zig });
     errdefer tree.deinit(allocator);
     return .{
         .tree = tree,

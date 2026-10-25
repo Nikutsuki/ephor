@@ -466,7 +466,7 @@ pub const Walker = struct {
 /// Tags whose data is `node_and_node` (binary ops, assignments, ranges,
 /// catch/orelse, error unions — verified against Parse.zig's operTable).
 const binary_like_tags = blk: {
-    var set = std.EnumSet(Ast.Node.Tag).initEmpty();
+    var set = std.EnumSet(Ast.Node.Tag).empty;
     const tags = [_]Ast.Node.Tag{
         .assign,          .assign_mul,      .assign_div,      .assign_mod,
         .assign_add,      .assign_sub,      .assign_shl,      .assign_shl_sat,
@@ -474,7 +474,7 @@ const binary_like_tags = blk: {
         .assign_mul_wrap, .assign_add_wrap, .assign_sub_wrap, .assign_mul_sat,
         .assign_add_sat,  .assign_sub_sat,  .equal_equal,     .bang_equal,
         .less_than,       .greater_than,    .less_or_equal,   .greater_or_equal,
-        .mul,             .div,             .mod,             .array_mult,
+        .mul,             .div,             .mod,             
         .mul_wrap,        .mul_sat,         .add,             .sub,
         .array_cat,       .add_wrap,        .sub_wrap,        .add_sat,
         .sub_sat,         .shl,             .shl_sat,         .shr,
